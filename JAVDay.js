@@ -1,8 +1,8 @@
 var WidgetMetadata = {
-  id: "ti.bemarkt.javday",
+  id: "javday",
   title: "JAVDay",
-  description: "获取 JAVDay 推荐",
-  author: "Ti",
+  description: "JAVDay",
+  author: "XXX",
   site: "https://javday.app",
   version: "1.1.0",
   requiredVersion: "0.0.1",
@@ -10,8 +10,8 @@ var WidgetMetadata = {
   modules: [
     // 搜索模块
     {
-      title: "搜索视频",
-      description: "搜索JAVDay视频库",
+      title: "搜尋影片",
+      description: "搜尋JAVDay影片庫",
       requiresWebView: false,
       functionName: "search",
       cacheDuration: 3600,
