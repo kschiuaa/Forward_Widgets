@@ -93,19 +93,14 @@ async function loadDetail(link) {
 
   var playUrlStr = item.vod_play_url || "";
   var sourceGroups = playUrlStr.split("$$$");
-  var sourceNames = (item.vod_play_from || "").split("$$$");
   
   var firstVideoUrl = "";
-  var episodesList = [];
-  var playlist = [];
+  var seasons = [];
+  var totalEpisodes = 0;
 
-  // 解析多線路與多集數
-  for (var i = 0; i < sourceGroups.length; i++) {
-    var group = sourceGroups[i];
-    if (!group) continue;
-    
-    var sourceName = sourceNames[i] || "線路" + (i + 1);
-    var parts = group.split("#");
+  // 為了適配 TMDB，我們通常取第一個有效線路作為 Season 1 寫入
+  if (sourceGroups.length > 0 && sourceGroups[0]) {
+    var parts = sourceGroups[0].split("#");
     var currentSourceEpisodes = [];
     
     for (var j = 0; j < parts.length; j++) {
@@ -115,37 +110,39 @@ async function loadDetail(link) {
       var videoUrl = splitPart[1];
       
       if (videoUrl) {
-        if (!firstVideoUrl) {
-          firstVideoUrl = videoUrl;
-        }
+        if (!firstVideoUrl) firstVideoUrl = videoUrl;
         
-        // 構建單集物件 (多種鍵值命名以相容 Forward 底層的不同解析)
-        var epObj = {
-          id: videoUrl,
-          name: epName,
-          title: epName,
-          url: videoUrl,
-          videoUrl: videoUrl
-        };
-        currentSourceEpisodes.push(epObj);
-        episodesList.push(epObj);
+        // 【關鍵】：從「第43集」、「20261004期」等字串中提取數字
+        // 如果提取不到數字，則默認使用陣列索引 (j+1)
+        var epNumMatch = epName.match(/\d+/);
+        var epIndex = epNumMatch ? parseInt(epNumMatch[0], 10) : (j + 1);
+        
+        totalEpisodes++;
+
+        currentSourceEpisodes.push({
+          id: "play://" + videoUrl,
+          title: epName,           // 顯示名稱 (例如: 第43集)
+          videoUrl: videoUrl,      // 實際播放連結
+          link: "play://" + videoUrl,
+          seasonNumber: 1,         // TMDB 綁定需要：第 1 季
+          episodeNumber: epIndex   // TMDB 綁定需要：第 N 集
+        });
       }
     }
     
-    // 按線路分組的播放列表
-    playlist.push({
-      name: sourceName,
-      title: sourceName,
+    // 構建 Forward 預期的 seasons 結構
+    seasons.push({
+      seasonNumber: 1,
+      title: "第1季",
       episodes: currentSourceEpisodes
     });
   }
 
-  // 清理 HTML 標籤，讓簡介乾淨顯示
   var rawDescription = item.vod_blurb || item.vod_content || "暫無簡介";
   var cleanDescription = rawDescription.replace(/<[^>]+>/g, '').trim();
   
-  // 動態判斷：超過1集就告訴 Forward 這是 TV 劇集，觸發選集 UI
-  var isTvShow = episodesList.length > 1;
+  // 判斷是否為影集/綜藝：集數大於1，或是分類名稱包含劇/綜藝
+  var isTvShow = totalEpisodes > 1 || (item.type_name && (item.type_name.indexOf("劇") !== -1 || item.type_name.indexOf("綜藝") !== -1));
 
   return {
     id: link,
@@ -154,13 +151,7 @@ async function loadDetail(link) {
     mediaType: isTvShow ? "tv" : "movie", 
     title: item.vod_name,
     description: cleanDescription,
-    
-    // 輸出三種最常見的影視 App 陣列格式，確保 Forward 能抓到集數
-    episodes: episodesList, 
-    playlist: playlist,
-    seasons: [{
-      seasonNumber: 1,
-      episodes: episodesList
-    }]
+    // 傳入結構化的 seasons，Forward 就能自動點亮 image_5.png 裡的資源
+    seasons: seasons 
   };
 }
