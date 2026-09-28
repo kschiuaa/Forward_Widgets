@@ -81,12 +81,13 @@ async function search(params) {
 }
 
 async function loadDetail(link) {
+  // 處理點擊集數時的直鏈播放
   if (link && link.indexOf("play://") === 0) {
     return {
       id: link,
       type: "detail",
       videoUrl: link.replace("play://", ""),
-      mediaType: "movie" // 具體播放某集時，當作單影片處理即可
+      mediaType: "movie"
     };
   }
 
@@ -103,49 +104,67 @@ async function loadDetail(link) {
 
   var playUrlStr = item.vod_play_url || "";
   var sourceGroups = playUrlStr.split("$$$");
+  var sourceNames = (item.vod_play_from || "").split("$$$");
   
   var firstVideoUrl = "";
-  var seasons = [];
-  var episodesList = []; // 同時保留平鋪的集數，相容不同的 UI 渲染
+  var playlistsData = []; 
+  var totalEpisodesCount = 0;
 
-  if (sourceGroups.length > 0 && sourceGroups[0]) {
-    var parts = sourceGroups[0].split("#");
+  // 完美建構 Forward 支援的 playlists (包含多線路與集數)
+  for (var i = 0; i < sourceGroups.length; i++) {
+    var group = sourceGroups[i];
+    if (!group) continue;
+    
+    var sourceName = sourceNames[i] || "線路" + (i + 1);
+    var parts = group.split("#");
+    var currentEpisodes = [];
     
     for (var j = 0; j < parts.length; j++) {
       var part = parts[j];
       var splitPart = part.split("$");
-      var epName = splitPart[0] || "";
+      var epName = splitPart[0] || ("第" + (j + 1) + "集");
       var videoUrl = splitPart[1];
       
       if (videoUrl) {
         if (!firstVideoUrl) firstVideoUrl = videoUrl;
         
-        // 從名稱中提取集數數字給 TMDB 配對使用
+        // 提取數字供 TMDB 配對
         var epNumMatch = epName.match(/\d+/);
         var epIndex = epNumMatch ? parseInt(epNumMatch[0], 10) : (j + 1);
+        totalEpisodesCount++;
         
-        var epObj = {
-          id: "play://" + videoUrl,
+        // 【關鍵】將所有 Forward 可能讀取的集數變數全部寫入，確保 100% 觸發
+        currentEpisodes.push({
+          id: videoUrl,
           title: epName,
+          name: epName,
+          url: videoUrl,
           videoUrl: videoUrl,
           link: "play://" + videoUrl,
           seasonNumber: 1,
           episodeNumber: epIndex
-        };
-        episodesList.push(epObj);
+        });
       }
     }
     
-    seasons.push({
-      seasonNumber: 1,
-      title: "第1季",
-      episodes: episodesList
+    // 【關鍵】將所有 Forward 可能讀取的線路變數全部寫入
+    playlistsData.push({
+      id: sourceName,
+      title: sourceName,
+      name: sourceName,
+      episodes: currentEpisodes, // 相容 TMDB 模式
+      items: currentEpisodes,    // 相容純列表模式
+      list: currentEpisodes      // 相容舊版模式
     });
   }
 
   var rawDescription = item.vod_blurb || item.vod_content || "暫無簡介";
   var cleanDescription = rawDescription.replace(/<[^>]+>/g, '').trim();
-  var isTv = checkIsTvShow(item);
+  
+  // 判斷是否為 TV 模式
+  var tName = item.type_name || "";
+  var remarks = item.vod_remarks || "";
+  var isTv = (tName.indexOf("劇") !== -1 || tName.indexOf("綜") !== -1 || tName.indexOf("漫") !== -1 || remarks.indexOf("集") !== -1 || remarks.indexOf("期") !== -1) || totalEpisodesCount > 1;
 
   return {
     id: link,
@@ -154,7 +173,9 @@ async function loadDetail(link) {
     mediaType: isTv ? "tv" : "movie", 
     title: item.vod_name,
     description: cleanDescription,
-    seasons: seasons,
-    episodes: episodesList 
+    
+    // 將整理好的多線路/多集數資料交給 Forward
+    playlists: playlistsData, 
+    playlist: playlistsData
   };
 }
