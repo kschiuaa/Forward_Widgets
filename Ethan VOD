@@ -183,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.0.9",
+  version: "1.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -263,8 +263,9 @@ WidgetMetadata = {
 // ==================== 工具函数模块 ====================
 // 實測發現：真實 API 回傳的播放連結分兩種，一種是標準 .m3u8 直串，
 // 另一種是無副檔名的 /share/<md5> 頁面（點擊後仍會導向播放器）。
-// 若只認 .m3u8 會把大量可播來源整個濾掉，因此改為「排除明確不可播」而非
-// 「只接受 m3u8」。
+// 只認播放器真的能開的串流／檔案格式。
+// 「無副檔名就放行」會讓站方自帶播放器頁（/share/xxx）混進結果，Forward 播不了，
+// 使用者點了只會看到轉圈後失敗。寧可少給可選項，也不要給必定失敗的選項。
 const PLAYABLE_EXT = /\.(m3u8|mp4|flv|mkv|avi|mov|ts)(?:$|[?#])/i;
 const BLOCKED_URL = /(javascript:|data:)/i;
 
@@ -273,11 +274,7 @@ function isPlayableUrl(url) {
   const u = url.trim();
   if (!u || BLOCKED_URL.test(u)) return false;
   if (!/^https?:\/\//i.test(u)) return false;
-  // 有已知可播副檔名 -> 直接視為可播
-  if (PLAYABLE_EXT.test(u)) return true;
-  // 無副檔名：排除明顯是網頁/介面的路徑，其餘視為可播
-  if (/\.(html?|php|asp|aspx|jsp)(\?|$)/i.test(u)) return false;
-  return true;
+  return PLAYABLE_EXT.test(u);
 }
 
 // 相容舊呼叫點
@@ -665,6 +662,24 @@ function playSourceKeyOf(resource) {
   if (fromDesc) return fromDesc[1];
   if (resource?.playFrom) return String(resource.playFrom);
   return 'src';
+}
+
+/**
+ * 依集數挑出該集的來源。
+ *
+ * 有些站用日期命名集數（「- 1 -」而不是「第1集」），這類來源抽不出集數。
+ * 一律保留會在點第3集時混進第1集的連結，比少給更糟：使用者不會自己分辨。
+ * 但若某站完全沒有本集來源，寧可給一個可能可播的選項，也不要讓該站整個消失。
+ */
+function filterByEpisode(results, targetEpisode) {
+  if (!targetEpisode) return results;
+  const hasExact = results.some(res => episodeLabelOf(res) === targetEpisode);
+  return results.filter(res => {
+    const label = episodeLabelOf(res);
+    if (label === targetEpisode) return true;
+    if (label !== null) return false;
+    return !hasExact;
+  });
 }
 
 function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
@@ -1320,21 +1335,19 @@ class SmartSearchExecutor {
   processImmediateResults(resources, site, onResultCallback) {
     const newResults = [];
     
-    for (const resource of resources) {
+    // 指定集數時只推送該集，否則 UI 會先收到第1、2集的來源，
+    // 使用者選第34集卻看到不相干的連結。逐站判斷，理由見 filterByEpisode。
+    const candidates = (this.type === 'tv' && this.targetEpisode !== null)
+      ? filterByEpisode(resources, this.targetEpisode)
+      : resources;
+    
+    for (const resource of candidates) {
       if (this.seenUrls.has(resource.url)) continue;
       
       this.seenUrls.add(resource.url);
       resource._searchTime = Date.now();
       resource._site = site.title;
       resource._priority = site.priority;
-      
-      // 指定集數時只推送該集，否則 UI 會先收到第1、2集的來源，
-      // 使用者選第34集卻看到不相干的連結。集數無法判斷的來源保留：
-      // 寧可多給一個可能可播的選項，也不要把站整個濾掉。
-      if (this.type === 'tv' && this.targetEpisode !== null) {
-        const label = episodeLabelOf(resource);
-        if (label !== null && label !== this.targetEpisode) continue;
-      }
       
       if (!this.isContentDuplicate(resource)) {
         this.foundCount++;
@@ -1565,10 +1578,7 @@ async function loadResource(params, onStreamResult = null) {
         let usable = cachedResults;
         if (type === 'tv' && targetEpisode) {
           const before = usable.length;
-          usable = usable.filter(res => {
-            const label = episodeLabelOf(res);
-            return label === null || label === targetEpisode;
-          });
+          usable = filterByEpisode(usable, targetEpisode);
           console.log(`🎯 集数过滤(缓存): ${before} -> ${usable.length}`);
         }
         
@@ -1620,11 +1630,7 @@ async function loadResource(params, onStreamResult = null) {
   
   if (type === 'tv' && targetEpisode) {
     const beforeFilter = finalResults.length;
-    // 與串流過濾一致：只排除「明確是別集」的來源，無法判斷集數的保留。
-    finalResults = finalResults.filter(res => {
-      const label = episodeLabelOf(res);
-      return label === null || label === targetEpisode;
-    });
+    finalResults = filterByEpisode(finalResults, targetEpisode);
     console.log(`🎯 集数过滤: ${beforeFilter} -> ${finalResults.length}`);
   }
   
