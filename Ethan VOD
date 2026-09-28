@@ -183,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.0.8",
+  version: "1.0.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -642,6 +642,29 @@ function episodeLabelOf(resource) {
   }
   const fromText = String(resource?.description || '').match(/第(\d+)集/);
   return fromText ? parseInt(fromText[1], 10) : null;
+}
+
+/**
+ * 去重用的集數標識。抽不出集數的來源（綜藝日期集、單集電影）給一個穩定的
+ * 佔位值，讓它們彼此仍可去重，但永遠不會跟有集數的來源互相合併。
+ */
+function episodeKeyOf(resource) {
+  const label = episodeLabelOf(resource);
+  if (label !== null && label !== undefined) return `ep${label}`;
+  if (resource?._episodeDate) return `date:${resource._episodeDate}`;
+  return 'no-ep';
+}
+
+/**
+ * 播放來源標識。同一集在同一站常有數個 CDN 來源（如 wjm3u8 / jinyingm3u8），
+ * 這些是使用者要挑的可選來源，不能互相去重。來源名寫在 description 尾端的
+ * [xxx] 括號中。
+ */
+function playSourceKeyOf(resource) {
+  const fromDesc = String(resource?.description || '').match(/\[([^\]]+)\]/);
+  if (fromDesc) return fromDesc[1];
+  if (resource?.playFrom) return String(resource.playFrom);
+  return 'src';
 }
 
 function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
@@ -1336,12 +1359,12 @@ class SmartSearchExecutor {
   isContentDuplicate(resource) {
     if (!CONFIG.DEDUPLICATION.ENABLED) return false;
     
+    // 精確比對，不用字串相似度：集數與播放源已經是鍵的一部分，用模糊比對會讓
+    // 相鄰集數誤判為同一筆，見 generateContentKey 的說明。
     const contentKey = this.generateContentKey(resource);
     
     for (const [existingKey, existingResource] of this.seenContent.entries()) {
-      const similarity = calculateStringSimilarity(contentKey, existingKey);
-      
-      if (similarity >= CONFIG.DEDUPLICATION.SIMILARITY_THRESHOLD) {
+      if (existingKey === contentKey) {
         const existingScore = calculateResourceScore(existingResource);
         const newScore = calculateResourceScore(resource);
         
@@ -1360,17 +1383,19 @@ class SmartSearchExecutor {
   
   /**
    * 去重鍵必須含站名：不同站的同一集是不同的來源，使用者要的是多個可選來源，
-   * 跨站合併會讓每集只剩一個源。站內的重複才靠描述與畫質判定。
+   * 跨站合併會讓每集只剩一個源。
+   *
+   * 集數與播放源都必須是硬性獨立維度，不能靠字串相似度去猜：
+   * calculateStringSimilarity 是字元 Jaccard 集合比對，「第1集」與「第3集」的
+   * 字元集幾乎完全相同（相似度 >0.95），會讓同一站同一源的相鄰集數被當成重複，
+   * 使用者點第3集時整集的來源都已被去重吃掉。
    */
   generateContentKey(resource) {
-    const parts = [
+    return [
       resource.name,
-      resource.description?.substring(0, 50) || '',
-      resource.resolution || '',
-      resource.resolutionLevel || 0
-    ];
-    
-    return parts.join('_');
+      episodeKeyOf(resource),
+      playSourceKeyOf(resource)
+    ].join('|');
   }
   
   shouldStopSearch() {
@@ -1424,7 +1449,8 @@ class SmartSearchExecutor {
       let isDuplicate = false;
       
       for (const [existingKey, existingResource] of contentMap.entries()) {
-        if (calculateStringSimilarity(contentKey, existingKey) >= CONFIG.DEDUPLICATION.SIMILARITY_THRESHOLD) {
+        // 精確比對，不用字串相似度，理由同 generateContentKey。
+        if (existingKey === contentKey) {
           isDuplicate = true;
           
           if (calculateResourceScore(resource) > calculateResourceScore(existingResource)) {
