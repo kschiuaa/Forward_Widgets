@@ -183,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.0.7",
+  version: "1.0.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -789,8 +789,38 @@ function parseResourceSites(VodData) {
 
 // 部分 MacCMS 站台的分類 ID 與慣例不符（慣例 t=2 為電視劇），
 // 帶上 t 會得到 0 筆結果，必須不帶 t 才有資料。
-// 此表記住已確認不吃 t 的站台，避免每次都先送出注定失敗的請求。
-const SITES_REJECTING_TYPE_PARAM = new Set();
+// 這個發現會在執行時補進去，但 App 每次重啟都會清空記憶體，
+// 因此一併寫死已知站台，並用 storage 記住新發現的，避免每次都先送注定失敗的請求。
+const SITES_REJECTING_TYPE_PARAM = new Set([
+  // 實測：這幾站以 t=2 查詢回傳 pagecount=0，改用不帶 t 或 t=0 才有資料。
+  'dyttzyapi.com',
+  'ffzyapi.com',
+  'ryyshh.com'
+]);
+
+const REJECTING_TYPE_STORAGE_KEY = 'vod_sites_rejecting_t';
+
+function loadRejectingTypeSites() {
+  try {
+    const saved = Widget.storage?.get?.(REJECTING_TYPE_STORAGE_KEY);
+    if (Array.isArray(saved)) {
+      saved.forEach(site => SITES_REJECTING_TYPE_PARAM.add(site));
+    }
+  } catch (e) {
+    // storage 不可用時仍可運作，只是每個 App 工作階段都要重新試錯一次
+  }
+}
+
+function rememberRejectingTypeSite(siteValue) {
+  SITES_REJECTING_TYPE_PARAM.add(siteValue);
+  try {
+    Widget.storage?.set?.(REJECTING_TYPE_STORAGE_KEY, [...SITES_REJECTING_TYPE_PARAM]);
+  } catch (e) {
+    // 寫入失敗不影響本次搜尋結果
+  }
+}
+
+loadRejectingTypeSites();
 
 const API_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
@@ -834,17 +864,17 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
         return normalized;
       }
 
-      // 仍為空：去掉 t 分類參數再試一次，涵蓋分類 ID 不同的站台
-      if (searchParams.params.t !== undefined) {
-        delete searchParams.params.t;
-        const fallbackResponse = await httpGetApi(url, searchParams.params);
-        const fallback = normalizeHttpResponse(fallbackResponse);
-        if (fallback?.list && fallback.list.length > 0) {
-          SITES_REJECTING_TYPE_PARAM.add(url);
+        // 仍為空：去掉 t 分類參數再試一次，涵蓋分類 ID 不同的站台
+        if (searchParams.params.t !== undefined) {
+          delete searchParams.params.t;
+          const fallbackResponse = await httpGetApi(url, searchParams.params);
+          const fallback = normalizeHttpResponse(fallbackResponse);
+          if (fallback?.list && fallback.list.length > 0) {
+            rememberRejectingTypeSite(url);
+            return fallback;
+          }
           return fallback;
         }
-        return fallback;
-      }
 
       return normalized;
     } catch (error) {
@@ -1240,7 +1270,7 @@ class SmartSearchExecutor {
           const retry = await httpGetApi(site.value, params);
           const fallback = normalizeHttpResponse(retry);
           if (fallback?.list && fallback.list.length > 0) {
-            SITES_REJECTING_TYPE_PARAM.add(site.value);
+            rememberRejectingTypeSite(site.value);
             return fallback;
           }
           return fallback;
