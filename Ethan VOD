@@ -202,11 +202,21 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.4",
+  version: "1.2.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
   site: "",
+  // 必須是 0（詳細頁資料不快取）。
+  //
+  // Forward 預設 60 秒。在這段時間內於詳細頁切換同系列的另一部電影
+  // （讓子彈飛 → 一步之遙），App 會認為還是同一個詳細頁，直接沿用
+  // 快取的播放源列表 —— 畫面標題已換、播放源仍是舊片。
+  // 返回頁面重新搜尋會走完整流程，所以看起來只有那條路徑正常。
+  //
+  // 開啟快取換不到速度：真正的搜尋成本本來就在模組內部，
+  // 那層已按「片名+序號+年份+季+集」精確分鍵，看過的片不會重打站台。
+  detailCacheDuration: 0,
   globalParams: [
     {
       name: "multiSource",
@@ -2014,6 +2024,22 @@ async function loadResource(params, onStreamResult = null) {
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
+  
+  // 診斷用：記錄每次呼叫實際收到的欄位。頁內切換相關作品若沒刷新，
+  // 先看這份記錄確認 Forward 到底帶了什麼進來（連續兩次的 seriesName
+  // 若相同，代表是 App 端沒換片；不同的話就是模組層快取或比對問題）。
+  // 確認完畢後可整段移除。
+  try {
+    const logKey = 'vod_debug_calls';
+    const prev = Widget.storage?.get?.(logKey) || [];
+    Widget.storage?.set?.(logKey, prev.concat([{
+      t: new Date().toISOString(),
+      seriesName,
+      keys: Object.keys(params || {}),
+      params: Object.fromEntries(Object.entries(params || {})
+        .filter(([, v]) => typeof v !== 'object'))
+    }]).slice(-20));
+  } catch (e) { /* 診斷記錄失敗不影響搜尋 */ }
   
   const startTime = Date.now();
   
