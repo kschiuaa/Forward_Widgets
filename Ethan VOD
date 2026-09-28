@@ -183,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.0.4",
+  version: "1.0.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -924,21 +924,19 @@ class SiteManager {
       }
     }
     
+    // 健康檢查必須走 Widget.http：Forward 的腳本沙箱不保證提供全域 fetch，
+    // 直接用 fetch 會拋錯並把所有站點誤判為不健康，導致搜尋前就被全數跳過。
     try {
       const startTime = Date.now();
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
-      
-      const response = await fetch(site.value, {
-        method: 'HEAD',
-        signal: controller.signal,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-      }).finally(() => clearTimeout(timeoutId));
+      const response = await Widget.http.get(site.value, {
+        headers: { 'User-Agent': API_USER_AGENT },
+        timeout
+      });
       
       const responseTime = Date.now() - startTime;
-      const isHealthy = response.ok;
+      const status = response?.status ?? response?.statusCode ?? 200;
+      // 連不上（0 / 負數 / 5xx）才視為不健康；4xx 代表主機活著，僅該路徑有問題
+      const isHealthy = status >= 200 && status < 500;
       
       const siteInfo = this.sites.get(siteKey);
       if (siteInfo) {
@@ -963,21 +961,18 @@ class SiteManager {
       
       return isHealthy;
     } catch (error) {
+      // 探測本身失敗（沙箱限制、暫時性網路問題）不等於站點失效。
+      // 保守放行，讓後續真正的搜尋請求去驗證；在此直接判死會讓
+      // 整批站點在搜尋前就被跳過，導致 0 結果。
       const siteInfo = this.sites.get(siteKey);
       if (siteInfo) {
-        siteInfo.isHealthy = false;
+        siteInfo.isHealthy = true;
         siteInfo.lastCheck = now;
-        siteInfo.priority = Math.max(0.1, siteInfo.priority * 0.5);
       }
       
-      this.updateStats(siteKey, false, 0);
-      this.healthCache.set(siteKey, {
-        isHealthy: false,
-        timestamp: now,
-        responseTime: 0
-      });
+      this.updateStats(siteKey, true, 0);
       
-      return false;
+      return true;
     }
   }
   
