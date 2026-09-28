@@ -202,7 +202,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.2",
+  version: "1.2.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -275,6 +275,15 @@ WidgetMetadata = {
       title: "載入資源",
       functionName: "loadResource",
       type: "stream",
+      // 必須是 0（不快取模組結果）。
+      //
+      // 使用者在詳細頁切換系列內的另一部電影（讓子彈飛 → 一步之遙）時，
+      // Forward 只替換畫面內容，不會重建模組的執行環境。未設此值時
+      // Forward 沿用預設快取，直接把上一次的播放源列表回傳，
+      // 於是畫面標題已變、播放源仍是舊片 —— 返回頁面重新搜尋才會正確。
+      // 模組內部已有精確到「片名+序號+年份+季+集」的快取，
+      // 不需要靠這一層快取，重複請求也不會重打站台。
+      cacheDuration: 0,
       params: [],
     }
   ],
@@ -1976,17 +1985,28 @@ function cleanResourceForOutput(resource) {
 }
 
 async function loadResource(params, onStreamResult = null) {
-  const { 
-    seriesName, 
-    type = 'tv', 
-    season, 
-    episode, 
-    multiSource, 
+  const {
+    type = 'tv',
+    season,
+    episode,
+    multiSource,
     VodData,
     matchStrictness = 'standard',
     preferResolution = 'auto',
     searchMode = 'smart_stream'
   } = params;
+
+  // Forward 傳入片名的欄位名並非只有一種：詳細頁通常給 seriesName，
+  // 但由相關作品卡片切換進場時可能走別的欄位。任何一個欄位帶著
+  // 與上次不同的片名就代表使用者換片，必須優先採用。
+  // 全部取不到時直接放棄 —— 拿舊片名續搜只會得到舊片的來源。
+  const seriesName =
+    params.seriesName ||
+    params.episodeName ||
+    params.title ||
+    params.name ||
+    params.movieName ||
+    '';
 
   if (multiSource !== "enabled" || !seriesName) {
     return [];
