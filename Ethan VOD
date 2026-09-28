@@ -183,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.0.3",
+  version: "1.0.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1759,3 +1759,5 @@ async function performBatchSearch(params) {
   
   return finalResults.slice(0, 100);
 }
+
+module.exports = { loadResource };
