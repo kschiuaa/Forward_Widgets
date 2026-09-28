@@ -195,7 +195,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.1.6",
+  version: "1.1.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -379,6 +379,39 @@ function deepCleanSeriesName(name) {
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
   
   return cleaned;
+}
+
+/**
+ * 取出片名結尾的續集序號。
+ * 「战狼2」「无间道II」「窃听风云3：终极监听」→ "2" / "2" / "3"；
+ * 沒有續集序號則回傳 null。
+ * 電影沒有季度概念，序號就是辨識同系列不同作品的主要依據：
+ * 「追龙2」和「追龙」是不同的兩部片，序號不同即不可視為同一部。
+ */
+function extractSequelNumber(name) {
+  if (!name) return null;
+  const s = String(name).trim();
+
+  // 羅馬數字結尾（II / III / IV / Ⅴ）
+  const roman = s.match(/(?:\s|^)([IVXivx]+)$/);
+  if (roman) {
+    const map = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
+    const v = map[roman[1].toUpperCase()];
+    if (v) return v;
+  }
+
+  // 阿拉伯數字結尾。「2017」這類年份不算序號。
+  const arabic = s.match(/(\d+)\s*$/);
+  if (arabic) {
+    const n = parseInt(arabic[1], 10);
+    if (!Number.isNaN(n) && n < 100 && n > 0) return n;
+  }
+
+  // 「第X部」形式的續集
+  const diBu = s.match(/第\s*(\d+)\s*部/);
+  if (diBu) return parseInt(diBu[1], 10);
+
+  return null;
 }
 
 function calculateStringSimilarity(str1, str2) {
@@ -577,7 +610,25 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     return { match: false, type: 'none', score: 0, confidence: 0 };
   }
 
+  // 續集序號不同 = 不同的作品，無論字面多像都不能當成同一部片。
+  // 必須在相似度比對之前擋下：片名互相包含時相似度必然很高
+  // （「追龙2」對「追龙2017」清理後是「追龙」vs「追龙」），
+  // 而且年份尾巴的數字會撞上序號（"追龙2017" 包含 "追龙2"）。
+  const targetSequel = extractSequelNumber(targetInfo.rawName);
+  const candidateSequel = extractSequelNumber(candidateInfo.rawName);
+  const sequelConflict = targetSequel !== null && candidateSequel !== null &&
+                         targetSequel !== candidateSequel;
+
   const similarity = calculateHybridSimilarity(targetName, candidateName);
+
+  // 相似度完全命中也可能是續集誤判（清理後同名），序號衝突時一律否決。
+  if (sequelConflict) {
+    return {
+      match: false, type: 'sequel_conflict', score: 0,
+      similarity, sequelTarget: targetSequel, sequelCandidate: candidateSequel,
+      seasonMatch: false, confidence: 0
+    };
+  }
   
   let thresholds = CONFIG.MATCH_THRESHOLDS;
   if (matchStrictness === 'strict') {
@@ -625,14 +676,29 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     };
   } else if (targetInfo.rawName.includes(candidateInfo.rawName) || 
              candidateInfo.rawName.includes(targetInfo.rawName)) {
-    return { 
-      match: true, 
-      type: 'fallback', 
-      score: 50,
-      similarity: similarity,
-      seasonMatch: targetInfo.seasonNumber === candidateInfo.seasonNumber,
-      confidence: 0.60
-    };
+    // 互相包含只代表「片名有重疊」，不保證是同一部作品。
+    // 「追龙2」包含於「追龙2017」（年份的 2 開頭撞上序號）、
+    // 「战狼2」包含於「战狼传说」：這些都是同系列的不同片。
+    // 續集序號已在前面擋下；這裡再要求片名主體（去掉序號與年份後）完全相同，
+    // 否則寧可判為不匹配 —— 給錯電影的來源比少給更糟。
+    const targetCore = normalizeTitleForMatch(extractSequelNumber(targetInfo.rawName) !== null
+      ? targetInfo.rawName.replace(/\s*(?:\d+|第\s*\d+\s*部)\s*$/, '')
+      : targetInfo.baseName);
+    const candidateCore = normalizeTitleForMatch(extractSequelNumber(candidateInfo.rawName) !== null
+      ? candidateInfo.rawName.replace(/\s*(?:\d+|第\s*\d+\s*部)\s*$/, '')
+      : candidateInfo.baseName);
+    const sameCore = targetCore === candidateCore;
+
+    if (sameCore) {
+      return {
+        match: true,
+        type: 'fallback',
+        score: 50,
+        similarity: similarity,
+        seasonMatch: targetInfo.seasonNumber === candidateInfo.seasonNumber,
+        confidence: 0.60
+      };
+    }
   }
   
   return { match: false, type: 'none', score: 0, similarity: 0, confidence: 0 };
@@ -1667,7 +1733,11 @@ async function loadResource(params, onStreamResult = null) {
   // 快取鍵使用正規化名稱，繁簡輸入才會命中同一份快取。
   // episode 必須納入：不同集數的請求不可共用同一份快取，否則先播第1集
   // 存下的結果會被第34集的請求命中，回傳錯誤集數的來源。
-  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
+  // 另需帶上續集序號：清理片名時年份與序號都會被移除，
+  // 「追龙2017」與「追龙2」清理後都是「追龙」，共用同一鍵會讓後者
+  // 讀到前者的來源 —— 使用者點開同系列的另一部電影時看到舊片。
+  const sequelTag = extractSequelNumber(targetInfo.rawName);
+  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
   let cachedResults = [];
   
   if (CONFIG.CACHE_TTL > 0) {
@@ -1875,7 +1945,9 @@ async function performBatchSearch(params) {
   const targetEpisode = episode ? parseInt(episode) : null;
   targetInfo.seasonNumber = targetSeason;
 
-  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_s${targetSeason}_${type}`;
+  // 與串流模式同樣帶上續集序號，理由見 loadResource 的 cacheKey 說明。
+  const batchSequel = extractSequelNumber(targetInfo.rawName);
+  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_s${targetSeason}_${type}`;
   let allResults = [];
 
   try {
