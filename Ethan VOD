@@ -207,7 +207,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.3",
+  version: "1.2.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1849,15 +1849,41 @@ class SmartSearchExecutor {
     throw lastError;
   }
   
+  // 資源是否屬於目標版本。
+  //
+  // 這是即時推播的必經關卡。loadResource 裡的版本過濾發生在所有站都跑完之後，
+  // 但 processImmediateResults 會在每個站一完成的當下就把結果推給使用者 ——
+  // 電影天堂是最高優先站、也最快回應，韓版結果會第一時間出現在列表裡，
+  // 使用者看到的永遠是錯的版本，之後再過濾也已經來不及。
+  //
+  // 判斷依據是站方的 vod_year，不是片名：實測搜「仁医」時檔名多為光溜溜的
+  // 「仁医」，年份只存在於 vod_year 欄位，拿片名比會誤殺。
+  // 候選沒有年份就放行 —— 無法判斷不等於是錯的版本。
+  matchesTargetVersion(resource) {
+    if (!this.targetInfo.year) return true;
+    const candYear = resource._year;
+    if (!candYear) return true;
+    return String(candYear) === String(this.targetInfo.year);
+  }
+
   processImmediateResults(resources, site, onResultCallback) {
     const newResults = [];
-    
+
     // 指定集數時只推送該集，否則 UI 會先收到第1、2集的來源，
     // 使用者選第34集卻看到不相干的連結。逐站判斷，理由見 filterByEpisode。
-    const candidates = (this.type === 'tv' && this.targetEpisode !== null)
+    let candidates = (this.type === 'tv' && this.targetEpisode !== null)
       ? filterByEpisode(resources, this.targetEpisode)
       : resources;
-    
+
+    // 版本過濾必須在推播之前，否則使用者會先看到別的版本。
+    if (this.targetInfo.year) {
+      const before = candidates.length;
+      candidates = candidates.filter(r => this.matchesTargetVersion(r));
+      if (before !== candidates.length) {
+        console.log(`🚫 ${site.title}: 版本不符(${this.targetInfo.year})，略過 ${before - candidates.length}笔`);
+      }
+    }
+
     for (const resource of candidates) {
       if (this.seenUrls.has(resource.url)) continue;
       
@@ -2142,7 +2168,13 @@ async function loadResource(params, onStreamResult = null) {
           usable = filterByEpisode(usable, targetEpisode);
           console.log(`🎯 集数过滤(缓存): ${before} -> ${usable.length}`);
         }
-        
+
+        // 版本過濾必須在推播之前。
+        //
+        // 後面的版本過濾是在所有站都跑完才執行，而快取回推是立即發生的 ——
+        // 韓版結果會先出現在列表裡，之後再過濾也來不及。
+        usable = filterByTargetVersion(usable, targetInfo);
+
         if (usable.length === 0) {
           console.log('💾 缓存无匹配集数，改用实时搜索');
           cachedResults = [];
@@ -2197,27 +2229,9 @@ async function loadResource(params, onStreamResult = null) {
 
   // 指定版本時，排除確定是其他年份的來源。
   //
-  // 搜尋字串已鎖定版本（「仁医2009」），但站台仍可能回傳其他版本。
-  // 這裡只排除「片名明確帶著別的年份」的結果，判斷依據是站方的
-  // vod_year 欄位，不是片名 ——
-  //
-  // 原因：實測搜「仁医2009」時，電影天堂與非凡直接回 0 筆（站台不接受
-  // 年份關鍵字），能回傳結果的站，檔名也常是光溜溜的「仁医」不帶年份，
-  // 唯獨年份存在於 vod_year 欄位。拿片名判斷會把正確結果整批殺掉
-  // （實測 11 筆全滅）。拿 vod_year 判斷才是站台自己認可的版本標記。
-  if (targetInfo.year) {
-    const before = finalResults.length;
-    // 兩邊都轉字串比：_year 來自站台欄位是字串，targetInfo.year 是數字，
-    // 直接用 === 比會永遠不相等，把正確結果整批殺掉（實測 11 筆全滅）。
-    const want = String(targetInfo.year);
-    finalResults = finalResults.filter(res => {
-      const candYear = res._year;
-      return !candYear || String(candYear) === want;
-    });
-    if (before !== finalResults.length) {
-      console.log(`🚫 版本過濾(${want}): ${before} -> ${finalResults.length}`);
-    }
-  }
+  // 搜尋字串不含年份（實測塞年份進關鍵字會讓四個站回 0 筆），
+  // 站台會把所有版本一起回傳，版本判斷只能靠站方的 vod_year。
+  finalResults = filterByTargetVersion(finalResults, targetInfo);
   
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
@@ -2331,6 +2345,31 @@ function applyDetailVersion(params, targetInfo) {
   }
   const detailArea = resolveTargetArea(params, targetInfo);
   if (detailArea) targetInfo.region = detailArea;
+}
+
+// 依站方 vod_year 排除其他版本。
+//
+// 判斷依據必須是 vod_year，不是片名：實測搜「仁医」時五個站的檔名多為
+// 光溜溜的「仁医」，年份只存在於 vod_year 欄位。
+// 候選沒有年份就放行 —— 無法判斷不等於是錯的版本。
+//
+// 兩邊都轉字串比：_year 來自站台欄位是字串，targetInfo.year 是數字，
+// 直接用 === 比會永遠不相等，把正確結果整批殺掉（實測 11 筆全滅）。
+//
+// 快取裡的結果 _year 已被 cleanResourceForOutput 移除，所以放行片名比對
+// 作為後備 —— 那是快取路徑唯一還拿得到的版本線索。
+function filterByTargetVersion(results, targetInfo) {
+  if (!targetInfo.year) return results;
+  const want = String(targetInfo.year);
+  const before = results.length;
+  const filtered = results.filter(res => {
+    const candYear = res._year ?? extractVersionMarker(res.description || '');
+    return !candYear || String(candYear) === want;
+  });
+  if (before !== filtered.length) {
+    console.log(`🚫 版本過濾(${want}): ${before} -> ${filtered.length}`);
+  }
+  return filtered;
 }
 
 async function performSmartSearch(params, onStreamResult) {
@@ -2504,20 +2543,8 @@ async function performBatchSearch(params) {
     });
   }
 
-  // 版本過濾，理由與串流模式相同。批次結果不帶 _year（欄位在
-  // cleanResourceForOutput 才被移除），所以用站台年份欄位比對。
-  const batchYear = targetInfo.year || extractVersionMarker(targetInfo.rawName);
-  if (batchYear) {
-    const before = finalResults.length;
-    const want = String(batchYear);
-    finalResults = finalResults.filter(res => {
-      const candYear = res._year ?? extractVersionMarker(res.description || '');
-      return !candYear || String(candYear) === want;
-    });
-    if (before !== finalResults.length) {
-      console.log(`🚫 版本過濾(${want}): ${before} -> ${finalResults.length}`);
-    }
-  }
+  // 版本過濾，理由與串流模式相同。
+  finalResults = filterByTargetVersion(finalResults, targetInfo);
   
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
