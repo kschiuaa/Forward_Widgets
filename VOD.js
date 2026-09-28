@@ -3,7 +3,7 @@ WidgetMetadata = {
   title: "在線影視搜索",
   description: "基於MacCMS API的VOD資源",
   author: "Ethan",
-  version: "1.0.0",
+  version: "2.0.0",
   requiredVersion: "0.0.1",
   detailCacheDuration: 60,
   modules: [
