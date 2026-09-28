@@ -1,7 +1,7 @@
 WidgetMetadata = {
-  id: "maccms_vod",
-  title: "線上影視搜尋",
-  description: "提供 VOD 影視資源搜尋與播放",
+  id: "dytt_vod",
+  title: "在線影視搜索",
+  description: "基於MacCMS API的VOD資源",
   author: "Ethan",
   version: "1.0.0",
   requiredVersion: "0.0.1",
@@ -9,7 +9,7 @@ WidgetMetadata = {
   modules: [
     {
       title: "影片搜尋",
-      description: "搜尋資源",
+      description: "搜尋影片資源",
       requiresWebView: false,
       functionName: "search",
       cacheDuration: 3600,
@@ -18,111 +18,110 @@ WidgetMetadata = {
           name: "keyword",
           title: "關鍵詞",
           type: "input",
-          description: "請輸入影片名稱",
+          description: "請輸入影片名稱"
         },
-        { 
-          name: "page", 
-          title: "頁碼", 
-          type: "page", 
-          description: "頁碼", 
-          value: "1" 
+        {
+          name: "page",
+          title: "頁碼",
+          type: "page",
+          description: "頁碼",
+          value: "1"
         }
-      ],
+      ]
     }
-  ],
+  ]
 };
 
-const MAC_CMS_URL = "http://caiji.dyttzyapi.com/api.php/provide/vod/";
-
-// 1. 搜尋函數 (對應 modules 中的 functionName)
-async function search(params = {}) {
-  const keyword = encodeURIComponent(params.keyword || "");
-  const page = params.page || 1;
-  const url = `${MAC_CMS_URL}?ac=detail&wd=${keyword}&pg=${page}`;
+async function search(params) {
+  params = params || {};
+  var keyword = encodeURIComponent(params.keyword || "");
+  var page = params.page || "1";
+  var url = "http://caiji.dyttzyapi.com/api.php/provide/vod/?ac=detail&wd=" + keyword + "&pg=" + page;
   
-  const response = await Widget.http.get(url, {
+  var response = await Widget.http.get(url, {
     headers: {
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    },
+      "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+    }
   });
   
-  const data = JSON.parse(response.data);
-  const list = data.list || [];
+  var data = JSON.parse(response.data);
+  var list = data.list || [];
+  var results = [];
   
-  // 回傳格式對齊 ja.js 的要求
-  return list.map(item => ({
-    id: item.vod_id.toString(),
-    type: "url",
-    title: item.vod_name,
-    backdropPath: item.vod_pic, 
-    previewUrl: item.vod_pic,
-    link: item.vod_id.toString(), // 傳遞給 loadDetail 的參數
-    mediaType: "movie",
-    durationText: item.vod_remarks || "更新中",
-    description: item.vod_blurb || item.vod_content || "暫無簡介"
-  }));
+  for (var i = 0; i < list.length; i++) {
+    var item = list[i];
+    results.push({
+      id: item.vod_id.toString(),
+      type: "url",
+      title: item.vod_name,
+      backdropPath: item.vod_pic,
+      previewUrl: item.vod_pic,
+      link: item.vod_id.toString(),
+      mediaType: "movie",
+      durationText: item.vod_remarks || "更新中",
+      description: item.vod_blurb || item.vod_content || "暫無簡介"
+    });
+  }
+  return results;
 }
 
-// 2. 詳情與播放函數 (全域調用)
 async function loadDetail(link) {
-  // 【巧妙設計】如果 link 帶有 play:// 前綴，代表使用者點擊了下方集數列表，直接返回播放器 URL
-  if (link && link.startsWith("play://")) {
-    const directVideoUrl = link.replace("play://", "");
+  // 如果點擊了相關集數，直接返回播放直鏈
+  if (link && link.indexOf("play://") === 0) {
     return {
       id: link,
       type: "detail",
-      videoUrl: directVideoUrl,
+      videoUrl: link.replace("play://", ""),
       mediaType: "movie"
     };
   }
 
-  // 正常獲取影片詳情
-  const url = `${MAC_CMS_URL}?ac=detail&ids=${link}`;
-  const response = await Widget.http.get(url, {
+  var url = "http://caiji.dyttzyapi.com/api.php/provide/vod/?ac=detail&ids=" + link;
+  var response = await Widget.http.get(url, {
     headers: {
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    },
+      "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+    }
   });
   
-  const data = JSON.parse(response.data);
-  const item = data.list && data.list[0];
-  
+  var data = JSON.parse(response.data);
+  var item = data.list[0];
   if (!item) throw new Error("無法獲取影片資料");
 
-  // 解析多線路與多集數
-  const playUrlStr = item.vod_play_url || "";
-  const sourceGroups = playUrlStr.split('$$$');   const sourceNames = (item.vod_play_from \vert{}\vert{} "").split('$$$');
+  var playUrlStr = item.vod_play_url || "";
+  var sourceGroups = playUrlStr.split("$$$");
+  var sourceNames = (item.vod_play_from || "").split("$$$");
   
-  let firstVideoUrl = "";
-  let episodes = [];
+  var firstVideoUrl = "";
+  var episodes = [];
 
-  sourceGroups.forEach((group, index) => {
-    const sourceName = sourceNames[index] || `線路 ${index + 1}`;
-    const parts = group.split('#');
+  for (var i = 0; i < sourceGroups.length; i++) {
+    var group = sourceGroups[i];
+    var sourceName = sourceNames[i] || "線路" + (i + 1);
+    var parts = group.split("#");
     
-    parts.forEach((part) => {
-      const splitPart = part.split('$');
-      const epName = splitPart[0];
-      const videoUrl = splitPart[1];
+    for (var j = 0; j < parts.length; j++) {
+      var part = parts[j];
+      var splitPart = part.split("$");
+      var epName = splitPart[0];
+      var videoUrl = splitPart[1];
       
       if (videoUrl) {
-        if (!firstVideoUrl) firstVideoUrl = videoUrl; // 預設播放第一集
-        
-        // 將所有集數塞入 childItems 中，做為相關影片顯示在下方
+        if (!firstVideoUrl) {
+          firstVideoUrl = videoUrl;
+        }
         episodes.push({
-          id: `play://${videoUrl}`,
-          type: "url", 
-          title: `${sourceName} - ${epName}`,
+          id: "play://" + videoUrl,
+          type: "url",
+          title: sourceName + " - " + epName,
           backdropPath: item.vod_pic,
-          link: `play://${videoUrl}`, // 點擊時再次呼叫 loadDetail，並觸發上方 play:// 判斷
+          link: "play://" + videoUrl,
           mediaType: "movie",
           description: epName
         });
       }
-    });
-  });
+    }
+  }
 
-  // 回傳包含播放連結 (videoUrl) 與集數列表 (childItems) 的詳情物件
   return {
     id: link,
     type: "detail",
@@ -130,6 +129,6 @@ async function loadDetail(link) {
     mediaType: "movie",
     title: item.vod_name,
     description: item.vod_content,
-    childItems: episodes 
+    childItems: episodes
   };
 }
