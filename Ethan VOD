@@ -93,15 +93,21 @@ function normalizeForMatching(text) {
 }
 
 // ==================== 資源站清單 ====================
-// 僅保留實測可回應的站點；已剔除失效站、403 站與解析失敗站。
-// 鏡像站已合併去重，HTTP 站保留但排序權重較低。
+// 2026-09 實測結論：
+//   愛蛋 / 樂子  → 帶 t 分類參數搜尋正常
+//   電影天堂 / 如意資源 / 非凡資源 → 站方分類 ID 與慣例不同，
+//     送 t=2 會得到 0 筆，但搜尋本身正常（不帶 t 可回 7~8 筆）。
+//     程式已內建「空結果則去掉 t 重試」的 fallback，故保留啟用。
+//   天涯資源 → 明確回「暂不支持搜索」，暫停啟用；
+//     其 7 萬部內容的主分類 t=1/2/4 皆為空，無法透過 API 檢索。
+// 暫停站以 # 註解保留，站方恢復後取消註解即可重新啟用。
 const RESOURCE_SITES = `
 電影天堂,http://caiji.dyttzyapi.com/api.php/provide/vod
-如意資源,https://cj.rycjapi.com/api.php/provide/vod
-天涯資源,https://tyyszy.com/api.php/provide/vod
 非凡資源,https://cj.ffzyapi.com/api.php/provide/vod
-樂子,https://cj.lziapi.com/api.php/provide/vod
+如意資源,https://cj.rycjapi.com/api.php/provide/vod
+#天涯資源,https://tyyszy.com/api.php/provide/vod
 愛蛋,https://lovedan.net/api.php/provide/vod
+樂子,https://cj.lziapi.com/api.php/provide/vod
 `;
 
 // 中文數字映射
@@ -119,8 +125,8 @@ const CONFIG = {
   RETRY_ATTEMPTS: 2,
   CACHE_TTL: 10800,
 
-  // 主力源配置
-  MAIN_SOURCES: ['電影天堂', '如意資源', '天涯資源', '非凡資源'],
+  // 主力源配置：內容豐富且實測可回傳結果的站，可獲得排序加成
+  MAIN_SOURCES: ['愛蛋', '非凡資源', '電影天堂', '如意資源', '樂子'],
 
   // 流式搜尋配置
   STREAMING: {
@@ -177,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.0.1",
+  version: "1.0.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -706,11 +712,16 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
 
 function parseResourceSites(VodData) {
   const parseLine = (line) => {
-    const [title, value] = line.split(',').map(s => s.trim());
+    // 以 # 開頭為停用站註解，需在切分前排除，
+    // 否則站名會變成「#站名」而被誤認為有效來源。
+    const trimmedLine = line.trim();
+    if (!trimmedLine || trimmedLine.startsWith('#')) return null;
+
+    const [title, value] = trimmedLine.split(',').map(s => s.trim());
     if (title && value?.startsWith('http')) {
       const normalizedValue = (value.endsWith('/') || value.includes('.php') || value.includes('/json')) ? value : value + '/';
-      return { 
-        title, 
+      return {
+        title,
         value: normalizedValue,
         isMain: CONFIG.MAIN_SOURCES.includes(title)
       };
@@ -747,19 +758,22 @@ function parseResourceSites(VodData) {
   }
 }
 
+// 部分 MacCMS 站台的分類 ID 與慣例不符（慣例 t=2 為電視劇），
+// 帶上 t 會得到 0 筆結果，必須不帶 t 才有資料。
+// 此表記住已確認不吃 t 的站台，避免每次都先送出注定失敗的請求。
+const SITES_REJECTING_TYPE_PARAM = new Set();
+
 async function fetchWithSmartRetry(url, params, retries, siteTitle) {
   let lastError;
-  
+
   for (let i = 0; i <= retries; i++) {
     try {
-      const searchParams = {
-        ...params,
-        params: {
-          ...params.params,
-          t: params.params.t || (params.params.wd?.includes('综艺') ? 4 : 2)
-        }
-      };
-      
+      const baseQuery = { ...params.params };
+      if (SITES_REJECTING_TYPE_PARAM.has(url)) {
+        delete baseQuery.t;
+      }
+      const searchParams = { ...params, params: baseQuery };
+
       const response = await Widget.http.get(url, {
         ...searchParams,
         timeout: CONFIG.REQUEST_TIMEOUT
@@ -769,13 +783,23 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
       // 未正規化時 .data.list 永遠取不到，導致整個搜尋靜默回傳 0 筆。
       const normalized = normalizeHttpResponse(response);
 
-      if (!normalized?.list || normalized.list.length === 0) {
+      if (normalized?.list && normalized.list.length > 0) {
+        return normalized;
+      }
+
+      // 仍為空：去掉 t 分類參數再試一次，涵蓋分類 ID 不同的站台
+      if (searchParams.params.t !== undefined) {
         delete searchParams.params.t;
         const fallbackResponse = await Widget.http.get(url, {
           ...searchParams,
           timeout: CONFIG.REQUEST_TIMEOUT
         });
-        return normalizeHttpResponse(fallbackResponse);
+        const fallback = normalizeHttpResponse(fallbackResponse);
+        if (fallback?.list && fallback.list.length > 0) {
+          SITES_REJECTING_TYPE_PARAM.add(url);
+          return fallback;
+        }
+        return fallback;
       }
 
       return normalized;
@@ -1141,7 +1165,7 @@ class SmartSearchExecutor {
   
   async fetchWithSmartRetry(site, keyword, maxRetries = CONFIG.RETRY_ATTEMPTS) {
     let lastError;
-    
+
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         const params = {
@@ -1149,20 +1173,46 @@ class SmartSearchExecutor {
           wd: keyword,
           t: this.type === 'movie' ? 1 : (this.targetInfo.isVariety ? 4 : 2)
         };
-        
+
         if (site.value.includes('ffzy') || site.value.includes('wolong')) {
           if (this.targetInfo.year) {
             params.y = this.targetInfo.year;
           }
         }
-        
+
+        // 已確認不吃 t 參數的站台，直接略過分類條件
+        if (SITES_REJECTING_TYPE_PARAM.has(site.value)) {
+          delete params.t;
+        }
+
         const response = await Widget.http.get(site.value, {
           params,
           timeout: CONFIG.REQUEST_TIMEOUT
         });
 
         // 同 fetchWithSmartRetry：統一解析字串/巢狀回應
-        return normalizeHttpResponse(response);
+        const normalized = normalizeHttpResponse(response);
+
+        if (normalized?.list && normalized.list.length > 0) {
+          return normalized;
+        }
+
+        // 結果為空時改用不帶 t 的請求再試一次
+        if (params.t !== undefined) {
+          delete params.t;
+          const retry = await Widget.http.get(site.value, {
+            params,
+            timeout: CONFIG.REQUEST_TIMEOUT
+          });
+          const fallback = normalizeHttpResponse(retry);
+          if (fallback?.list && fallback.list.length > 0) {
+            SITES_REJECTING_TYPE_PARAM.add(site.value);
+            return fallback;
+          }
+          return fallback;
+        }
+
+        return normalized;
       } catch (error) {
         lastError = error;
         
