@@ -194,6 +194,11 @@ const CONFIG = {
     // 目標片名自帶年份而候選年份不符（「仁醫2012」搜到「仁医2009」）
     // 屬於另一部劇，必須排到最後。
     VERSION_CONFLICT_PENALTY: 120,
+    // 地區不符的強烈指標：Forward 詳細頁已選定版本，使用者要的是日版
+    // 仁医，站台卻回傳 area=韓國 的仁医2012。地區比片名可靠得多
+    // （片名只差年份，文字比對分不出來）。
+    AREA_MISMATCH_PENALTY: 150,
+    AREA_MATCH_BONUS: 40,
   }
 };
 
@@ -202,21 +207,11 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.5",
+  version: "1.2.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
   site: "",
-  // 必須是 0（詳細頁資料不快取）。
-  //
-  // Forward 預設 60 秒。在這段時間內於詳細頁切換同系列的另一部電影
-  // （讓子彈飛 → 一步之遙），App 會認為還是同一個詳細頁，直接沿用
-  // 快取的播放源列表 —— 畫面標題已換、播放源仍是舊片。
-  // 返回頁面重新搜尋會走完整流程，所以看起來只有那條路徑正常。
-  //
-  // 開啟快取換不到速度：真正的搜尋成本本來就在模組內部，
-  // 那層已按「片名+序號+年份+季+集」精確分鍵，看過的片不會重打站台。
-  detailCacheDuration: 0,
   globalParams: [
     {
       name: "multiSource",
@@ -1006,6 +1001,23 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
   const { vod_name, vod_play_url, vod_play_from, vod_remarks = '' } = item;
   if (!vod_name || !vod_play_url) return [];
 
+  // 站台已標註的年份與地區：片名文字只差一個年份時（「仁医2009」對
+  // 「仁医2012」），只有這些欄位能分辨是日版還是韓版。
+  const itemYear = String(item.vod_year || '').trim() || null;
+  const itemArea = normalizeArea(item.vod_area) || normalizeArea(item.type_name);
+  const targetYear = extractVersionMarker(targetInfo?.rawName) || targetInfo?.year || null;
+  const targetArea = resolveTargetArea(null, targetInfo);
+
+  // 地區衝突只在兩邊都有明確地區時才算，避免沒有 area 的站台被誤判
+  // （精簡站回傳的 type_name 可能是泛用分類，不能當地區）。
+  const areaMismatch = Boolean(targetArea && itemArea && targetArea !== itemArea);
+  const areaMatch = Boolean(targetArea && itemArea && targetArea === itemArea);
+
+  // 年份衝突要雙方都有年份才成立，否則沒有年份的站台會被全部誤殺。
+  const yearConflict = Boolean(
+    targetYear && itemYear && targetYear !== itemYear
+  );
+
   const playSources = vod_play_url.replace(/#+$/, '').split('$$$');
   const sourceNames = (vod_play_from || '').split('$$$');
   const results = [];
@@ -1054,8 +1066,10 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
             _hasEpInfo: episodeNumber !== null || dateMatch !== null,
             _updateRecency: vod_remarks.includes('更新') || vod_remarks.includes('第') ? 1 : 0,
             _seasonMatch: matchInfo.seasonMatch,
-            _versionConflict: isConflictingVersion(targetInfo, vod_name),
-            _versionAmbiguous: isVersionAmbiguous(targetInfo, vod_name)
+            _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
+            _versionAmbiguous: !yearConflict && isVersionAmbiguous(targetInfo, vod_name),
+            _areaMismatch: areaMismatch,
+            _areaMatch: areaMatch
           };
           
           results.push(resource);
@@ -1089,8 +1103,10 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           _hasEpInfo: false,
           _updateRecency: vod_remarks.includes('更新') ? 1 : 0,
           _seasonMatch: matchInfo.seasonMatch,
-          _versionConflict: isConflictingVersion(targetInfo, vod_name),
-          _versionAmbiguous: isVersionAmbiguous(targetInfo, vod_name)
+          _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
+          _versionAmbiguous: !yearConflict && isVersionAmbiguous(targetInfo, vod_name),
+          _areaMismatch: areaMismatch,
+          _areaMatch: areaMatch
         };
         
         results.push(resource);
@@ -1284,6 +1300,36 @@ function isVersionAmbiguous(targetInfo, candidateName) {
   return extractVersionMarker(candidateName) !== null;
 }
 
+// ==================== 地區辨識 ====================
+// 片名比對不足以分辨不同國家的同名劇：「仁医2009」與「仁医2012」
+// 文字只差年份，都被判成完全匹配，韓版就混進日版的結果。
+//
+// 站台其實已經把答案放在欄位裡（實測 cj.lziapi.com 完整回傳）：
+//   仁医        year=2009  area=日本  type_name=日本剧
+//   仁医2012    year=2012  area=韩国  type_name=韩国剧
+// 只靠片名文字猜不出日韓版，讀 vod_area / type_name 才能分清楚。
+// 其他站只回精簡欄位（無 area/year），此時退回片名判斷。
+const AREA_ALIASES = {
+  jp: 'jp', japan: 'jp', 日本: 'jp', 日語: 'jp', 日语: 'jp', 日韩: 'jp', 日韓: 'jp', 国产: 'cn', 中國: 'cn', 中国: 'cn', 大陆: 'cn', 内地: 'cn', 國語: 'cn', 国语: 'cn', 普通话: 'cn', 普通話: 'cn', 粤语: 'hk', 廣東: 'hk', 广东: 'hk', 港台: 'hk', 港澳: 'hk', 台灣: 'tw', 台湾: 'tw', 韓: 'kr', 韩: 'kr', 韓國: 'kr', 韩国: 'kr', 美: 'us', 美国: 'us', 英: 'uk', 英国: 'uk', 法: 'fr', 法国: 'fr', 泰: 'th', 泰国: 'th', 印度: 'in'
+};
+
+function normalizeArea(value) {
+  if (!value) return null;
+  // 部分站的 area 是「日本 / 日本剧」或陣列，先取第一段再比對
+  const first = Array.isArray(value) ? value[0] : String(value).split(/[\/,\s、]+/)[0];
+  const key = String(first || '').trim();
+  if (!key) return null;
+  return AREA_ALIASES[key] || AREA_ALIASES[key.toLowerCase()] || null;
+}
+
+// 從 Forward 傳入的片名 / 標題 / 首播資訊推測目標地區。
+// 詳細頁已選定具體版本，這些欄位常帶著國別線索（「日本」版權、海外片名）。
+function resolveTargetArea(params, targetInfo) {
+  const direct = normalizeArea(params?.area || params?.region || params?.country);
+  if (direct) return direct;
+  return normalizeArea(targetInfo?.region);
+}
+
 function calculateResourceScore(resource, preferResolution = 'auto') {
   let score = resource._matchScore || 0;
   const weights = CONFIG.SORT_WEIGHTS;
@@ -1296,6 +1342,8 @@ function calculateResourceScore(resource, preferResolution = 'auto') {
   if (resource._seasonMatch) score += weights.SEASON_MATCH_BONUS;
   if (resource._versionConflict) score -= weights.VERSION_CONFLICT_PENALTY;
   else if (resource._versionAmbiguous) score -= weights.VERSION_AMBIGUOUS_PENALTY;
+  if (resource._areaMismatch) score -= weights.AREA_MISMATCH_PENALTY;
+  else if (resource._areaMatch) score += weights.AREA_MATCH_BONUS;
   if (resource._isVariety && resource._hasEpInfo) score += weights.VARIETY_MATCH_BONUS;
   if (resource._isMainSource) score += weights.MAIN_SOURCE;
   if (resource._hasEpInfo) score += weights.HAS_EP_INFO;
@@ -1964,7 +2012,7 @@ function cleanResourceForOutput(resource) {
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch', 
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep', 
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
-    '_confidence', '_versionConflict', '_versionAmbiguous'
+    '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch'
   ];
   
   fieldsToDelete.forEach(field => {
@@ -2022,24 +2070,23 @@ async function loadResource(params, onStreamResult = null) {
     return [];
   }
 
+  // 記錄 Forward 實際帶進來的片名相關欄位。
+  // 詳細頁切換作品時，Forward 不一定會更新所有欄位，需要實際觀察才知道
+  // 哪些欄位跟著換、哪些停留在舊片 —— 這是判斷「播放源沒刷新」的依據。
+  const identity = {
+    seriesName,
+    season: season ?? '',
+    episode: episode ?? '',
+    premiereDate: params.premiereDate ?? '',
+    airDate: params.airDate ?? '',
+    episodeName: params.episodeName ?? '',
+    link: params.link ?? '',
+    id: params.id ?? params.tmdbId ?? params.imdbId ?? ''
+  };
+  console.log('🔎 詳細頁傳入:', JSON.stringify(identity));
+
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
-  
-  // 診斷用：記錄每次呼叫實際收到的欄位。頁內切換相關作品若沒刷新，
-  // 先看這份記錄確認 Forward 到底帶了什麼進來（連續兩次的 seriesName
-  // 若相同，代表是 App 端沒換片；不同的話就是模組層快取或比對問題）。
-  // 確認完畢後可整段移除。
-  try {
-    const logKey = 'vod_debug_calls';
-    const prev = Widget.storage?.get?.(logKey) || [];
-    Widget.storage?.set?.(logKey, prev.concat([{
-      t: new Date().toISOString(),
-      seriesName,
-      keys: Object.keys(params || {}),
-      params: Object.fromEntries(Object.entries(params || {})
-        .filter(([, v]) => typeof v !== 'object'))
-    }]).slice(-20));
-  } catch (e) { /* 診斷記錄失敗不影響搜尋 */ }
   
   const startTime = Date.now();
   
@@ -2053,6 +2100,30 @@ async function loadResource(params, onStreamResult = null) {
   const targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
   const targetEpisode = episode ? parseInt(episode) : null;
   targetInfo.seasonNumber = targetSeason;
+
+  // 詳細頁已選定具體版本時，Forward 會帶入首播年份（premiereDate / airDate）。
+  // 那是使用者實際選擇的那一版，必須優先於片名推導的年份 ——
+  // 韓版與日版片名只差年份，片名推導幾乎必然推錯。
+  const detailYear = extractVersionMarker(params.premiereDate) ||
+    extractVersionMarker(params.airDate) || null;
+  const titleYear = extractVersionMarker(targetInfo.rawName);
+  if (detailYear && detailYear !== targetInfo.year) {
+    console.log(`📅 詳細頁指定版本: ${detailYear}年 (片名推導: ${targetInfo.year ?? '無'})`);
+    targetInfo.year = detailYear;
+  }
+  // 同理，Forward 若帶了國別線索，一併採用。
+  const detailArea = resolveTargetArea(params, targetInfo);
+  if (detailArea) targetInfo.region = detailArea;
+
+  // 指定版本時，年份必須進到搜尋字串。
+  //
+  // 使用者在詳細頁選了韓版仁医（首播 2012），片名卻只有「仁醫」。
+  // 只送「仁医」會讓站台把日版與韓版一起回傳（實測五個站有四個把韓版
+  // 排在前面），再靠排序去猜要把哪些降權 —— 猜錯就是錯的版本排在最前。
+  // 搜「仁医2012」則由站台直接給出該版本，結果可控得多。
+  if (targetInfo.year && !titleYear && !/\d$/.test(targetInfo.searchQuery)) {
+    targetInfo.searchQuery += targetInfo.year;
+  }
 
   // season 參數是獨立於 seriesName 傳入的，使用者切換季別時 seriesName
   // 往往不變（「仁醫」+ season=2）。extractEnhancedInfo 只能從片名推季別，
@@ -2073,8 +2144,11 @@ async function loadResource(params, onStreamResult = null) {
   const sequelTag = extractSequelNumber(targetInfo.rawName);
   // 年份也要納入：clean 後「仁醫2009」與「仁醫2012」都變成「仁醫」，
   // 共用同一鍵會讓指定韓版的請求讀到日版的來源，指定年份形同失效。
-  const versionTag = extractVersionMarker(targetInfo.rawName) ?? targetInfo.year ?? 'x';
-  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_y${versionTag}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
+  // targetInfo.year 優先：詳細頁指定的版本（premiereDate）已寫入該欄位，
+  // 片名只有在使用者自己輸入年份時才是權威來源。
+  const versionTag = targetInfo.year ?? extractVersionMarker(targetInfo.rawName) ?? 'x';
+  const areaTag = targetInfo.region ?? 'x';
+  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_y${versionTag}_a${areaTag}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
   let cachedResults = [];
   
   if (CONFIG.CACHE_TTL > 0) {
@@ -2163,7 +2237,7 @@ async function loadResource(params, onStreamResult = null) {
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch',
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
-    '_versionConflict', '_versionAmbiguous'
+    '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch'
   ];
   
   finalResults.forEach(res => {
@@ -2243,6 +2317,21 @@ async function performSmartSearch(params, onStreamResult) {
   if (targetSeason > 1 && !/\d$/.test(targetInfo.searchQuery)) {
     targetInfo.searchQuery += String(targetSeason);
   }
+
+  // 詳細頁指定的版本同樣要帶進來。
+  //
+  // 這裡重新呼叫了 extractEnhancedInfo，loadResource 內套用的
+  // premiereDate / airDate / 地區資訊會全部消失 —— 韓版與日版片名幾乎相同，
+  // 少了版本資訊就會把兩個版本混在一起回傳。
+  // 傳入時用同一套規則補回，避免兩處各寫一套而漏掉。
+  const detailYear = extractVersionMarker(params.premiereDate) ||
+    extractVersionMarker(params.airDate) || null;
+  if (detailYear) targetInfo.year = detailYear;
+  if (!extractVersionMarker(targetInfo.rawName) && targetInfo.year && !/\d$/.test(targetInfo.searchQuery)) {
+    targetInfo.searchQuery += targetInfo.year;
+  }
+  const detailArea = resolveTargetArea(params, targetInfo);
+  if (detailArea) targetInfo.region = detailArea;
 
   // 原本這裡會先對 10 個站做健康檢查再開始搜尋。該檢查只是 GET 站點首頁、
   // 結果不影響搜尋行為，等於每個站先被多打一次請求再打正式的搜尋請求，
@@ -2401,7 +2490,8 @@ async function performBatchSearch(params) {
   const fieldsToDelete = ['_finalScore', '_matchType', '_matchScore', '_seasonMatch',
                          '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
                          '_isVariety', '_episodeDate', '_confidence',
-                         '_versionConflict', '_versionAmbiguous'];
+                         '_versionConflict', '_versionAmbiguous',
+                         '_areaMismatch', '_areaMatch'];
   finalResults.forEach(res => {
     fieldsToDelete.forEach(field => {
       if (field in res) delete res[field];
