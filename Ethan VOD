@@ -118,6 +118,11 @@ const CONFIG = {
   MAX_CONCURRENT_REQUESTS: 8,
   MIN_CONCURRENT_REQUESTS: 3,
   REQUEST_TIMEOUT: 6000,
+  // 實測延遲不穩定的站（愛蛋 8 次取樣：2.0~10.0 秒，中位數 4.3 秒，
+  // 約三分之一超過 6 秒）。用一般逾時會讓它經常半路被砍，
+  // 每次失敗還要拖住整批等待。給它專屬的寬裕逾時。
+  SLOW_SITE_TIMEOUT: 12000,
+  SLOW_SITE_MATCH: ['lovedan.net'],
   // 串流模式下 Forward 會在拿到第一個 complete 後就停止等待。慢站重試拖太久
   // 會讓整批結果來不及送出，使用者看到的是「暫無可用資源」——即使其他站
   // 早就回來了。重試必須讓總時間遠小於前端的等待上限。
@@ -125,7 +130,8 @@ const CONFIG = {
   CACHE_TTL: 10800,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
-  SEARCH_DEADLINE: 15000,
+  // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
+  SEARCH_DEADLINE: 18000,
   // 已從這麼多個站拿到結果就收尾，剩下的站不再等待。5 = 目前全部站點，
   // 等同「全都回來才收尾」，但仍受 SEARCH_DEADLINE 保護。
   // 調小可換取更快回應，代價是站數變少。設 0 停用。
@@ -189,7 +195,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.1.4",
+  version: "1.1.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -881,9 +887,12 @@ function buildRequestUrl(baseUrl, params) {
 }
 
 async function httpGetApi(baseUrl, params, timeout) {
+  // 實測延遲不穩定的站需要更寬裕的逾時，否則會在半路被砍掉。
+  const slow = CONFIG.SLOW_SITE_MATCH.some(m => baseUrl.includes(m));
+  const effective = timeout || (slow ? CONFIG.SLOW_SITE_TIMEOUT : CONFIG.REQUEST_TIMEOUT);
   return Widget.http.get(buildRequestUrl(baseUrl, params), {
     headers: { 'User-Agent': API_USER_AGENT },
-    timeout: timeout || CONFIG.REQUEST_TIMEOUT
+    timeout: effective
   });
 }
 
@@ -1125,7 +1134,7 @@ class SmartSearchExecutor {
     this.isSearching = true;
     // 各站完成即累積，逾時中止時仍能交出已完成的部分結果。
     this.collected = [];
-    // 各站在途請求的起始時間，用來判斷「剩下的站是否還有可能回來」。
+    // 各站在途請求：起始時間 + 該站可等待的預算（慢站預算較長）。
     this.inFlight = new Map();
     
     this.stats = {
@@ -1183,16 +1192,15 @@ class SmartSearchExecutor {
         //  3. 整體時限到 -> 強制收尾
         groupResults = await new Promise(resolve => {
           // 記錄「最後一次有站加入」的時間。有新站加入代表還有進展，
-          // 就該繼續等；反之若一段時間都沒有新站加入且在途站已超時，
-          // 剩下的站多半是卡住的，等下去不會有新結果。
+          // 就該繼續等；反之若一段時間都沒有新站加入，且在途站已用完自己的
+          // 預算，剩下的站多半是卡住的，等下去不會有新結果。
           const start = Date.now();
           let maxStart = start;
           const noteProgress = () => {
-            for (const t of this.inFlight.values()) {
-              if (t > maxStart) maxStart = t;
+            for (const v of this.inFlight.values()) {
+              if (v.start > maxStart) maxStart = v.start;
             }
           };
-          const perSiteBudget = CONFIG.REQUEST_TIMEOUT + CONFIG.RETRY_ATTEMPTS * 1500;
 
           const tick = () => {
             if (enough()) return resolve(drain());
@@ -1201,10 +1209,8 @@ class SmartSearchExecutor {
             const now = Date.now();
             noteProgress();
             const noNewSite = now - maxStart > 2000;
-            const oldest = this.inFlight.size
-              ? Math.min(...this.inFlight.values())
-              : now;
-            if (this.inFlight.size > 0 && noNewSite && now - oldest > perSiteBudget) {
+            const hopeless = [...this.inFlight.values()].every(v => now - v.start > v.budget);
+            if (this.inFlight.size > 0 && noNewSite && hopeless) {
               return resolve(drain());
             }
             setTimeout(tick, 100);
@@ -1293,7 +1299,14 @@ class SmartSearchExecutor {
 
     const siteStartTime = Date.now();
     const siteKey = `${site.title}_${site.value}`;
-    this.inFlight.set(siteKey, siteStartTime);
+    const perSite = CONFIG.SLOW_SITE_MATCH.some(m => site.value.includes(m))
+      ? CONFIG.SLOW_SITE_TIMEOUT
+      : CONFIG.REQUEST_TIMEOUT;
+    this.inFlight.set(siteKey, {
+      start: siteStartTime,
+      // 逾時 + 重試退避；超過這個時間還沒回來就不可能再成功了。
+      budget: perSite + CONFIG.RETRY_ATTEMPTS * 1500
+    });
     
     try {
       const response = await this.fetchWithSmartRetry(site, this.targetInfo.searchQuery || this.targetInfo.baseName);
@@ -1403,7 +1416,10 @@ class SmartSearchExecutor {
 
           // 重試必須仍趕得在整體時限內送出，否則這段退避只是讓使用者
           // 多空等 — 逾時的站再試一次通常也是逾時。
-          if (this.deadline && Date.now() + delay + CONFIG.REQUEST_TIMEOUT > this.deadline) {
+          const perSite = CONFIG.SLOW_SITE_MATCH.some(m => site.value.includes(m))
+            ? CONFIG.SLOW_SITE_TIMEOUT
+            : CONFIG.REQUEST_TIMEOUT;
+          if (this.deadline && Date.now() + delay + perSite > this.deadline) {
             console.log(`⏱️ ${site.title} 剩餘時間不足重試，直接放棄`);
             break;
           }
