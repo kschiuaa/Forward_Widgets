@@ -183,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.0.6",
+  version: "1.0.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1276,10 +1276,11 @@ class SmartSearchExecutor {
       resource._priority = site.priority;
       
       // 指定集數時只推送該集，否則 UI 會先收到第1、2集的來源，
-      // 使用者選第34集卻看到不相干的連結。
-      if (this.type === 'tv' && this.targetEpisode !== null &&
-          episodeLabelOf(resource) !== this.targetEpisode) {
-        continue;
+      // 使用者選第34集卻看到不相干的連結。集數無法判斷的來源保留：
+      // 寧可多給一個可能可播的選項，也不要把站整個濾掉。
+      if (this.type === 'tv' && this.targetEpisode !== null) {
+        const label = episodeLabelOf(resource);
+        if (label !== null && label !== this.targetEpisode) continue;
       }
       
       if (!this.isContentDuplicate(resource)) {
@@ -1328,27 +1329,18 @@ class SmartSearchExecutor {
   }
   
   /**
-   * 跨站去重的判定鍵。刻意不含站名：同一集在多個站的描述與畫質完全相同，
-   * 應該只保留一份。若把站名算進去，相同內容在不同站永遠判不出重複，
-   * 會導致串流結果重複、最終結果又被 smartDeduplicate 刪掉，兩邊數量對不上。
+   * 去重鍵必須含站名：不同站的同一集是不同的來源，使用者要的是多個可選來源，
+   * 跨站合併會讓每集只剩一個源。站內的重複才靠描述與畫質判定。
    */
   generateContentKey(resource) {
     const parts = [
-      this.normalizeDescriptionForDedupe(resource.description),
+      resource.name,
+      resource.description?.substring(0, 50) || '',
       resource.resolution || '',
       resource.resolutionLevel || 0
     ];
     
     return parts.join('_');
-  }
-  
-  // 描述格式為「片名 - 第N集 - 備註 - [來源]」，來源與備註各站不同，
-  // 去掉尾端的來源標記後剩下的才是真正代表內容的部分。
-  normalizeDescriptionForDedupe(description) {
-    return String(description || '')
-      .replace(/\s*-\s*\[[^\]]*\]\s*$/, '')
-      .replace(/\s*-\s*[^-]*$/, '')
-      .trim();
   }
   
   shouldStopSearch() {
@@ -1517,7 +1509,10 @@ async function loadResource(params, onStreamResult = null) {
         let usable = cachedResults;
         if (type === 'tv' && targetEpisode) {
           const before = usable.length;
-          usable = usable.filter(res => episodeLabelOf(res) === targetEpisode);
+          usable = usable.filter(res => {
+            const label = episodeLabelOf(res);
+            return label === null || label === targetEpisode;
+          });
           console.log(`🎯 集数过滤(缓存): ${before} -> ${usable.length}`);
         }
         
@@ -1569,7 +1564,11 @@ async function loadResource(params, onStreamResult = null) {
   
   if (type === 'tv' && targetEpisode) {
     const beforeFilter = finalResults.length;
-    finalResults = finalResults.filter(res => episodeLabelOf(res) === targetEpisode);
+    // 與串流過濾一致：只排除「明確是別集」的來源，無法判斷集數的保留。
+    finalResults = finalResults.filter(res => {
+      const label = episodeLabelOf(res);
+      return label === null || label === targetEpisode;
+    });
     console.log(`🎯 集数过滤: ${beforeFilter} -> ${finalResults.length}`);
   }
   
@@ -1791,7 +1790,10 @@ async function performBatchSearch(params) {
 
   let finalResults = allResults;
   if (type === 'tv' && targetEpisode) {
-    finalResults = allResults.filter(res => episodeLabelOf(res) === targetEpisode);
+    finalResults = allResults.filter(res => {
+      const label = episodeLabelOf(res);
+      return label === null || label === targetEpisode;
+    });
   }
   
   finalResults.forEach(res => {
