@@ -183,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.1.0",
+  version: "1.1.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1724,14 +1724,11 @@ async function performSmartSearch(params, onStreamResult) {
   const sortedSites = siteManager.initializeSites(resourceSites);
   
   const targetInfo = extractEnhancedInfo(seriesName);
-  
-  const quickCheckSites = sortedSites.slice(0, 10);
-  const healthChecks = quickCheckSites.map(site => 
-    siteManager.checkSiteHealth(site, 1500)
-  );
-  
-  await Promise.allSettled(healthChecks);
-  
+
+  // 原本這裡會先對 10 個站做健康檢查再開始搜尋。該檢查只是 GET 站點首頁、
+  // 結果不影響搜尋行為，等於每個站先被多打一次請求再打正式的搜尋請求，
+  // 慢的站還要等滿 1500ms 超時。串流的價值就是快，實測因此多花掉數秒，
+  // 這裡直接移除。
   const executor = new SmartSearchExecutor(siteManager, targetInfo, type, matchStrictness, targetEpisode);
   
   const allResults = await executor.search(onStreamResult);
