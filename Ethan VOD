@@ -195,13 +195,13 @@ const CONFIG = {
 
 // ==================== 模組中繼資料 ====================
 WidgetMetadata = {
-  id: "vod_stream_enhanced_pro",
-  title: "VOD源(流式增強專業版)",
+  id: "EthanVOD",
+  title: "EthanVOD",
   icon: "",
-  version: "5.0.0",
+  version: "1.0.0",
   requiredVersion: "0.0.1",
   description: "VOD 聚合搜尋(全源 + 快速 + 精準匹配 + 即時流式 + 繁簡自動轉換)",
-  author: "MoYan",
+  author: "Ethan",
   site: "",
   globalParams: [
     {
