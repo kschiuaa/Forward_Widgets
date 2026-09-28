@@ -195,7 +195,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.1.7",
+  version: "1.2.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -382,34 +382,121 @@ function deepCleanSeriesName(name) {
 }
 
 /**
- * 取出片名結尾的續集序號。
- * 「战狼2」「无间道II」「窃听风云3：终极监听」→ "2" / "2" / "3"；
- * 沒有續集序號則回傳 null。
- * 電影沒有季度概念，序號就是辨識同系列不同作品的主要依據：
- * 「追龙2」和「追龙」是不同的兩部片，序號不同即不可視為同一部。
+ * 剝離片名的副標題與版本註記，只留下主片名。
+ * 「追龙2：追缉大富豪」→「追龙2」
+ * 「无间道2[普通话版]」→「无间道2」
+ * 「窃听风云粤语版」→「窃听风云」
+ *
+ * 中文片名常在冒號、方括號、分隔線或空白後接續副標題、語言版本、
+ * 畫質標示。比對「是否為同一部片」時這些都是噪音：同一作品在不同
+ * 資源站的片名寫法不一致，但主片名一定相同。
+ */
+function stripSubtitle(name) {
+  if (!name) return '';
+  let s = String(name);
+
+  // 方括號 / 圓括號內的註記：語言版本、畫質、來源等。
+  s = s.replace(/[（(【\[][^）)】\]]*[）)】\]]/g, ' ');
+
+  // 冒號、豎線、分隔線之後的副標題。
+  s = s.split(/[：:｜|]|\s[-–—]\s/)[0];
+
+  // 片名尾端的語言／版本註記（清理函式已移除方括號，剩下的是裸露文字）。
+  s = s.replace(/[一-鿿]{2,4}版$/, ' ');
+  s = s.replace(/\s*(國語|粤语|粤語|普通話|普通话|英语|英語|日语|日語|韩语|韓語|中字|双语|雙語|简繁|內封|内封|未删减|未刪減|完整版|終章|终章)$/g, ' ');
+
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 中文數字轉阿拉伯數字，用於片名中的「第二部」「第三季」這類寫法。
+ * 「二」→ 2、「十」→ 10、「二十」→ 20、「二十一」→ 21。
+ * 超出 0~99（續集序號的合理範圍）回傳 0，表示無法解讀。
+ */
+function parseChineseNumeral(text) {
+  if (!text) return 0;
+  const s = String(text).trim();
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+
+  const digits = { 零: 0, 一: 1, 壹: 1, 二: 2, 贰: 2, 兩: 2, 三: 3, 叁: 3, 四: 4, 肆: 4,
+                   五: 5, 伍: 5, 六: 6, 陆: 6, 七: 7, 柒: 7, 八: 8, 捌: 8, 九: 9, 玖: 9 };
+  const units = { 十: 10, 拾: 10, 百: 100, 佰: 100 };
+
+  let total = 0;
+  let section = 0;
+  let current = 0;
+  for (const ch of s) {
+    if (ch in digits) {
+      current = digits[ch];
+    } else if (ch in units) {
+      // 「十二」的十前面沒有數字時視為一十。
+      section += (current || 1) * units[ch];
+      current = 0;
+    } else {
+      return 0;
+    }
+  }
+  total = section + current;
+  return total > 0 && total < 100 ? total : 0;
+}
+
+/**
+ * 取出片名中的續集序號。
+ *
+ * 「战狼2」「无间道II」「窃听风云3：终极监听」「追龙2：追缉大富豪」
+ * 「无间道2[普通话版]」→ 分別為 2 / 2 / 3 / 2 / 2，沒有則 null。
+ *
+ * 序號不一定在結尾，資源站的片名常帶「：副標題」「[普通話版]」
+ * 之類的綴飾，所以要在整個片名中搜尋，而非只比對結尾。
+ * 同時必須排除：
+ *  - 年份（红海行动2018 的 2018 是上映年份，不是續集序號）
+ *  - 「解说 / 速看 / 剪輯 / 預告」等二次剪輯影片的編號
+ * 這些會讓同一部片被誤判成不同作品，或反過來讓續集被當成原版。
  */
 function extractSequelNumber(name) {
   if (!name) return null;
   const s = String(name).trim();
+  if (!s) return null;
 
-  // 羅馬數字結尾（II / III / IV / Ⅴ）
-  const roman = s.match(/(?:\s|^)([IVXivx]+)$/);
+  // 二次剪輯／解說影片不是正片，不參與續集判斷。
+  if (/解说|解說|速看|剪輯|預告|预告|片花|花絮|影评|影評|-trailer/i.test(s)) {
+    return null;
+  }
+
+  // 羅馬數字（II / III / IV）：不論在結尾還是副標題中都算。
+  const roman = s.match(/(?:\s|：|:)([IVX]{1,4})\b/);
   if (roman) {
     const map = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
     const v = map[roman[1].toUpperCase()];
     if (v) return v;
   }
 
-  // 阿拉伯數字結尾。「2017」這類年份不算序號。
-  const arabic = s.match(/(\d+)\s*$/);
-  if (arabic) {
-    const n = parseInt(arabic[1], 10);
-    if (!Number.isNaN(n) && n < 100 && n > 0) return n;
+  // 「第X部 / 第二部」形式的續集（含中文數字）。
+  const diBu = s.match(/第\s*([0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+)\s*部/);
+  if (diBu) {
+    const v = parseChineseNumeral(diBu[1]);
+    if (v) return v;
   }
 
-  // 「第X部」形式的續集
-  const diBu = s.match(/第\s*(\d+)\s*部/);
-  if (diBu) return parseInt(diBu[1], 10);
+  // 「大江大河II」這類純羅馬數字結尾。
+  const romanTail = s.match(/(?:\s|[：:：])([IVX]{1,4})$/);
+  if (romanTail) {
+    const map = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
+    const v = map[romanTail[1].toUpperCase()];
+    if (v) return v;
+  }
+
+  // 阿拉伯數字：取第一個出現且不像年份的數字。
+  const digits = [...s.matchAll(/(\d+)/g)]
+    .map(m => ({ raw: m[1], at: m.index }))
+    .filter(d => {
+      const n = parseInt(d.raw, 10);
+      if (!(n > 0 && n < 100)) return false;      // 排除 0 與 100 以上（含年份）
+      // 序號前面是中文／英文文字才算續集；「红海行动2018」整個是年份。
+      const before = s.slice(0, d.at);
+      return /[^\d\s]$/.test(before) || before.length === 0;
+    });
+  if (digits.length) return parseInt(digits[0].raw, 10);
 
   return null;
 }
@@ -610,14 +697,18 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     return { match: false, type: 'none', score: 0, confidence: 0 };
   }
 
-  // 續集序號不同 = 不同的作品，無論字面多像都不能當成同一部片。
-  // 必須在相似度比對之前擋下：片名互相包含時相似度必然很高
-  // （「追龙2」對「追龙2017」清理後是「追龙」vs「追龙」），
-  // 而且年份尾巴的數字會撞上序號（"追龙2017" 包含 "追龙2"）。
+  // 續集序號的判斷必須同時涵蓋兩種衝突：
+  //  1. 兩者都有序號但數字不同（「无间道2」對「无间道3」）
+  //  2. 一個有序號、一個沒有（「窃听风云2」對「窃听风云」是續集與原版，
+  //     「战狼2」對「战狼」亦然 —— 這是最容易出錯的一組）
+  // 第 2 種在片名互相包含時相似度必然很高（清理後幾乎同名），
+  // 且年份尾巴的數字會撞上序號（"追龙2017" 包含 "追龙2"），
+  // 因此必須在相似度比對之前就擋下，不能交給門檻判斷。
   const targetSequel = extractSequelNumber(targetInfo.rawName);
   const candidateSequel = extractSequelNumber(candidateInfo.rawName);
-  const sequelConflict = targetSequel !== null && candidateSequel !== null &&
-                         targetSequel !== candidateSequel;
+  const sequelShapeMismatch = (targetSequel === null) !== (candidateSequel === null);
+  const sequelConflict = sequelShapeMismatch ||
+    (targetSequel !== null && candidateSequel !== null && targetSequel !== candidateSequel);
 
   const similarity = calculateHybridSimilarity(targetName, candidateName);
 
@@ -679,17 +770,16 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     // 互相包含只代表「片名有重疊」，不保證是同一部作品。
     // 「追龙2」包含於「追龙2017」（年份的 2 開頭撞上序號）、
     // 「战狼2」包含於「战狼传说」：這些都是同系列的不同片。
-    // 續集序號已在前面擋下；這裡再要求片名主體（去掉序號與年份後）完全相同，
-    // 否則寧可判為不匹配 —— 給錯電影的來源比少給更糟。
-    const targetCore = normalizeTitleForMatch(extractSequelNumber(targetInfo.rawName) !== null
-      ? targetInfo.rawName.replace(/\s*(?:\d+|第\s*\d+\s*部)\s*$/, '')
-      : targetInfo.baseName);
-    const candidateCore = normalizeTitleForMatch(extractSequelNumber(candidateInfo.rawName) !== null
-      ? candidateInfo.rawName.replace(/\s*(?:\d+|第\s*\d+\s*部)\s*$/, '')
-      : candidateInfo.baseName);
-    const sameCore = targetCore === candidateCore;
+    //
+    // 判斷原則：主片名相同、且續集序號一致。
+    // 主片名要去掉副標題：「追龙2」與「追龙2：追缉大富豪」是同一部片，
+    // 但完整片名並不相等，只比完整名會漏掉這類常見寫法。
+    // 序號則相反 —— 它是區別作品的關鍵，絕不可從主片名中剔除。
+    const targetCore = normalizeTitleForMatch(stripSubtitle(targetInfo.baseName));
+    const candidateCore = normalizeTitleForMatch(stripSubtitle(candidateInfo.baseName));
+    const sameSequel = targetSequel === candidateSequel;
 
-    if (sameCore) {
+    if (targetCore === candidateCore && sameSequel) {
       return {
         match: true,
         type: 'fallback',
