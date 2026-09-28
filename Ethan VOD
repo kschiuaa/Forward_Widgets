@@ -207,7 +207,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.6",
+  version: "1.2.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -974,8 +974,10 @@ function episodeKeyOf(resource) {
  * [xxx] 括號中。
  */
 function playSourceKeyOf(resource) {
-  const fromDesc = String(resource?.description || '').match(/\[([^\]]+)\]/);
-  if (fromDesc) return fromDesc[1];
+  // 必須取最後一個括號。描述尾端依序是「畫質」與「版本標註」兩個方括號
+  // （「仁醫 - 第01集 - 已完結 - [wjm3u8] [2012 · 韓國]」），來源名在中間。
+  const all = String(resource?.description || '').match(/\[([^\]]+)\]/g);
+  if (all && all.length) return all[all.length - 2] || all[0];
   if (resource?.playFrom) return String(resource.playFrom);
   return 'src';
 }
@@ -1116,6 +1118,10 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           _updateRecency: vod_remarks.includes('更新') ? 1 : 0,
           _year: itemYear,
           _area: itemArea,
+          // 站方原始片名。去重要用它區分「片名相同但其實是不同版本」的情況：
+          // 有幾個站同時存在日版與韓版、兩者檔名都只寫「仁医」且不帶年份欄位，
+          // 只靠 _year 無法分辨，會被去重吃掉其中一版。
+          _rawName: vod_name,
           _seasonMatch: matchInfo.seasonMatch,
           _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
           _versionAmbiguous: !yearConflict && isVersionAmbiguous(targetInfo, vod_name),
@@ -1964,14 +1970,30 @@ class SmartSearchExecutor {
    * 去重鍵必須含站名：不同站的同一集是不同的來源，使用者要的是多個可選來源，
    * 跨站合併會讓每集只剩一個源。
    *
+   * 年份同樣是硬性獨立維度，否則同名不同年份的作品會互相吃掉。
+   * 實測愛蛋站搜「仁医」回傳 22 集 × 2 個版本（日版仁医與韓版仁医2012，
+   * 播放源分別是 wjm3u8 與 jinyingm3u8）。兩者片名都顯示成「仁醫」、
+   * 集數相同，站名相同，若鍵不含年份就只有先到的那筆留下 ——
+   * 韓版排在前面時，日版 22 筆會被整批刪掉，使用者根本看不到正確版本。
+   *
    * 集數與播放源都必須是硬性獨立維度，不能靠字串相似度去猜：
    * calculateStringSimilarity 是字元 Jaccard 集合比對，「第1集」與「第3集」的
    * 字元集幾乎完全相同（相似度 >0.95），會讓同一站同一源的相鄰集數被當成重複，
    * 使用者點第3集時整集的來源都已被去重吃掉。
    */
   generateContentKey(resource) {
+    // 版本維度優先用年份，但年份抽不到時必須退回站方原始片名，
+    // 不能一律當成同一個。
+    //
+    // 實測愛蛋站搜「仁医」回傳兩個版本（日版與韓版），片名在該站都顯示成
+    // 「仁医」而 vod_year 欄位不存在，於是兩者的 _year 都是 null。若缺年份就
+    // 統一填 'x'，兩者會撞成同一個鍵，只留分數較高的韓版 —— 日版 22 筆被
+    // 整批吃掉，使用者看到的永遠是錯的版本。
+    // 同一個站不可能有兩個同名同集數的片子，原始片名可以安全地區分。
+    const versionKey = resource._year || resource._rawName || 'x';
     return [
       resource.name,
+      versionKey,
       episodeKeyOf(resource),
       playSourceKeyOf(resource)
     ].join('|');
@@ -2066,7 +2088,7 @@ function cleanResourceForOutput(resource) {
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch', 
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep', 
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
-    '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area'
+    '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName'
   ];
   
   // 版本資訊必須在欄位刪除前寫進描述。
@@ -2295,7 +2317,7 @@ async function loadResource(params, onStreamResult = null) {
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch',
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
-    '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area'
+    '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName'
   ];
   
   finalResults.forEach(res => {
@@ -2602,7 +2624,7 @@ async function performBatchSearch(params) {
                          '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
                          '_isVariety', '_episodeDate', '_confidence',
                          '_versionConflict', '_versionAmbiguous',
-                         '_areaMismatch', '_areaMatch', '_year', '_area'];
+                         '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName'];
   finalResults.forEach(res => {
     fieldsToDelete.forEach(field => {
       if (field in res) delete res[field];
