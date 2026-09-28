@@ -207,7 +207,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.5",
+  version: "1.2.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1327,6 +1327,20 @@ const AREA_ALIASES = {
   jp: 'jp', japan: 'jp', 日本: 'jp', 日語: 'jp', 日语: 'jp', 日韩: 'jp', 日韓: 'jp', 国产: 'cn', 中國: 'cn', 中国: 'cn', 大陆: 'cn', 内地: 'cn', 國語: 'cn', 国语: 'cn', 普通话: 'cn', 普通話: 'cn', 粤语: 'hk', 廣東: 'hk', 广东: 'hk', 港台: 'hk', 港澳: 'hk', 台灣: 'tw', 台湾: 'tw', 韓: 'kr', 韩: 'kr', 韓國: 'kr', 韩国: 'kr', 美: 'us', 美国: 'us', 英: 'uk', 英国: 'uk', 法: 'fr', 法国: 'fr', 泰: 'th', 泰国: 'th', 印度: 'in'
 };
 
+// 地區代碼的人類可讀名稱。
+//
+// AREA_ALIASES 的值（jp / kr / cn）是給比對用的代碼，直接顯示出來只會讓
+// 使用者看到無意義的「jp」。顯示層需要轉成中文。
+const AREA_LABELS = {
+  jp: '日本', cn: '國語', hk: '粵語', tw: '台灣', kr: '韓國',
+  us: '美國', uk: '英國', fr: '法國', th: '泰國', in: '印度'
+};
+
+function areaLabel(area) {
+  if (!area) return null;
+  return AREA_LABELS[area] || area;
+}
+
 function normalizeArea(value) {
   if (!value) return null;
   // 部分站的 area 是「日本 / 日本剧」或陣列，先取第一段再比對
@@ -2055,6 +2069,24 @@ function cleanResourceForOutput(resource) {
     '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area'
   ];
   
+  // 版本資訊必須在欄位刪除前寫進描述。
+  //
+  // _year / _area 隨後就會被刪掉，Forward 拿不到；但同名不同年份的作品
+  // （日版「仁医」與韓版「仁医2012」）在使用者沒有指定年份時根本無法分辨，
+  // 站方檔名又常把年份省略。把版本直接寫進描述，使用者一眼就能分辨要哪一版。
+  //
+  // 只在站方真的有標年份／地區時才加，否則描述會被無關資訊灌水。
+  if (resource._year || resource._area) {
+    const parts = [];
+    if (resource._year) parts.push(`${resource._year}`);
+    const label = areaLabel(resource._area);
+    if (label) parts.push(label);
+    const versionTag = parts.join(' · ');
+    if (versionTag && !clean.description.includes(versionTag)) {
+      clean.description = `${clean.description} [${versionTag}]`;
+    }
+  }
+
   fieldsToDelete.forEach(field => {
     if (field in clean) delete clean[field];
   });
