@@ -123,8 +123,9 @@ const CONFIG = {
   // 早就回來了。重試必須讓總時間遠小於前端的等待上限。
   RETRY_ATTEMPTS: 1,
   CACHE_TTL: 10800,
-  // 整批搜尋時限（毫秒）。需小於 Forward 串流介面的等待上限，否則使用者看到空結果。
-  SEARCH_DEADLINE: 12000,
+  // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
+  // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
+  SEARCH_DEADLINE: 15000,
   // 已從這麼多個站拿到結果就收尾，剩下的站不再等待。5 = 目前全部站點，
   // 等同「全都回來才收尾」，但仍受 SEARCH_DEADLINE 保護。
   // 調小可換取更快回應，代價是站數變少。設 0 停用。
@@ -188,7 +189,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.1.2",
+  version: "1.1.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1124,6 +1125,8 @@ class SmartSearchExecutor {
     this.isSearching = true;
     // 各站完成即累積，逾時中止時仍能交出已完成的部分結果。
     this.collected = [];
+    // 各站在途請求的起始時間，用來判斷「剩下的站是否還有可能回來」。
+    this.inFlight = new Map();
     
     this.stats = {
       totalSites: 0,
@@ -1173,11 +1176,36 @@ class SmartSearchExecutor {
       if (remaining < 1000) {
         groupResults = await groupPromise;
       } else {
-        // 在時限內輪詢：站數夠了就立刻收尾，否則等到時限。
+        // 在時限內輪詢，三種情況可收尾：
+        //  1. 站數已足夠 -> 立刻用已完成結果
+        //  2. 剩下的在途請求都已超過單站時限且沒有新站加入 -> 不會再有結果
+        //  3. 整體時限到 -> 強制收尾
         groupResults = await new Promise(resolve => {
+          // 記錄「最後一次有站加入」的時間。有新站加入代表還有進展，
+          // 就該繼續等；反之若一段時間都沒有新站加入且在途站已超時，
+          // 剩下的站多半是卡住的，等下去不會有新結果。
+          const start = Date.now();
+          let maxStart = start;
+          const noteProgress = () => {
+            for (const t of this.inFlight.values()) {
+              if (t > maxStart) maxStart = t;
+            }
+          };
+          const perSiteBudget = CONFIG.REQUEST_TIMEOUT + CONFIG.RETRY_ATTEMPTS * 1500;
+
           const tick = () => {
             if (enough()) return resolve(drain());
             if (Date.now() >= deadline) return resolve(null);
+
+            const now = Date.now();
+            noteProgress();
+            const noNewSite = now - maxStart > 2000;
+            const oldest = this.inFlight.size
+              ? Math.min(...this.inFlight.values())
+              : now;
+            if (this.inFlight.size > 0 && noNewSite && now - oldest > perSiteBudget) {
+              return resolve(drain());
+            }
             setTimeout(tick, 100);
           };
           groupPromise.then(r => resolve(r), () => resolve(null));
@@ -1261,9 +1289,10 @@ class SmartSearchExecutor {
   
   async searchSingleSite(site, onResultCallback) {
     if (!this.isSearching) return [];
-    
+
     const siteStartTime = Date.now();
     const siteKey = `${site.title}_${site.value}`;
+    this.inFlight.set(siteKey, siteStartTime);
     
     try {
       const response = await this.fetchWithSmartRetry(site, this.targetInfo.searchQuery || this.targetInfo.baseName);
@@ -1314,6 +1343,8 @@ class SmartSearchExecutor {
       this.stats.failedSites++;
       console.warn(`❌ ${site.title}: 搜索失败 (${error.message})`);
       return [];
+    } finally {
+      this.inFlight.delete(siteKey);
     }
   }
   
