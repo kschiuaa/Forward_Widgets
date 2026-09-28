@@ -195,7 +195,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.1.5",
+  version: "1.1.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1156,9 +1156,9 @@ class SmartSearchExecutor {
     const siteGroups = this.groupSitesByPriority(sites);
     let allResults = [];
 
-    // 整批搜尋的時限。慢站（實測愛蛋需 2.4 秒，偶發逾時）若被無限等待，
-    // complete 事件會晚到前端等待上限之後，使用者只會看到「暫無可用資源」，
-    // 即使其他站早已回傳結果。到點就帶著已完成的結果收尾。
+    // 整批搜尋的時限。慢站若被無限等待，complete 事件會晚到前端等待上限之後，
+    // 使用者只會看到「暫無可用資源」——即使其他站早已回傳結果。
+    // 到點就帶著已完成的結果收尾。
     const deadline = Date.now() + CONFIG.SEARCH_DEADLINE;
     this.deadline = deadline;
     // 執行器會隨各站完成即回推結果，因此逾時時仍能取回已完成的部分，
