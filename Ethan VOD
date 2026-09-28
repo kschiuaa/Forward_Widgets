@@ -207,7 +207,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.4",
+  version: "1.2.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1004,7 +1004,16 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
 
   // 站台已標註的年份與地區：片名文字只差一個年份時（「仁医2009」對
   // 「仁医2012」），只有這些欄位能分辨是日版還是韓版。
-  const itemYear = String(item.vod_year || '').trim() || null;
+  //
+  // 實測五個站只有「樂子」回傳 vod_year，電影天堂、非凡、如意、愛蛋的
+  // 列表 API 根本不帶這個欄位。所以必須補上台詞片名的年份當後備 ——
+  // 那四個站的檔名幾乎都帶著年份（「仁医2012」「仁医（2009）」「仁医2」），
+  // 沒有這層後備，它們回傳的韓版會被當成「沒有年份」而全數放行。
+  //
+  // 順序刻意是欄位優先、片名後備：欄位是站台自己標的，權威度最高；
+  // 片名只是推導，且「完结篇」「第2季」這類字樣不該被當成年份。
+  const itemYear = String(item.vod_year || '').trim() ||
+    extractVersionMarker(vod_name) || null;
   const itemArea = normalizeArea(item.vod_area) || normalizeArea(item.type_name);
   const targetYear = extractVersionMarker(targetInfo?.rawName) || targetInfo?.year || null;
   const targetArea = resolveTargetArea(null, targetInfo);
