@@ -183,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.0.5",
+  version: "1.0.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -282,6 +282,20 @@ function isPlayableUrl(url) {
 
 // 相容舊呼叫點
 const isM3U8Url = (url) => isPlayableUrl(url);
+
+/**
+ * 是否為播放器可直接載入的媒體檔串流。
+ *
+ * isPlayableUrl 的判定較寬：/share/<md5> 這類頁面也會算可播（點擊後
+ * 仍會導向播放器），但多數播放器無法直接載入頁面。排序時以本函式為準，
+ * 讓串流連結排在頁面連結之前，避免使用者第一個選項就打不開。
+ */
+function isDirectMediaUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  const u = url.trim();
+  if (!/^https?:\/\//i.test(u) || BLOCKED_URL.test(u)) return false;
+  return PLAYABLE_EXT.test(u);
+}
 
 /**
  * 比對前把片名正規化，讓繁體查詢能對上簡體結果。
@@ -613,6 +627,21 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   }
   
   return { match: false, type: 'none', score: 0, similarity: 0, confidence: 0 };
+}
+
+/**
+ * 取出資源實際對應的集數。
+ *
+ * 以站方原始的 _ep 為準（那是從 vod_play_url 逐集解析出來的，最可靠）；
+ * 對外輸出時 _ep 已被清掉，此時退回解析 description 的「第N集」。
+ * 兩種來源都不認得時回傳 null，代表無法判斷，交由呼叫端決定如何處置。
+ */
+function episodeLabelOf(resource) {
+  if (resource?._ep !== null && resource?._ep !== undefined) {
+    return resource._ep;
+  }
+  const fromText = String(resource?.description || '').match(/第(\d+)集/);
+  return fromText ? parseInt(fromText[1], 10) : null;
 }
 
 function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
@@ -1008,11 +1037,12 @@ class SiteManager {
 
 // ==================== 智能搜索执行模块 ====================
 class SmartSearchExecutor {
-  constructor(siteManager, targetInfo, type, matchStrictness) {
+  constructor(siteManager, targetInfo, type, matchStrictness, targetEpisode = null) {
     this.siteManager = siteManager;
     this.targetInfo = targetInfo;
     this.type = type;
     this.matchStrictness = matchStrictness;
+    this.targetEpisode = targetEpisode;
     
     this.allResults = [];
     this.seenUrls = new Set();
@@ -1245,6 +1275,13 @@ class SmartSearchExecutor {
       resource._site = site.title;
       resource._priority = site.priority;
       
+      // 指定集數時只推送該集，否則 UI 會先收到第1、2集的來源，
+      // 使用者選第34集卻看到不相干的連結。
+      if (this.type === 'tv' && this.targetEpisode !== null &&
+          episodeLabelOf(resource) !== this.targetEpisode) {
+        continue;
+      }
+      
       if (!this.isContentDuplicate(resource)) {
         this.foundCount++;
         newResults.push(resource);
@@ -1290,15 +1327,28 @@ class SmartSearchExecutor {
     return false;
   }
   
+  /**
+   * 跨站去重的判定鍵。刻意不含站名：同一集在多個站的描述與畫質完全相同，
+   * 應該只保留一份。若把站名算進去，相同內容在不同站永遠判不出重複，
+   * 會導致串流結果重複、最終結果又被 smartDeduplicate 刪掉，兩邊數量對不上。
+   */
   generateContentKey(resource) {
     const parts = [
-      resource.name,
-      resource.description?.substring(0, 50) || '',
+      this.normalizeDescriptionForDedupe(resource.description),
       resource.resolution || '',
       resource.resolutionLevel || 0
     ];
     
     return parts.join('_');
+  }
+  
+  // 描述格式為「片名 - 第N集 - 備註 - [來源]」，來源與備註各站不同，
+  // 去掉尾端的來源標記後剩下的才是真正代表內容的部分。
+  normalizeDescriptionForDedupe(description) {
+    return String(description || '')
+      .replace(/\s*-\s*\[[^\]]*\]\s*$/, '')
+      .replace(/\s*-\s*[^-]*$/, '')
+      .trim();
   }
   
   shouldStopSearch() {
@@ -1452,39 +1502,55 @@ async function loadResource(params, onStreamResult = null) {
   const targetEpisode = episode ? parseInt(episode) : null;
   targetInfo.seasonNumber = targetSeason;
   
-  // 快取鍵使用正規化名稱，繁簡輸入才會命中同一份快取
-  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_s${targetSeason}_${type}_${matchStrictness}`;
+  // 快取鍵使用正規化名稱，繁簡輸入才會命中同一份快取。
+  // episode 必須納入：不同集數的請求不可共用同一份快取，否則先播第1集
+  // 存下的結果會被第34集的請求命中，回傳錯誤集數的來源。
+  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
   let cachedResults = [];
   
   if (CONFIG.CACHE_TTL > 0) {
     try {
       cachedResults = Widget.storage?.get?.(cacheKey) || [];
       if (cachedResults.length > 0) {
-        console.log(`💾 缓存命中: ${cachedResults.length}个结果`);
-        
-        if (onStreamResult) {
-          const batchSize = 5;
-          for (let i = 0; i < cachedResults.length; i += batchSize) {
-            const batch = cachedResults.slice(i, i + batchSize);
-            onStreamResult(batch, {
-              type: 'cached_results',
-              batch: Math.floor(i / batchSize) + 1,
-              totalBatches: Math.ceil(cachedResults.length / batchSize),
-              foundCount: cachedResults.length
-            });
-            
-            await new Promise(resolve => setTimeout(resolve, 50));
-          }
-          
-          onStreamResult(cachedResults, {
-            type: 'complete',
-            source: 'cache',
-            totalCount: cachedResults.length,
-            searchTime: Date.now() - startTime
-          });
+        // 快取是整部劇的結果，指定集數時仍需過濾，否則會把其他集數的連結
+        // 當成這一集回傳。
+        let usable = cachedResults;
+        if (type === 'tv' && targetEpisode) {
+          const before = usable.length;
+          usable = usable.filter(res => episodeLabelOf(res) === targetEpisode);
+          console.log(`🎯 集数过滤(缓存): ${before} -> ${usable.length}`);
         }
         
-        return cachedResults;
+        if (usable.length === 0) {
+          console.log('💾 缓存无匹配集数，改用实时搜索');
+          cachedResults = [];
+        } else {
+          console.log(`💾 缓存命中: ${usable.length}个结果`);
+        
+          if (onStreamResult) {
+            const batchSize = 5;
+            for (let i = 0; i < usable.length; i += batchSize) {
+              const batch = usable.slice(i, i + batchSize);
+              onStreamResult(batch, {
+                type: 'cached_results',
+                batch: Math.floor(i / batchSize) + 1,
+                totalBatches: Math.ceil(usable.length / batchSize),
+                foundCount: usable.length
+              });
+              
+              await new Promise(resolve => setTimeout(resolve, 50));
+            }
+            
+            onStreamResult(usable, {
+              type: 'complete',
+              source: 'cache',
+              totalCount: usable.length,
+              searchTime: Date.now() - startTime
+            });
+          }
+          
+          return usable;
+        }
       }
     } catch (e) {
       console.warn('缓存读取失败:', e.message);
@@ -1503,10 +1569,7 @@ async function loadResource(params, onStreamResult = null) {
   
   if (type === 'tv' && targetEpisode) {
     const beforeFilter = finalResults.length;
-    finalResults = finalResults.filter(res => 
-      (res._ep === targetEpisode) ||
-      (res.description && res.description.includes(`第${targetEpisode}集`))
-    );
+    finalResults = finalResults.filter(res => episodeLabelOf(res) === targetEpisode);
     console.log(`🎯 集数过滤: ${beforeFilter} -> ${finalResults.length}`);
   }
   
@@ -1515,6 +1578,11 @@ async function loadResource(params, onStreamResult = null) {
   });
   
   finalResults.sort((a, b) => {
+    // 媒體直連優先：頁面型來源（/share/xxx）多數播放器開不起來，
+    // 排在前面會讓使用者第一個選項就失敗。
+    const aMedia = isDirectMediaUrl(a.url) ? 0 : 1;
+    const bMedia = isDirectMediaUrl(b.url) ? 0 : 1;
+    if (aMedia !== bMedia) return aMedia - bMedia;
     if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
     if (b.resolutionLevel !== a.resolutionLevel) return b.resolutionLevel - a.resolutionLevel;
     if (b.qualityScore !== a.qualityScore) return b.qualityScore - a.qualityScore;
@@ -1583,9 +1651,11 @@ async function performSmartSearch(params, onStreamResult) {
     seriesName, 
     type = 'tv', 
     VodData,
-    matchStrictness = 'standard'
+    matchStrictness = 'standard',
+    episode
   } = params;
   
+  const targetEpisode = episode ? parseInt(episode, 10) : null;
   const startTime = Date.now();
   
   const siteManager = new SiteManager();
@@ -1601,7 +1671,7 @@ async function performSmartSearch(params, onStreamResult) {
   
   await Promise.allSettled(healthChecks);
   
-  const executor = new SmartSearchExecutor(siteManager, targetInfo, type, matchStrictness);
+  const executor = new SmartSearchExecutor(siteManager, targetInfo, type, matchStrictness, targetEpisode);
   
   const allResults = await executor.search(onStreamResult);
   
@@ -1721,17 +1791,19 @@ async function performBatchSearch(params) {
 
   let finalResults = allResults;
   if (type === 'tv' && targetEpisode) {
-    finalResults = allResults.filter(res => 
-      (res._ep === targetEpisode) ||
-      (res.description && res.description.includes(`第${targetEpisode}集`))
-    );
+    finalResults = allResults.filter(res => episodeLabelOf(res) === targetEpisode);
   }
   
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
   });
   
-  finalResults.sort((a, b) => b._finalScore - a._finalScore);
+  finalResults.sort((a, b) => {
+    const aMedia = isDirectMediaUrl(a.url) ? 0 : 1;
+    const bMedia = isDirectMediaUrl(b.url) ? 0 : 1;
+    if (aMedia !== bMedia) return aMedia - bMedia;
+    return b._finalScore - a._finalScore;
+  });
   
   const fieldsToDelete = ['_finalScore', '_matchType', '_matchScore', '_seasonMatch', 
                          '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep', 
