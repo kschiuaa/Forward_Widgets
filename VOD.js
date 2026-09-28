@@ -34,6 +34,16 @@ WidgetMetadata = {
 
 var MAC_CMS_URL = "http://caiji.dyttzyapi.com/api.php/provide/vod/";
 
+// 輔助函數：精準判斷是否為電視劇或綜藝
+function checkIsTvShow(item) {
+  var tName = item.type_name || "";
+  var remarks = item.vod_remarks || "";
+  // 如果分類名稱有劇、綜藝、動漫，或是備註裡寫著「集」、「期」，就認定是 TV
+  if (tName.indexOf("劇") !== -1 || tName.indexOf("綜") !== -1 || tName.indexOf("漫") !== -1) return true;
+  if (remarks.indexOf("集") !== -1 || remarks.indexOf("期") !== -1) return true;
+  return false;
+}
+
 async function search(params) {
   params = params || {};
   var keyword = encodeURIComponent(params.keyword || "");
@@ -46,14 +56,14 @@ async function search(params) {
     }
   });
   
-  // 判斷 response.data 是否已被 Forward 底層自動解析為 Object
   var data = typeof response.data === "string" ? JSON.parse(response.data) : response.data;
-  
   var list = data.list || [];
   var results = [];
   
   for (var i = 0; i < list.length; i++) {
     var item = list[i];
+    var isTv = checkIsTvShow(item);
+    
     results.push({
       id: item.vod_id.toString(),
       type: "url",
@@ -61,7 +71,8 @@ async function search(params) {
       backdropPath: item.vod_pic,
       previewUrl: item.vod_pic,
       link: item.vod_id.toString(),
-      mediaType: "movie",
+      // 【關鍵修正】：在搜尋結果就必須正確標記 "tv" 或 "movie"
+      mediaType: isTv ? "tv" : "movie", 
       durationText: item.vod_remarks || "更新中",
       description: item.vod_blurb || item.vod_content || "暫無簡介"
     });
@@ -70,13 +81,12 @@ async function search(params) {
 }
 
 async function loadDetail(link) {
-  // 攔截集數點擊，直接返回播放器直鏈
   if (link && link.indexOf("play://") === 0) {
     return {
       id: link,
       type: "detail",
       videoUrl: link.replace("play://", ""),
-      mediaType: "movie"
+      mediaType: "movie" // 具體播放某集時，當作單影片處理即可
     };
   }
 
@@ -96,62 +106,55 @@ async function loadDetail(link) {
   
   var firstVideoUrl = "";
   var seasons = [];
-  var totalEpisodes = 0;
+  var episodesList = []; // 同時保留平鋪的集數，相容不同的 UI 渲染
 
-  // 為了適配 TMDB，我們通常取第一個有效線路作為 Season 1 寫入
   if (sourceGroups.length > 0 && sourceGroups[0]) {
     var parts = sourceGroups[0].split("#");
-    var currentSourceEpisodes = [];
     
     for (var j = 0; j < parts.length; j++) {
       var part = parts[j];
       var splitPart = part.split("$");
-      var epName = splitPart[0];
+      var epName = splitPart[0] || "";
       var videoUrl = splitPart[1];
       
       if (videoUrl) {
         if (!firstVideoUrl) firstVideoUrl = videoUrl;
         
-        // 【關鍵】：從「第43集」、「20261004期」等字串中提取數字
-        // 如果提取不到數字，則默認使用陣列索引 (j+1)
+        // 從名稱中提取集數數字給 TMDB 配對使用
         var epNumMatch = epName.match(/\d+/);
         var epIndex = epNumMatch ? parseInt(epNumMatch[0], 10) : (j + 1);
         
-        totalEpisodes++;
-
-        currentSourceEpisodes.push({
+        var epObj = {
           id: "play://" + videoUrl,
-          title: epName,           // 顯示名稱 (例如: 第43集)
-          videoUrl: videoUrl,      // 實際播放連結
+          title: epName,
+          videoUrl: videoUrl,
           link: "play://" + videoUrl,
-          seasonNumber: 1,         // TMDB 綁定需要：第 1 季
-          episodeNumber: epIndex   // TMDB 綁定需要：第 N 集
-        });
+          seasonNumber: 1,
+          episodeNumber: epIndex
+        };
+        episodesList.push(epObj);
       }
     }
     
-    // 構建 Forward 預期的 seasons 結構
     seasons.push({
       seasonNumber: 1,
       title: "第1季",
-      episodes: currentSourceEpisodes
+      episodes: episodesList
     });
   }
 
   var rawDescription = item.vod_blurb || item.vod_content || "暫無簡介";
   var cleanDescription = rawDescription.replace(/<[^>]+>/g, '').trim();
-  
-  // 判斷是否為影集/綜藝：集數大於1，或是分類名稱包含劇/綜藝
-  var isTvShow = totalEpisodes > 1 || (item.type_name && (item.type_name.indexOf("劇") !== -1 || item.type_name.indexOf("綜藝") !== -1));
+  var isTv = checkIsTvShow(item);
 
   return {
     id: link,
     type: "detail",
     videoUrl: firstVideoUrl,
-    mediaType: isTvShow ? "tv" : "movie", 
+    mediaType: isTv ? "tv" : "movie", 
     title: item.vod_name,
     description: cleanDescription,
-    // 傳入結構化的 seasons，Forward 就能自動點亮 image_5.png 裡的資源
-    seasons: seasons 
+    seasons: seasons,
+    episodes: episodesList 
   };
 }
