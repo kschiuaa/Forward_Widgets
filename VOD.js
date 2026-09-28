@@ -87,9 +87,7 @@ async function loadDetail(link) {
     }
   });
   
-  // 判斷 response.data 是否已被 Forward 底層自動解析為 Object
   var data = typeof response.data === "string" ? JSON.parse(response.data) : response.data;
-  
   var item = data.list[0];
   if (!item) throw new Error("無法獲取影片資料");
 
@@ -98,12 +96,17 @@ async function loadDetail(link) {
   var sourceNames = (item.vod_play_from || "").split("$$$");
   
   var firstVideoUrl = "";
-  var episodes = [];
+  var episodesList = [];
+  var playlist = [];
 
+  // 解析多線路與多集數
   for (var i = 0; i < sourceGroups.length; i++) {
     var group = sourceGroups[i];
+    if (!group) continue;
+    
     var sourceName = sourceNames[i] || "線路" + (i + 1);
     var parts = group.split("#");
+    var currentSourceEpisodes = [];
     
     for (var j = 0; j < parts.length; j++) {
       var part = parts[j];
@@ -115,26 +118,49 @@ async function loadDetail(link) {
         if (!firstVideoUrl) {
           firstVideoUrl = videoUrl;
         }
-        episodes.push({
-          id: "play://" + videoUrl,
-          type: "url",
-          title: sourceName + " - " + epName,
-          backdropPath: item.vod_pic,
-          link: "play://" + videoUrl,
-          mediaType: "movie",
-          description: epName
-        });
+        
+        // 構建單集物件 (多種鍵值命名以相容 Forward 底層的不同解析)
+        var epObj = {
+          id: videoUrl,
+          name: epName,
+          title: epName,
+          url: videoUrl,
+          videoUrl: videoUrl
+        };
+        currentSourceEpisodes.push(epObj);
+        episodesList.push(epObj);
       }
     }
+    
+    // 按線路分組的播放列表
+    playlist.push({
+      name: sourceName,
+      title: sourceName,
+      episodes: currentSourceEpisodes
+    });
   }
+
+  // 清理 HTML 標籤，讓簡介乾淨顯示
+  var rawDescription = item.vod_blurb || item.vod_content || "暫無簡介";
+  var cleanDescription = rawDescription.replace(/<[^>]+>/g, '').trim();
+  
+  // 動態判斷：超過1集就告訴 Forward 這是 TV 劇集，觸發選集 UI
+  var isTvShow = episodesList.length > 1;
 
   return {
     id: link,
     type: "detail",
     videoUrl: firstVideoUrl,
-    mediaType: "movie",
+    mediaType: isTvShow ? "tv" : "movie", 
     title: item.vod_name,
-    description: item.vod_content,
-    childItems: episodes
+    description: cleanDescription,
+    
+    // 輸出三種最常見的影視 App 陣列格式，確保 Forward 能抓到集數
+    episodes: episodesList, 
+    playlist: playlist,
+    seasons: [{
+      seasonNumber: 1,
+      episodes: episodesList
+    }]
   };
 }
