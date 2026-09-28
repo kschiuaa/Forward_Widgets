@@ -183,7 +183,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.0.2",
+  version: "1.0.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -763,6 +763,27 @@ function parseResourceSites(VodData) {
 // 此表記住已確認不吃 t 的站台，避免每次都先送出注定失敗的請求。
 const SITES_REJECTING_TYPE_PARAM = new Set();
 
+const API_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
+// Forward 的 Widget.http.get 只支援 headers，不解析 params 選項，
+// 查詢參數必須自行接進 URL，否則請求會命中無參數的 API 首頁並回傳空結果。
+function buildRequestUrl(baseUrl, params) {
+  if (!params || typeof params !== 'object') return baseUrl;
+  const query = Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join('&');
+  if (!query) return baseUrl;
+  return baseUrl + (baseUrl.includes('?') ? '&' : '?') + query;
+}
+
+async function httpGetApi(baseUrl, params, timeout) {
+  return Widget.http.get(buildRequestUrl(baseUrl, params), {
+    headers: { 'User-Agent': API_USER_AGENT },
+    timeout: timeout || CONFIG.REQUEST_TIMEOUT
+  });
+}
+
 async function fetchWithSmartRetry(url, params, retries, siteTitle) {
   let lastError;
 
@@ -774,10 +795,7 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
       }
       const searchParams = { ...params, params: baseQuery };
 
-      const response = await Widget.http.get(url, {
-        ...searchParams,
-        timeout: CONFIG.REQUEST_TIMEOUT
-      });
+      const response = await httpGetApi(url, searchParams.params);
 
       // Forward 的 http 層依站台行為可能回傳字串或已解析的物件，
       // 未正規化時 .data.list 永遠取不到，導致整個搜尋靜默回傳 0 筆。
@@ -790,10 +808,7 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
       // 仍為空：去掉 t 分類參數再試一次，涵蓋分類 ID 不同的站台
       if (searchParams.params.t !== undefined) {
         delete searchParams.params.t;
-        const fallbackResponse = await Widget.http.get(url, {
-          ...searchParams,
-          timeout: CONFIG.REQUEST_TIMEOUT
-        });
+        const fallbackResponse = await httpGetApi(url, searchParams.params);
         const fallback = normalizeHttpResponse(fallbackResponse);
         if (fallback?.list && fallback.list.length > 0) {
           SITES_REJECTING_TYPE_PARAM.add(url);
@@ -1185,10 +1200,7 @@ class SmartSearchExecutor {
           delete params.t;
         }
 
-        const response = await Widget.http.get(site.value, {
-          params,
-          timeout: CONFIG.REQUEST_TIMEOUT
-        });
+        const response = await httpGetApi(site.value, params);
 
         // 同 fetchWithSmartRetry：統一解析字串/巢狀回應
         const normalized = normalizeHttpResponse(response);
@@ -1200,10 +1212,7 @@ class SmartSearchExecutor {
         // 結果為空時改用不帶 t 的請求再試一次
         if (params.t !== undefined) {
           delete params.t;
-          const retry = await Widget.http.get(site.value, {
-            params,
-            timeout: CONFIG.REQUEST_TIMEOUT
-          });
+          const retry = await httpGetApi(site.value, params);
           const fallback = normalizeHttpResponse(retry);
           if (fallback?.list && fallback.list.length > 0) {
             SITES_REJECTING_TYPE_PARAM.add(site.value);
