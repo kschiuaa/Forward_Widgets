@@ -207,7 +207,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.2",
+  version: "1.2.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -718,24 +718,25 @@ function extractEnhancedInfo(seriesName) {
 
   baseName = deepCleanSeriesName(baseName);
 
-  // deepCleanSeriesName 會移除年份與副標（比對用），但年份對搜尋是必要的：
-  // 「仁醫2012」與「仁醫」是韓版與日版兩部不同的劇，搜尋字串若都變成
-  // 「仁医」，站台只會回傳當下排序最前的那一版，指定年份形同無效。
+  // 年份刻意不進搜尋字串。
   //
-  // 年份必須接在清理後的片名之後，不能用清理前的 rawName 整段取代：
-  // 清理會把括號內文字移到片名後方（「仁醫（2009）」→「仁醫2009」），
-  // 直接沿用 rawName 會讓副標殘留在字串裡（「仁医完结篇」反而搜不到）。
-  const yearForQuery = extractVersionMarker(rawName);
+  // 舊註解認為「搜尋字串若都變成『仁医』，站台只會回傳排序最前的那一版」——
+  // 實測不成立，站台會把所有版本一起回傳（搜「仁医」五個站合計 41 筆，
+  // 裡面同時有日版與韓版）。
+  //
+  // 真正該避免的是反過來：把年份塞進關鍵字。實測搜「仁医2009」五個站
+  // 只剩 2 筆，四個站直接零結果。站台對關鍵字做起始匹配，
+  // 而檔名就存成「仁医」，年份只存在於 vod_year 欄位 ——
+  // 要求站台比對它手上沒有的東西，自然搜不到。
+  //
+  // 版本交給結果階段用 vod_year / vod_area 判斷（見 extractPlayInfoForCache），
+  // 那才是站台自己認可的版本依據。
 
   // VOD 資源站幾乎都是簡體內容：以繁體關鍵字直接查詢會零結果。
   // 送出前一律轉成簡體，命中後再把片名轉回繁體顯示。
   let searchQuery = CONFIG.CONVERSION.ENABLED
     ? convertChinese(baseName, false)
     : baseName;
-
-  if (yearForQuery) {
-    searchQuery += yearForQuery;
-  }
 
   // 搜尋字串要帶上季別，否則資源站一律回傳第一季。
   //
@@ -1065,6 +1066,8 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
             _isMainSource: CONFIG.MAIN_SOURCES.includes(siteTitle),
             _hasEpInfo: episodeNumber !== null || dateMatch !== null,
             _updateRecency: vod_remarks.includes('更新') || vod_remarks.includes('第') ? 1 : 0,
+            _year: itemYear,
+            _area: itemArea,
             _seasonMatch: matchInfo.seasonMatch,
             _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
             _versionAmbiguous: !yearConflict && isVersionAmbiguous(targetInfo, vod_name),
@@ -1102,6 +1105,8 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           _isMainSource: CONFIG.MAIN_SOURCES.includes(siteTitle),
           _hasEpInfo: false,
           _updateRecency: vod_remarks.includes('更新') ? 1 : 0,
+          _year: itemYear,
+          _area: itemArea,
           _seasonMatch: matchInfo.seasonMatch,
           _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
           _versionAmbiguous: !yearConflict && isVersionAmbiguous(targetInfo, vod_name),
@@ -2012,7 +2017,7 @@ function cleanResourceForOutput(resource) {
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch', 
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep', 
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
-    '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch'
+    '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area'
   ];
   
   fieldsToDelete.forEach(field => {
@@ -2101,39 +2106,13 @@ async function loadResource(params, onStreamResult = null) {
   const targetEpisode = episode ? parseInt(episode) : null;
   targetInfo.seasonNumber = targetSeason;
 
-  // 詳細頁已選定具體版本時，Forward 會帶入首播年份（premiereDate / airDate）。
-  // 那是使用者實際選擇的那一版，必須優先於片名推導的年份 ——
-  // 韓版與日版片名只差年份，片名推導幾乎必然推錯。
-  const detailYear = extractVersionMarker(params.premiereDate) ||
-    extractVersionMarker(params.airDate) || null;
-  const titleYear = extractVersionMarker(targetInfo.rawName);
-  if (detailYear && detailYear !== targetInfo.year) {
-    console.log(`📅 詳細頁指定版本: ${detailYear}年 (片名推導: ${targetInfo.year ?? '無'})`);
-    targetInfo.year = detailYear;
-  }
-  // 同理，Forward 若帶了國別線索，一併採用。
-  const detailArea = resolveTargetArea(params, targetInfo);
-  if (detailArea) targetInfo.region = detailArea;
-
-  // 指定版本時，年份必須進到搜尋字串。
+  // 詳細頁已選定具體版本時，Forward 有時會帶入首播年份（premiereDate / airDate）。
   //
-  // 使用者在詳細頁選了韓版仁医（首播 2012），片名卻只有「仁醫」。
-  // 只送「仁医」會讓站台把日版與韓版一起回傳（實測五個站有四個把韓版
-  // 排在前面），再靠排序去猜要把哪些降權 —— 猜錯就是錯的版本排在最前。
-  // 搜「仁医2012」則由站台直接給出該版本，結果可控得多。
-  if (targetInfo.year && !titleYear && !/\d$/.test(targetInfo.searchQuery)) {
-    targetInfo.searchQuery += targetInfo.year;
-  }
-
-  // season 參數是獨立於 seriesName 傳入的，使用者切換季別時 seriesName
-  // 往往不變（「仁醫」+ season=2）。extractEnhancedInfo 只能從片名推季別，
-  // 看不到這個參數，所以搜尋字串必須依 targetSeason 補一次 ——
-  // 否則第 2 季的請求會用第一季的字串去查，拿回第一季的內容，
-  // 畫面看起來就像「切換季別沒有刷新」。
-  // 用序號而非「第N季」，理由見 extractEnhancedInfo 內的說明。
-  if (targetSeason > 1 && !/\d$/.test(targetInfo.searchQuery)) {
-    targetInfo.searchQuery += String(targetSeason);
-  }
+  // 實測 Forward 並非每次都傳：多數情況下這兩個欄位是空字串，
+  // 版本資訊只體現在 seriesName 上（「仁醫 2009」）。
+  // 因此年份的第一來源必須是片名，這裡只作為覆寫。
+  applyDetailVersion(params, targetInfo);
+  targetInfo.searchQuery = buildSearchQuery(targetInfo.searchQuery, targetInfo, targetSeason);
   
   // 快取鍵使用正規化名稱，繁簡輸入才會命中同一份快取。
   // episode 必須納入：不同集數的請求不可共用同一份快取，否則先播第1集
@@ -2215,6 +2194,30 @@ async function loadResource(params, onStreamResult = null) {
     finalResults = filterByEpisode(finalResults, targetEpisode);
     console.log(`🎯 集数过滤: ${beforeFilter} -> ${finalResults.length}`);
   }
+
+  // 指定版本時，排除確定是其他年份的來源。
+  //
+  // 搜尋字串已鎖定版本（「仁医2009」），但站台仍可能回傳其他版本。
+  // 這裡只排除「片名明確帶著別的年份」的結果，判斷依據是站方的
+  // vod_year 欄位，不是片名 ——
+  //
+  // 原因：實測搜「仁医2009」時，電影天堂與非凡直接回 0 筆（站台不接受
+  // 年份關鍵字），能回傳結果的站，檔名也常是光溜溜的「仁医」不帶年份，
+  // 唯獨年份存在於 vod_year 欄位。拿片名判斷會把正確結果整批殺掉
+  // （實測 11 筆全滅）。拿 vod_year 判斷才是站台自己認可的版本標記。
+  if (targetInfo.year) {
+    const before = finalResults.length;
+    // 兩邊都轉字串比：_year 來自站台欄位是字串，targetInfo.year 是數字，
+    // 直接用 === 比會永遠不相等，把正確結果整批殺掉（實測 11 筆全滅）。
+    const want = String(targetInfo.year);
+    finalResults = finalResults.filter(res => {
+      const candYear = res._year;
+      return !candYear || String(candYear) === want;
+    });
+    if (before !== finalResults.length) {
+      console.log(`🚫 版本過濾(${want}): ${before} -> ${finalResults.length}`);
+    }
+  }
   
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
@@ -2237,7 +2240,7 @@ async function loadResource(params, onStreamResult = null) {
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch',
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
-    '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch'
+    '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area'
   ];
   
   finalResults.forEach(res => {
@@ -2290,6 +2293,46 @@ async function loadResource(params, onStreamResult = null) {
   return finalResults;
 }
 
+// ==================== 搜尋字串組裝 ====================
+// 片名與季別是兩個維度，年份刻意「不」放進搜尋字串。
+//
+// 實測五個站的結果數（搜「仁医」）：41 筆；搜「仁医2009」：只剩 2 筆。
+// 站台對關鍵字做的是起始匹配，「片名+年份」這種寫法有四個站直接回 0 筆
+// —— 檔名明明就存成「仁医」，年份只存在於 vod_year 欄位，
+// 把年份塞進關鍵字等於要站台做它不會做的比對。
+//
+// 所以：搜尋用乾淨片名，版本交給 vod_year / vod_area 在結果階段判斷。
+// 這也是為什麼 extractPlayInfoForCache 一定要讀那兩個欄位 ——
+// 它們是唯一可靠的版本依據。
+//
+// 舊寫法「字串結尾不是數字才追加」更是雪上加霜：在「仁醫 2009」上
+// searchQuery 是「仁医2009」，結尾的 9 被當成「已經有年份」，
+// 第 2 季該加的序號也被擋掉，切換季別拿回的都是第 1 季的內容。
+//
+// 三個搜尋路徑（串流、批次、內部）都必須呼叫這裡，否則會各壞各的。
+function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
+  const base = String(searchQuery)
+    .replace(/(?:19|20)\d{2}\s*$/, '')  // 年份交給結果階段，這裡不帶
+    .replace(/\d+$/, '');               // 序號由 seasonPart 統一決定
+  // 用序號而非「第N季」，理由見 extractEnhancedInfo 內的說明。
+  // 季別可以放進關鍵字：站台確實有「XX2」這種檔名，實測可正常命中。
+  const seasonPart = targetSeason > 1 ? String(targetSeason) : '';
+  return base + seasonPart;
+}
+
+// 套用 Forward 傳來的版本覆寫（首播年份、國別）。
+// Forward 並非每次都傳 premiereDate（實測多數為空），因此片名仍是主要來源。
+function applyDetailVersion(params, targetInfo) {
+  const detailYear = extractVersionMarker(params.premiereDate) ||
+    extractVersionMarker(params.airDate) || null;
+  if (detailYear && detailYear !== targetInfo.year) {
+    console.log(`📅 詳細頁指定版本: ${detailYear}年 (片名推導: ${targetInfo.year ?? '無'})`);
+    targetInfo.year = detailYear;
+  }
+  const detailArea = resolveTargetArea(params, targetInfo);
+  if (detailArea) targetInfo.region = detailArea;
+}
+
 async function performSmartSearch(params, onStreamResult) {
   const {
     seriesName,
@@ -2314,24 +2357,14 @@ async function performSmartSearch(params, onStreamResult) {
   // 就完全沒有刷新。理由與寫法見 loadResource 內的說明。
   const targetSeason = season ? parseInt(season, 10) : targetInfo.seasonNumber;
   targetInfo.seasonNumber = targetSeason;
-  if (targetSeason > 1 && !/\d$/.test(targetInfo.searchQuery)) {
-    targetInfo.searchQuery += String(targetSeason);
-  }
 
   // 詳細頁指定的版本同樣要帶進來。
   //
   // 這裡重新呼叫了 extractEnhancedInfo，loadResource 內套用的
   // premiereDate / airDate / 地區資訊會全部消失 —— 韓版與日版片名幾乎相同，
   // 少了版本資訊就會把兩個版本混在一起回傳。
-  // 傳入時用同一套規則補回，避免兩處各寫一套而漏掉。
-  const detailYear = extractVersionMarker(params.premiereDate) ||
-    extractVersionMarker(params.airDate) || null;
-  if (detailYear) targetInfo.year = detailYear;
-  if (!extractVersionMarker(targetInfo.rawName) && targetInfo.year && !/\d$/.test(targetInfo.searchQuery)) {
-    targetInfo.searchQuery += targetInfo.year;
-  }
-  const detailArea = resolveTargetArea(params, targetInfo);
-  if (detailArea) targetInfo.region = detailArea;
+  applyDetailVersion(params, targetInfo);
+  targetInfo.searchQuery = buildSearchQuery(targetInfo.searchQuery, targetInfo, targetSeason);
 
   // 原本這裡會先對 10 個站做健康檢查再開始搜尋。該檢查只是 GET 站點首頁、
   // 結果不影響搜尋行為，等於每個站先被多打一次請求再打正式的搜尋請求，
@@ -2382,20 +2415,15 @@ async function performBatchSearch(params) {
   const targetEpisode = episode ? parseInt(episode) : null;
   targetInfo.seasonNumber = targetSeason;
 
-  // season 參數是獨立於 seriesName 傳入的，使用者切換季別時 seriesName
-  // 往往不變（「仁醫」+ season=2）。extractEnhancedInfo 只能從片名推季別，
-  // 看不到這個參數，所以搜尋字串必須依 targetSeason 補一次 ——
-  // 否則第 2 季的請求會用第一季的字串去查，拿回第一季的內容，
-  // 畫面看起來就像「切換季別沒有刷新」。
-  // 用序號而非「第N季」，理由見 extractEnhancedInfo 內的說明。
-  if (targetSeason > 1 && !/\d$/.test(targetInfo.searchQuery)) {
-    targetInfo.searchQuery += String(targetSeason);
-  }
+  // 搜尋字串組裝規則必須與串流模式一致（buildSearchQuery），
+  // 否則同一個片名在兩種模式下會送出不同的關鍵字。
+  applyDetailVersion(params, targetInfo);
+  targetInfo.searchQuery = buildSearchQuery(targetInfo.searchQuery, targetInfo, targetSeason);
 
   // 與串流模式同樣帶上續集序號，理由見 loadResource 的 cacheKey 說明。
   const batchSequel = extractSequelNumber(targetInfo.rawName);
-  const batchVersion = extractVersionMarker(targetInfo.rawName) ?? targetInfo.year ?? 'x';
-  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_s${targetSeason}_${type}`;
+  const batchVersion = targetInfo.year ?? extractVersionMarker(targetInfo.rawName) ?? 'x';
+  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}`;
   let allResults = [];
 
   try {
@@ -2475,6 +2503,21 @@ async function performBatchSearch(params) {
       return label === null || label === targetEpisode;
     });
   }
+
+  // 版本過濾，理由與串流模式相同。批次結果不帶 _year（欄位在
+  // cleanResourceForOutput 才被移除），所以用站台年份欄位比對。
+  const batchYear = targetInfo.year || extractVersionMarker(targetInfo.rawName);
+  if (batchYear) {
+    const before = finalResults.length;
+    const want = String(batchYear);
+    finalResults = finalResults.filter(res => {
+      const candYear = res._year ?? extractVersionMarker(res.description || '');
+      return !candYear || String(candYear) === want;
+    });
+    if (before !== finalResults.length) {
+      console.log(`🚫 版本過濾(${want}): ${before} -> ${finalResults.length}`);
+    }
+  }
   
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
@@ -2491,7 +2534,7 @@ async function performBatchSearch(params) {
                          '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
                          '_isVariety', '_episodeDate', '_confidence',
                          '_versionConflict', '_versionAmbiguous',
-                         '_areaMismatch', '_areaMatch'];
+                         '_areaMismatch', '_areaMatch', '_year', '_area'];
   finalResults.forEach(res => {
     fieldsToDelete.forEach(field => {
       if (field in res) delete res[field];
