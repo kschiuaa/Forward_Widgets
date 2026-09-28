@@ -1,82 +1,137 @@
-// 文件名：vod_stream_enhanced_pro.js
-// 模块：VOD 流式增强专业版
-// 作者：MoYan
-// 版本：4.0.0
-// 描述：VOD聚合搜索(全源+快速+精准匹配+实时流式)
-// 核心特性：
-// 1. 全源搜索 - 搜索所有可用站点，不提前停止
-// 2. 极速响应 - 智能并发+健康检查+缓存优化
-// 3. 精准匹配 - 混合相似度算法+上下文匹配
-// 4. 实时流式 - 搜到一个返回一个，实时反馈
-// 5. 智能去重 - 内容相似性去重，避免重复
+// 文件名：Ethan VOD.js
+// 模块：Ethan VOD
+// 版本：1.0.0
+// 說明：VOD 聚合搜尋（全源 + 快速 + 精準匹配 + 即時流式 + 繁簡自動轉換）
+// 核心特色：
+// 1. 全源搜尋 - 搜尋所有可用站點，不提前停止
+// 2. 极速回應 - 智慧並發 + 健康檢查 + 快取最佳化
+// 3. 精準匹配 - 混合相似度演算法 + 上下文匹配
+// 4. 即時流式 - 搜到一个回傳一个，即時回饋
+// 5. 智慧去重 - 內容相似性去重，避免重複
+// 6. 繁簡互通 - 繁體搜尋自動轉簡體查詢，結果自動轉繁體顯示
+// 7. 來源精選 - 僅保留實測可用的資源站，剔除失效與廣告站
 
-// ==================== 配置常量 ====================
+// ==================== 繁簡自動轉換 ====================
+// ==================== 繁簡自動轉換 ====================
+// 2583 組一對一、無歧義的常用字對照（由 zhconv 產生，僅保留雙向可逆的映射，
+// 排除「乾/幹」這類多對一歧義字，避免錯誤轉換）。
+// 用途：使用者以繁體搜尋 -> 轉成簡體送去 VOD 站；結果回傳 -> 轉成繁體顯示。
+const SIMP_CHARS =
+  '万与丑专业丛东丝丢两严丧个丰临为丽举么义乌乐乔习乡书买乱争于亏云亘亚产亩亲亵亸亿仅仆从仑仓仪们价众优伙会伛伞伟传伡伣伤伥伦伧伪伫体余佣佥侠侣侥侦侧侨侩侪侬俣俦俨俩俪俫俭债倾偬偻偾偿傤傥傧储傩儿兑兖党兰关兴兹养兽冁内冈册写军农冯冲决况冻净凄准凉减凑凛几凤凫凭凯凶击凿刍划刘则刚创删别刬刭刹刽刿剀剂剐剑剥剧劝办务劢动励劲劳势勋勚匀匦匮区医华协单卖占卢卤卧卫却卺厂厅历厉压厌厍厐厕厘厢厣厦厨厩厮县叁参叆叇双'
+  + '发变叙叠台叶号叹叽吁吃后吓吕吗吣吨听启吴呐呒呓呕呖呗员呙呛呜咏咙咛咝咤咨咸响哑哒哓哔哕哗哙哜哝哟唇唛唝唠唡唢唤啧啬啭啮啯啰啴啸喂喷喽喾嗫嗳嘘嘤嘱噜嚣团园囱围囵国图圆圣圹场坏块坚坛坜坝坞坟坠垄垅垆垒垦垩垫垭垯垱垲垴埘埙埚堑堕塆墙壮声壳壶壸处备复够头夸夹夺奁奂奋奖奥妆妇妈妩妪妫姗姹娄娅娆娇娈娱娲娴婳婴婵婶媪媭嫒嫔嫱嬷孙学孪宁宝实宠审宪宫宽宾寝对寻导寿将尔尘尝尧尴尸尽层屃屉届属屡屦屿岁岂岖岗岘岚岛岩岭岳'
+  + '岽岿峃峄峡峣峤峥峦峰崂崃崄崭嵘嵚嵝巅巩巯币帅师帏帐帘帜带帧帮帱帻帼幂干并广庄庆床庐庑库应庙庞废庼廪开异弃弑张弥弪弯弹强归当录彟彦彨彻征径徕忆忏忧忾怀态怂怃怄怅怆怜总怼怿恋恒恳恶恸恹恺恻恼恽悦悫悬悭悮悯惊惧惨惩惫惬惭惮惯愠愤愦愿慑慭懑懒懔戆戋戏戗战戬戯户扑托执扩扪扫扬扰抚抛抟抠抡抢护报担拟拢拣拥拦拧拨择挂挚挛挜挝挞挟挠挡挢挣挤挥挦捝捞损捡换捣据掳掴掷掸掺掼揽揾揿搀搁搂搄搅携摄摅摆摇摈摊撄撑撵撷撸撺擞'
+  + '攒敌敚敛敩数斋斓斗斩断无旧时旷旸昙昵昼昽显晋晒晓晔晕晖暂暧术朴机杀杂权杠条来杨杩杰极构枞枢枣枥枧枨枪枫枭柜柠柽栀栅标栈栉栊栋栌栎栏树栖栗样栾桠桡桢档桤桥桦桧桨桩桪梦梼梾梿检棁棂椁椝椟椠椢椤椫椭椮楼榄榅榇榈榉榝槚槛槟槠横樯樱橥橱橹橼檩欢欤欧歼殁殇残殒殓殚殡殴毁毂毕毙毡毵氇气氢氩氲汇汉汤汹沟没沣沤沥沦沧沨沩沪泞泪泶泷泸泺泻泼泽泾洁洒洼浃浅浆浇浈浉浊测浍济浏浐浑浒浓浔浕涂涌涚涛涝涞涟涠涡涢涣涤润涧涨涩淀'
+  + '渊渌渍渎渐渑渔渗温游湾湿溁溃溅溆溇滗滚滞滟滠满滢滤滥滦滨滩滪漤潆潇潋潍潜潴澛澜濑濒灏灭灯灵灶灾灿炀炉炖炜炝点炼炽烁烂烃烛烟烦烧烨烩烫烬热焕焖焘煴熏爱爷牍牦牵牺犊状犷犸犹狈狝狞独狭狮狯狰狱狲猃猎猕猡猪猫猬献獭玑玙玚玛玮环现玱玺珐珑珰珲琎琏琐琼瑶瑷瑸璎瓒瓮瓯电画畅畴疖疗疟疠疡疬疭疮疯疱疴痈痉痒痖痨痪痫痳痴瘅瘆瘗瘘瘪瘫瘾瘿癞癣癫皂皑皱皲盏盐监盖盗盘眍眦眬睁睐睑瞆瞒瞩矫矶矾矿砀码砖砗砚砜砺砻砾础硁硕硖硗硙'
+  + '硚确硵硷碍碛碜碱礼祃祎祢祯祷祸禀禄禅离秃秆种秘积称秽秾税稣稳穑穞穷窃窍窎窑窜窝窥窦窭竖竞笃笋笔笕笺笼笾筑筚筛筜筝筹筼签筿简箓箦箧箨箩箪箫篑篓篮篯篱簖籁籴类籼粜粝粤粪粮粽糁糇糍紧絷纟纠纡红纣纤纥约级纨纩纪纫纬纭纮纯纰纱纲纳纴纵纶纷纸纹纺纻纼纽纾线绀绁绂练组绅细织终绉绊绋绌绍绎经绐绑绒结绔绕绖绗绘给绚绛络绝绞统绠绡绢绣绤绥绦继绨绩绪绫绬续绮绯绰绱绲绳维绵绶绷绸绹绺绻综绽绾绿缀缁缂缃缄缅缆缇缈缉缊缋缌缍'
+  + '缎缏缑缒缓缔缕编缗缘缙缚缛缜缝缞缟缠缡缢缣缤缥缦缧缨缩缪缫缬缭缮缯缰缱缲缳缴缵罂网罗罚罢罴羁羟羡群翘翙翚耢耧耸耻聂聋职聍联聩聪肃肠肤肮肴肾肿胀胁胆胜胧胨胪胫胶脉脍脏脐脑脓脔脚脱脶脸腊腌腘腭腻腼腽腾膑膻臜舆舣舰舱舻艰艳艺节芈芗芜芦苁苇苈苋苌苍苏苧苹范茎茏茑茔茕茧荆荐荙荚荛荜荝荞荟荠荡荣荤荥荦荧荨荩荪荫荬荭荮药莅莱莲莳莴莶获莸莹莺莼萚萝萤营萦萧萨葱蒀蒇蒉蒋蒌蒏蓝蓟蓠蓣蓥蓦蔂蔷蔹蔺蔼蕰蕲蕴薮藓蘖虏虑虚虫'
+  + '虬虮虱虽虾虿蚀蚁蚂蚃蚕蚝蚬蛊蛎蛏蛮蛰蛱蛲蛳蛴蜕蜗蜡蝇蝈蝉蝎蝼蝾螀螨蟏衅衔补衬衮袄袅袆袜袭袯装裆裈裢裣裤裥褛褴襕见观觃规觅视觇览觉觊觋觌觍觎觏觐觑觞触觯訚詟誉誊讠计订讣认讥讦讧讨让讪讫训议讯记讱讲讳讴讵讶讷许讹论讻讼讽设访诀证诂诃评诅识诇诈诉诊诋诌词诎诏诐译诒诓诔试诖诗诘诙诚诛诜话诞诟诠诡询诣诤该详诧诨诩诪诫诬语诮误诰诱诲诳说诵诶请诸诹诺读诼诽课诿谀谁谂调谄谅谆谇谈谉谊谋谌谍谎谏谐谑谒谓谔谕谖谗谙谚'
+  + '谛谜谝谞谟谠谡谢谣谤谥谦谧谨谩谪谫谬谭谮谯谰谱谲谳谴谵谶豮贝贞负贠贡财责贤败账货质贩贪贫贬购贮贯贰贱贲贳贴贵贶贷贸费贺贻贼贽贾贿赀赁赂赃资赅赆赇赈赉赊赋赌赍赎赏赐赑赒赓赔赕赖赗赘赙赚赛赜赝赞赟赠赡赢赣赪赵赶趋趱趸跃跄跖跞践跶跷跸跹跻踊踌踪踬踯蹑蹒蹰蹿躏躜躯车轧轨轩轪轫转轭轮软轰轱轲轳轴轵轶轷轸轹轺轻轼载轾轿辀辁辂较辄辅辆辇辈辉辊辋辌辍辎辏辐辑辒输辔辕辖辗辘辙辚辞辟辩辫边辽达迁过迈运还这进远违连迟迩'
+  + '迳迹适选逊递逦逻遗遥邓邝邬邮邹邺邻郁郏郐郑郓郦郧郸酂酝酦酱酽酾酿采释里鉴銮錾钅钆钇针钉钊钋钌钍钎钏钐钑钒钓钔钕钖钗钘钙钚钛钝钞钟钠钡钢钣钤钥钦钧钨钩钪钫钬钭钮钯钰钱钲钳钴钵钶钷钸钹钺钻钼钽钾钿铀铁铂铃铄铅铆铇铈铉铊铋铌铍铎铏铐铑铒铓铔铕铖铗铘铙铚铛铜铝铞铟铠铡铢铣铤铥铦铧铨铩铪铫铬铭铮铯铰铱铲铳铴铵银铷铸铹铺铻铼铽链铿销锁锂锃锄锅锆锇锈锉锊锋锌锍锎锏锐锑锒锓锔锕锖锗锘错锚锛锜锝锞锟锠锡锢锣锤锥锦锧'
+  + '锨锩锪锫锬锭键锯锰锱锲锳锴锵锶锷锸锹锻锼锽锾锿镀镁镂镃镄镅镆镇镈镉镊镋镌镍镎镏镐镑镒镓镔镕镖镗镘镙镚镛镜镝镞镠镡镢镣镤镥镦镧镨镩镪镫镬镭镮镯镰镱镲镳镴镵镶长门闩闪闫闬闭问闯闰闱闲闳间闵闶闷闸闹闺闻闼闽闾闿阀阁阂阃阄阅阆阇阈阉阊阋阌阍阎阏阐阑阒阓阔阕阖阗阘阙阚阛队阳阴阵阶际陆陇陈陉陕陦陧陨险随隐隶隽难雇雏雠雳雾霁霉霡霭靓靔静靥鞑鞒鞯鞲韦韧韨韩韪韫韬韵页顶顷顸项顺须顼顽顾顿颀颁颂颃预颅领颇颈颉颊颋颌颍'
+  + '颎颏颐频颒颓颔颕颖颗题颙颚颛颜额颞颟颠颡颢颣颤颥颦颧风飏飐飑飒飓飔飕飖飗飘飙飚飞飨餍饣饤饥饦饧饨饩饪饫饬饭饮饯饰饱饲饳饴饵饶饷饸饹饺饻饼饽饾饿馁馂馃馄馅馆馇馈馉馊馋馌馍馎馏馐馑馒馓馔馕马驭驮驯驰驱驲驳驴驵驶驷驸驹驺驻驼驽驾驿骀骁骂骃骄骅骆骇骈骉骊骋验骍骎骏骐骑骒骓骔骕骖骗骘骙骚骛骜骝骞骟骠骡骢骣骤骥骦骧髅髋髌鬓鬶魇魉鱼鱽鱾鱿鲀鲁鲂鲄鲅鲆鲇鲈鲉鲊鲋鲌鲍鲎鲏鲐鲑鲒鲓鲔鲕鲖鲗鲘鲙鲚鲛鲜鲝鲞鲟鲠鲡鲢鲣鲤鲥'
+  + '鲦鲧鲨鲩鲪鲫鲬鲭鲮鲯鲰鲱鲲鲳鲴鲵鲶鲷鲸鲹鲺鲻鲼鲽鲾鲿鳀鳁鳂鳃鳄鳅鳆鳇鳈鳉鳊鳋鳌鳍鳎鳏鳐鳑鳒鳓鳔鳕鳖鳗鳘鳙鳛鳜鳝鳞鳟鳠鳡鳢鳣鸟鸠鸡鸢鸣鸤鸥鸦鸧鸨鸩鸪鸫鸬鸭鸮鸯鸰鸱鸲鸳鸴鸵鸶鸷鸸鸹鸺鸻鸼鸽鸾鸿鹀鹁鹂鹃鹄鹅鹆鹇鹈鹉鹊鹋鹌鹍鹎鹏鹐鹑鹒鹓鹔鹕鹖鹗鹘鹙鹚鹛鹜鹝鹞鹟鹠鹡鹢鹣鹤鹥鹦鹧鹨鹩鹪鹫鹬鹭鹯鹰鹱鹲鹳鹴鹾麦麸黄黉黡黩黪黾鼋鼌鼍鼗鼹齐齑齿龀龁龂龃龄龅龆龇龈龉龊龋龌龙龚龛龟鿒鿔鿭';
+const TRAD_CHARS =
+  '萬與醜專業叢東絲丟兩嚴喪個豐臨爲麗舉麼義烏樂喬習鄉書買亂爭於虧雲亙亞產畝親褻嚲億僅僕從侖倉儀們價衆優夥會傴傘偉傳俥俔傷倀倫傖僞佇體餘傭僉俠侶僥偵側僑儈儕儂俁儔儼倆儷倈儉債傾傯僂僨償儎儻儐儲儺兒兌兗黨蘭關興茲養獸囅內岡冊寫軍農馮衝決況凍淨悽準涼減湊凜幾鳳鳧憑凱兇擊鑿芻劃劉則剛創刪別剗剄剎劊劌剴劑剮劍剝劇勸辦務勱動勵勁勞勢勳勩勻匭匱區醫華協單賣佔盧滷臥衛卻巹廠廳歷厲壓厭厙龎廁釐廂厴廈廚廄廝縣叄參靉靆雙'
+  + '發變敘疊臺葉號嘆嘰籲喫後嚇呂嗎唚噸聽啓吳吶嘸囈嘔嚦唄員咼嗆嗚詠嚨嚀噝吒諮鹹響啞噠嘵嗶噦譁噲嚌噥喲脣嘜嗊嘮啢嗩喚嘖嗇囀齧嘓囉嘽嘯餵噴嘍嚳囁噯噓嚶囑嚕囂團園囪圍圇國圖圓聖壙場壞塊堅壇壢壩塢墳墜壟壠壚壘墾堊墊埡墶壋塏堖塒壎堝塹墮壪牆壯聲殼壺壼處備復夠頭誇夾奪奩奐奮獎奧妝婦媽嫵嫗嬀姍奼婁婭嬈嬌孌娛媧嫺嫿嬰嬋嬸媼嬃嬡嬪嬙嬤孫學孿寧寶實寵審憲宮寬賓寢對尋導壽將爾塵嘗堯尷屍盡層屓屜屆屬屢屨嶼歲豈嶇崗峴嵐島巖嶺嶽'
+  + '崬巋嶨嶧峽嶢嶠崢巒峯嶗崍嶮嶄嶸嶔嶁巔鞏巰幣帥師幃帳簾幟帶幀幫幬幘幗冪幹並廣莊慶牀廬廡庫應廟龐廢廎廩開異棄弒張彌弳彎彈強歸當錄彠彥彲徹徵徑徠憶懺憂愾懷態慫憮慪悵愴憐總懟懌戀恆懇惡慟懨愷惻惱惲悅愨懸慳悞憫驚懼慘懲憊愜慚憚慣慍憤憒願懾憖懣懶懍戇戔戲戧戰戩戱戶撲託執擴捫掃揚擾撫拋摶摳掄搶護報擔擬攏揀擁攔擰撥擇掛摯攣掗撾撻挾撓擋撟掙擠揮撏挩撈損撿換搗據擄摑擲撣摻摜攬搵撳攙擱摟揯攪攜攝攄擺搖擯攤攖撐攆擷擼攛擻'
+  + '攢敵敓斂斆數齋斕鬥斬斷無舊時曠暘曇暱晝曨顯晉曬曉曄暈暉暫曖術樸機殺雜權槓條來楊榪傑極構樅樞棗櫪梘棖槍楓梟櫃檸檉梔柵標棧櫛櫳棟櫨櫟欄樹棲慄樣欒椏橈楨檔榿橋樺檜槳樁樳夢檮棶槤檢梲欞槨槼櫝槧槶欏樿橢槮樓欖榲櫬櫚櫸樧檟檻檳櫧橫檣櫻櫫櫥櫓櫞檁歡歟歐殲歿殤殘殞殮殫殯毆毀轂畢斃氈毿氌氣氫氬氳匯漢湯洶溝沒灃漚瀝淪滄渢潙滬濘淚澩瀧瀘濼瀉潑澤涇潔灑窪浹淺漿澆湞溮濁測澮濟瀏滻渾滸濃潯濜塗湧涗濤澇淶漣潿渦溳渙滌潤澗漲澀澱'
+  + '淵淥漬瀆漸澠漁滲溫遊灣溼濚潰濺漵漊潷滾滯灩灄滿瀅濾濫灤濱灘澦灠瀠瀟瀲濰潛瀦瀂瀾瀨瀕灝滅燈靈竈災燦煬爐燉煒熗點煉熾爍爛烴燭煙煩燒燁燴燙燼熱煥燜燾熅燻愛爺牘犛牽犧犢狀獷獁猶狽獮獰獨狹獅獪猙獄猻獫獵獼玀豬貓蝟獻獺璣璵瑒瑪瑋環現瑲璽琺瓏璫琿璡璉瑣瓊瑤璦璸瓔瓚甕甌電畫暢疇癤療瘧癘瘍癧瘲瘡瘋皰痾癰痙癢瘂癆瘓癇痲癡癉瘮瘞瘻癟癱癮癭癩癬癲皁皚皺皸盞鹽監蓋盜盤瞘眥矓睜睞瞼瞶瞞矚矯磯礬礦碭碼磚硨硯碸礪礱礫礎硜碩硤磽磑'
+  + '礄確磠礆礙磧磣鹼禮禡禕禰禎禱禍稟祿禪離禿稈種祕積稱穢穠稅穌穩穡穭窮竊竅窵窯竄窩窺竇窶豎競篤筍筆筧箋籠籩築篳篩簹箏籌篔籤篠簡籙簀篋籜籮簞簫簣簍籃籛籬籪籟糴類秈糶糲粵糞糧糉糝餱餈緊縶糹糾紆紅紂纖紇約級紈纊紀紉緯紜紘純紕紗綱納紝縱綸紛紙紋紡紵紖紐紓線紺紲紱練組紳細織終縐絆紼絀紹繹經紿綁絨結絝繞絰絎繪給絢絳絡絕絞統綆綃絹繡綌綏絛繼綈績緒綾緓續綺緋綽鞝緄繩維綿綬繃綢綯綹綣綜綻綰綠綴緇緙緗緘緬纜緹緲緝縕繢緦綞'
+  + '緞緶緱縋緩締縷編緡緣縉縛縟縝縫縗縞纏縭縊縑繽縹縵縲纓縮繆繅纈繚繕繒繮繾繰繯繳纘罌網羅罰罷羆羈羥羨羣翹翽翬耮耬聳恥聶聾職聹聯聵聰肅腸膚骯餚腎腫脹脅膽勝朧腖臚脛膠脈膾髒臍腦膿臠腳脫腡臉臘醃膕齶膩靦膃騰臏羶臢輿艤艦艙艫艱豔藝節羋薌蕪蘆蓯葦藶莧萇蒼蘇薴蘋範莖蘢蔦塋煢繭荊薦薘莢蕘蓽萴蕎薈薺蕩榮葷滎犖熒蕁藎蓀蔭蕒葒葤藥蒞萊蓮蒔萵薟獲蕕瑩鶯蓴蘀蘿螢營縈蕭薩蔥蒕蕆蕢蔣蔞醟藍薊蘺蕷鎣驀虆薔蘞藺藹薀蘄蘊藪蘚櫱虜慮虛蟲'
+  + '虯蟣蝨雖蝦蠆蝕蟻螞蠁蠶蠔蜆蠱蠣蟶蠻蟄蛺蟯螄蠐蛻蝸蠟蠅蟈蟬蠍螻蠑螿蟎蠨釁銜補襯袞襖嫋褘襪襲襏裝襠褌褳襝褲襉褸襤襴見觀覎規覓視覘覽覺覬覡覿覥覦覯覲覷觴觸觶誾讋譽謄訁計訂訃認譏訐訌討讓訕訖訓議訊記訒講諱謳詎訝訥許訛論訩訟諷設訪訣證詁訶評詛識詗詐訴診詆謅詞詘詔詖譯詒誆誄試詿詩詰詼誠誅詵話誕詬詮詭詢詣諍該詳詫諢詡譸誡誣語誚誤誥誘誨誑說誦誒請諸諏諾讀諑誹課諉諛誰諗調諂諒諄誶談讅誼謀諶諜謊諫諧謔謁謂諤諭諼讒諳諺'
+  + '諦謎諞諝謨讜謖謝謠謗諡謙謐謹謾謫譾謬譚譖譙讕譜譎讞譴譫讖豶貝貞負貟貢財責賢敗賬貨質販貪貧貶購貯貫貳賤賁貰貼貴貺貸貿費賀貽賊贄賈賄貲賃賂贓資賅贐賕賑賚賒賦賭齎贖賞賜贔賙賡賠賧賴賵贅賻賺賽賾贗贊贇贈贍贏贛赬趙趕趨趲躉躍蹌蹠躒踐躂蹺蹕躚躋踴躊蹤躓躑躡蹣躕躥躪躦軀車軋軌軒軑軔轉軛輪軟轟軲軻轤軸軹軼軤軫轢軺輕軾載輊轎輈輇輅較輒輔輛輦輩輝輥輞輬輟輜輳輻輯轀輸轡轅轄輾轆轍轔辭闢辯辮邊遼達遷過邁運還這進遠違連遲邇'
+  + '逕跡適選遜遞邐邏遺遙鄧鄺鄔郵鄒鄴鄰鬱郟鄶鄭鄆酈鄖鄲酇醞醱醬釅釃釀採釋裏鑑鑾鏨釒釓釔針釘釗釙釕釷釺釧釤鈒釩釣鍆釹鍚釵鈃鈣鈈鈦鈍鈔鍾鈉鋇鋼鈑鈐鑰欽鈞鎢鉤鈧鈁鈥鈄鈕鈀鈺錢鉦鉗鈷鉢鈳鉕鈽鈸鉞鑽鉬鉭鉀鈿鈾鐵鉑鈴鑠鉛鉚鉋鈰鉉鉈鉍鈮鈹鐸鉶銬銠鉺鋩錏銪鋮鋏鋣鐃銍鐺銅鋁銱銦鎧鍘銖銑鋌銩銛鏵銓鎩鉿銚鉻銘錚銫鉸銥鏟銃鐋銨銀銣鑄鐒鋪鋙錸鋱鏈鏗銷鎖鋰鋥鋤鍋鋯鋨鏽銼鋝鋒鋅鋶鐦鐧銳銻鋃鋟鋦錒錆鍺鍩錯錨錛錡鍀錁錕錩錫錮鑼錘錐錦鑕'
+  + '鍁錈鍃錇錟錠鍵鋸錳錙鍥鍈鍇鏘鍶鍔鍤鍬鍛鎪鍠鍰鎄鍍鎂鏤鎡鐨鎇鏌鎮鎛鎘鑷钂鐫鎳鎿鎦鎬鎊鎰鎵鑌鎔鏢鏜鏝鏍鏰鏞鏡鏑鏃鏐鐔钁鐐鏷鑥鐓鑭鐠鑹鏹鐙鑊鐳鐶鐲鐮鐿鑔鑣鑞鑱鑲長門閂閃閆閈閉問闖閏闈閒閎間閔閌悶閘鬧閨聞闥閩閭闓閥閣閡閫鬮閱閬闍閾閹閶鬩閿閽閻閼闡闌闃闠闊闋闔闐闒闕闞闤隊陽陰陣階際陸隴陳陘陝隯隉隕險隨隱隸雋難僱雛讎靂霧霽黴霢靄靚靝靜靨韃鞽韉韝韋韌韍韓韙韞韜韻頁頂頃頇項順須頊頑顧頓頎頒頌頏預顱領頗頸頡頰頲頜潁'
+  + '熲頦頤頻頮頹頷頴穎顆題顒顎顓顏額顳顢顛顙顥纇顫顬顰顴風颺颭颮颯颶颸颼颻飀飄飆飈飛饗饜飠飣飢飥餳飩餼飪飫飭飯飲餞飾飽飼飿飴餌饒餉餄餎餃餏餅餑餖餓餒餕餜餛餡館餷饋餶餿饞饁饃餺餾饈饉饅饊饌饢馬馭馱馴馳驅馹駁驢駔駛駟駙駒騶駐駝駑駕驛駘驍罵駰驕驊駱駭駢驫驪騁驗騂駸駿騏騎騍騅騌驌驂騙騭騤騷騖驁騮騫騸驃騾驄驏驟驥驦驤髏髖髕鬢鬹魘魎魚魛魢魷魨魯魴魺鮁鮃鮎鱸鮋鮓鮒鮊鮑鱟鮍鮐鮭鮚鮳鮪鮞鮦鰂鮜鱠鱭鮫鮮鮺鯗鱘鯁鱺鰱鰹鯉鰣'
+  + '鰷鯀鯊鯇鮶鯽鯒鯖鯪鯕鯫鯡鯤鯧鯝鯢鯰鯛鯨鰺鯴鯔鱝鰈鰏鱨鯷鰮鰃鰓鱷鰍鰒鰉鰁鱂鯿鰠鰲鰭鰨鰥鰩鰟鰜鰳鰾鱈鱉鰻鰵鱅鰼鱖鱔鱗鱒鱯鱤鱧鱣鳥鳩雞鳶鳴鳲鷗鴉鶬鴇鴆鴣鶇鸕鴨鴞鴦鴒鴟鴝鴛鷽鴕鷥鷙鴯鴰鵂鴴鵃鴿鸞鴻鵐鵓鸝鵑鵠鵝鵒鷳鵜鵡鵲鶓鵪鵾鵯鵬鵮鶉鶊鵷鷫鶘鶡鶚鶻鶖鷀鶥鶩鷊鷂鶲鶹鶺鷁鶼鶴鷖鸚鷓鷚鷯鷦鷲鷸鷺鸇鷹鸌鸏鸛鸘鹺麥麩黃黌黶黷黲黽黿鼂鼉鞀鼴齊齏齒齔齕齗齟齡齙齠齜齦齬齪齲齷龍龔龕龜鿓鎶鉨';
+
+const _simpToTradMap = new Map();
+const _tradToSimpMap = new Map();
+for (let _i = 0; _i < SIMP_CHARS.length; _i++) {
+  _simpToTradMap.set(SIMP_CHARS[_i], TRAD_CHARS[_i]);
+  _tradToSimpMap.set(TRAD_CHARS[_i], SIMP_CHARS[_i]);
+}
+
+/**
+ * 逐字轉換。任何不在對照表內的字元原樣保留，因此不會破壞英文、
+ * 數字、標點或已正確的繁體字。
+ */
+function convertChinese(text, toTraditional = true) {
+  if (!text || typeof text !== 'string') return text || '';
+  const map = toTraditional ? _simpToTradMap : _tradToSimpMap;
+  let out = '';
+  for (const ch of text) out += map.get(ch) || ch;
+  return out;
+}
+
+/**
+ * 產生搜尋關鍵字的所有候選變體。
+ * 繁體站點常見片名為簡體，若只用原字串搜尋會零結果；
+ * 反之簡體關鍵字送進繁體站同樣搜不到，故雙向都試。
+ */
+function buildSearchVariants(keyword) {
+  const variants = [];
+  const push = (v) => {
+    const t = (v || '').trim();
+    if (t && !variants.includes(t)) variants.push(t);
+  };
+  push(keyword);
+  push(convertChinese(keyword, true));   // -> 繁體
+  push(convertChinese(keyword, false));  // -> 簡體
+  return variants;
+}
+
+/**
+ * 移除片名中的繁簡差異，讓「繁體查詢」與「簡體結果」能正確比對。
+ * 回傳正規化後的鍵：兩個方向的片名都會落到同一個鍵上。
+ */
+function normalizeForMatching(text) {
+  if (!text) return '';
+  return convertChinese(String(text), true)
+    .replace(/\s+/g, '')
+    .toLowerCase();
+}
+
+// ==================== 資源站清單 ====================
+// 僅保留實測可回應的站點；已剔除失效站、403 站與解析失敗站。
+// 鏡像站已合併去重，HTTP 站保留但排序權重較低。
 const RESOURCE_SITES = `
-非凡,http://ffzy5.tv/api.php/provide/vod
-卧龙,https://wolongzyw.com/api.php/provide/vod
-最大,https://api.zuidapi.com/api.php/provide/vod
-百度,https://api.apibdzy.com/api.php/provide/vod
-暴风,https://bfzyapi.com/api.php/provide/vod
-极速,https://jszyapi.com/api.php/provide/vod
-天涯,https://tyyszy.com/api.php/provide/vod
-无尽,https://api.wujinapi.com/api.php/provide/vod
-魔都,https://www.mdzyapi.com/api.php/provide/vod
-三灵,https://360zy.com/api.php/provide/vod
-天影,http://caiji.dyttzyapi.com/api.php/provide/vod
-如意,https://cj.rycjapi.com/api.php/provide/vod
-旺旺,https://wwzy.tv/api.php/provide/vod
-红牛,https://www.hongniuzy2.com/api.php/provide/vod
 光速,https://api.guangsuapi.com/api.php/provide/vod
-爱坤,https://ikunzyapi.com/api.php/provide/vod
-优酷,https://api.ukuapi.com/api.php/provide/vod
-虎牙,https://www.huyaapi.com/api.php/provide/vod
-新浪,http://api.xinlangapi.com/xinlangapi.php/provide/vod
-乐子,https://cj.lziapi.com/api.php/provide/vod
 海豚,https://hhzyapi.com/api.php/provide/vod
-鲸鱼,https://jyzyapi.com/provide/vod
-爱蛋,https://lovedan.net/api.php/provide/vod
-魔影,https://www.moduzy.com/api.php/provide/vod
-非凡,https://api.ffzyapi.com/api.php/provide/vod
-非采,http://cj.ffzyapi.com/api.php/provide/vod
-非云,https://cj.ffzyapi.com/api.php/provide/vod
-非一,http://ffzy1.tv/api.php/provide/vod
-卧采,https://collect.wolongzyw.com/api.php/provide/vod
-暴影,https://app.bfzyapi.com/api.php/provide/vod
-无境,https://api.wujinapi.me/api.php/provide/vod
-天角,https://tyyszyapi.com/api.php/provide/vod
-光速,http://api.guangsuapi.com/api.php/provide/vod
-新影,https://api.xinlangapi.com/xinlangapi.php/provide/vod
-清影,https://api.1080zyku.com/inc/apijson.php
-乐影,http://cj.lziapi.com/api.php/provide/vod
-优酷,https://api.ukuapi88.com/api.php/provide/vod
-无星,https://api.wujinapi.cc/api.php/provide/vod
-丫丫,https://cj.yayazy.net/api.php/provide/vod
-卧星,https://collect.wolongzy.cc/api.php/provide/vod
-无网,https://api.wujinapi.net/api.php/provide/vod
-旺影,https://api.wwzy.tv/api.php/provide/vod
-至大,http://zuidazy.me/api.php/provide/vod
-樱花,https://m3u8.apiyhzy.com/api.php/provide/vod
-步步,https://api.yparse.com/api/json
-牛牛,https://api.niuniuzy.me/api.php/provide/vod
-索尼,https://suoniapi.com/api.php/provide/vod
-茅台,https://caiji.maotaizy.cc/api.php/provide/vod
-豆瓣,https://dbzy.tv/api.php/provide/vod
 速博,https://subocaiji.com/api.php/provide/vod
-金鹰,https://jinyingzy.com/api.php/provide/vod
-闪电,https://sdzyapi.com/api.php/provide/vod
-飘零,https://p2100.net/api.php/provide/vod
-魔漫,https://caiji.moduapi.cc/api.php/provide/vod
-红影,https://www.hongniuzy3.com/api.php/provide/vod
-索闪,https://xsd.sdzyapi.com/api.php/provide/vod
+樂子,https://cj.lziapi.com/api.php/provide/vod
+愛坤,https://ikunzyapi.com/api.php/provide/vod
+優酷,https://api.ukuapi88.com/api.php/provide/vod
+無盡,https://api.wujinapi.me/api.php/provide/vod
+新影,https://api.xinlangapi.com/api.php/provide/vod
+魔都,https://www.mdzyapi.com/api.php/provide/vod
+金鷹,https://jinyingzy.com/api.php/provide/vod
+紅牛,https://www.hongniuzy2.com/api.php/provide/vod
+虎牙,https://www.huyaapi.com/api.php/provide/vod
+極速,https://jszyapi.com/api.php/provide/vod
+如意,https://cj.rycjapi.com/api.php/provide/vod
+無星,https://api.wujinapi.cc/api.php/provide/vod
+無盡B,https://api.wujinapi.com/api.php/provide/vod
+鯨魚,https://jyzyapi.com/provide/vod
+紅影,https://www.hongniuzy3.com/api.php/provide/vod
+非凡,https://api.ffzyapi.com/api.php/provide/vod
+清影,https://api.1080zyku.com/inc/apijson.php
+三靈,https://360zy.com/api.php/provide/vod
+百度,https://api.apibdzy.com/api.php/provide/vod
+暴風,https://bfzyapi.com/api.php/provide/vod
+最大,https://api.zuidapi.com/api.php/provide/vod
+愛蛋,https://lovedan.net/api.php/provide/vod
+天影,http://caiji.dyttzyapi.com/api.php/provide/vod
+至大,http://zuidazy.me/api.php/provide/vod
 `;
 
-// 中文数字映射
+// 中文數字映射
 const CHINESE_NUM_MAP = {
   '一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
   '六': 6, '七': 7, '八': 8, '九': 9, '十': 10
 };
 
-// ==================== 优化配置 ====================
+// ==================== 最佳化配置 ====================
 const CONFIG = {
   // 性能配置
   MAX_CONCURRENT_REQUESTS: 8,
@@ -84,11 +139,11 @@ const CONFIG = {
   REQUEST_TIMEOUT: 6000,
   RETRY_ATTEMPTS: 2,
   CACHE_TTL: 10800,
-  
+
   // 主力源配置
-  MAIN_SOURCES: ['非凡', '最大', '暴风', '极速', '天影', '豆瓣', '卧龙', '百度'],
-  
-  // 流式搜索配置
+  MAIN_SOURCES: ['非凡', '最大', '暴風', '極速', '天影', '百度', '愛坤', '金鷹'],
+
+  // 流式搜尋配置
   STREAMING: {
     ENABLED: true,
     FAST_MODE_THRESHOLD: 25,
@@ -96,24 +151,31 @@ const CONFIG = {
     MAX_STREAM_RESULTS: 200,
     SKIP_BACKUP_IF_MAIN_SUCCESS: false,
   },
-  
-  // 智能匹配配置
+
+  // 智慧匹配配置
   MATCH_THRESHOLDS: {
     SIMILARITY_EXACT: 0.96,
     SIMILARITY_STRICT: 0.87,
     SIMILARITY_LOOSE: 0.75,
     KEYWORD_MIN_MATCH: 0.65,
   },
-  
-  // 智能去重配置
+
+  // 智慧去重配置
   DEDUPLICATION: {
     ENABLED: true,
     SIMILARITY_THRESHOLD: 0.85,
     CHECK_CONTENT: true,
     CHECK_RESOLUTION: true,
   },
-  
-  // 结果排序权重
+
+  // 繁簡轉換配置
+  CONVERSION: {
+    ENABLED: true,
+    TO_TRADITIONAL_DISPLAY: true,  // 結果顯示轉繁體
+    DUAL_QUERY: true,              // 繁簡雙向查詢
+  },
+
+  // 結果排序權重
   SORT_WEIGHTS: {
     EXACT_MATCH: 100,
     FUZZY_MATCH: 85,
@@ -131,52 +193,52 @@ const CONFIG = {
   }
 };
 
-// ==================== 模块元数据 ====================
+// ==================== 模組中繼資料 ====================
 WidgetMetadata = {
   id: "vod_stream_enhanced_pro",
-  title: "VOD源(流式增强专业版)",
+  title: "VOD源(流式增強專業版)",
   icon: "",
-  version: "4.0.0",
+  version: "5.0.0",
   requiredVersion: "0.0.1",
-  description: "VOD聚合搜索(全源+快速+精准匹配+实时流式)",
+  description: "VOD 聚合搜尋(全源 + 快速 + 精準匹配 + 即時流式 + 繁簡自動轉換)",
   author: "MoYan",
   site: "",
   globalParams: [
     {
       name: "multiSource",
-      title: "聚合搜索",
+      title: "聚合搜尋",
       type: "enumeration",
       enumOptions: [
-        { title: "启用", value: "enabled" },
-        { title: "禁用", value: "disabled" }
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
       ],
       value: "enabled"
     },
     {
       name: "VodData",
-      title: "自定义源配置",
+      title: "自訂源設定",
       type: "input",
       value: RESOURCE_SITES
     },
     {
       name: "searchMode",
-      title: "搜索模式",
+      title: "搜尋模式",
       type: "enumeration",
       enumOptions: [
-        { title: "智能流式", value: "smart_stream" },
-        { title: "批量搜索", value: "batch" },
-        { title: "自动选择", value: "auto" }
+        { title: "智慧流式", value: "smart_stream" },
+        { title: "批次搜尋", value: "batch" },
+        { title: "自動選擇", value: "auto" }
       ],
       value: "smart_stream"
     },
     {
       name: "matchStrictness",
-      title: "匹配严格度",
+      title: "匹配嚴格度",
       type: "enumeration",
       enumOptions: [
-        { title: "宽松(匹配更多)", value: "loose" },
-        { title: "标准", value: "standard" },
-        { title: "严格(更准确)", value: "strict" }
+        { title: "寬鬆(匹配更多)", value: "loose" },
+        { title: "標準", value: "standard" },
+        { title: "嚴格(更精確)", value: "strict" }
       ],
       value: "standard"
     },
@@ -185,27 +247,107 @@ WidgetMetadata = {
       title: "清晰度偏好",
       type: "enumeration",
       enumOptions: [
-        { title: "自动", value: "auto" },
-        { title: "4K优先", value: "4k" },
-        { title: "1080P优先", value: "1080p" },
-        { title: "720P优先", value: "720p" }
+        { title: "自動", value: "auto" },
+        { title: "4K優先", value: "4k" },
+        { title: "1080P優先", value: "1080p" },
+        { title: "720P優先", value: "720p" }
       ],
       value: "auto"
+    },
+    {
+      name: "convertChinese",
+      title: "繁簡自動轉換",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用 (繁體顯示)", value: "enabled" },
+        { title: "停用 (保留原文)", value: "disabled" }
+      ],
+      value: "enabled"
     }
   ],
   modules: [
     {
       id: "loadResource",
-      title: "加载资源",
+      title: "載入資源",
       functionName: "loadResource",
       type: "stream",
       params: [],
     }
   ],
 };
-
 // ==================== 工具函数模块 ====================
-const isM3U8Url = (url) => url?.toLowerCase().includes('m3u8') || false;
+// 實測發現：真實 API 回傳的播放連結分兩種，一種是標準 .m3u8 直串，
+// 另一種是無副檔名的 /share/<md5> 頁面（點擊後仍會導向播放器）。
+// 若只認 .m3u8 會把大量可播來源整個濾掉，因此改為「排除明確不可播」而非
+// 「只接受 m3u8」。
+const PLAYABLE_EXT = /\.(m3u8|mp4|flv|mkv|avi|mov|ts)(?:$|[?#])/i;
+const BLOCKED_URL = /(javascript:|data:)/i;
+
+function isPlayableUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  const u = url.trim();
+  if (!u || BLOCKED_URL.test(u)) return false;
+  if (!/^https?:\/\//i.test(u)) return false;
+  // 有已知可播副檔名 -> 直接視為可播
+  if (PLAYABLE_EXT.test(u)) return true;
+  // 無副檔名：排除明顯是網頁/介面的路徑，其餘視為可播
+  if (/\.(html?|php|asp|aspx|jsp)(\?|$)/i.test(u)) return false;
+  return true;
+}
+
+// 相容舊呼叫點
+const isM3U8Url = (url) => isPlayableUrl(url);
+
+/**
+ * 比對前把片名正規化，讓繁體查詢能對上簡體結果。
+ * 統一轉繁體 + 去除空白 + 轉小寫。
+ */
+function normalizeTitleForMatch(title) {
+  if (!title) return '';
+  const converted = CONFIG.CONVERSION.ENABLED
+    ? convertChinese(String(title), true)
+    : String(title);
+  return converted.replace(/[\s\u3000]+/g, '').toLowerCase();
+}
+
+/**
+ * 顯示用文字：資源站內容為簡體，此處統一轉為繁體。
+ * 關閉轉換設定時原樣輸出。
+ */
+function toDisplayText(text) {
+  if (!text) return '';
+  if (!CONFIG.CONVERSION.TO_TRADITIONAL_DISPLAY) return String(text);
+  return convertChinese(String(text), true);
+}
+
+/**
+ * 把 Widget.http 的回應正規化成可直接取用 list 的物件。
+ * 需處理三種情況：
+ *   1. data 已是物件
+ *   2. data 是 JSON 字串
+ *   3. MacCMS 的 { data: { list: [...] } } 巢狀結構
+ */
+function normalizeHttpResponse(response) {
+  if (!response) return null;
+
+  let payload = response.data;
+  if (typeof payload === 'string') {
+    try {
+      payload = JSON.parse(payload);
+    } catch (e) {
+      return null;
+    }
+  }
+  if (!payload || typeof payload !== 'object') return null;
+
+  // MacCMS 回傳 { data: { list } }；部分站點直接回傳 { list }
+  if (!payload.list && payload.data && typeof payload.data === 'object') {
+    payload = payload.data;
+  }
+  if (!Array.isArray(payload.list)) return null;
+
+  return payload;
+}
 
 function deepCleanSeriesName(name) {
   if (!name) return '';
@@ -398,8 +540,15 @@ function extractEnhancedInfo(seriesName) {
 
   baseName = deepCleanSeriesName(baseName);
 
-  return { 
+  // VOD 資源站幾乎都是簡體內容：以繁體關鍵字直接查詢會零結果。
+  // 送出前一律轉成簡體，命中後再把片名轉回繁體顯示。
+  const searchQuery = CONFIG.CONVERSION.ENABLED
+    ? convertChinese(baseName, false)
+    : baseName;
+
+  return {
     baseName,
+    searchQuery,
     seasonNumber,
     isVariety,
     varietyEpisode,
@@ -411,13 +560,15 @@ function extractEnhancedInfo(seriesName) {
 }
 
 function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standard') {
-  const targetName = targetInfo.baseName;
-  const candidateName = candidateInfo.baseName;
-  
+  // 使用者以繁體搜尋、資源站回傳簡體，兩者字面不同但其實是同一部片。
+  // 比對前統一轉為繁體並去除空白，才能正確判定為同一作品。
+  const targetName = normalizeTitleForMatch(targetInfo.baseName);
+  const candidateName = normalizeTitleForMatch(candidateInfo.baseName);
+
   if (!targetName || !candidateName) {
     return { match: false, type: 'none', score: 0, confidence: 0 };
   }
-  
+
   const similarity = calculateHybridSimilarity(targetName, candidateName);
   
   let thresholds = CONFIG.MATCH_THRESHOLDS;
@@ -488,26 +639,31 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
   const results = [];
 
   playSources.forEach((playSource, i) => {
-    const sourceName = sourceNames[i] || '默认源';
+    const sourceName = sourceNames[i] || '預設源';
     const isTV = playSource.includes('#');
 
     if (type === 'tv' && isTV) {
       const episodes = playSource.split('#').filter(Boolean);
       episodes.forEach(ep => {
         const [epName, url] = ep.split('$');
-        if (url && isM3U8Url(url)) {
+        if (url && isPlayableUrl(url)) {
           const epMatch = epName.match(/第(\d+)(集|期)/);
           const episodeNumber = epMatch ? parseInt(epMatch[1]) : null;
-          
+
           const resolutionInfo = extractResolutionInfo(vod_name, epName);
-          
+
           const dateMatch = epName.match(/(\d{4}年\d{1,2}月\d{1,2}日|\d{4}\.\d{1,2}\.\d{1,2}|\d{4}\d{2}\d{2})/);
-          
+
+          // 資源站回傳簡體，統一轉繁體後再顯示
+          const displayName = toDisplayText(vod_name);
+          const displayEp = toDisplayText(epName);
+          const displayRemarks = toDisplayText(vod_remarks);
+
           const resource = {
             name: siteTitle,
-            description: `${vod_name} - ${epName}${vod_remarks ? ' - ' + vod_remarks : ''} - [${sourceName}]`,
+            description: `${displayName} - ${displayEp}${displayRemarks ? ' - ' + displayRemarks : ''} - [${sourceName}]`,
             url: url.trim(),
-            
+
             resolution: resolutionInfo.label,
             resolutionLevel: resolutionInfo.level,
             isHD: resolutionInfo.isHD,
@@ -515,7 +671,7 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
             qualityTags: resolutionInfo.tags,
             qualityScore: resolutionInfo.qualityScore,
             isHttps: url.startsWith('https'),
-            
+
             _ep: episodeNumber,
             _episodeDate: dateMatch ? dateMatch[0] : null,
             _isVariety: dateMatch !== null || epMatch?.[2] === '期',
@@ -535,7 +691,7 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
       const firstM3U8 = playSource.split('#').find(v => isM3U8Url(v.split('$')[1]));
       if (firstM3U8) {
         const [quality, url] = firstM3U8.split('$');
-        const qualityText = quality.toLowerCase().includes('tc') ? '抢先版' : '正片';
+        const qualityText = quality.toLowerCase().includes('tc') ? '搶先版' : '正片';
         
         const resolutionInfo = extractResolutionInfo(vod_name, quality);
         
@@ -629,17 +785,21 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
         ...searchParams,
         timeout: CONFIG.REQUEST_TIMEOUT
       });
-      
-      if (!response?.data?.list || response.data.list.length === 0) {
+
+      // Forward 的 http 層依站台行為可能回傳字串或已解析的物件，
+      // 未正規化時 .data.list 永遠取不到，導致整個搜尋靜默回傳 0 筆。
+      const normalized = normalizeHttpResponse(response);
+
+      if (!normalized?.list || normalized.list.length === 0) {
         delete searchParams.params.t;
         const fallbackResponse = await Widget.http.get(url, {
           ...searchParams,
           timeout: CONFIG.REQUEST_TIMEOUT
         });
-        return fallbackResponse;
+        return normalizeHttpResponse(fallbackResponse);
       }
-      
-      return response;
+
+      return normalized;
     } catch (error) {
       lastError = error;
       if (i < retries) {
@@ -950,9 +1110,9 @@ class SmartSearchExecutor {
     const siteKey = `${site.title}_${site.value}`;
     
     try {
-      const response = await this.fetchWithSmartRetry(site, this.targetInfo.baseName);
+      const response = await this.fetchWithSmartRetry(site, this.targetInfo.searchQuery || this.targetInfo.baseName);
       
-      if (!response?.data?.list) {
+      if (!response?.list) {
         this.stats.completedSites++;
         this.stats.skippedSites++;
         return [];
@@ -961,7 +1121,7 @@ class SmartSearchExecutor {
       const siteResults = [];
       const matchedItems = [];
       
-      for (const item of response.data.list) {
+      for (const item of response.list) {
         if (!item.vod_name) continue;
         
         const candidateInfo = extractEnhancedInfo(item.vod_name);
@@ -1021,8 +1181,9 @@ class SmartSearchExecutor {
           params,
           timeout: CONFIG.REQUEST_TIMEOUT
         });
-        
-        return response;
+
+        // 同 fetchWithSmartRetry：統一解析字串/巢狀回應
+        return normalizeHttpResponse(response);
       } catch (error) {
         lastError = error;
         
@@ -1215,11 +1376,11 @@ function cleanResourceForOutput(resource) {
   if (clean.resolutionLevel >= 5) {
     clean.recommended = '4K超清';
   } else if (clean.resolutionLevel >= 4 && clean.qualityScore > 20) {
-    clean.recommended = '蓝光高清';
+    clean.recommended = '藍光高清';
   } else if (clean.resolutionLevel >= 3) {
     clean.recommended = '高清';
   } else if (clean.qualityScore > 15) {
-    clean.recommended = '高质量';
+    clean.recommended = '高品質';
   }
   
   return clean;
@@ -1249,7 +1410,7 @@ async function loadResource(params, onStreamResult = null) {
   
   const resourceSites = parseResourceSites(VodData);
   if (resourceSites.length === 0) {
-    onStreamResult && onStreamResult([], { type: 'error', message: '无可用资源站' });
+    onStreamResult && onStreamResult([], { type: 'error', message: '無可用資源站' });
     return [];
   }
   
@@ -1258,7 +1419,8 @@ async function loadResource(params, onStreamResult = null) {
   const targetEpisode = episode ? parseInt(episode) : null;
   targetInfo.seasonNumber = targetSeason;
   
-  const cacheKey = `vod_smart_${targetInfo.baseName}_s${targetSeason}_${type}_${matchStrictness}`;
+  // 快取鍵使用正規化名稱，繁簡輸入才會命中同一份快取
+  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_s${targetSeason}_${type}_${matchStrictness}`;
   let cachedResults = [];
   
   if (CONFIG.CACHE_TTL > 0) {
@@ -1351,11 +1513,11 @@ async function loadResource(params, onStreamResult = null) {
     if (res.resolutionLevel >= 5) {
       res.recommended = '4K超清';
     } else if (res.resolutionLevel >= 4 && res.qualityScore > 20) {
-      res.recommended = '蓝光高清';
+      res.recommended = '藍光高清';
     } else if (res.resolutionLevel >= 3) {
       res.recommended = '高清';
     } else if (res.qualityScore > 15) {
-      res.recommended = '高质量';
+      res.recommended = '高品質';
     }
   });
   
@@ -1451,7 +1613,7 @@ async function performBatchSearch(params) {
   const targetEpisode = episode ? parseInt(episode) : null;
   targetInfo.seasonNumber = targetSeason;
 
-  const cacheKey = `vod_batch_${targetInfo.baseName}_s${targetSeason}_${type}`;
+  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_s${targetSeason}_${type}`;
   let allResults = [];
 
   try {
@@ -1472,18 +1634,18 @@ async function performBatchSearch(params) {
         const retries = site.isMain ? CONFIG.RETRY_ATTEMPTS : 1;
         const response = await fetchWithSmartRetry(
           site.value,
-          { params: { ac: "detail", wd: targetInfo.baseName } },
+          { params: { ac: "detail", wd: targetInfo.searchQuery || targetInfo.baseName } },
           retries,
           site.title
         );
 
-        if (!response?.data?.list) {
+        if (!response?.list) {
           stats.failed++;
           return [];
         }
 
         let siteResults = [];
-        for (const item of response.data.list) {
+        for (const item of response.list) {
           if (!item.vod_name) continue;
           
           const candidateInfo = extractEnhancedInfo(item.vod_name);
@@ -1559,5 +1721,3 @@ async function performBatchSearch(params) {
   
   return finalResults.slice(0, 100);
 }
-
-module.exports = { loadResource };
