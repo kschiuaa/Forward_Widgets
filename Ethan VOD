@@ -189,7 +189,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.1.3",
+  version: "1.1.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1151,6 +1151,7 @@ class SmartSearchExecutor {
     // complete 事件會晚到前端等待上限之後，使用者只會看到「暫無可用資源」，
     // 即使其他站早已回傳結果。到點就帶著已完成的結果收尾。
     const deadline = Date.now() + CONFIG.SEARCH_DEADLINE;
+    this.deadline = deadline;
     // 執行器會隨各站完成即回推結果，因此逾時時仍能取回已完成的部分，
     // 而不必因為等待整組而全部丟棄。
     const drain = () => this.smartDeduplicate(this.collected.slice());
@@ -1394,12 +1395,19 @@ class SmartSearchExecutor {
         return normalized;
       } catch (error) {
         lastError = error;
-        
+
         if (attempt < maxRetries) {
           const baseDelay = 1000 * Math.pow(2, attempt);
           const jitter = Math.random() * 1000;
           const delay = baseDelay + jitter;
-          
+
+          // 重試必須仍趕得在整體時限內送出，否則這段退避只是讓使用者
+          // 多空等 — 逾時的站再試一次通常也是逾時。
+          if (this.deadline && Date.now() + delay + CONFIG.REQUEST_TIMEOUT > this.deadline) {
+            console.log(`⏱️ ${site.title} 剩餘時間不足重試，直接放棄`);
+            break;
+          }
+
           console.log(`⏱️ ${site.title} 请求失败，${delay}ms后重试 (${error.message})`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
