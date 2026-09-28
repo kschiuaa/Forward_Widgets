@@ -186,6 +186,14 @@ const CONFIG = {
     QUALITY_TAG_BONUS: 18,
     HTTPS_BONUS: 12,
     VALIDATED_BONUS: 15,
+    // 搜尋片名沒有年份時（「仁醫」），站台會把韓版「仁医2012」與日版
+    // 「仁医2009」一起回傳，且五個站有四個把韓版排前面。降權帶年份
+    // 標記的候選，讓未標記的版本（使用者輸入的原版）排在前面。
+    // 不直接丟棄：使用者若明確輸入年份，該候選仍可勝出。
+    VERSION_AMBIGUOUS_PENALTY: 40,
+    // 目標片名自帶年份而候選年份不符（「仁醫2012」搜到「仁医2009」）
+    // 屬於另一部劇，必須排到最後。
+    VERSION_CONFLICT_PENALTY: 120,
   }
 };
 
@@ -194,7 +202,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.1",
+  version: "1.2.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -359,7 +367,13 @@ function normalizeHttpResponse(response) {
 function deepCleanSeriesName(name) {
   if (!name) return '';
   let cleaned = String(name);
-  
+
+  // 先移除括號及其內容（「仁醫（2009）」→「仁醫」），再去掉裸露的年份。
+  // 順序相反會留下空白間隙：「（2009）」的括號被刪後，年份規則把剩下的
+  // 數字連同前後空白一起換成空格，產生「仁醫 」這種帶尾端空白的殘留，
+  // 查詢字串因此變成「仁医（ ）2009」而搜不到。
+  cleaned = cleaned.replace(/[（(【\[]\s*[^）)】\]]{0,24}\s*[）)】\]]/g, '');
+
   const removablePatterns = [
     /剧场版|电影版|特别篇|SP|OVA/gi,
     /\s*(HD|高清|超清|蓝光|4K|1080[Pp]|720[Pp]|HDR|杜比|Dolby|HEVC|X265|X264)\s*/gi,
@@ -367,16 +381,16 @@ function deepCleanSeriesName(name) {
     /\s*(国语|粤语|英语|日语|韩语|中字|双语|简繁|内封|内嵌|字幕|未删减|完整版|完结|全集|合集|番外)\s*/g,
     /[\[\]()【】《》「」『』]/g,
   ];
-  
+
   removablePatterns.forEach(pattern => {
     cleaned = cleaned.replace(pattern, '');
   });
-  
-  cleaned = cleaned.replace(/\s*\d{4}\s*/g, ' ');
+
+  cleaned = cleaned.replace(/\s*(?:19|20)\d{2}\s*/g, ' ');
   cleaned = cleaned.replace(/第\d+[集话]/g, '');
   cleaned = cleaned.replace(/[\.\-\s]+$/g, '');
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
-  
+
   return cleaned;
 }
 
@@ -690,11 +704,24 @@ function extractEnhancedInfo(seriesName) {
 
   baseName = deepCleanSeriesName(baseName);
 
+  // deepCleanSeriesName 會移除年份與副標（比對用），但年份對搜尋是必要的：
+  // 「仁醫2012」與「仁醫」是韓版與日版兩部不同的劇，搜尋字串若都變成
+  // 「仁医」，站台只會回傳當下排序最前的那一版，指定年份形同無效。
+  //
+  // 年份必須接在清理後的片名之後，不能用清理前的 rawName 整段取代：
+  // 清理會把括號內文字移到片名後方（「仁醫（2009）」→「仁醫2009」），
+  // 直接沿用 rawName 會讓副標殘留在字串裡（「仁医完结篇」反而搜不到）。
+  const yearForQuery = extractVersionMarker(rawName);
+
   // VOD 資源站幾乎都是簡體內容：以繁體關鍵字直接查詢會零結果。
   // 送出前一律轉成簡體，命中後再把片名轉回繁體顯示。
   let searchQuery = CONFIG.CONVERSION.ENABLED
     ? convertChinese(baseName, false)
     : baseName;
+
+  if (yearForQuery) {
+    searchQuery += yearForQuery;
+  }
 
   // 搜尋字串要帶上季別，否則資源站一律回傳第一季。
   //
@@ -1007,7 +1034,9 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
             _isMainSource: CONFIG.MAIN_SOURCES.includes(siteTitle),
             _hasEpInfo: episodeNumber !== null || dateMatch !== null,
             _updateRecency: vod_remarks.includes('更新') || vod_remarks.includes('第') ? 1 : 0,
-            _seasonMatch: matchInfo.seasonMatch
+            _seasonMatch: matchInfo.seasonMatch,
+            _versionConflict: isConflictingVersion(targetInfo, vod_name),
+            _versionAmbiguous: isVersionAmbiguous(targetInfo, vod_name)
           };
           
           results.push(resource);
@@ -1040,7 +1069,9 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           _isMainSource: CONFIG.MAIN_SOURCES.includes(siteTitle),
           _hasEpInfo: false,
           _updateRecency: vod_remarks.includes('更新') ? 1 : 0,
-          _seasonMatch: matchInfo.seasonMatch
+          _seasonMatch: matchInfo.seasonMatch,
+          _versionConflict: isConflictingVersion(targetInfo, vod_name),
+          _versionAmbiguous: isVersionAmbiguous(targetInfo, vod_name)
         };
         
         results.push(resource);
@@ -1203,6 +1234,37 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
   throw lastError;
 }
 
+// ==================== 版本歧義（同年不同劇） ====================
+// 資源站常用年份標記同一片名的不同版本，且不一定是續集：
+// 「仁医2009」是日版、「仁医2012」是韓版，兩者片名幾乎相同卻是不同劇集。
+// 搜尋片名沒有年份時，站台會把兩個版本一起回傳（實測五個站有四個
+// 把 2012 排在 2009 前面），使用者看到的預設就是錯的那一版。
+//
+// 這裡標記候選是否帶有「與目標片名不同的年份/版本標記」，
+// 讓排序可以把未標記的版本（通常是使用者輸入的原版）排在前面，
+// 而非直接丟棄帶年份的版本 —— 搜「仁醫2012」時它仍然是唯一正確答案。
+function extractVersionMarker(name) {
+  const t = String(name || '');
+  const m = t.match(/[（(【\[]?\s*((?:19|20)\d{2})\s*(?:年)?\s*[)）】\]]?/);
+  if (!m) return null;
+  return m[1];
+}
+
+// 目標片名自帶年份時（「仁醫2012」），候選年份不同即為另一版本。
+function isConflictingVersion(targetInfo, candidateName) {
+  const targetYear = extractVersionMarker(targetInfo.rawName) || targetInfo.year;
+  const candYear = extractVersionMarker(candidateName);
+  if (!targetYear || !candYear) return false;
+  return targetYear !== candYear;
+}
+
+// 目標片名沒有年份（「仁醫」）：候選帶年份標記代表它是某個特定版本，
+// 站台通常把重製/韓版排前面。標記但不丟棄，交由排序降權。
+function isVersionAmbiguous(targetInfo, candidateName) {
+  if (targetInfo.year) return false;
+  return extractVersionMarker(candidateName) !== null;
+}
+
 function calculateResourceScore(resource, preferResolution = 'auto') {
   let score = resource._matchScore || 0;
   const weights = CONFIG.SORT_WEIGHTS;
@@ -1213,6 +1275,8 @@ function calculateResourceScore(resource, preferResolution = 'auto') {
   else if (resource._matchType === 'fallback') score += weights.FALLBACK_MATCH;
   
   if (resource._seasonMatch) score += weights.SEASON_MATCH_BONUS;
+  if (resource._versionConflict) score -= weights.VERSION_CONFLICT_PENALTY;
+  else if (resource._versionAmbiguous) score -= weights.VERSION_AMBIGUOUS_PENALTY;
   if (resource._isVariety && resource._hasEpInfo) score += weights.VARIETY_MATCH_BONUS;
   if (resource._isMainSource) score += weights.MAIN_SOURCE;
   if (resource._hasEpInfo) score += weights.HAS_EP_INFO;
@@ -1881,7 +1945,7 @@ function cleanResourceForOutput(resource) {
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch', 
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep', 
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
-    '_confidence'
+    '_confidence', '_versionConflict', '_versionAmbiguous'
   ];
   
   fieldsToDelete.forEach(field => {
@@ -1961,7 +2025,10 @@ async function loadResource(params, onStreamResult = null) {
   // 「追龙2017」與「追龙2」清理後都是「追龙」，共用同一鍵會讓後者
   // 讀到前者的來源 —— 使用者點開同系列的另一部電影時看到舊片。
   const sequelTag = extractSequelNumber(targetInfo.rawName);
-  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
+  // 年份也要納入：clean 後「仁醫2009」與「仁醫2012」都變成「仁醫」，
+  // 共用同一鍵會讓指定韓版的請求讀到日版的來源，指定年份形同失效。
+  const versionTag = extractVersionMarker(targetInfo.rawName) ?? targetInfo.year ?? 'x';
+  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_y${versionTag}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
   let cachedResults = [];
   
   if (CONFIG.CACHE_TTL > 0) {
@@ -2047,9 +2114,10 @@ async function loadResource(params, onStreamResult = null) {
   });
   
   const fieldsToDelete = [
-    '_finalScore', '_matchType', '_matchScore', '_seasonMatch', 
-    '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep', 
-    '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority'
+    '_finalScore', '_matchType', '_matchScore', '_seasonMatch',
+    '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
+    '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
+    '_versionConflict', '_versionAmbiguous'
   ];
   
   finalResults.forEach(res => {
@@ -2191,7 +2259,8 @@ async function performBatchSearch(params) {
 
   // 與串流模式同樣帶上續集序號，理由見 loadResource 的 cacheKey 說明。
   const batchSequel = extractSequelNumber(targetInfo.rawName);
-  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_s${targetSeason}_${type}`;
+  const batchVersion = extractVersionMarker(targetInfo.rawName) ?? targetInfo.year ?? 'x';
+  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_s${targetSeason}_${type}`;
   let allResults = [];
 
   try {
@@ -2283,9 +2352,10 @@ async function performBatchSearch(params) {
     return b._finalScore - a._finalScore;
   });
   
-  const fieldsToDelete = ['_finalScore', '_matchType', '_matchScore', '_seasonMatch', 
-                         '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep', 
-                         '_isVariety', '_episodeDate', '_confidence'];
+  const fieldsToDelete = ['_finalScore', '_matchType', '_matchScore', '_seasonMatch',
+                         '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
+                         '_isVariety', '_episodeDate', '_confidence',
+                         '_versionConflict', '_versionAmbiguous'];
   finalResults.forEach(res => {
     fieldsToDelete.forEach(field => {
       if (field in res) delete res[field];
