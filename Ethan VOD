@@ -131,7 +131,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 4,
+  WIDGET_VERSION: 5,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -840,7 +840,10 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   // 第 2 種在片名互相包含時相似度必然很高（清理後幾乎同名），
   // 且年份尾巴的數字會撞上序號（"追龙2017" 包含 "追龙2"），
   // 因此必須在相似度比對之前就擋下，不能交給門檻判斷。
-  const targetSequel = extractSequelNumber(targetInfo.rawName);
+  // 目標序號取用：直接從片名抓不到時（典型情況：使用者輸入「仁醫」但
+  // Forward 透過 season=第二季 表達要第 N 季），從 targetInfo._expectedSequel
+  // 補。沒有 season 參數時這個欄位是 undefined，行為等同舊版。
+  const targetSequel = extractSequelNumber(targetInfo.rawName) ?? targetInfo._expectedSequel ?? null;
   const candidateSequel = extractSequelNumber(candidateInfo.rawName);
   const sequelShapeMismatch = (targetSequel === null) !== (candidateSequel === null);
   const sequelConflict = sequelShapeMismatch ||
@@ -918,7 +921,7 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       seasonMatch: targetInfo.seasonNumber === candidateInfo.seasonNumber,
       confidence: 0.70
     };
-  } else if (targetInfo.rawName.includes(candidateInfo.rawName) || 
+  } else if (targetInfo.rawName.includes(candidateInfo.rawName) ||
              candidateInfo.rawName.includes(targetInfo.rawName)) {
     // 互相包含只代表「片名有重疊」，不保證是同一部作品。
     // 「追龙2」包含於「追龙2017」（年份的 2 開頭撞上序號）、
@@ -928,11 +931,20 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     // 主片名要去掉副標題：「追龙2」與「追龙2：追缉大富豪」是同一部片，
     // 但完整片名並不相等，只比完整名會漏掉這類常見寫法。
     // 序號則相反 —— 它是區別作品的關鍵，絕不可從主片名中剔除。
-    const targetCore = normalizeTitleForMatch(stripSubtitle(targetInfo.baseName));
-    const candidateCore = normalizeTitleForMatch(stripSubtitle(candidateInfo.baseName));
+    let targetCore = normalizeTitleForMatch(stripSubtitle(targetInfo.baseName));
+    let candidateCore = normalizeTitleForMatch(stripSubtitle(candidateInfo.baseName));
     const sameSequel = targetSequel === candidateSequel;
 
-    if (targetCore === candidateCore && sameSequel) {
+    // 互補情境：target 是「仁医」+ sequel=2，candidate 是「仁医2」+ sequel=2，
+    // 兩者 baseName 一個有 2 一個沒 2，但實際是同一部片。去除尾端單一數字
+    // 後再比對。同樣反向也適用（target 有序號、candidate 沒有，
+    // 例如 target 是「仁医2」、candidate 是「仁医」+ target._expectedSequel=2）。
+    const targetCoreNoDigit = targetCore.replace(/\d+$/, '');
+    const candidateCoreNoDigit = candidateCore.replace(/\d+$/, '');
+    const coreMatches = targetCore === candidateCore ||
+                        (targetCoreNoDigit && targetCoreNoDigit === candidateCoreNoDigit);
+
+    if (coreMatches && sameSequel) {
       return {
         match: true,
         type: 'fallback',
@@ -2255,8 +2267,34 @@ async function loadResource(params, onStreamResult = null) {
   }
   
   const targetInfo = extractEnhancedInfo(seriesName);
-  const targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
+  let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
   const targetEpisode = episode ? parseInt(episode) : null;
+
+  // 修正「仁医 / season=第二季」情境。
+  //
+  // 實機日誌：seriesName=仁医 + season=第二季 + airDate 空 → 推播 100 筆全
+  // 是「仁醫2012」韓版，完全找不到愛蛋站實際有的「仁医2」（仁醫第二季）。
+  // 根本原因有兩個：
+  //   1. parseInt('第二季') = NaN，targetSeason 變成 NaN。
+  //   2. 就算 targetSeason 是 2，extractSequelNumber('仁医') = null，
+  //      extractSequelNumber('仁医2') = 2，target 與 candidate 的序號一個
+  //      是 null 一個是 2 → sequelShapeMismatch → sequelConflict → 匹配失敗，
+  //      「仁医2」整個被拒絕。
+  //
+  // 正確解讀：season 參數帶著「第二季」這個語意時，候選檔名帶序號 2
+  // （「仁医2」）才是正確答案，不該因序號不對稱而被當成不同作品。
+  //
+  // 補救：當 season 參數存在但 parseInt 失敗（中文 / 「S2」之類）時，
+  // 嘗試從 season 字串抽數字；若 targetSeason 是有效數字且 > 1，把它視為
+  // 「明確要第 N 季」，讓 sequel 序號比對通過。
+  if (Number.isNaN(targetSeason) && typeof season === 'string') {
+    const m = season.match(/\d+|[一二三四五六七八九十零]+/);
+    targetSeason = m ? (parseInt(m[0], 10) || parseChineseNumeral(m[0]) || NaN) : NaN;
+  }
+  if (Number.isFinite(targetSeason) && targetSeason > 1) {
+    targetInfo._expectedSequel = targetSeason;
+  }
+
   targetInfo.seasonNumber = targetSeason;
 
   // 詳細頁已選定具體版本時，Forward 有時會帶入首播年份（premiereDate / airDate）。
@@ -2526,7 +2564,15 @@ async function performSmartSearch(params, onStreamResult) {
   // season 參數不會出現在 seriesName 裡，必須在這裡套用，否則搜尋字串
   // 永遠是裸片名。使用者切換季別時拿到的是第一季的內容，畫面看起來
   // 就完全沒有刷新。理由與寫法見 loadResource 內的說明。
-  const targetSeason = season ? parseInt(season, 10) : targetInfo.seasonNumber;
+  let targetSeason = season ? parseInt(season, 10) : targetInfo.seasonNumber;
+  // 中文季別（「第二季」之類）容錯，理由見 loadResource。
+  if (Number.isNaN(targetSeason) && typeof season === 'string') {
+    const m = season.match(/\d+|[一二三四五六七八九十零]+/);
+    targetSeason = m ? (parseInt(m[0], 10) || parseChineseNumeral(m[0]) || NaN) : NaN;
+  }
+  if (Number.isFinite(targetSeason) && targetSeason > 1) {
+    targetInfo._expectedSequel = targetSeason;
+  }
   targetInfo.seasonNumber = targetSeason;
 
   // 詳細頁指定的版本同樣要帶進來。
@@ -2582,8 +2628,16 @@ async function performBatchSearch(params) {
   }
 
   const targetInfo = extractEnhancedInfo(seriesName);
-  const targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
+  let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
   const targetEpisode = episode ? parseInt(episode) : null;
+  // 中文季別容錯
+  if (Number.isNaN(targetSeason) && typeof season === 'string') {
+    const m = season.match(/\d+|[一二三四五六七八九十零]+/);
+    targetSeason = m ? (parseInt(m[0], 10) || parseChineseNumeral(m[0]) || NaN) : NaN;
+  }
+  if (Number.isFinite(targetSeason) && targetSeason > 1) {
+    targetInfo._expectedSequel = targetSeason;
+  }
   targetInfo.seasonNumber = targetSeason;
 
   // 搜尋字串組裝規則必須與串流模式一致（buildSearchQuery），
