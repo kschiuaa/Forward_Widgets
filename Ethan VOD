@@ -131,7 +131,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 8,
+  WIDGET_VERSION: 9,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -212,7 +212,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.8.0",
+  version: "1.10.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -811,7 +811,7 @@ function findYearMarkedSequels(list, targetInfo, matchStrictness = 'standard') {
     stripSubtitle(targetInfo.rawName).replace(/\s*(19|20)\d{2}\s*$/, '').trim()
   );
 
-  const groups = new Map();   // 片名主體 -> [候選年份]
+  const groups = new Map();   // 片名主體 -> [{year, vodYear}]
   for (const item of list) {
     if (!item?.vod_name) continue;
     const info = extractEnhancedInfo(item.vod_name);
@@ -823,16 +823,36 @@ function findYearMarkedSequels(list, targetInfo, matchStrictness = 'standard') {
     if (itemCore !== targetCore) continue;
 
     if (!groups.has(itemCore)) groups.set(itemCore, []);
-    groups.get(itemCore).push(info.year ?? null);
+    groups.get(itemCore).push({
+      fileNameYear: info.year ?? null,                  // 從檔名抽出的年份
+      vodYear: item.vod_year ? Number(item.vod_year) : null  // 站方 metadata 年份
+    });
   }
 
-  // 需要至少兩個同名版本才有意義；單一版本無法判斷先後。
-  for (const years of groups.values()) {
-    if (years.length < 2) continue;
-    // 無年份的版本視為原季（最優先），其次是年份最早者。
-    const withYear = years.filter(y => y !== null);
-    const earliest = years.includes(null) ? null : Math.min(...withYear);
-    return { earliestYear: earliest, sequels: years.filter(y => y !== earliest) };
+  for (const items of groups.values()) {
+    if (items.length < 2) continue;   // 單一版本無法判斷先後
+
+    // 推算每筆的有效年份：優先用檔名年份，否則退回站方年份。
+    // 只在兩者都是 null 時才算「無年份」，避免「仁醫」(檔名無年份、
+    // vod_year=2009) 被誤當成「無年份原版」，導致同名有檔名年份的版本
+    // 被錯判為續集。樂子站的仁醫就是這種情況 —— 站方只在 metadata
+    // 帶年份，檔名卻沒寫，使用 stripSeasonMarker 抓不到。
+    const effectiveYears = items.map(it => it.fileNameYear ?? it.vodYear ?? null);
+    const withYear = effectiveYears.filter(y => y !== null);
+    const uniqueYears = new Set(withYear);
+
+    // 所有版本有效年份都一樣（即使有些「無年份」其實是缺資料），
+    // 沒辦法判斷哪個是續集。退回全部放行（return null），
+    // 不要硬湊一個「最早年份」當原版。
+    if (uniqueYears.size < 2) return null;
+
+    // 有「真正無年份」的版本時，優先當原版。
+    const hasTrueNull = effectiveYears.includes(null);
+    const earliest = hasTrueNull
+      ? null
+      : Math.min(...withYear);
+    const sequels = effectiveYears.filter(y => y !== earliest);
+    return { earliestYear: earliest, sequels: sequels.filter(y => y !== null) };
   }
   return null;
 }
@@ -2762,23 +2782,82 @@ async function performBatchSearch(params) {
           return [];
         }
 
+        // 年份歧異剔除：smart_stream 路徑在站內比對結果，
+        // batch 路徑同樣需要這層過濾，否則「仁醫」會把韓版 2012 當成
+        // 第一季推給使用者 —— 兩部完全不同的片僅因檔名撞字而被誤判。
+        //
+        // 規則：站內同時有「無年份」與「帶年份」兩個同名版本時，帶年份的
+        // 屬於續集，無年份的是原版（第一季）。只留原版（與目標 version
+        // 一致的版本）。
+        //
+        // 例外：若站內只有帶年份版本（沒有原版對照），一律放行；
+        // 此時寧可多給，不可誤殺正確來源。
+        const yearMarked = (this?.type !== 'movie' && type !== 'movie')
+          ? null  // batch 路徑無 this，給 null 走放行
+          : null;
+        const batchYearMarked = findYearMarkedSequels(response.list, targetInfo, matchStrictness);
+        const sequelsToSkip = batchYearMarked?.sequels ?? null;
+
         let siteResults = [];
         for (const item of response.list) {
           if (!item.vod_name) continue;
-          
+
           const candidateInfo = extractEnhancedInfo(item.vod_name);
           const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness);
-          
+
           if (matchResult.match && matchResult.confidence >= 0.6) {
+            // 年份歧異剔除：站內「仁医2012」與「仁医」並列時，
+            // 2012 被視為續集而跳過（除非目標明確要 2012 版）。
+            if (sequelsToSkip) {
+              // 同時考慮 candidateInfo.year（從檔名抓）與 item.vod_year（站方欄位）。
+              // 兩個任一屬於續集年份都跳過。實測愛蛋的韓版「仁医」檔名不帶年份、
+              // 但 item.vod_year=2012，只看 candidateInfo.year=null 會被放行。
+              const yearCandidates = [];
+              if (candidateInfo.year != null) yearCandidates.push(candidateInfo.year);
+              if (item.vod_year) yearCandidates.push(Number(item.vod_year));
+              // sequel 年份也轉數字比對（站方資料型別不穩，vod_year 可能是字串）。
+              const sequelsNum = sequelsToSkip.map(Number);
+              const hit = yearCandidates.some(y => sequelsNum.includes(y));
+
+              // 跳過條件：「候選有任一年份命中續集，且目標**沒指定同一個**續集年份」。
+              // targetInfo.year = null 表示使用者沒指定，「候選命中續集」就必須跳過；
+              // targetInfo.year = 2012 表示使用者明確要 2012，那「候選命中 2012」就不跳。
+              //
+              // 不能寫 `targetInfo.year !== candidateInfo.year`，因為兩者皆為 null 時
+              // 會是相等而誤判放行 —— 實機測出 44 筆韓版愛蛋就是栽在這裡。
+              const userWantsYear = targetInfo.year != null ? Number(targetInfo.year) : null;
+              const candidateYears = [];
+              if (candidateInfo.year != null) candidateYears.push(Number(candidateInfo.year));
+              if (item.vod_year) candidateYears.push(Number(item.vod_year));
+              const userWantsThisYear = userWantsYear != null && candidateYears.includes(userWantsYear);
+
+              if (hit && !userWantsThisYear) {
+                continue;
+              }
+            }
+            if (/仁医/.test(item.vod_name) && matchResult.match) {
+              console.log(`  ✅ ${site.title}: 留下 ${item.vod_name} (vod_year=${item.vod_year})`);
+            }
+            // 「完结篇 / 完結篇」是日劇續集（第二季或最終季）的常見副標題，
+            // 例如「仁醫完結篇」（仁醫第二季，2011）。
+            // 當目標明確要第一季（targetSeason===1）時，這類候選不可能
+            // 是第一季本體，跳過避免把第二季誤推給使用者。
+            // 目標 season>=2 時（例如明確要第二季），就放行讓「第 2 季
+            // 過濾」去識別 —— 此處不再攔。
+            if (targetInfo.seasonNumber === 1 &&
+                /完结篇|完結篇|最終季|最终季|完结篇|第二季|最終章|终章/.test(item.vod_name)) {
+              console.log(`  🚫 ${site.title}: 跳過 ${item.vod_name} (續集副標題，目標要第一季)`);
+              continue;
+            }
             const resources = extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
             siteResults.push(...resources);
           }
         }
-        
+
         if (siteResults.length > 0) {
           stats.success++;
         }
-        
+
         return siteResults;
       } catch (error) {
         stats.failed++;
@@ -2814,7 +2893,27 @@ async function performBatchSearch(params) {
 
   // 版本過濾，理由與串流模式相同。
   finalResults = filterByTargetVersion(finalResults, targetInfo);
-  
+
+  // 第 2 季過濾：smart_stream 與 batch 兩個路徑都必須套用，
+  // 否則批次搜「仁醫」+ season=2 會把第一季的「仁医」也一起推上來。
+  // 與 loadResource 內的邏輯同步，理由見該處的註解。
+  if (type === 'tv' && Number.isFinite(targetSeason) && targetSeason > 1) {
+    const before = finalResults.length;
+    const filtered = finalResults.filter(res => {
+      const rawName = res._rawName || res.description || '';
+      const sequel = extractSequelNumber(rawName);
+      if (sequel === targetSeason) return true;
+      if (/完结篇|完結篇|完结|完結|最終季|最终季/.test(rawName) && sequel === null) return true;
+      return false;
+    });
+    if (filtered.length > 0) {
+      finalResults = filtered;
+      console.log(`🎯 第${targetSeason}季過濾(batch): ${before} -> ${finalResults.length}`);
+    } else if (before > 0) {
+      console.log(`⚠️ 第${targetSeason}季過濾(batch)無命中(${before}筆)，保留全部候選`);
+    }
+  }
+
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
   });
