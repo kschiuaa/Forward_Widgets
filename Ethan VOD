@@ -219,7 +219,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.3",
+  version: "2.0.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3017,4 +3017,17 @@ async function loadSubtitle(params) {
   return null;
 }
 
-module.exports = { loadResource, loadDetail, loadSubtitle };
+// ==================== REX runtime 相容匯出 ====================
+// REX runtime 是純 JS 沙箱（vm.runInContext / eval），沒有 CommonJS `module`。
+// 任何「typeof module」都會 ReferenceError，所以**絕對不能**用 module.exports。
+// 改用頂層變數：REX runtime 抓函式是看頂層宣告；globalThis 雙保險。
+//
+// 對 Node / Forward 內部測試環境同樣有效：
+//   - globalThis.loadResource 在兩個環境都成立；
+//   - Node 沒有 `module` 也不會炸。
+if (typeof globalThis !== 'undefined') {
+  globalThis.loadResource = loadResource;
+  globalThis.loadDetail = loadDetail;
+  globalThis.loadSubtitle = loadSubtitle;
+  globalThis.WidgetMetadata = WidgetMetadata;
+}
