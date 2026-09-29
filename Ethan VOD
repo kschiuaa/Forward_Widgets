@@ -7,6 +7,13 @@
 // 6. 繁簡互通 - 繁體搜尋自動轉簡體查詢，結果自動轉繁體顯示
 // 7. 來源精選 - 僅保留實測可用的資源站，剔除失效與廣告站
 
+// ==================== REX / Forward Widget 相容介面 ====================
+// 同時相容 Forward 原生 Widget 與 REX 框架。
+// REX 規範請見 https://github.com/baranwang/rex-widget-libs
+// 真正的 WidgetMetadata 完整宣告在下方「資源站清單」之後；
+// 此處只在宣告位置留下 JSDoc 型別提示供編輯器使用。
+/** @type {import('@rexnow/libs/env').WidgetMetadata} */
+WidgetMetadata = undefined;
 // ==================== 繁簡自動轉換 ====================
 // 2583 組一對一、無歧義的常用字對照（由 zhconv 產生，僅保留雙向可逆的映射，
 // 排除「乾/幹」這類多對一歧義字，避免錯誤轉換）。
@@ -212,7 +219,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.2",
+  version: "2.0.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -297,6 +304,22 @@ WidgetMetadata = {
       params: [],
     }
   ],
+  // REX 規範：全域搜尋區塊。對 Forward 不起作用，但 REX 會用。
+  // REX 用 search 區塊作為首頁搜尋；對應到 loadResource 函式簽名。
+  search: {
+    title: "搜尋",
+    functionName: "loadResource",
+    params: [
+      { name: "title", title: "關鍵字", type: "input", value: "" },
+      { name: "type", title: "類型", type: "enumeration",
+        enumOptions: [
+          { title: "劇集", value: "tv" },
+          { title: "電影", value: "movie" },
+        ], value: "tv" },
+      { name: "season", title: "季", type: "input", value: "" },
+      { name: "episode", title: "集", type: "input", value: "" },
+    ],
+  },
 };
 // ==================== 工具函数模块 ====================
 // 實測發現：真實 API 回傳的播放連結分兩種，一種是標準 .m3u8 直串，
@@ -2947,4 +2970,51 @@ async function performBatchSearch(params) {
   return finalResults.slice(0, 100);
 }
 
-module.exports = { loadResource };
+/**
+ * REX 規範：詳情頁入口。給一個片名/連結，回傳 VideoItem[]。
+ * 最小實作：直接呼叫 loadResource 取得資源，組裝出 VideoItem。
+ * link 格式：`search:<title>` 表示用標題搜索；其餘當作直接 ID 透傳。
+ *
+ * @param {string} link
+ * @returns {Promise<VideoItem[]|null>}
+ */
+async function loadDetail(link) {
+  try {
+    const query = (link || '').replace(/^search:/, '').trim();
+    if (!query) return null;
+
+    const results = await loadResource({
+      title: query,
+      type: 'movie',
+      searchMode: 'comprehensive',
+      matchStrictness: 'standard',
+      preferResolution: 'auto',
+    });
+
+    if (!results || !results.length) return null;
+
+    return [{
+      id: `search:${query}`,
+      type: 'url',
+      title: query,
+      mediaType: 'movie',
+      description: '從 VOD 源取得的資源列表',
+      videoUrl: results[0].url,
+    }];
+  } catch (e) {
+    console.error('[loadDetail] 失敗:', e?.message || e);
+    return null;
+  }
+}
+
+/**
+ * REX 規範：字幕模組入口。本 widget 不提供字幕，回 null 即可。
+ *
+ * @param {object} params
+ * @returns {Promise<null>}
+ */
+async function loadSubtitle(params) {
+  return null;
+}
+
+module.exports = { loadResource, loadDetail, loadSubtitle };
