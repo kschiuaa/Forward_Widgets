@@ -131,7 +131,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 5,
+  WIDGET_VERSION: 6,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -212,7 +212,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.3.2",
+  version: "1.3.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -397,7 +397,10 @@ function deepCleanSeriesName(name) {
     /剧场版|电影版|特别篇|SP|OVA/gi,
     /\s*(HD|高清|超清|蓝光|4K|1080[Pp]|720[Pp]|HDR|杜比|Dolby|HEVC|X265|X264)\s*/gi,
     /\s*(WEB[-\s]?DL|WEBRip|BluRay|BDrip|BDRip|HDTV|TVrip|HQC)\s*/gi,
-    /\s*(国语|粤语|英语|日语|韩语|中字|双语|简繁|内封|内嵌|字幕|未删减|完整版|完结|全集|合集|番外)\s*/g,
+    /\s*(国语|粤语|英语|日语|韩语|中字|双语|简繁|内封|内嵌|字幕|未删减|完整版|全集|合集|番外)\s*/g,
+    // 「完结」獨立出現才算 ——「完结篇」是續集的真實副標題，
+    // 整段刪掉會留下「仁医篇」，後續相似度比對就錯了。
+    /\s+完结\s*$/g, /\s+完結\s*$/g,
     /[\[\]()【】《》「」『』]/g,
   ];
 
@@ -844,7 +847,17 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   // Forward 透過 season=第二季 表達要第 N 季），從 targetInfo._expectedSequel
   // 補。沒有 season 參數時這個欄位是 undefined，行為等同舊版。
   const targetSequel = extractSequelNumber(targetInfo.rawName) ?? targetInfo._expectedSequel ?? null;
-  const candidateSequel = extractSequelNumber(candidateInfo.rawName);
+  // 候選序號：除了從檔名抓數字，也把「完结篇/完結篇/最终季/最終季」視為
+  // 序號標記 —— 實機上「仁醫第二季」在電影天堂/非凡/樂子/愛蛋四個站的
+  // 真實檔名都是「仁医完结篇」，沒有任何數字序號，只能靠這個副標題識別。
+  //
+  // 條件：僅在 target 透過 season 明確指定第 N 季時才啟用。
+  // 若 target 沒指定，候選「完结篇」可能是別的作品，不能硬塞 sequel。
+  let candidateSequel = extractSequelNumber(candidateInfo.rawName);
+  if (candidateSequel === null && targetInfo._expectedSequel &&
+      /完结篇|完結篇/.test(candidateInfo.rawName)) {
+    candidateSequel = targetInfo._expectedSequel;
+  }
   const sequelShapeMismatch = (targetSequel === null) !== (candidateSequel === null);
   const sequelConflict = sequelShapeMismatch ||
     (targetSequel !== null && candidateSequel !== null && targetSequel !== candidateSequel);
@@ -933,6 +946,10 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     // 序號則相反 —— 它是區別作品的關鍵，絕不可從主片名中剔除。
     let targetCore = normalizeTitleForMatch(stripSubtitle(targetInfo.baseName));
     let candidateCore = normalizeTitleForMatch(stripSubtitle(candidateInfo.baseName));
+    // 「完结篇/完結篇」是續集標記，比對主片名時應去除，否則「仁医」跟
+    // 「仁医完结篇」會被當成 baseName 不一致而拒絕。
+    targetCore = targetCore.replace(/完结篇|完結篇/g, '');
+    candidateCore = candidateCore.replace(/完结篇|完結篇/g, '');
     const sameSequel = targetSequel === candidateSequel;
 
     // 互補情境：target 是「仁医」+ sequel=2，candidate 是「仁医2」+ sequel=2，
@@ -944,7 +961,26 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     const coreMatches = targetCore === candidateCore ||
                         (targetCoreNoDigit && targetCoreNoDigit === candidateCoreNoDigit);
 
-    if (coreMatches && sameSequel) {
+    // 額外處理「完结篇/完結篇」當作 sequel 標記。
+    //
+    // 實機情境：仁醫第二季在電影天堂 / 非凡資源 / 樂子 / 愛蛋四個站的真實
+    // 檔名都是「仁医完结篇」(2011)，只有愛蛋另外有「仁医2」(2011)。
+    // extractSequelNumber 對「仁医完结篇」回 null（檔名沒數字序號），
+    // 對「仁医」也是 null —— 若 target._expectedSequel = 2，則
+    // targetSequel = 2、candidateSequel = null，sameSequel 是 false，
+    // fallback 也會拒絕。
+    //
+    // 解法：把「完结篇/完結篇」字樣視為 sequel = target._expectedSequel。
+    const targetIsFinale = /完结篇|完結篇/.test(targetInfo.rawName);
+    const candidateIsFinale = /完结篇|完結篇/.test(candidateInfo.rawName);
+    const finaleMatches = targetIsFinale === candidateIsFinale; // 兩者都沒有/都有才算對稱
+    const expectedSequel = targetInfo._expectedSequel;
+    const sequelCompatible = sameSequel ||
+      (expectedSequel &&
+              ((candidateIsFinale && candidateSequel === null) ||
+               (targetIsFinale && targetSequel === null)));
+
+    if (coreMatches && (sequelCompatible || (finaleMatches && targetIsFinale === false))) {
       return {
         match: true,
         type: 'fallback',
@@ -2398,6 +2434,31 @@ async function loadResource(params, onStreamResult = null) {
   // 搜尋字串不含年份（實測塞年份進關鍵字會讓四個站回 0 筆），
   // 站台會把所有版本一起回傳，版本判斷只能靠站方的 vod_year。
   finalResults = filterByTargetVersion(finalResults, targetInfo);
+
+  // 指定續集季別時（season > 1），站台回傳第一季與後續季混在一起。
+  // 搜尋字串已不再拼序號（理由見 buildSearchQuery）—— 改在結果階段挑：
+  //   - 候選 sequel 序號 = targetSeason（如「仁医2」的 sequel=2）
+  //   - 候選檔名含「完结/完結」字樣（如「仁医完结篇」是第二季的真實命名）
+  //   - 候選 _year 屬於「明顯是後續季」的年份（2011 是仁醫第二季首播年）
+  //
+  // 安全網：如果過濾後 0 筆，退而求其次 —— 不過濾全部推播，
+  // 至少使用者會看到候選項目（會包含第一季內容，但比「空白」好）。
+  if (type === 'tv' && Number.isFinite(targetSeason) && targetSeason > 1) {
+    const before = finalResults.length;
+    const filtered = finalResults.filter(res => {
+      const rawName = res._rawName || res.description || '';
+      const sequel = extractSequelNumber(rawName);
+      if (sequel === targetSeason) return true;
+      if (/完结篇|完結篇|完结|完結|最終季|最终季/.test(rawName) && sequel === null) return true;
+      return false;
+    });
+    if (filtered.length > 0) {
+      finalResults = filtered;
+      console.log(`🎯 第${targetSeason}季過濾: ${before} -> ${finalResults.length}`);
+    } else if (before > 0) {
+      console.log(`⚠️ 第${targetSeason}季過濾無命中(${before}筆)，保留全部候選`);
+    }
+  }
   
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
@@ -2477,14 +2538,21 @@ async function loadResource(params, onStreamResult = null) {
 // 第 2 季該加的序號也被擋掉，切換季別拿回的都是第 1 季的內容。
 //
 // 三個搜尋路徑（串流、批次、內部）都必須呼叫這裡，否則會各壞各的。
+//
+// 註：之前這裡會把 season 拼進搜尋字串（「仁医2」），理由是「站台確實有
+// XX2 這種檔名」。但實測後發現大多數站對續集季別用完全不同的命名 ——
+// 「仁醫第二季」在電影天堂 / 非凡資源 / 樂子 / 愛蛋四個站的真實檔名都是
+// 「仁医完结篇」(2011)，愛蛋另外有「仁医2」(2011)。把 season 拼成
+// 「仁医2」後只能命中愛蛋那個，其他四個站的「仁医完结篇」完全搜不到。
+//
+// 正確解法：搜尋字串只放裸片名，續集識別交給 isSmartSeriesMatch 內的
+// season 比對 + sequel 邏輯處理。
 function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
   const base = String(searchQuery)
     .replace(/(?:19|20)\d{2}\s*$/, '')  // 年份交給結果階段，這裡不帶
-    .replace(/\d+$/, '');               // 序號由 seasonPart 統一決定
-  // 用序號而非「第N季」，理由見 extractEnhancedInfo 內的說明。
-  // 季別可以放進關鍵字：站台確實有「XX2」這種檔名，實測可正常命中。
-  const seasonPart = targetSeason > 1 ? String(targetSeason) : '';
-  return base + seasonPart;
+    .replace(/\s+$/, '')
+    .trim();
+  return base;
 }
 
 // 套用 Forward 傳來的版本覆寫（首播年份、國別）。
