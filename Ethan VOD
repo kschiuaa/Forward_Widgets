@@ -117,10 +117,6 @@ const CONFIG = {
   MAX_CONCURRENT_REQUESTS: 8,
   MIN_CONCURRENT_REQUESTS: 3,
   REQUEST_TIMEOUT: 6000,
-  // .ts 分片走 worker 代理（CF edge cache），讓重看 / 跳進度條時能命中快取
-  // 第一次拖到新位置仍然會付握手時間；後續重看 / 重跳才會明顯變快
-  SEGMENT_PROXY_ENABLED: true,
-  SEGMENT_PROXY_WORKER: 'https://forward.kschiu-ethan.workers.dev',
   // 實測延遲不穩定的站（愛蛋 8 次取樣：2.0~10.0 秒，中位數 4.3 秒，
   // 約三分之一超過 6 秒）。用一般逾時會讓它經常半路被砍，
   // 每次失敗還要拖住整批等待。給它專屬的寬裕逾時。
@@ -216,7 +212,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.0",
+  version: "2.0.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1126,15 +1122,6 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
     const sourceName = sourceNames[i] || '預設源';
     const isTV = playSource.includes('#');
 
-    // 將 m3u8 URL 包進 worker 代理（讓 .ts 分片走 CF edge cache）
-    const wrapSegmentProxy = (u) => {
-      const trimmed = u.trim();
-      if (!CONFIG.SEGMENT_PROXY_ENABLED) return trimmed;
-      if (!/\.m3u8(\?|$)/i.test(trimmed)) return trimmed;
-      const encoded = btoa(unescape(encodeURIComponent(trimmed)));
-      return `${CONFIG.SEGMENT_PROXY_WORKER}/?m3u8=${encoded}`;
-    };
-
     if (type === 'tv' && isTV) {
       const episodes = playSource.split('#').filter(Boolean);
       episodes.forEach(ep => {
@@ -1155,7 +1142,7 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           const resource = {
             name: siteTitle,
             description: `${displayName} - ${displayEp}${displayRemarks ? ' - ' + displayRemarks : ''} - [${sourceName}]`,
-            url: wrapSegmentProxy(url),
+            url: url.trim(),
 
             playerType: 'app',
             customHeaders: {
@@ -1201,7 +1188,7 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
         const resource = {
           name: siteTitle,
           description: `${vod_name} - ${qualityText} - [${sourceName}]`,
-          url: wrapSegmentProxy(url),
+          url: url.trim(),
 
           playerType: 'app',
           customHeaders: {
