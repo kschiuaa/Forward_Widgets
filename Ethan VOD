@@ -207,7 +207,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.2.7",
+  version: "1.2.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -810,6 +810,27 @@ function findYearMarkedSequels(list, targetInfo, matchStrictness = 'standard') {
   // 需要至少兩個同名版本才有意義；單一版本無法判斷先後。
   for (const years of groups.values()) {
     if (years.length < 2) continue;
+
+    // 使用者若明確指定 season（不是預設的第 1 季），站內「無年份的原版」
+    // 不再被視為「最早者」——它對當前請求而言是其他季的內容。
+    // 例如詳細頁切到 season=2，候選「仁医」(無年份, 第1季) 與「仁医2011」
+    // (第2季) 並存時，不能照舊規則把「仁医」當成「最早」而把「仁医2011」
+    // 當成續集剔除 —— 對 season=2 而言「仁医2011」才是目標，「仁医」
+    // 才是其他季。
+    //
+    // 但這條「按季別挑選對應版本」的邏輯在單純比對年份時無法做到：
+    // seasonN→年份 N 的對應規則並不通用（韓版「仁医2012」其實是韓國版
+    // 仁医第一季，不是 season 2）。要在不知道地區的情況下判斷「仁医2011」
+    // 是第幾季是不安全的。
+    //
+    // 因此採保守做法：使用者指定 season>1 時，**完全跳過**這個「剔除
+    // 後續作品」的最佳化邏輯，把所有同名候選都交給後面的版本/地區/季別
+    // 過濾處理。代價是站內同時存在多季時多送幾筆候選；
+    // 收穫是 season>1 不會被誤殺。
+    if ((targetInfo.seasonNumber ?? 1) > 1) {
+      return null;
+    }
+
     // 無年份的版本視為原季（最優先），其次是年份最早者。
     const withYear = years.filter(y => y !== null);
     const earliest = years.includes(null) ? null : Math.min(...withYear);
@@ -2387,6 +2408,11 @@ async function loadResource(params, onStreamResult = null) {
 // 第 2 季該加的序號也被擋掉，切換季別拿回的都是第 1 季的內容。
 //
 // 三個搜尋路徑（串流、批次、內部）都必須呼叫這裡，否則會各壞各的。
+//
+// 季別的關鍵字：實測「仁医2」能命中部分站，但日版第二季「仁医2011」只有
+// 對站方有該檔名的站才會被命中。同時送出多個變體（「仁医2」「仁医2011」
+// 「仁医2012」等），各站會回各自有的那一版，由結果階段的版本/季別/地區
+// 過濾去揀出正確的，而不是用單一關鍵字把目標站過濾掉。
 function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
   const base = String(searchQuery)
     .replace(/(?:19|20)\d{2}\s*$/, '')  // 年份交給結果階段，這裡不帶
@@ -2395,6 +2421,34 @@ function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
   // 季別可以放進關鍵字：站台確實有「XX2」這種檔名，實測可正常命中。
   const seasonPart = targetSeason > 1 ? String(targetSeason) : '';
   return base + seasonPart;
+}
+
+// 為一個查詢字串產生多個搜尋變體，覆蓋站方可能採用的不同檔名寫法。
+//
+// 站方對「同一部作品的不同季度」命名並不一致，實測常見寫法：
+//  - 「仁医2」（序號）
+//  - 「仁医2011」（年標記；仁医 season2 播出於 2011）
+//  - 「仁医2012」（年標記；韓版仁医首播於 2012，會與 season 2 撞年份）
+// 用「仁医2」單一關鍵字時，恰好存成「仁医2011」檔名的日版第二季會完全
+// 不在結果中。若關鍵字再被前面的「年份結尾不追加」規則清掉，連 season 標記
+// 都不剩，搜回的全是第一季內容。
+//
+// 同時送出多個變體可讓站方依自身命名回應，命中後再用 _year / _area 與
+// seasonMatch 做精確過濾，避免單一關鍵字誤殺。
+function buildSearchVariantsForSeason(baseQuery, targetSeason) {
+  if (!baseQuery) return [];
+  const variants = new Set();
+  variants.add(baseQuery);
+  if (targetSeason > 1) {
+    // 同季可能有的年標記：站方有時存成「XX2」、有時存成「XX<年份>」。
+    // 這兩個年份是「仁醫」這個 IP 的真實播出年（日版 S2=2011、韓版=2012），
+    // 但因為「韓版是重拍、播出年不同於日版」，把它們一併送進去，命中後
+    // 再依 _area / _year / _seasonMatch 過濾。
+    [targetSeason + 2009, targetSeason + 2010, targetSeason + 2011, targetSeason + 2012, targetSeason + 2013].forEach(y => {
+      variants.add(baseQuery.replace(/\d+$/, '') + y);
+    });
+  }
+  return Array.from(variants);
 }
 
 // 套用 Forward 傳來的版本覆寫（首播年份、國別）。
