@@ -131,7 +131,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 6,
+  WIDGET_VERSION: 8,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -212,7 +212,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.5.0",
+  version: "1.8.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -430,6 +430,11 @@ function stripSeasonMarker(name) {
   if (!name) return '';
   return String(name)
     .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季/g, ' ')
+    // 「第N集」是集數不是續集序號。留下來會被 extractSequelNumber 的
+    // 阿拉伯數字規則誤抓（實測「仁醫完結篇 - 第02集」回傳 2，
+    // 「第01集」回傳 1，每集都被誤判成不同 sequel），
+    // 必須先於續集序號判定清除。
+    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*[集话話回]/g, ' ')
     .replace(/\s[Ss]eason\s*[0-9]+/gi, ' ')
     .replace(/\s[Ss][0-9]+\b/g, ' ')
     .replace(/\s+/g, ' ')
@@ -545,13 +550,19 @@ function extractSequelNumber(name) {
   }
 
   // 阿拉伯數字：取第一個出現且不像年份的數字。
-  const digits = [...s.matchAll(/(\d+)/g)]
+  //
+  // 先把方括號內容（[hnm3u8] / [wjm3u8] 之類的宿主標籤）整段移除。
+  // 沒移除的話，方括號裡的 m3u8、f4、1080p 等數字會被當成續集序號，
+  // 實測「仁醫完結篇 - 第02集 - [ffm3u8]」會抓出 3（從 ffm3u8），
+  // 「仁医2 - 第01集 - [wjm3u8]」會抓出 8，整個比對規則全面錯亂。
+  const sNoBrackets = s.replace(/\[[^\]]*\]/g, '');
+  const digits = [...sNoBrackets.matchAll(/(\d+)/g)]
     .map(m => ({ raw: m[1], at: m.index }))
     .filter(d => {
       const n = parseInt(d.raw, 10);
       if (!(n > 0 && n < 100)) return false;      // 排除 0 與 100 以上（含年份）
       // 序號前面是中文／英文文字才算續集；「红海行动2018」整個是年份。
-      const before = s.slice(0, d.at);
+      const before = sNoBrackets.slice(0, d.at);
       return /[^\d\s]$/.test(before) || before.length === 0;
     });
   if (digits.length) return parseInt(digits[0].raw, 10);
@@ -2290,6 +2301,10 @@ async function loadResource(params, onStreamResult = null) {
     id: params.id ?? params.tmdbId ?? params.imdbId ?? ''
   };
   console.log('🔎 詳細頁傳入:', JSON.stringify(identity));
+
+  // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
+  // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
+  console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
