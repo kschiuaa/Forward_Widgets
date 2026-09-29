@@ -212,7 +212,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.1",
+  version: "2.0.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1145,6 +1145,9 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
             url: url.trim(),
 
             playerType: 'app',
+            customHeaders: {
+              'X-Forward-Skip-Redirect-Probe': '1',
+            },
             resolution: resolutionInfo.label,
             resolutionLevel: resolutionInfo.level,
             isHD: resolutionInfo.isHD,
@@ -1188,6 +1191,9 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           url: url.trim(),
 
           playerType: 'app',
+          customHeaders: {
+            'X-Forward-Skip-Redirect-Probe': '1',
+          },
           resolution: resolutionInfo.label,
           resolutionLevel: resolutionInfo.level,
           isHD: resolutionInfo.isHD,
