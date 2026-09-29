@@ -207,7 +207,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.3.0",
+  version: "1.3.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1211,9 +1211,9 @@ function parseCacheValue(raw) {
   return [];
 }
 
-function loadRejectingTypeSites() {
+async function loadRejectingTypeSites() {
   try {
-    const saved = parseCacheValue(Widget.storage?.get?.(REJECTING_TYPE_STORAGE_KEY));
+    const saved = parseCacheValue(await Widget.storage?.get?.(REJECTING_TYPE_STORAGE_KEY));
     saved.forEach(site => SITES_REJECTING_TYPE_PARAM.add(site));
   } catch (e) {
     // storage 不可用時仍可運作，只是每個 App 工作階段都要重新試錯一次
@@ -1229,7 +1229,7 @@ function rememberRejectingTypeSite(siteValue) {
   }
 }
 
-loadRejectingTypeSites();
+loadRejectingTypeSites(); // 不需要 await：這只是 warm-up storage，第一個實際搜尋會等它完成
 
 const API_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
@@ -2108,11 +2108,18 @@ function cleanResourceForOutput(resource) {
   // （日版「仁医」與韓版「仁医2012」）在使用者沒有指定年份時根本無法分辨，
   // 站方檔名又常把年份省略。把版本直接寫進描述，使用者一眼就能分辨要哪一版。
   //
-  // 只在站方真的有標年份／地區時才加，否則描述會被無關資訊灌水。
-  if (resource._year || resource._area) {
+  // 年份來源採三層 fallback，因為實機 iOS/Android 上 vod_year / vod_area
+  // 偶爾會因站台回傳格式差異而取不到（不同於 Node.js 的解析行為）：
+  //   1. _year / _area（站方欄位最權威）
+  //   2. extractVersionMarker(_rawName)（從站方檔名裡抓年份）
+  //      ——「仁医2012」這類就算 _year 為 null 也能抓到
+  //   3. 都拿不到就跳過，描述不被灌水
+  const itemYear = resource._year || extractVersionMarker(resource._rawName) || null;
+  const itemArea = resource._area || null;
+  if (itemYear || itemArea) {
     const parts = [];
-    if (resource._year) parts.push(`${resource._year}`);
-    const label = areaLabel(resource._area);
+    if (itemYear) parts.push(`${itemYear}`);
+    const label = areaLabel(itemArea);
     if (label) parts.push(label);
     const versionTag = parts.join(' · ');
     if (versionTag && !clean.description.includes(versionTag)) {
@@ -2175,6 +2182,11 @@ async function loadResource(params, onStreamResult = null) {
     return [];
   }
 
+  // 確保「拒絕 type 參數」的站台清單從 storage 載入完再開始搜尋，
+  // 否則 SITES_REJECTING_TYPE_PARAM 在第一次呼叫時是空的，
+  // 要等到該站搜失敗才知道它不收 type，白白浪費一次請求。
+  await loadRejectingTypeSites();
+
   // 記錄 Forward 實際帶進來的片名相關欄位。
   // 詳細頁切換作品時，Forward 不一定會更新所有欄位，需要實際觀察才知道
   // 哪些欄位跟著換、哪些停留在舊片 —— 這是判斷「播放源沒刷新」的依據。
@@ -2232,7 +2244,7 @@ async function loadResource(params, onStreamResult = null) {
   
   if (CONFIG.CACHE_TTL > 0) {
     try {
-      const raw = Widget.storage?.get?.(cacheKey);
+      const raw = await Widget.storage?.get?.(cacheKey);
       cachedResults = parseCacheValue(raw);
       if (cachedResults.length > 0) {
         // 快取是整部劇的結果，指定集數時仍需過濾，否則會把其他集數的連結
@@ -2333,29 +2345,16 @@ async function loadResource(params, onStreamResult = null) {
   ];
   
   finalResults.forEach(res => {
-    fieldsToDelete.forEach(field => {
-      if (field in res) delete res[field];
-    });
-    
-    if (!res.resolution) {
-      res.resolution = '未知';
-      res.resolutionLevel = 0;
-      res.isHD = false;
-      res.is4K = false;
-      res.qualityTags = [];
-      res.qualityScore = 0;
-      res.isHttps = res.url.startsWith('https');
-    }
-    
-    if (res.resolutionLevel >= 5) {
-      res.recommended = '4K超清';
-    } else if (res.resolutionLevel >= 4 && res.qualityScore > 20) {
-      res.recommended = '藍光高清';
-    } else if (res.resolutionLevel >= 3) {
-      res.recommended = '高清';
-    } else if (res.qualityScore > 15) {
-      res.recommended = '高品質';
-    }
+    // 寫進 cache / 給予後續回傳的項目，必須包含版本標籤。
+    // 之前只在 onStreamResult 推播路徑呼叫 cleanResourceForOutput，
+    // 寫 cache 的 finalResults 走自己的清理邏輯，導致 cache 命中時沒有標籤。
+    // 改用同一個 helper 統一處理。
+    const cleaned = cleanResourceForOutput(res);
+
+    // cleanResourceForOutput 用 { ...resource } 淺拷貝回傳新物件，
+    // 這裡把原 res 的欄位換成 cleaned，後面寫 cache 與最終 return 都看得到。
+    Object.keys(res).forEach(k => delete res[k]);
+    Object.assign(res, cleaned);
   });
   
   if (finalResults.length > 0 && CONFIG.CACHE_TTL > 0) {
@@ -2541,7 +2540,7 @@ async function performBatchSearch(params) {
   let allResults = [];
 
   try {
-    const cached = parseCacheValue(Widget.storage?.get?.(cacheKey));
+    const cached = parseCacheValue(await Widget.storage?.get?.(cacheKey));
     if (cached.length > 0) {
       console.log(`✅ 批量模式缓存命中: ${cached.length}个结果`);
       allResults = cached;
@@ -2638,21 +2637,11 @@ async function performBatchSearch(params) {
                          '_versionConflict', '_versionAmbiguous',
                          '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName'];
   finalResults.forEach(res => {
-    fieldsToDelete.forEach(field => {
-      if (field in res) delete res[field];
-    });
-    
-    if (!res.resolution) {
-      res.resolution = '未知';
-      res.resolutionLevel = 0;
-      res.isHD = false;
-      res.is4K = false;
-      res.qualityTags = [];
-      res.qualityScore = 0;
-      res.isHttps = res.url.startsWith('https');
-    }
+    const cleaned = cleanResourceForOutput(res);
+    Object.keys(res).forEach(k => delete res[k]);
+    Object.assign(res, cleaned);
   });
-  
+
   return finalResults.slice(0, 100);
 }
 
