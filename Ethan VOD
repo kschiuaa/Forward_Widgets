@@ -127,6 +127,11 @@ const CONFIG = {
   // 早就回來了。重試必須讓總時間遠小於前端的等待上限。
   RETRY_ATTEMPTS: 1,
   CACHE_TTL: 10800,
+  // widget 版本號。任何 cache schema 變更時（例如加了版本標籤、改了
+  // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
+  // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
+  // 使用者看到的會是錯的。
+  WIDGET_VERSION: 4,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1229,6 +1234,29 @@ function rememberRejectingTypeSite(siteValue) {
   }
 }
 
+const WIDGET_VERSION_KEY = 'vod_widget_version';
+
+// 版本變更時清掉舊 cache。詳見 loadResource 內 syncWidgetVersion 的說明。
+async function syncWidgetVersion() {
+  try {
+    const saved = await Widget.storage?.get?.(WIDGET_VERSION_KEY);
+    const savedNum = saved ? parseInt(saved, 10) : 0;
+    if (savedNum !== CONFIG.WIDGET_VERSION) {
+      console.log(`🧹 版本 ${savedNum} → ${CONFIG.WIDGET_VERSION}，清掉舊 cache`);
+      const keys = await Widget.storage?.keys?.();
+      if (Array.isArray(keys)) {
+        for (const k of keys) {
+          if (k === WIDGET_VERSION_KEY) continue;
+          try { await Widget.storage?.remove?.(k); } catch {}
+        }
+      }
+      await Widget.storage?.set?.(WIDGET_VERSION_KEY, String(CONFIG.WIDGET_VERSION));
+    }
+  } catch {
+    // storage 不可用就不處理，使用者手動重匯入即可
+  }
+}
+
 loadRejectingTypeSites(); // 不需要 await：這只是 warm-up storage，第一個實際搜尋會等它完成
 
 const API_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
@@ -2182,6 +2210,19 @@ async function loadResource(params, onStreamResult = null) {
     return [];
   }
 
+  // widget 版本升級時清掉舊 cache。
+  //
+  // 為什麼必須做：cache schema 改了（例如本版加了 _rawName 欄位、加了
+  // 版本標籤、改了去重鍵）之後，舊 cache 讀回來的物件結構與新邏輯推論
+  // 出來的版本標籤會衝突 —— 使用者看到的會是「仁醫2012 [2009 · 日本]」
+  // 這種不可能存在的組合。
+  //
+  // 為什麼不靠 ttl 自動過期：實機 cache 可能跨工作階段保留數日，
+  // 與 TTL 計算錯誤也會殘留。
+  //
+  // 實作：把當前版本寫進 storage，第一次載入會對齊；版本不同就清掉全部 cache。
+  await syncWidgetVersion();
+
   // 確保「拒絕 type 參數」的站台清單從 storage 載入完再開始搜尋，
   // 否則 SITES_REJECTING_TYPE_PARAM 在第一次呼叫時是空的，
   // 要等到該站搜失敗才知道它不收 type，白白浪費一次請求。
@@ -2433,17 +2474,34 @@ function applyDetailVersion(params, targetInfo) {
 // 快取裡的結果 _year 已被 cleanResourceForOutput 移除，所以放行片名比對
 // 作為後備 —— 那是快取路徑唯一還拿得到的版本線索。
 function filterByTargetVersion(results, targetInfo) {
-  if (!targetInfo.year) return results;
-  const want = String(targetInfo.year);
-  const before = results.length;
-  const filtered = results.filter(res => {
-    const candYear = res._year ?? extractVersionMarker(res.description || '');
-    return !candYear || String(candYear) === want;
-  });
-  if (before !== filtered.length) {
-    console.log(`🚫 版本過濾(${want}): ${before} -> ${filtered.length}`);
+  // 目標帶年份：只留同年份與無年份的候選。
+  if (targetInfo.year) {
+    const want = String(targetInfo.year);
+    const before = results.length;
+    const filtered = results.filter(res => {
+      const candYear = res._year ?? extractVersionMarker(res._rawName || '');
+      return !candYear || String(candYear) === want;
+    });
+    if (before !== filtered.length) {
+      console.log(`🚫 版本過濾(${want}): ${before} -> ${filtered.length}`);
+    }
+    return filtered;
   }
-  return filtered;
+
+  // 目標沒帶年份：不主動過濾，由版本標籤讓使用者分辨。
+  //
+  // 為什麼不做「跨站多數決」或「剔除帶年份版本」這類啟發式：
+  // - 多數決：四個站給 2009、一個站給 2012，把 2012 剔除會讓韓劇資源
+  //   永遠找不到；但韓劇在台灣本來就是少數派（搜「仁醫」是韓劇的人不會多），
+  //   多數決會永久站在日劇那一邊。
+  // - 剔除帶年份版本：跨站沒有「無年份」的同名候選時（典型情況：
+  //   電影天堂「仁医」雖無檔名年份但 _year=2009），會誤殺真實的日版。
+  // - airDate 沒傳：Forward 從詳細頁帶的是 season + episodeName 為主，
+  //   airDate / premiereDate 多數情況為空，無法用 airDate 區分。
+  //
+  // 真正合理的策略：兩個版本都留，靠 cleanResourceForOutput 寫入
+  // [2009 · 日本] / [2012 · 韓國] 標籤，讓使用者在 UI 上自己挑。
+  return results;
 }
 
 async function performSmartSearch(params, onStreamResult) {
