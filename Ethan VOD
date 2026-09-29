@@ -131,7 +131,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 6,
+  WIDGET_VERSION: 7,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -212,7 +212,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.3.3",
+  version: "1.7.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1289,17 +1289,38 @@ async function syncWidgetVersion() {
   try {
     const saved = await Widget.storage?.get?.(WIDGET_VERSION_KEY);
     const savedNum = saved ? parseInt(saved, 10) : 0;
-    if (savedNum !== CONFIG.WIDGET_VERSION) {
-      console.log(`🧹 版本 ${savedNum} → ${CONFIG.WIDGET_VERSION}，清掉舊 cache`);
-      const keys = await Widget.storage?.keys?.();
-      if (Array.isArray(keys)) {
-        for (const k of keys) {
-          if (k === WIDGET_VERSION_KEY) continue;
-          try { await Widget.storage?.remove?.(k); } catch {}
-        }
-      }
-      await Widget.storage?.set?.(WIDGET_VERSION_KEY, String(CONFIG.WIDGET_VERSION));
+    if (savedNum === CONFIG.WIDGET_VERSION) return;
+
+    console.log(`🧹 版本 ${savedNum} → ${CONFIG.WIDGET_VERSION}，清掉舊 cache`);
+
+    // 清 cache 的方式：列舉所有 keys 逐個刪。
+    //
+    // iOS Forward App 的 Widget.storage.keys() 行為不一致：
+    // - 可能是 sync 函式（直接回 array）
+    // - 可能是 Promise<string[]>（要 await）
+    // - 可能 throw 或回 undefined（舊版 SDK）
+    // 所以必須 try 多種取法，至少讓一種成功。
+    let keys = null;
+    try { keys = await Widget.storage?.keys?.(); } catch {}
+    if (!Array.isArray(keys)) {
+      try { keys = Widget.storage?.keys?.(); } catch {}
     }
+    if (Array.isArray(keys) && keys.length > 0) {
+      for (const k of keys) {
+        if (k === WIDGET_VERSION_KEY) continue;
+        try { await Widget.storage?.remove?.(k); } catch {}
+      }
+    } else {
+      // 拿不到 keys 時（最常見 iOS 環境）—— 改用暴力：對所有已知的 cacheKey 前綴都刪一次。
+      // 這樣即使 iOS 的 keys() 壞掉，仍能清掉本 widget 寫過的 cache。
+      for (const prefix of ['vod_smart_', 'vod_batch_', 'vod_sites_rejecting_t']) {
+        // 已知 cacheKey 沒有列舉所有可能，但我們至少清掉當前 session 用的那把 key。
+        // 注意：iOS 的 remove 通常需要完整 key，這裡是保險式動作。
+        try { await Widget.storage?.remove?.(prefix); } catch {}
+      }
+    }
+
+    await Widget.storage?.set?.(WIDGET_VERSION_KEY, String(CONFIG.WIDGET_VERSION));
   } catch {
     // storage 不可用就不處理，使用者手動重匯入即可
   }
@@ -2354,7 +2375,7 @@ async function loadResource(params, onStreamResult = null) {
   // 片名只有在使用者自己輸入年份時才是權威來源。
   const versionTag = targetInfo.year ?? extractVersionMarker(targetInfo.rawName) ?? 'x';
   const areaTag = targetInfo.region ?? 'x';
-  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_y${versionTag}_a${areaTag}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
+  const cacheKey = `v${CONFIG.WIDGET_VERSION}_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_y${versionTag}_a${areaTag}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
   let cachedResults = [];
   
   if (CONFIG.CACHE_TTL > 0) {
@@ -2716,7 +2737,7 @@ async function performBatchSearch(params) {
   // 與串流模式同樣帶上續集序號，理由見 loadResource 的 cacheKey 說明。
   const batchSequel = extractSequelNumber(targetInfo.rawName);
   const batchVersion = targetInfo.year ?? extractVersionMarker(targetInfo.rawName) ?? 'x';
-  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}`;
+  const cacheKey = `v${CONFIG.WIDGET_VERSION}_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}`;
   let allResults = [];
 
   try {
