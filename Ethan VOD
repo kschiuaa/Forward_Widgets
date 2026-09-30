@@ -133,7 +133,15 @@ const CONFIG = {
   // 會讓整批結果來不及送出，使用者看到的是「暫無可用資源」——即使其他站
   // 早就回來了。重試必須讓總時間遠小於前端的等待上限。
   RETRY_ATTEMPTS: 1,
-  CACHE_TTL: 10800,
+  CACHE_TTL: 1800,
+  // 採集器吐的 m3u8 URL 容易被 CDN 清理（昨天測的：svip.high25-playback.com
+  // 對該片整段回 502）。cache hit 後 URL 死了，AVPlayer 拿到 502 會 reset
+  // 到 m3u8 開頭，這就是「播一會斷線重頭」的根因。cache miss 時對
+  // finalResults 內每個 m3u8 URL 做一次 HEAD 探測，失效的不寫 cache，
+  // 下次進入就重抓。HEAD probe 只在 cache 寫入前做一次，不影響搜尋延遲。
+  URL_PROBE_TIMEOUT: 5000,
+  // 同時進行的 HEAD probe 數。m3u8 在不同 CDN，併發可壓低總時間。
+  URL_PROBE_CONCURRENCY: 6,
   // widget 版本號。任何 cache schema 變更時（例如加了版本標籤、改了
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
@@ -219,7 +227,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.4",
+  version: "2.0.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1324,6 +1332,63 @@ function parseCacheValue(raw) {
     catch { return []; }
   }
   return [];
+}
+
+/**
+ * 並行探測一組 URL，回傳對應位置的 boolean（true=活著，false=失效/timeout）。
+ * 用於 cache 寫入前過濾，避免把死 URL 寫進 cache 讓下次進入還會拿到舊失效 URL。
+ * HEAD 探測比 GET 省頻寬；CDN 對 HEAD 通常也會回正確狀態碼。
+ * 找不到 Widget.http 時直接視為活著（保留向後相容）。
+ */
+async function probeUrlsAlive(urls, opts = {}) {
+  const timeout = opts.timeout ?? CONFIG.URL_PROBE_TIMEOUT ?? 5000;
+  const concurrency = opts.concurrency ?? CONFIG.URL_PROBE_CONCURRENCY ?? 6;
+  if (!Array.isArray(urls) || urls.length === 0) return [];
+
+  // 沒 Widget.http：無法探測，全部視為活著（不擋 cache）
+  if (!Widget?.http?.request) return urls.map(() => true);
+
+  const results = new Array(urls.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < urls.length) {
+      const i = cursor++;
+      const u = urls[i];
+      try {
+        // request 走 HEAD；Widget.http.get 在某些 runtime 不支援 method 參數，
+        // 失敗/超時/非 2xx 都視為失效
+        const resp = await Widget.http.request({
+          url: u,
+          method: 'HEAD',
+          timeout,
+        });
+        const code = resp?.statusCode ?? 0;
+        results[i] = code >= 200 && code < 400;
+      } catch (_) {
+        // 某些 CDN 不接受 HEAD，會在 GET 時回 405/200，這裡先標失效
+        // 讓 probe 函式可以 fallback 到 GET 重試
+        results[i] = false;
+      }
+    }
+  };
+  const workers = Array.from({ length: Math.min(concurrency, urls.length) }, worker);
+  await Promise.all(workers);
+
+  // 第二輪：HEAD 失敗的用 GET 重試一次（CDN 常見：HEAD 拒絕但 GET 200）
+  const needRetry = results.map((alive, i) => alive ? -1 : i).filter(i => i >= 0);
+  if (needRetry.length > 0 && Widget.http.get) {
+    await Promise.all(needRetry.map(async i => {
+      try {
+        const resp = await Widget.http.get(urls[i], { timeout });
+        const code = resp?.statusCode ?? 0;
+        results[i] = code >= 200 && code < 400;
+      } catch (_) {
+        results[i] = false;
+      }
+    }));
+  }
+
+  return results;
 }
 
 async function loadRejectingTypeSites() {
@@ -2563,10 +2628,31 @@ async function loadResource(params, onStreamResult = null) {
     Object.assign(res, cleaned);
   });
   
+  // cache 寫入前做 URL 健康檢查：m3u8 URL 失效（CDN 清理資源回 502）的話
+  // 寫進 cache 會讓「播一會斷線重頭」持續 30 分鐘，直到 TTL 過期重新搜尋。
+  // 對 finalResults 內每個 m3u8 探測一次，失效的就過濾掉再寫 cache。
+  // 注意：搜尋結果不過濾，Forward 仍能拿到所有候選；只在 cache 部分做嚴格。
   if (finalResults.length > 0 && CONFIG.CACHE_TTL > 0) {
     try {
-      Widget.storage?.set?.(cacheKey, JSON.stringify(finalResults), CONFIG.CACHE_TTL);
-      console.log(`💾 已缓存 ${finalResults.length} 个结果`);
+      const urlMap = new Map();
+      finalResults.forEach(r => {
+        if (r.url && !urlMap.has(r.url)) urlMap.set(r.url, true);
+      });
+      const urls = Array.from(urlMap.keys());
+      const alive = await probeUrlsAlive(urls);
+      const aliveUrls = new Set(urls.filter((_, i) => alive[i]));
+      const deadCount = urls.length - aliveUrls.size;
+      if (deadCount > 0) {
+        console.log(`🩺 URL 探測: ${aliveUrls.size}/${urls.length} 活著，過濾 ${deadCount} 條失效`);
+      }
+
+      const cacheable = finalResults.filter(r => !r.url || aliveUrls.has(r.url));
+      if (cacheable.length > 0) {
+        Widget.storage?.set?.(cacheKey, JSON.stringify(cacheable), CONFIG.CACHE_TTL);
+        console.log(`💾 已缓存 ${cacheable.length} 个结果`);
+      } else {
+        console.log(`💾 全部 URL 失效，跳過 cache 寫入`);
+      }
     } catch (e) {
       console.warn('缓存写入失败:', e.message);
     }
