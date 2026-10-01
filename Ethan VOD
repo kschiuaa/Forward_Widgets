@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.5",
+  version: "2.1.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3236,6 +3236,10 @@ async function performBatchSearch(params) {
               }
             }
             const resources = extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
+            // TEMP debug: 看哪些 item 進了 extractPlayInfoForCache
+            if (/仁医|仁醫/.test(item.vod_name || '')) {
+              console.log(`  [batch-extract] name="${site.title}" vod_name="${item.vod_name}" vod_year="${item.vod_year}" match=${matchResult.match} conf=${matchResult.confidence} -> ${resources.length} resources`);
+            }
             siteResults.push(...resources);
           }
         }
