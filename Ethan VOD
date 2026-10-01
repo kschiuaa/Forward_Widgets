@@ -150,7 +150,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 11,
+  WIDGET_VERSION: 12,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -231,7 +231,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.7",
+  version: "2.0.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -464,7 +464,13 @@ function deepCleanSeriesName(name) {
 function stripSeasonMarker(name) {
   if (!name) return '';
   return String(name)
+    // 「第N季」+ 阿拉伯數字：「第五季」「第 1 季」。
     .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季/g, ' ')
+    // 「S2」「Season 2」類型。「第二季」「第三季」沒「第」時也涵蓋：
+    // 中文/阿拉伯數字直接 + 季（中間可選空白）。這條很重要 —— 站方檔名
+    // 「五等分的新娘 第二季 - 第01集」沒有「第」字但有「第二季」，原本
+    // extractSequelNumber 會抓不到這個「季」數字，第二季過濾因此漏抓。
+    .replace(/[一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾0-9]+\s*季/g, ' ')
     // 「第N集」是集數不是續集序號。留下來會被 extractSequelNumber 的
     // 阿拉伯數字規則誤抓（實測「仁醫完結篇 - 第02集」回傳 2，
     // 「第01集」回傳 1，每集都被誤判成不同 sequel），
@@ -550,6 +556,30 @@ function parseChineseNumeral(text) {
  */
 function extractSequelNumber(name) {
   if (!name) return null;
+
+  // 先抓「X季」（無「第」前綴）再處理 stripSeasonMarker。
+  //
+  // 為什麼要這個順序：stripSeasonMarker 會把「第二季」字樣移除（跟「第N季」
+  // 一起清掉），但後續「season > 1 過濾」邏輯又需要這個 N。
+  // 例如 rawName「五等分的新娘 第二季 - 第01集 - 全集」—— strip 後變
+  // 「五等分的新娘 - 全集」，裡面完全沒有數字可抓，extractSequelNumber 回 null。
+  // 但使用者的 season='2' 卻需要這條被判定 sequel=2 才能通過 season filter。
+  //
+  // 規則：X季 必須在片名中段或結尾（不要求「第」），且前後是中文字符，
+  // 避免誤抓「三季報」這類詞。
+  //
+  // 例：
+  //   「五等分的新娘 第二季」 → 2
+  //   「五等分的新娘 第二季[电影解说]」→ 2（sNoBrackets 後）
+  //   「第二季 第01集」 → 2（剝掉「第01集」後開頭是「第二季」）
+  const directSeasonMatch = String(name).match(
+    /([一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾0-9]+)\s*季(?=[\s\-【\[(]|$|[^0-9])/,
+  );
+  if (directSeasonMatch) {
+    const v = parseChineseNumeral(directSeasonMatch[1]);
+    if (v) return v;
+  }
+
   // 先移除季度標記：「第一季」「第1季」「Season2」「S2」是季度而不是續集序號，
   // 「仁醫 第一季」的 1 若被當成序號，會讓第一季與原版被判為不同作品。
   // 季度交由 seasonNumber 處理，兩者必須分開判斷。
@@ -566,6 +596,18 @@ function extractSequelNumber(name) {
   if (roman) {
     const map = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
     const v = map[roman[1].toUpperCase()];
+    if (v) return v;
+  }
+
+  // 「第二季」「第三季」這類沒「第」前綴的季別。站方檔名常用這種寫法：
+// 「五等分的新娘 第二季」(2021)。stripSeasonMarker 會移除「第二季」字樣，
+// 但我們需要這個 N 來做「season > 1 過濾」。在「完结篇」分支之前先檢查。
+//
+// 注意：要先於「第X部」分支，因為這條規則更寬（不要求「第」前綴），
+// 但同一個字串中兩者不會同時出現。
+const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾0-9]+)\s*季/);
+  if (seasonBare) {
+    const v = parseChineseNumeral(seasonBare[1]);
     if (v) return v;
   }
 
@@ -653,10 +695,20 @@ function calculateEditDistanceSimilarity(str1, str2) {
 function calculateHybridSimilarity(str1, str2) {
   if (!str1 || !str2) return 0;
   if (str1 === str2) return 1;
-  
-  const charSimilarity = calculateStringSimilarity(str1, str2);
-  const editSimilarity = calculateEditDistanceSimilarity(str1, str2);
-  
+
+  // 「的」「之」是中文常用虛詞，計算相似度前移除。
+  // 實機搜「五等分新娘」第二季卻回 0 筆：站方檔名「五等分的新娘 第二季」
+  // 帶「的」，target 沒「的」，字元相似度 = 4/6 ≈ 0.667，連 SIMILARITY_LOOSE
+  // 0.75 都不到，連 loose match 都沒過。把虛詞從兩個字串都拿掉，相似度變 1.0
+  // 就能正確命中。
+  const stripFiller = (s) => s.replace(/的|之/g, '');
+  const s1 = stripFiller(str1);
+  const s2 = stripFiller(str2);
+  if (s1 === s2) return 1;
+
+  const charSimilarity = calculateStringSimilarity(s1, s2);
+  const editSimilarity = calculateEditDistanceSimilarity(s1, s2);
+
   return (charSimilarity * 0.6 + editSimilarity * 0.4);
 }
 
@@ -898,6 +950,15 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   const targetName = normalizeTitleForMatch(targetInfo.baseName);
   const candidateName = normalizeTitleForMatch(candidateInfo.baseName);
 
+  // 「的」「之」是中文常用虛詞，Forward / 站方 / 使用者輸入時常有省略：
+  //   target「五等分新娘」vs candidate「五等分的新娘」其實是同一片。
+  // 比對前去掉這些虛詞，否則相似度會被 1 個虛詞拉低，導致「實際同片」誤判失敗。
+  // （實機搜「五等分新娘」第二季卻回 0 筆就是這個原因 —— 樂子站只有
+  //  「五等分的新娘 第二季」這條，站方檔名固定帶「的」。）
+  const stripFiller = (s) => s.replace(/的|之/g, '');
+  const targetNameNoFiller = stripFiller(targetName);
+  const candidateNameNoFiller = stripFiller(candidateName);
+
   if (!targetName || !candidateName) {
     return { match: false, type: 'none', score: 0, confidence: 0 };
   }
@@ -924,7 +985,7 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       /完结篇|完結篇/.test(candidateInfo.rawName)) {
     candidateSequel = targetInfo._expectedSequel;
   }
-  const sequelShapeMismatch = (targetSequel === null) !== (candidateSequel === null);
+  const sequelShapeMismatch = (targetSequel === null) && (candidateSequel !== null);
   const sequelConflict = sequelShapeMismatch ||
     (targetSequel !== null && candidateSequel !== null && targetSequel !== candidateSequel);
 
@@ -1022,9 +1083,15 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     // 兩者 baseName 一個有 2 一個沒 2，但實際是同一部片。去除尾端單一數字
     // 後再比對。同樣反向也適用（target 有序號、candidate 沒有，
     // 例如 target 是「仁医2」、candidate 是「仁医」+ target._expectedSequel=2）。
-    const targetCoreNoDigit = targetCore.replace(/\d+$/, '');
-    const candidateCoreNoDigit = candidateCore.replace(/\d+$/, '');
+    //
+    // 同時去掉「的」「之」這類中文虛詞 —— 使用者輸入「五等分新娘」時往往
+    // 不帶「的」，站方檔名卻固定寫「五等分的新娘」，差一個字 core 比對就
+    // 失敗，後續 fallback 也要走相似度而非 core match。
+    const stripFiller = (s) => s.replace(/的|之/g, '');
+    const targetCoreNoDigit = stripFiller(targetCore).replace(/\d+$/, '');
+    const candidateCoreNoDigit = stripFiller(candidateCore).replace(/\d+$/, '');
     const coreMatches = targetCore === candidateCore ||
+                        stripFiller(targetCore) === stripFiller(candidateCore) ||
                         (targetCoreNoDigit && targetCoreNoDigit === candidateCoreNoDigit);
 
     // 額外處理「完结篇/完結篇」當作 sequel 標記。
@@ -2983,24 +3050,22 @@ async function performBatchSearch(params) {
             }
             // 「完结篇 / 完結篇」是日劇續集（第二季或最終季）的常見副標題，
             // 例如「仁醫完結篇」（仁醫第二季，2011）。
-            // 當目標明確要第一季（targetSeason===1）時，這類候選不可能
-            // 是第一季本體，跳過避免把第二季誤推給使用者。
-            // 目標 season>=2 時（例如明確要第二季），就放行讓「第 2 季
-            // 過濾」去識別 —— 此處不再攔。
+            // 當目標明確要某一季時，這類候選不可能是本季本體，跳過避免誤推。
             if (targetInfo.seasonNumber === 1 &&
-                /完结篇|完結篇|最終季|最终季|完结篇|第二季|最終章|终章/.test(item.vod_name)) {
+                /完结篇|完結篇|最終季|最终季|第二季|最終章|终章/.test(item.vod_name)) {
               continue;
             }
             // 番外型副標題：「特別篇 / 特别篇」、「OVA」、「劇場版 / 剧场版」、
-            // 「外傳 / 外传」、「總集篇 / 总集篇」、「番外」、「電影解說 / 电影解说」。
+            // 「外傳 / 外传」、「總集篇 / 总集篇」、「番外」、「電影解說 / 电影解说」、
+            // 「＊」（FINAL 期中特別篇）「∽」（五等分新娘系列）。
             // 這些都不屬於任何正季，目標明確要某一季時不該混入。
             //
             // 實測「五等分的新娘特別篇」(2023) 與 target baseName「五等分新娘」
             // 走 loose 匹配（共同字元比 0.625），原本會被當成第一季推播，
             // 結果 OVA 跟正劇混在一起，使用者點進去看到內容不符。
             // 劇場版與「電影解說」是二次剪輯影片，並非正片。
-            if (targetInfo.seasonNumber === 1 &&
-                /特别篇|特別篇|劇場版|剧场版|OVA|外传|外傳|总集篇|總集篇|番外|电影解说|電影解說/.test(item.vod_name)) {
+            if (targetInfo.seasonNumber >= 1 &&
+                /特别篇|特別篇|劇場版|剧场版|OVA|外传|外傳|总集篇|總集篇|番外|电影解说|電影解說|＊|∽/.test(item.vod_name)) {
               continue;
             }
             const resources = extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
