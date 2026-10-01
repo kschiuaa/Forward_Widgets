@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.6",
+  version: "2.1.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1060,8 +1060,8 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       seasonMatch: targetInfo.seasonNumber === candidateInfo.seasonNumber,
       confidence: 0.70
     };
-  } else if (targetInfo.rawName.includes(candidateInfo.rawName) ||
-             candidateInfo.rawName.includes(targetInfo.rawName)) {
+  } else if (targetName.includes(candidateName) ||
+             candidateName.includes(targetName)) {
     // 互相包含只代表「片名有重疊」，不保證是同一部作品。
     // 「追龙2」包含於「追龙2017」（年份的 2 開頭撞上序號）、
     // 「战狼2」包含於「战狼传说」：這些都是同系列的不同片。
@@ -2485,7 +2485,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -2870,9 +2870,6 @@ function filterBySequel(results, targetInfo) {
     .filter(y => y && Number.isFinite(y));
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
-  // TEMP debug: 一次性確認 filterBySequel 是否正確收到 sequelMatched
-  console.log(`[fbseq] before=${before} targetSeason=${targetSeason} sequelMatched=${sequelMatched.length} pooledYearMin=${pooledYearMin}`);
-
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
   const unversionedBases = new Map();
@@ -2912,8 +2909,6 @@ function filterBySequel(results, targetInfo) {
     // 片名沒寫季、vod_year 比命中群最早年還要早 1 年以上 → 上一季嫌疑
     if (sequel === null && pooledYearMin !== null) {
       const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
-      // TEMP debug: 看實際條件
-      console.log(`  [rule3] name="${res.name}" _year=${res._year} candYear=${candYear} pooledYearMin=${pooledYearMin} pooledYearMinMinus1=${pooledYearMin - 1} hit=${candYear !== null && candYear < pooledYearMin - 1}`);
       if (candYear && candYear < pooledYearMin - 1) {
         console.log(`  [drop-rule3] name="${res.name}" rawName="${rawName}" candYear=${candYear} pooledYearMin=${pooledYearMin} (${candYear} < ${pooledYearMin - 1})`);
         dropped.push(res); continue;
@@ -3236,10 +3231,6 @@ async function performBatchSearch(params) {
               }
             }
             const resources = extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
-            // TEMP debug: 看哪些 item 進了 extractPlayInfoForCache
-            if (/仁医|仁醫/.test(item.vod_name || '')) {
-              console.log(`  [batch-extract] name="${site.title}" vod_name="${item.vod_name}" vod_year="${item.vod_year}" match=${matchResult.match} conf=${matchResult.confidence} -> ${resources.length} resources`);
-            }
             siteResults.push(...resources);
           }
         }
