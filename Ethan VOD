@@ -231,7 +231,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.1",
+  version: "2.1.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2486,7 +2486,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel-with-unversioned-base-drop.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-完结篇only.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -2891,7 +2891,19 @@ function filterBySequel(results, targetInfo) {
     const sequel = extractSequelNumber(rawName);
 
     if (sequel === targetSeason) { kept.push(res); continue; }
-    if (/完结篇|完結篇|完结|完結|最終季|最终季/.test(rawName) && sequel === null) {
+    // 規則 2：片名含「完結/完结/全集」字樣，且 sequel=null
+    //
+    // 重要！這個字眼**只有片名本身就是續集命名**才該放行：
+    //   - 範例命中（合法）：「仁医完结篇」這是仁醫第二季的真實命名，沒有「第2季」字眼
+    //   - 範例命中（合法）：「仁医完結篇」（繁體版）
+    //
+    // 反例「五等分的新娘 - 第01集 - 已完結」/「...全集」描述的是「整部片已播完」，
+    // 是 S1 第一季播完的狀態說明，不是 S2 的標題。舊規則用 `/完结篇|完結篇|完结|/
+    // 完結|最終季|最终季/.test(rawName)` 會被「已完結/全集」誤觸，導致 S1 漏殺。
+    // 改用「片名本體就含有『完结篇/完結篇』」才放行（必須是「篇」字配套）。
+    // 「最終季/最终季」保留 —— 可能是命名如「魔法少女小圓 最終季」，但實務上也常出
+    // 現在 S1 描述中當成描述語（較罕見），與「全集」一樣要小心。保守只留「篇」。
+    if (/完结篇|完結篇/.test(rawName) && sequel === null) {
       kept.push(res); continue;
     }
 
@@ -2899,7 +2911,12 @@ function filterBySequel(results, targetInfo) {
     if (sequel === null && pooledYearMin !== null) {
       const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
       if (candYear && candYear < pooledYearMin - 1) {
+        console.log(`  [drop-rule3] name="${res.name}" rawName="${rawName}" candYear=${candYear} pooledYearMin=${pooledYearMin} (${candYear} < ${pooledYearMin - 1})`);
         dropped.push(res); continue;
+      }
+      // DEBUG: 印出通過/沒通過規則 3 的情況，幫忙定位漏網之魚
+      if (candYear && candYear >= pooledYearMin - 1 && candYear < pooledYearMin) {
+        console.log(`  [PASS-rule3 borderline] name="${res.name}" _year=${res._year} candYear=${candYear} pooledYearMin=${pooledYearMin}`);
       }
     }
 
@@ -3236,6 +3253,7 @@ async function performBatchSearch(params) {
       for (const k of r.kept) {
         console.log(`  ✅ name="${k.name}" desc="${k.description}" _year=${k._year} _rawName="${k._rawName}"`);
       }
+      console.log(`📊 第2季過濾後送往 forward app 的最終清單（confirm count）: ${finalResults.length}`);
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
       console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾(batch)無命中(${r.before}筆)，保留全部候選`);
     } else if (r.kept && r.kept.length === r.before && r.before > 0) {
