@@ -231,7 +231,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.2",
+  version: "2.1.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2486,7 +2486,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-完结篇only.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -3120,7 +3120,18 @@ async function performBatchSearch(params) {
           ? null  // batch 路徑無 this，給 null 走放行
           : null;
         const batchYearMarked = findYearMarkedSequels(response.list, targetInfo, matchStrictness);
-        const sequelsToSkip = batchYearMarked?.sequels ?? null;
+        // sequelsToSkip 只在 S1 目標時啟用。
+        //
+        // 這個 helper 是給「仁医 2009」/「仁医 2012」這類韓日版歧異設計的——
+        // 早的年份當原版，晚的當續集跳過。但套到「五等分的新娘」(S1, 2019)
+        // vs「五等分的新娘第二季」(S2, 2021) 時，2021 會被誤判成「續集」跳過，
+        // 偏偏 S2 才是使用者在查的目標。
+        //
+        // 規則：targetInfo.seasonNumber >= 2 時，使用者要的就是後續季，那些
+        // 「續集年份」就是本體，不該跳。
+        const sequelsToSkip = (targetInfo.seasonNumber >= 2 || !batchYearMarked)
+          ? null
+          : batchYearMarked.sequels;
 
         let siteResults = [];
         for (const item of response.list) {
