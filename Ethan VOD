@@ -146,7 +146,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 9,
+  WIDGET_VERSION: 10,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -227,7 +227,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.5",
+  version: "2.0.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2952,9 +2952,6 @@ async function performBatchSearch(params) {
                 continue;
               }
             }
-            if (/仁医/.test(item.vod_name) && matchResult.match) {
-              console.log(`  ✅ ${site.title}: 留下 ${item.vod_name} (vod_year=${item.vod_year})`);
-            }
             // 「完结篇 / 完結篇」是日劇續集（第二季或最終季）的常見副標題，
             // 例如「仁醫完結篇」（仁醫第二季，2011）。
             // 當目標明確要第一季（targetSeason===1）時，這類候選不可能
@@ -2963,7 +2960,18 @@ async function performBatchSearch(params) {
             // 過濾」去識別 —— 此處不再攔。
             if (targetInfo.seasonNumber === 1 &&
                 /完结篇|完結篇|最終季|最终季|完结篇|第二季|最終章|终章/.test(item.vod_name)) {
-              console.log(`  🚫 ${site.title}: 跳過 ${item.vod_name} (續集副標題，目標要第一季)`);
+              continue;
+            }
+            // 番外型副標題：「特別篇 / 特别篇」、「OVA」、「劇場版 / 剧场版」、
+            // 「外傳 / 外传」、「總集篇 / 总集篇」、「番外」、「電影解說 / 电影解说」。
+            // 這些都不屬於任何正季，目標明確要某一季時不該混入。
+            //
+            // 實測「五等分的新娘特別篇」(2023) 與 target baseName「五等分新娘」
+            // 走 loose 匹配（共同字元比 0.625），原本會被當成第一季推播，
+            // 結果 OVA 跟正劇混在一起，使用者點進去看到內容不符。
+            // 劇場版與「電影解說」是二次剪輯影片，並非正片。
+            if (targetInfo.seasonNumber === 1 &&
+                /特别篇|特別篇|劇場版|剧场版|OVA|外传|外傳|总集篇|總集篇|番外|电影解说|電影解說/.test(item.vod_name)) {
               continue;
             }
             const resources = extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
