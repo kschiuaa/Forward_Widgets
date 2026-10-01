@@ -231,7 +231,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.0",
+  version: "2.1.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2486,6 +2486,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel-with-unversioned-base-drop.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -2645,6 +2646,14 @@ async function loadResource(params, onStreamResult = null) {
     if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
       finalResults = r.kept;
       console.log(`🎯 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
+      console.log(`[stream dropped=${r.dropped.length}]`);
+      for (const d of r.dropped) {
+        console.log(`  ❌ name="${d.name}" desc="${d.description}" _year=${d._year} _rawName="${d._rawName}"`);
+      }
+      console.log(`[stream kept=${r.kept.length}]`);
+      for (const k of r.kept) {
+        console.log(`  ✅ name="${k.name}" desc="${k.description}" _year=${k._year} _rawName="${k._rawName}"`);
+      }
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
       console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾無命中(${r.before}筆)，保留全部候選`);
     } else if (r.kept && r.kept.length === r.before && r.before > 0) {
@@ -3219,6 +3228,14 @@ async function performBatchSearch(params) {
     if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
       finalResults = r.kept;
       console.log(`🎯 第${targetInfo.seasonNumber}季過濾(batch): ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
+      console.log(`[batch dropped=${r.dropped.length}]`);
+      for (const d of r.dropped) {
+        console.log(`  ❌ name="${d.name}" desc="${d.description}" _year=${d._year} _rawName="${d._rawName}"`);
+      }
+      console.log(`[batch kept=${r.kept.length}]`);
+      for (const k of r.kept) {
+        console.log(`  ✅ name="${k.name}" desc="${k.description}" _year=${k._year} _rawName="${k._rawName}"`);
+      }
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
       console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾(batch)無命中(${r.before}筆)，保留全部候選`);
     } else if (r.kept && r.kept.length === r.before && r.before > 0) {
