@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.4",
+  version: "2.1.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2870,6 +2870,9 @@ function filterBySequel(results, targetInfo) {
     .filter(y => y && Number.isFinite(y));
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
+  // TEMP debug: 一次性確認 filterBySequel 是否正確收到 sequelMatched
+  console.log(`[fbseq] before=${before} targetSeason=${targetSeason} sequelMatched=${sequelMatched.length} pooledYearMin=${pooledYearMin}`);
+
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
   const unversionedBases = new Map();
@@ -2909,6 +2912,8 @@ function filterBySequel(results, targetInfo) {
     // 片名沒寫季、vod_year 比命中群最早年還要早 1 年以上 → 上一季嫌疑
     if (sequel === null && pooledYearMin !== null) {
       const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      // TEMP debug: 看實際條件
+      console.log(`  [rule3] name="${res.name}" _year=${res._year} candYear=${candYear} pooledYearMin=${pooledYearMin} pooledYearMinMinus1=${pooledYearMin - 1} hit=${candYear !== null && candYear < pooledYearMin - 1}`);
       if (candYear && candYear < pooledYearMin - 1) {
         console.log(`  [drop-rule3] name="${res.name}" rawName="${rawName}" candYear=${candYear} pooledYearMin=${pooledYearMin} (${candYear} < ${pooledYearMin - 1})`);
         dropped.push(res); continue;
