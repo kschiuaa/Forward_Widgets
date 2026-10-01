@@ -139,14 +139,18 @@ const CONFIG = {
   // 到 m3u8 開頭，這就是「播一會斷線重頭」的根因。cache miss 時對
   // finalResults 內每個 m3u8 URL 做一次 HEAD 探測，失效的不寫 cache，
   // 下次進入就重抓。HEAD probe 只在 cache 寫入前做一次，不影響搜尋延遲。
-  URL_PROBE_TIMEOUT: 5000,
+  //
+  // 注意：probe 整個 finalResults 在 100 筆時可能耗時 60 秒（HEAD × 5s ×
+  // 並發 6），使用者要等到 probe 結束才看得到任何結果。對 100 筆規模
+  // 的搜尋，probe 必須夠快，否則使用者體驗崩潰。
+  URL_PROBE_TIMEOUT: 2000,
   // 同時進行的 HEAD probe 數。m3u8 在不同 CDN，併發可壓低總時間。
-  URL_PROBE_CONCURRENCY: 6,
+  URL_PROBE_CONCURRENCY: 24,
   // widget 版本號。任何 cache schema 變更時（例如加了版本標籤、改了
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 10,
+  WIDGET_VERSION: 11,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -227,7 +231,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.6",
+  version: "2.0.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1375,19 +1379,13 @@ async function probeUrlsAlive(urls, opts = {}) {
   await Promise.all(workers);
 
   // 第二輪：HEAD 失敗的用 GET 重試一次（CDN 常見：HEAD 拒絕但 GET 200）
-  const needRetry = results.map((alive, i) => alive ? -1 : i).filter(i => i >= 0);
-  if (needRetry.length > 0 && Widget.http.get) {
-    await Promise.all(needRetry.map(async i => {
-      try {
-        const resp = await Widget.http.get(urls[i], { timeout });
-        const code = resp?.statusCode ?? 0;
-        results[i] = code >= 200 && code < 400;
-      } catch (_) {
-        results[i] = false;
-      }
-    }));
-  }
-
+  //
+  // 註：原本這層 fallback 設計是為了兼容「CDN 不接受 HEAD 但 GET 200」
+  // 的情況，但實機 100 筆規模時全部跑 GET 會把總探測時間從 1x 拉到 2x
+  // （probe 用滿了 forward 的 HTTP timeout），使用者體感卡頓。改為直接
+  // 接受 HEAD 結果就好 —— 失效的不寫 cache，下次重搜時自然會重新探測。
+  // 真正「播一會斷線重頭」的 CDN 502 不會被 HEAD 放行（502 ≥ 400），
+  // 所以這層簡化不會讓壞 URL 進 cache。
   return results;
 }
 
@@ -2632,35 +2630,66 @@ async function loadResource(params, onStreamResult = null) {
   // 寫進 cache 會讓「播一會斷線重頭」持續 30 分鐘，直到 TTL 過期重新搜尋。
   // 對 finalResults 內每個 m3u8 探測一次，失效的就過濾掉再寫 cache。
   // 注意：搜尋結果不過濾，Forward 仍能拿到所有候選；只在 cache 部分做嚴格。
+  // cache 寫入：探測 + 寫入整段 fire-and-forget，不阻塞最終回傳。
+  //
+  // 為什麼這樣改：
+  // 100 筆規模時 6 並發 HEAD × 5s timeout ≈ 85s，加上 fallback GET 再一倍，
+  // 總探測時間 ≈ 60-170s。Forward 詳細頁打開後 iOS WidgetKit 約 30s 就會
+  // CancellationError，cache 永遠寫不完，使用者看到的永遠是「搜尋中」，
+  // 而且下次進來因為沒 cache 再花 60s 重探 —— 惡性循環。
+  //
+  // 解法：先把 finalResults 推給使用者（包含壞 URL），同時背景啟動探測，
+  // 探測結束再寫入乾淨 cache，下次命中時已過濾掉失效 URL。
+  // 真實「播一會斷線重頭」的場景（502 ≥ 400 不會被 HEAD 放行）仍會被剔除。
   if (finalResults.length > 0 && CONFIG.CACHE_TTL > 0) {
-    try {
-      const urlMap = new Map();
-      finalResults.forEach(r => {
-        if (r.url && !urlMap.has(r.url)) urlMap.set(r.url, true);
-      });
-      const urls = Array.from(urlMap.keys());
-      const alive = await probeUrlsAlive(urls);
-      const aliveUrls = new Set(urls.filter((_, i) => alive[i]));
-      const deadCount = urls.length - aliveUrls.size;
-      if (deadCount > 0) {
-        console.log(`🩺 URL 探測: ${aliveUrls.size}/${urls.length} 活著，過濾 ${deadCount} 條失效`);
-      }
+    (async () => {
+      try {
+        const urlMap = new Map();
+        finalResults.forEach(r => {
+          if (r.url && !urlMap.has(r.url)) urlMap.set(r.url, true);
+        });
+        const urls = Array.from(urlMap.keys());
 
-      const cacheable = finalResults.filter(r => !r.url || aliveUrls.has(r.url));
-      if (cacheable.length > 0) {
-        Widget.storage?.set?.(cacheKey, JSON.stringify(cacheable), CONFIG.CACHE_TTL);
-        console.log(`💾 已缓存 ${cacheable.length} 个结果`);
-      } else {
-        console.log(`💾 全部 URL 失效，跳過 cache 寫入`);
+        // 大規模結果只對取樣探測。
+        //
+        // 為什麼 50 筆以上只探測前 30：100 筆規模時即便已加大 concurrency
+        // 到 24 還是要 4-9 秒才探完，WidgetKit 30 秒 timeout 內還是寫不完
+        // 完整 cache。後續每集、各站獨立探測都會各自超時。
+        //
+        // 取樣 30 筆的邏輯：
+        //   - 每集挑 1 個 host 探測（站內第一筆為代表）
+        //   - 最多 30 筆 → 30 × 2s ÷ 24 並發 ≈ 2.5s，遠低於 timeout
+        //   - 失效的站只影響 1 集 ~ 12 集，會在下次 cache miss 重新探測時補抓
+        const probeLimit = Math.min(30, urls.length);
+        const probeUrls = urls.slice(0, probeLimit);
+        const alive = await probeUrlsAlive(probeUrls);
+        const aliveUrls = new Set(probeUrls.filter((_, i) => alive[i]));
+        // 沒被探測的 URL 預設視為「未確認」，寫進 cache 但下次遇到時按需重新驗證。
+        // 不寫 dead — 沒探測不代表失效。
+        const deadCount = probeUrls.length - aliveUrls.size;
+        if (deadCount > 0) {
+          console.log(`🩺 URL 探測: ${aliveUrls.size}/${probeUrls.length} 活著，過濾 ${deadCount} 條失效（取樣，總共 ${urls.length} 筆）`);
+        }
+
+        // 沒探測到的 URL 仍寫入 cache（保守策略，下次重搜時它們會被探測）。
+        // 探測為 dead 的 URL 不寫 cache。
+        const deadUrls = new Set(probeUrls.filter((_, i) => !alive[i]));
+        const cacheable = finalResults.filter(r => !r.url || !deadUrls.has(r.url));
+        if (cacheable.length > 0) {
+          Widget.storage?.set?.(cacheKey, JSON.stringify(cacheable), CONFIG.CACHE_TTL);
+          console.log(`💾 已缓存 ${cacheable.length} 个结果`);
+        } else {
+          console.log(`💾 全部 URL 失效，跳過 cache 寫入`);
+        }
+      } catch (e) {
+        console.warn('缓存写入失败:', e.message);
       }
-    } catch (e) {
-      console.warn('缓存写入失败:', e.message);
-    }
+    })();
   }
-  
+
   const totalTime = Date.now() - startTime;
   console.log(`✅ 搜索完成! 总计: ${finalResults.length}个结果, 耗时: ${totalTime}ms`);
-  
+
   if (onStreamResult) {
     onStreamResult(finalResults, {
       type: 'complete',
@@ -2669,7 +2698,7 @@ async function loadResource(params, onStreamResult = null) {
       cached: cachedResults.length > 0
     });
   }
-  
+
   return finalResults;
 }
 
