@@ -231,7 +231,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.9",
+  version: "2.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2835,6 +2835,12 @@ function applyDetailVersion(params, targetInfo) {
 //      季的候選）」最小年份還要早超過 1 年 —— 這種「片名沒寫季但年份明顯
 //      較早」的多半是上一季內容被誤標全集的站方錯誤資料（如電影天堂對
 //      「五等分的新娘」回 vod_year=2019，實際是 S1 內容）。
+//   4. 候選 sequel=null 且 _year=null，且同名檔名「跨站出現次數」≥ 2
+//      且命中群已存在 —— 這種「片名沒寫季也沒年份」但多站都在回的，多半
+//      是上一季內容被當全集推播（愛蛋/如意對「五等分的新娘」回 S1 全集，
+//      但樂子寫明「第二季」所以樂子的進命中群）。沒年份就沒規則上殺，
+//      必須靠檔名頻率判斷：只有 1 站回的同名檔案可能是另一季，多站回的
+//      一定是站方拼錯或共用檔名，殺掉保險。
 //
 // 安全網：如果過濾後 0 筆，回傳 null（不是空陣列），由呼叫端決定是否
 // 退而求其次保留全部候選 —— 比「空白」好。
@@ -2856,6 +2862,19 @@ function filterBySequel(results, targetInfo) {
     .filter(y => y && Number.isFinite(y));
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
+  // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
+  // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
+  const unversionedBases = new Map();
+  for (const res of results) {
+    const rawName = res._rawName || res.description || '';
+    if (extractSequelNumber(rawName) === targetSeason) continue;
+    const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+    if (candYear) continue;
+    const base = (res._baseName || rawName.replace(/第[0-9一二三四五六七八九十百零〇]+[集話話回]/g, '').replace(/第[0-9]+季|Season\s*[0-9]+/gi, '')).trim();
+    if (!base) continue;
+    unversionedBases.set(base, (unversionedBases.get(base) || 0) + 1);
+  }
+
   const kept = [];
   const dropped = [];
   for (const res of results) {
@@ -2872,6 +2891,18 @@ function filterBySequel(results, targetInfo) {
       const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
       if (candYear && candYear < pooledYearMin - 1) {
         dropped.push(res); continue;
+      }
+    }
+
+    // 片名沒寫季也沒年份、且跨多站回傳同一 baseName → 上一季嫌疑
+    // （只有 1 站回的可能是另一季沒寫季的合法結果，2 站以上才殺）
+    if (sequel === null && pooledYearMin !== null) {
+      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      if (!candYear) {
+        const base = (res._baseName || rawName.replace(/第[0-9一二三四五六七八九十百零〇]+[集話話回]/g, '').replace(/第[0-9]+季|Season\s*[0-9]+/gi, '')).trim();
+        if (base && (unversionedBases.get(base) || 0) >= 2) {
+          dropped.push(res); continue;
+        }
       }
     }
 
