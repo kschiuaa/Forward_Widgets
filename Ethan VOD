@@ -231,7 +231,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.8",
+  version: "2.0.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2639,23 +2639,19 @@ async function loadResource(params, onStreamResult = null) {
   //
   // 安全網：如果過濾後 0 筆，退而求其次 —— 不過濾全部推播，
   // 至少使用者會看到候選項目（會包含第一季內容，但比「空白」好）。
-  if (type === 'tv' && Number.isFinite(targetSeason) && targetSeason > 1) {
-    const before = finalResults.length;
-    const filtered = finalResults.filter(res => {
-      const rawName = res._rawName || res.description || '';
-      const sequel = extractSequelNumber(rawName);
-      if (sequel === targetSeason) return true;
-      if (/完结篇|完結篇|完结|完結|最終季|最终季/.test(rawName) && sequel === null) return true;
-      return false;
-    });
-    if (filtered.length > 0) {
-      finalResults = filtered;
-      console.log(`🎯 第${targetSeason}季過濾: ${before} -> ${finalResults.length}`);
-    } else if (before > 0) {
-      console.log(`⚠️ 第${targetSeason}季過濾無命中(${before}筆)，保留全部候選`);
+// 續集季別過濾（共用 helper，cache 命中路徑與 batch 路徑都會經過）。
+  if (type === 'tv') {
+    const r = filterBySequel(finalResults, targetInfo);
+    if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
+      finalResults = r.kept;
+      console.log(`🎯 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
+    } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
+      console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾無命中(${r.before}筆)，保留全部候選`);
+    } else if (r.kept && r.kept.length === r.before && r.before > 0) {
+      console.log(`🎯 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${r.before}（已是最終）`);
     }
   }
-  
+
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
   });
@@ -2827,6 +2823,64 @@ function applyDetailVersion(params, targetInfo) {
 //
 // 快取裡的結果 _year 已被 cleanResourceForOutput 移除，所以放行片名比對
 // 作為後備 —— 那是快取路徑唯一還拿得到的版本線索。
+// 續集季別過濾（共用 helper）：smart_stream 與 batch 兩個路徑都必須套用，
+// 否則站台把同名第一季與後續季混在一起回傳時，第一季內容會被當成
+// 第N季推播（搜「仁醫」+ season=2 → 「仁医」也一起被推上來）。
+//
+// 三條放行條件（任一成立即保留）：
+//   1. 候選片名明確標出第 targetSeason 季（regex 抽到的 sequel 數字相符）。
+//   2. 候選片名有「完结/完結/最終季」字樣且 sequel=null（特例命名，如
+//      「仁医完结篇」是第二季的真實命名，沒有「第2季」字眼）。
+//   3. 候選 sequel=null 且 vod_year 比「命中群（明確標記為第 targetSeason
+//      季的候選）」最小年份還要早超過 1 年 —— 這種「片名沒寫季但年份明顯
+//      較早」的多半是上一季內容被誤標全集的站方錯誤資料（如電影天堂對
+//      「五等分的新娘」回 vod_year=2019，實際是 S1 內容）。
+//
+// 安全網：如果過濾後 0 筆，回傳 null（不是空陣列），由呼叫端決定是否
+// 退而求其次保留全部候選 —— 比「空白」好。
+function filterBySequel(results, targetInfo) {
+  const targetSeason = targetInfo?.seasonNumber;
+  if (!Number.isFinite(targetSeason) || targetSeason <= 1) {
+    return { kept: results, dropped: [] };
+  }
+
+  const before = results.length;
+
+  // 命中群：明確標為第 targetSeason 季的候選，用它們的年份決定 pooledYearMin。
+  const sequelMatched = results.filter(res => {
+    const rawName = res._rawName || res.description || '';
+    return extractSequelNumber(rawName) === targetSeason;
+  });
+  const yearsOfMatched = sequelMatched
+    .map(res => Number(res._year) || Number(extractVersionMarker(res._rawName || '')) || null)
+    .filter(y => y && Number.isFinite(y));
+  const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
+
+  const kept = [];
+  const dropped = [];
+  for (const res of results) {
+    const rawName = res._rawName || res.description || '';
+    const sequel = extractSequelNumber(rawName);
+
+    if (sequel === targetSeason) { kept.push(res); continue; }
+    if (/完结篇|完結篇|完结|完結|最終季|最终季/.test(rawName) && sequel === null) {
+      kept.push(res); continue;
+    }
+
+    // 片名沒寫季、vod_year 比命中群最早年還要早 1 年以上 → 上一季嫌疑
+    if (sequel === null && pooledYearMin !== null) {
+      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      if (candYear && candYear < pooledYearMin - 1) {
+        dropped.push(res); continue;
+      }
+    }
+
+    kept.push(res);
+  }
+
+  return { kept, dropped, before, pooledYearMin };
+}
+
 function filterByTargetVersion(results, targetInfo) {
   // 目標帶年份：只留同年份與無年份的候選。
   if (targetInfo.year) {
@@ -3064,9 +3118,21 @@ async function performBatchSearch(params) {
             // 走 loose 匹配（共同字元比 0.625），原本會被當成第一季推播，
             // 結果 OVA 跟正劇混在一起，使用者點進去看到內容不符。
             // 劇場版與「電影解說」是二次剪輯影片，並非正片。
-            if (targetInfo.seasonNumber >= 1 &&
-                /特别篇|特別篇|劇場版|剧场版|OVA|外传|外傳|总集篇|總集篇|番外|电影解说|電影解說|＊|∽/.test(item.vod_name)) {
-              continue;
+            //
+            // OAD / SP 額外處理：站方常把 OAD / SP 跟正劇混在同一個 vod_id 裡
+            // （「進擊的巨人」某季加映 OVA、「咒術迴戰」第3.5話 SP）。這些是
+            // 番外內容，搜主劇時不該被當成主劇集數推播。
+            // SP 限定「沒接集數、沒接『特別篇』字眼」才算番外 ——「第3話 SP」這類
+            // 是正劇的副標題（如 SP 後接續的 SP1、SP2 是該話的特殊版本），不在此列。
+            // OAD 同理：「OAD1」這種獨立條目才算番外；「第7話 OAD」是該話的 OAD 版本。
+            if (targetInfo.seasonNumber >= 1) {
+              const rawName = item.vod_name || '';
+              const looksLikeSpinOff = /特别篇|特別篇|劇場版|剧场版|OVA|外传|外傳|总集篇|總集篇|番外|电影解说|電影解說|＊|∽/.test(rawName);
+              const looksLikeOAD = /(^|[^0-9第])OAD($|[^0-9])|^OAD[0-9]|OAD版|OAD化/.test(rawName);
+              const looksLikeSP = /(^|[^0-9第])SP($|[^0-9])|^SP[0-9]|特别篇SP|特別篇SP/.test(rawName);
+              if (looksLikeSpinOff || looksLikeOAD || looksLikeSP) {
+                continue;
+              }
             }
             const resources = extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
             siteResults.push(...resources);
@@ -3116,20 +3182,16 @@ async function performBatchSearch(params) {
   // 第 2 季過濾：smart_stream 與 batch 兩個路徑都必須套用，
   // 否則批次搜「仁醫」+ season=2 會把第一季的「仁医」也一起推上來。
   // 與 loadResource 內的邏輯同步，理由見該處的註解。
-  if (type === 'tv' && Number.isFinite(targetSeason) && targetSeason > 1) {
-    const before = finalResults.length;
-    const filtered = finalResults.filter(res => {
-      const rawName = res._rawName || res.description || '';
-      const sequel = extractSequelNumber(rawName);
-      if (sequel === targetSeason) return true;
-      if (/完结篇|完結篇|完结|完結|最終季|最终季/.test(rawName) && sequel === null) return true;
-      return false;
-    });
-    if (filtered.length > 0) {
-      finalResults = filtered;
-      console.log(`🎯 第${targetSeason}季過濾(batch): ${before} -> ${finalResults.length}`);
-    } else if (before > 0) {
-      console.log(`⚠️ 第${targetSeason}季過濾(batch)無命中(${before}筆)，保留全部候選`);
+  // 續集季別過濾（共用 helper，與串流路徑同源）。
+  if (type === 'tv') {
+    const r = filterBySequel(finalResults, targetInfo);
+    if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
+      finalResults = r.kept;
+      console.log(`🎯 第${targetInfo.seasonNumber}季過濾(batch): ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
+    } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
+      console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾(batch)無命中(${r.before}筆)，保留全部候選`);
+    } else if (r.kept && r.kept.length === r.before && r.before > 0) {
+      console.log(`🎯 第${targetInfo.seasonNumber}季過濾(batch): ${r.before} -> ${r.before}（已是最終）`);
     }
   }
 
