@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.3.2",
+  version: "2.3.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3450,6 +3450,12 @@ async function performBatchSearch(params) {
       finalResults = r.kept;
       console.log(`🎯 第${targetInfo.seasonNumber}季過濾(batch): ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
       console.log(`📊 第2季過濾後送往 forward app 的最終清單（confirm count）: ${finalResults.length}`);
+      // 進入此分支表示 filterBySequel 確實有做 drop（kept < before），
+      // 若同時也有 s4FallbackCandidates 表示 r.kept 不包含 S3 後半候選，
+      // 需要把 fallback 候選塞回去並排在最前。
+      if (r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
+        s4FallbackUsed = true;
+      }
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
       console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾(batch)無命中(${r.before}筆)，保留全部候選`);
     } else if (r.kept && r.kept.length === r.before && r.before > 0) {
