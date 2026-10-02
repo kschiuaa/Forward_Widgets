@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.1",
+  version: "2.5.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3347,10 +3347,39 @@ async function performBatchSearch(params) {
             // 否則使用者點進去看到的還是 S3 內容，不是想要的 S4。
             const hasFinalSeason = /最终季|最終季/.test(item.vod_name || '');
             const hasSecondCour = /第\s*[2２]\s*期/.test(item.vod_name || '');
-            if ((hasFinalSeason || hasSecondCour) && tName && candName.startsWith(tName)) {
+            // SAO S4 = Alicization 後半 (Part 2 2019 + Part 3 2020)。
+            //   - Part 3 caiji/ffzy 標「最终季」、lzi 標「第 2 期」
+            //   - Part 2 (2019) 沒「最終季/第2期」標記，只用「爱丽丝篇 异界战争」區分。
+            // 若只放行 Part 3，使用者只看到 12 集，缺 24 集 Part 2。
+            // 補一個 hasAlicizationAndWar 條件抓 Part 2。
+            const hasAlicizationAndWar = /异界战争/.test(item.vod_name || '') &&
+              /爱丽丝|愛麗絲/.test(item.vod_name || '');
+            if ((hasFinalSeason || hasSecondCour || hasAlicizationAndWar) && tName && candName.startsWith(tName)) {
               console.log(`🟢 [S4-forced] 放行 ${item.vod_name} (target=${tName}, cand=${candName}, sim=${(matchResult.similarity || 0).toFixed(2)})`);
               matchResult.match = true;
               matchResult.type = 's4_fallback_forced';
+              matchResult.confidence = 0.85;
+            }
+          }
+
+          // 對 S3 查詢的「爱丽丝篇」候選強制放行：
+          // SAO S3 = Alicization Part 1 (2018)。各站命名：
+          //   - caiji/rycj/lzi：「刀剑神域 爱丽丝篇」
+          //   - ffzy：「刀剑神域第三季」
+          // 「爱丽丝篇」副標題讓 baseName 變長，sim 卡在 0.33~0.5 之間。
+          // 與 S4 的區分：S4 候選含「异界战争/最终季/第2期」副標題；
+          // 只含「爱丽丝」單獨的就是 S3 Part 1。
+          if (targetInfo.seasonNumber === 3 && !matchResult.match) {
+            const candName = normalizeTitleForMatch(item.vod_name || '');
+            const tName = normalizeTitleForMatch(targetInfo.rawName || targetInfo.baseName || '');
+            const hasAlicizationOnly = /爱丽丝|愛麗絲/.test(item.vod_name || '') &&
+              !/异界战争/.test(item.vod_name || '') &&
+              !/最终季|最終季/.test(item.vod_name || '') &&
+              !/第\s*[2２]\s*期/.test(item.vod_name || '');
+            if (hasAlicizationOnly && tName && candName.startsWith(tName)) {
+              console.log(`🟢 [S3-forced] 放行 ${item.vod_name} (target=${tName}, cand=${candName}, sim=${(matchResult.similarity || 0).toFixed(2)})`);
+              matchResult.match = true;
+              matchResult.type = 's3_fallback_forced';
               matchResult.confidence = 0.85;
             }
           }
