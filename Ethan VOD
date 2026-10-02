@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.2.2",
+  version: "2.2.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1247,9 +1247,20 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           const displayEp = toDisplayText(epName);
           const displayRemarks = toDisplayText(vod_remarks);
 
+          // 顯示用描述：片名與集數／副標之間用「．」連接，版本標記
+          // （年/國）由 cleanResourceForOutput 內追加「[年 - 國]」。
+          // 不再附加「已完結」或 [dyttm3u8] 等站內標記。
+          // 例：「零之使魔．第01集」 /「进击的巨人 最终季．完结篇」/
+          //   「银河铁道之父」+ 結尾「[2012年 - 日本]」。
+          const stripFinished = (s) => String(s || '').replace(/已完結|已完结/g, '').replace(/\s+/g, ' ').trim();
+          const epText = stripFinished(displayEp);
+          const remarkText = stripFinished(displayRemarks);
+          // epName / remark 中常含多段空白分隔，保留全部並用「．」串接
+          // （user 範例：「进击的巨人 最终季．完结篇」），再追加 remark 段。
+          const tail = [epText, remarkText].filter(Boolean).join('．').replace(/\s+/g, ' ').trim();
           const resource = {
             name: siteTitle,
-            description: `${displayName} - ${displayEp}${displayRemarks ? ' - ' + displayRemarks : ''} - [${sourceName}]`,
+            description: tail ? `${displayName}．${tail}` : displayName,
             url: url.trim(),
 
             playerType: 'app',
@@ -1292,12 +1303,16 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
       if (firstM3U8) {
         const [quality, url] = firstM3U8.split('$');
         const qualityText = quality.toLowerCase().includes('tc') ? '搶先版' : '正片';
-        
+
         const resolutionInfo = extractResolutionInfo(vod_name, quality);
-        
+
+        const displayName = toDisplayText(vod_name);
+        // Movie 描述：正片（默認）不附標記；搶先版/TC/其他非正片
+        // 標籤以「．」中點附在片名後。
+        const isMainRelease = qualityText === '正片';
         const resource = {
           name: siteTitle,
-          description: `${vod_name} - ${qualityText} - [${sourceName}]`,
+          description: isMainRelease ? displayName : `${displayName}．${qualityText}`,
           url: url.trim(),
 
           playerType: 'app',
@@ -2394,12 +2409,12 @@ function cleanResourceForOutput(resource) {
   const itemArea = resource._area || null;
   if (itemYear || itemArea) {
     const parts = [];
-    if (itemYear) parts.push(`${itemYear}`);
+    if (itemYear) parts.push(`${itemYear}年`);
     const label = areaLabel(itemArea);
     if (label) parts.push(label);
-    const versionTag = parts.join(' · ');
+    const versionTag = `[${parts.join(' - ')}]`;
     if (versionTag && !clean.description.includes(versionTag)) {
-      clean.description = `${clean.description} [${versionTag}]`;
+      clean.description = `${clean.description} ${versionTag}`;
     }
   }
 
@@ -2494,7 +2509,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path-plus-wanjiepian-equals-sequel2-plus-explicitDifferentSeason-drop-plus-rule3-strict1Year-plus-stripSubtitle-tilde.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path-plus-wanjiepian-equals-sequel2-plus-explicitDifferentSeason-drop-plus-rule3-strict1Year-plus-stripSubtitle-tilde-plus-description-dot-sep-no-dash-no-sourceTag-no-finished-versionTag-with-year-koku-plus-movie-nonMainRelease-dotSuffix.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
