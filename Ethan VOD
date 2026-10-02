@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.2.6",
+  version: "2.2.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2904,6 +2904,24 @@ function filterBySequel(results, targetInfo) {
     .filter(y => y && Number.isFinite(y));
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
+  // 啟發式集範圍：sequelMatched=0（dataset 沒標明第幾季）時，靠候選 _ep 數值
+  // 推測 targetSeason 集範圍。例如「皆大歡喜」+ season=3（user S3 頁約集 256-327），
+  // dataset 最大 _ep=327，啟發式 = 327/3*2+1=219 .. 327，篩出 S3 範圍。
+  //
+  // 風險：maxEp 來自單一 IP（如皆大歡喜 2001 327 集），但 user Forward 看的是
+  // 另一版本（皆大歡喜 2003 723 集），會誤篩。但 batch/get 對外暴露的就是 dataset
+  // 100 條結果（db cap），多版本混進的機率低；給 user 看集 256-327 區間總比
+  // 全推集 1-100（S3 頁全空）好。
+  const epValues = results.map(r => Number(r._ep) || null).filter(n => Number.isFinite(n));
+  const maxEp = epValues.length ? Math.max(...epValues) : null;
+  const heuristicEpLower = (maxEp && targetSeason > 1)
+    ? Math.floor((maxEp / targetSeason) * (targetSeason - 1)) + 1
+    : null;
+  // TEMP debug
+  if (heuristicEpLower !== null) {
+    console.log(`[fbseq-heuristic] sequelMatched=0, maxEp=${maxEp}, targetSeason=${targetSeason}, 啟發範圍=${heuristicEpLower}~${maxEp}`);
+  }
+
   // TEMP debug: 確認 sequelMatched 與 pooledYearMin
   console.log(`[fbseq] before=${before} sequelMatched=${sequelMatched.length} pooledYearMin=${pooledYearMin}`);
   // 列出 S3 candidate (Sequel=3, targetSeason=3) 與 S1 candidate (Sequel=null, _year=2006) 各 3 個
@@ -3027,6 +3045,19 @@ if (sequel === targetSeason) { kept.push(res); continue; }
         if (base && (unversionedBases.get(base) || 0) >= 2) {
           dropped.push(res); continue;
         }
+      }
+    }
+
+    // 啟發式集範圍篩：sequelMatched=0 且 dataset maxEp 已知時，靠候選 _ep 推測
+    // targetSeason 範圍，把落在 targetSeason 範圍外的 drop。
+    // 例：皆大歡喜 S3（集 256-327），maxEp=327，S3 啟發下界=327/3*2+1=219。
+    //     集 1-218 drop，集 219-327 留。
+    // 例外：_ep=null 的電影版（無集數）保留，避免誤殺集數不明的單集電影。
+    if (sequel === null && heuristicEpLower !== null) {
+      const ep = Number(res._ep) || null;
+      if (ep !== null && ep < heuristicEpLower) {
+        console.log(`  [drop-heuristicEpRange] name="${res.name}" desc="${res.description}" _ep=${ep} lower=${heuristicEpLower}`);
+        dropped.push(res); continue;
       }
     }
 
