@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.2.0",
+  version: "2.2.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2494,7 +2494,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path-plus-wanjiepian-equals-sequel2.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path-plus-wanjiepian-equals-sequel2-plus-explicitDifferentSeason-drop-plus-rule3-strict1Year.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -2901,8 +2901,32 @@ function filterBySequel(results, targetInfo) {
     const rawName = res._rawName || res.description || '';
     const sequel = extractSequelNumber(rawName);
 
-    if (sequel === targetSeason) { kept.push(res); continue; }
-    // 規則 2：片名含「完結/完结/全集」字樣，且 sequel=null
+if (sequel === targetSeason) { kept.push(res); continue; }
+
+  // 規則 X：candidate 的 sequel 明確標示為其他季，無條件 drop。
+  //
+  // 場景：user 查「零之使魔」season=2，VOD 站同時回傳：
+  //   - 零之使魔         (sequel=null → 走規則 3)
+  //   - 零之使魔2～双月的骑士～ (sequel=2 → kept)
+  //   - 零之使魔3～三美姬的轮舞～ (sequel=3 → sequel=null 路徑漏網)
+  //   - 零之使魔FINAL   (sequel=null → 走規則 2/規則 3)
+  //
+  // 規則 3 只處理 sequel=null，sequel=3 沒人管，最後 fall through 到
+  // line 2975 kept.push，整季 S3 結果混進 S2 結果裡。user 看到「零之使魔
+  // 第01集」排在最前，但進去點開發現是 S3 內容。
+  //
+  // 為什麼不直接拒絕 sequel != targetSeason：原本 line 2904 是這樣寫的，
+  // 但實際上 target==candidate 一個有 sequel 一個沒 sequel 時（互補情境）
+  // 會被這條規則誤殺，因此新增例外路徑處理那種情況。
+  if (sequel !== null && sequel !== targetSeason) {
+    // 例外：target 沒寫季（_expectedSequel 補入），candidate sequel=null
+    // 應該用規則 2 / 規則 3，不會走到這裡（sequel=null 跳過這條 if）。
+    // 所以「sequel !== null 且 sequel !== targetSeason」可以無條件 drop。
+    console.log(`  [drop-ruleX-explicitDifferentSeason] name="${res.name}" rawName="${rawName}" sequel=${sequel} targetSeason=${targetSeason}`);
+    dropped.push(res); continue;
+  }
+
+  // 規則 2：片名含「完結/完结/全集」字樣，且 sequel=null
     //
     // 重要！這個字眼**只有片名本身就是續集命名**才該放行：
     //   - 範例命中（合法）：「仁医完结篇」這是仁醫第二季的真實命名，沒有「第2季」字眼
@@ -2921,12 +2945,16 @@ function filterBySequel(results, targetInfo) {
     // 片名沒寫季、vod_year 比命中群最早年還要早 1 年以上 → 上一季嫌疑
     if (sequel === null && pooledYearMin !== null) {
       const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
-      if (candYear && candYear < pooledYearMin - 1) {
-        console.log(`  [drop-rule3] name="${res.name}" rawName="${rawName}" candYear=${candYear} pooledYearMin=${pooledYearMin} (${candYear} < ${pooledYearMin - 1})`);
+      // 為什麼用「candYear < pooledYearMin」而不是「candYear <= pooledYearMin - 1」：
+      // 上一季的播出年通常正是 pooledYearMin - 1（S2 拍攝年的前一年）。
+      // 把「candYear == pooledYearMin - 1」當 borderline 留著會讓 S1 整季漏網
+      // 混進 S2 結果（典型例子：「零之使魔」S1=2006、S2=2007，差 1 年）。
+      if (candYear && candYear < pooledYearMin) {
+        console.log(`  [drop-rule3] name="${res.name}" rawName="${rawName}" candYear=${candYear} pooledYearMin=${pooledYearMin} (${candYear} < ${pooledYearMin})`);
         dropped.push(res); continue;
       }
       // DEBUG: 印出通過/沒通過規則 3 的情況，幫忙定位漏網之魚
-      if (candYear && candYear >= pooledYearMin - 1 && candYear < pooledYearMin) {
+      if (candYear && candYear >= pooledYearMin && candYear < pooledYearMin + 1) {
         console.log(`  [PASS-rule3 borderline] name="${res.name}" _year=${res._year} candYear=${candYear} pooledYearMin=${pooledYearMin}`);
       }
     }
