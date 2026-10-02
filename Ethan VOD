@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.3.4",
+  version: "2.3.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3042,7 +3042,19 @@ if (sequel === targetSeason) { kept.push(res); continue; }
       const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
       // 候選年份 = pooledYearMin + 1 → 同時代另一版本嫌疑
       if (candYear && candYear === pooledYearMin + 1) {
-        dropped.push(res); continue;
+        // 例外：候選與命中群同地區（_area 一致），代表是同一作品的不同命名
+        // （SAO S3 第1期 2019 用「愛麗絲篇異界戰爭」命名，與 sequelMatched 「第三季」同 jp
+        // 地區，是正片不是翻拍） → 不應 drop。
+        //
+        // 「仁醫 2012 韓版翻拍」 _area=kr 與 sequelMatched 「仁医2」_area=jp 不同，
+        // 規則 3.6 仍生效。
+        const candArea = (res._area || '').toLowerCase().trim();
+        const matchedAreas = new Set(sequelMatched.map(m => (m._area || '').toLowerCase().trim()).filter(Boolean));
+        if (candArea && matchedAreas.has(candArea)) {
+          // 留著讓後續 keep
+        } else {
+          dropped.push(res); continue;
+        }
       }
     }
 
