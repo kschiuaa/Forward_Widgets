@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.2",
+  version: "2.5.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -953,6 +953,81 @@ function findYearMarkedSequels(list, targetInfo, matchStrictness = 'standard') {
     return { earliestYear: earliest, sequels: sequels.filter(y => y !== null) };
   }
   return null;
+}
+
+/**
+ * 通用「副標題型續集群」啟發式 helper。
+ *
+ * 場景：forward app metadata 把 SAO 切成 4 季，但 VOD 站目錄裡這些條目
+ * sequel 標記都是 null（沒「第N季」字眼），純粹靠「主標題 + 空格 + 副標題」
+ * 結構命名（caiji/rycj/lzi）：
+ *   - 「刀剑神域」(S1+S2 合, 2012)
+ *   - 「刀剑神域 序列之争」(劇場版, 2017)
+ *   - 「刀剑神域 爱丽丝篇」(S3 Part 1, 2018)
+ *   - 「刀剑神域 爱丽丝篇 异界战争」(S4 Part 2, 2019)
+ *   - 「刀剑神域爱丽丝篇异界战争最终季」(S4 Part 3, 2020)
+ *
+ * 啟發式：
+ *  1. baseName prefix 篩選出 series 內所有條目（容忍副標題長度差異）。
+ *  2. 按 year (vod_year 優先，檔名年份次之) 排序分群：差距 >2 年 = 不同群。
+ *  3. 群按最早年份排序，群序號 1..N 即 series 內的季序（S1 → SN）。
+ *  4. targetSeason > 群數 → 不啟動（return null，避免硬湊）。
+ *  5. targetSeason ≤ 群數 → return 第 targetSeason 群的 items。
+ *
+ * 通用性：不只 SAO — 任何「主標題 + 空格 + 副標題」結構的 series 都適用
+ * （如「進撃的巨人 最終季」、「呪術迴戰 涉谷事變」等）。
+ */
+function findSubtitledSequels(list, targetInfo, targetSeason, matchStrictness = 'standard') {
+  if (!Array.isArray(list) || !targetInfo) return null;
+  if (!Number.isFinite(targetSeason) || targetSeason < 2) return null;
+
+  const targetBase = normalizeTitleForMatch(targetInfo.baseName || '');
+  if (!targetBase) return null;
+
+  // 收集 series 內所有「baseName 是 target baseName prefix」的 candidate。
+  const matched = [];
+  for (const item of list) {
+    if (!item?.vod_name) continue;
+    const info = extractEnhancedInfo(item.vod_name);
+    const itemBase = normalizeTitleForMatch(info.baseName || '');
+    // 雙向 prefix 匹配（target 可能比 candidate 短，或反之）。
+    if (!targetBase.startsWith(itemBase) && !itemBase.startsWith(targetBase)) continue;
+
+    // 副標題：baseName 之外的字串部分。
+    const subt = itemBase.startsWith(targetBase)
+      ? itemBase.slice(targetBase.length)
+      : '';
+    const year = info.year ?? (item.vod_year ? Number(item.vod_year) : null);
+    matched.push({ item, info, year, subt });
+  }
+  if (matched.length === 0) return null;
+
+  // 沒年份資料的歸為「未知」檔，不能參與分群判斷。
+  const withYear = matched.filter(m => m.year !== null);
+  if (withYear.length < 2) return null;
+
+  // 按年份排序分群：差距 > 2 年視為不同群。
+  // 例: 2018 (爱丽丝篇), 2019/2020 (异界战争+最終季) → 2 群
+  withYear.sort((a, b) => a.year - b.year);
+  const groups = [];
+  for (const m of withYear) {
+    const last = groups[groups.length - 1];
+    if (last && m.year - last[last.length - 1].year <= 2) {
+      last.push(m);
+    } else {
+      groups.push([m]);
+    }
+  }
+
+  // 安全閘：群數必須 ≥ targetSeason 才啟動，否則不啟動（避免把 S1 硬塞成 S4）。
+  if (groups.length < targetSeason) return null;
+
+  const targetGroup = groups[targetSeason - 1];
+  return {
+    groupYear: targetGroup[0].year,
+    items: targetGroup.map(m => m.item),
+    groupCount: groups.length,
+  };
 }
 
 function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standard') {
@@ -3314,73 +3389,88 @@ async function performBatchSearch(params) {
           : batchYearMarked.sequels;
 
         let siteResults = [];
+        // SAO 用了兩種互補的啟發式放行「主標題 + 空格 + 副標題」結構的條目：
+        //  1. 通用 findSubtitledSequels helper（line 970 後）：分析站內同一
+        //     baseName 條目，按年份分群，targetSeason 對應第 N 群。
+        //     適用於「單 series 動漫」（進擊的巨人、鬼滅之刃等）。
+        //  2. SAO-specific 規則（下方 S3-forced / S4-forced）：SAO 是個多 sub-series
+        //     集合（主線 + GGO + Progressive + 劇場版），通用 helper 的年份分群
+        //     會把整個 SAO 黏成 1~2 群，無法對齊 forward app metadata 切季邏輯
+        //     （S3=爱丽丝篇 Part 1 / S4=异界战争 Part 2 + 最終季 Part 3）。
+        //
+        //     因此 SAO 場景必須用副標題字串特徵直接判斷，**目前**只能 hardcode
+        //     SAO 字串（爱丽丝/异界战争/最終季/第2期）。
+        //     若未來其他多 sub-series IP（如「物語系列」、「TYPE-MOON 系列」）
+        //     也有同樣切季問題，需各自加 SAO 風格的 hardcode 啟發式。
+        //
+        // 先跑通用 helper，若有結果才用通用路徑；SAO 由下方 hardcode 補位。
+        let subtitledResult = null;
+        const allItems = response.list.filter(it => it?.vod_name);
+        if (allItems.length > 0) {
+          subtitledResult = findSubtitledSequels(
+            response.list, targetInfo, targetSeason, matchStrictness
+          );
+        }
         for (const item of response.list) {
           if (!item.vod_name) continue;
 
           const candidateInfo = extractEnhancedInfo(item.vod_name);
           const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness);
 
-          // 診斷 log: 對 S4 查詢特別關注「最终季/第2期/异界战争」候選
-          if (targetInfo.seasonNumber >= 4 && /最终季|最終季|第2期|第２期|异界战争|爱丽丝/.test(item.vod_name || '')) {
-            console.log(`🔍 [S4-cand] vod_name="${item.vod_name}" match=${matchResult.match} conf=${(matchResult.confidence || 0).toFixed(2)} type=${matchResult.type} sim=${(matchResult.similarity || 0).toFixed(2)} candSeason=${candidateInfo.seasonNumber}`);
-          }
-
-          // 對 S4 查詢的「最終季/第2期/爱丽丝篇/异界战争」候選強制放行：
-          // 站方把 SAO S3 後半命名為「刀剑神域爱丽丝篇异界战争最终季」(2020)，
-          // 實際內容是 SAO 第四季。但 target 簡寫「刀劍神域」vs candidate
-          // 「刀剑神域爱丽丝篇异界战争最终季」相似度只有 0.286，
-          // 被 matchResult.confidence >= 0.6 卡住 12 集全部進不來。
-          //
-          // 啟發式：candidate 含「最终季/第2期/爱丽丝篇/异界战争/愛麗絲」其一，
-          // 且片名前綴以 targetName 開頭 → 強制放行為 S4 fallback 候選。
-          //
-          // 風險控制：必須以 targetName 開頭（去掉空白後），避免其他動漫
-          // 剛好含「异界战争」字眼（如「Re:0」劇場版）誤推。
-          if (targetInfo.seasonNumber >= 4 && !matchResult.match) {
-            // 用 normalizeTitleForMatch 處理簡轉繁，去空白，讓 target 與 candidate
-            // 可以比較。targetInfo.rawName 是 Forward 傳入字串（繁體），item.vod_name
-            // 是站方回傳（簡體），不處理會誤判為不同前綴。
-            const candName = normalizeTitleForMatch(item.vod_name || '');
-            const tName = normalizeTitleForMatch(targetInfo.rawName || targetInfo.baseName || '');
-            // 必須同時含「最終季/最終季」或「第2期」其一，並且以 targetName 開頭。
-            // 只含「爱丽丝篇/异界战争」(2018/2019 S3 第1期) 不算 S4 fallback，
-            // 否則使用者點進去看到的還是 S3 內容，不是想要的 S4。
-            const hasFinalSeason = /最终季|最終季/.test(item.vod_name || '');
-            const hasSecondCour = /第\s*[2２]\s*期/.test(item.vod_name || '');
-            // SAO S4 = Alicization 後半 (Part 2 2019 + Part 3 2020)。
-            //   - Part 3 caiji/ffzy 標「最终季」、lzi 標「第 2 期」
-            //   - Part 2 (2019) 沒「最終季/第2期」標記，只用「爱丽丝篇 异界战争」區分。
-            // 若只放行 Part 3，使用者只看到 12 集，缺 24 集 Part 2。
-            // 補一個 hasAlicizationAndWar 條件抓 Part 2。
-            const hasAlicizationAndWar = /异界战争/.test(item.vod_name || '') &&
-              /爱丽丝|愛麗絲/.test(item.vod_name || '');
-            if ((hasFinalSeason || hasSecondCour || hasAlicizationAndWar) && tName && candName.startsWith(tName)) {
-              console.log(`🟢 [S4-forced] 放行 ${item.vod_name} (target=${tName}, cand=${candName}, sim=${(matchResult.similarity || 0).toFixed(2)})`);
-              matchResult.match = true;
-              matchResult.type = 's4_fallback_forced';
-              matchResult.confidence = 0.85;
+          // 通用副標題型續集群啟發式（適用於進擊的巨人、鬼滅之刃等單 series）：
+          // 當 candidate 不 match、但屬於 findSubtitledSequels 算出來的目標群 → 放行。
+          if (!matchResult.match && subtitledResult && subtitledResult.items) {
+              const inSubtitledGroup = subtitledResult.items.some(sg =>
+                (sg.vod_id && sg.vod_id === item.vod_id) ||
+                (sg.vod_name === item.vod_name)
+              );
+              if (inSubtitledGroup) {
+                console.log(`🟢 [subtitled-general] 放行 ${item.vod_name} (groupYear=${subtitledResult.groupYear}, groupCount=${subtitledResult.groupCount}, targetSeason=${targetSeason})`);
+                matchResult.match = true;
+                matchResult.type = 'subtitled_sequel_forced';
+                matchResult.confidence = 0.80;
+                matchResult.subtitledGroup = subtitledResult.groupYear;
+              }
             }
-          }
 
-          // 對 S3 查詢的「爱丽丝篇」候選強制放行：
-          // SAO S3 = Alicization Part 1 (2018)。各站命名：
-          //   - caiji/rycj/lzi：「刀剑神域 爱丽丝篇」
-          //   - ffzy：「刀剑神域第三季」
-          // 「爱丽丝篇」副標題讓 baseName 變長，sim 卡在 0.33~0.5 之間。
-          // 與 S4 的區分：S4 候選含「异界战争/最终季/第2期」副標題；
-          // 只含「爱丽丝」單獨的就是 S3 Part 1。
-          if (targetInfo.seasonNumber === 3 && !matchResult.match) {
+          // ===== SAO-specific hardcode 規則 =====
+          // ⚠️ 這部分只針對 SAO 系列，因 SAO 是多 sub-series 集合，
+          // 通用 helper 無法正確分群（見上方註解）。
+          // 啟發式：forward app metadata 切季方式為 S3=爱丽丝篇 (2018)、
+          // S4=异界战争 (2019) + 最终季 (2020)。比對 candidate name 含對應字串。
+          // 限制：必須以 targetName 開頭（去空白簡轉繁）以避免誤推其他動漫。
+          if (!matchResult.match) {
             const candName = normalizeTitleForMatch(item.vod_name || '');
             const tName = normalizeTitleForMatch(targetInfo.rawName || targetInfo.baseName || '');
-            const hasAlicizationOnly = /爱丽丝|愛麗絲/.test(item.vod_name || '') &&
-              !/异界战争/.test(item.vod_name || '') &&
-              !/最终季|最終季/.test(item.vod_name || '') &&
-              !/第\s*[2２]\s*期/.test(item.vod_name || '');
-            if (hasAlicizationOnly && tName && candName.startsWith(tName)) {
-              console.log(`🟢 [S3-forced] 放行 ${item.vod_name} (target=${tName}, cand=${candName}, sim=${(matchResult.similarity || 0).toFixed(2)})`);
-              matchResult.match = true;
-              matchResult.type = 's3_fallback_forced';
-              matchResult.confidence = 0.85;
+            const tBase = normalizeTitleForMatch(targetInfo.baseName || '');
+            const startsWithTarget = tName && (candName.startsWith(tName) || (tBase && candName.startsWith(tBase)));
+            if (startsWithTarget) {
+              const nm = item.vod_name || '';
+              const isSaoLike = /爱丽丝|愛麗絲|异界战争|最終季|最终季|第\s*[2２]\s*期/.test(nm);
+              if (isSaoLike) {
+                if (targetInfo.seasonNumber >= 4) {
+                  // S4 = Part 2 (异界战争) + Part 3 (最终季 / 第2期)
+                  const isPart2 = /异界战争/.test(nm) && /爱丽丝|愛麗絲/.test(nm);
+                  const isPart3 = /(?:最終季|最终季|第\s*[2２]\s*期)/.test(nm);
+                  if (isPart2 || isPart3) {
+                    console.log(`🟢 [SAO-S4-forced] 放行 ${nm} (target=${tName})`);
+                    matchResult.match = true;
+                    matchResult.type = 'sao_s4_forced';
+                    matchResult.confidence = 0.85;
+                  }
+                } else if (targetInfo.seasonNumber === 3) {
+                  // S3 = 爱丽丝篇 Part 1 (沒「异界战争/最終季/第2期」副標)
+                  const isPart1 = /爱丽丝|愛麗絲/.test(nm) &&
+                    !/异界战争/.test(nm) &&
+                    !/(?:最終季|最终季|第\s*[2２]\s*期)/.test(nm);
+                  if (isPart1) {
+                    console.log(`🟢 [SAO-S3-forced] 放行 ${nm} (target=${tName})`);
+                    matchResult.match = true;
+                    matchResult.type = 'sao_s3_forced';
+                    matchResult.confidence = 0.85;
+                  }
+                }
+              }
             }
           }
 
