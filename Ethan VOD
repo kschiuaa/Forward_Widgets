@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.9",
+  version: "2.6.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3921,18 +3921,30 @@ async function loadDetail(link) {
     if (!meta) return null;
 
     const title = meta.title;
-    // 沒帶 season 時先從標題推斷（「仁醫完結篇」「仁醫第二季」之類），
-    // 推斷不到才默認為 S1。
+    // 季別處理策略：
     //
-    // 為什麼：REX 客戶端切換季別時呼叫 loadDetail，傳進來的 link 有時不帶
-    // season（特別是用戶從其他頁面進入的場景）。原本 ?? 1 會把這類請求一律當
-    // S1 處理 —— 即使標題已經明確標示第N季也回 S1 結果，使用者看到的播放源
-    // 列表永遠是 S1。
+    // 場景 A — 初次載入詳細頁：link 不帶 season 參數 → season=null。
+    //   必須拿「所有季」的結果，REX 客戶端才能從 episodeItems 中
+    //   提取唯一 season 值列表顯示「季下拉」，使用者切換 S1↔S2 時
+    //   UI 才能即時對應到正確的 episodeItems。
     //
-    // 從 seriesName 推斷後，loadResource 內的 S2 過濾會被觸發，cache key
-    // 也會帶正確的 season。影片庫能在 REX 客戶端忘了帶季節參數時自我修正。
+    //   實作上呼叫兩次 loadResource（S=1, S=2 各自一次）合併結果。
+    //   為什麼不一次呼叫帶 season=null：loadResource 內部 cacheKey 帶
+    //   season，null 會命中 S1 的 cache key（S1 路徑），S2 結果就被忽略。
+    //   為什麼不只依賴 S1 + 從用戶點選的季再請求：使用者若從未點過 S2，
+    //   S2 episodeItems 永遠空，切換就沒反應。
+    //
+    // 場景 B — 切換季別時：link 帶 season=2 → 直接拿 S2 結果。
+    //   但我們仍把 S1 結果也合併進來，避免 S1 切到 S2 後 REX 客戶端
+    //   內部 state 把 S1 episodeItems 清空（只剩 S2），再次切回 S1 又得
+    //   重新發一次 loadDetail。
+    //
+    // 簡化為「任何場景都合併所有已知季別」即可滿足 REX UI 需求。
     let season = meta.season;
     if (season == null) {
+      // 沒帶 season 時先從標題推斷（「仁醫完結篇」「仁醫第二季」之類），
+      // 推斷不到才默認為 S1。這個值會用於 buildDownloadLink、per-episode
+      // 預設 season，分組時也以它當 fallback（clean.season 缺失時）。
       const inferredInfo = extractEnhancedInfo(title);
       season = inferredInfo.seasonNumber > 1 ? inferredInfo.seasonNumber : 1;
     }
@@ -3942,25 +3954,50 @@ async function loadDetail(link) {
 
     console.log(`📡 [loadDetail] link="${link}" → title="${title}" season=${season} episode=${episode ?? '-'} type=${type}`);
 
-    const results = await loadResource({
-      seriesName: title,
-      title,
-      type,
-      season,
-      episode,
-      id,
-      // link 同步帶進去；loadResource 若收到 link 會再解析一次。
-      // 帶 link 也能讓 cache key 包含時出/集 metadata。
-      link,
-      searchMode: 'smart_stream',
-      matchStrictness: 'standard',
-      preferResolution: 'auto',
-      // loadDetail 不帶 multiSource/VodData，會被 loadResource 內的早期守衛
-      // 判為「multiSource !== 'enabled'」直接 return []，導致 REX 詳細頁
-      // 切換季別時永遠顯示「無搜到資源」。從 WidgetMetadata 全域參數讀取後帶進來。
-      multiSource: (WidgetMetadata.globalParams.find(p => p.name === 'multiSource') || {}).value || 'enabled',
-      VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
-    });
+    // 合併多季結果：S1 + S2 各自一次。
+    //
+    // 為什麼是 2 次而不是全部可能季別：實務上 VOD 站對「仁醫」這類
+    // 跨多季作品的搜尋，前三站通常就能 cover S1 + S2 結果，S3+ 極少見
+    // 且命中率低（不同關鍵字不同 id）；況且 S3+ 大多需要用戶主動指定
+    // 季別才合理。第一次載入時先收 S1+S2，使用者點 S3 觸發的切換
+    // 會重新走場景 B（link 帶 season=3）拿到 S3 episodeItems。
+    //
+    // cacheKey 在 loadResource 內部帶 _s${season}，S1/S2 各有獨立 cache，
+    // 兩次呼叫分別命中各自的快取，不會重打站台。
+    const seasonsToFetch = [1, 2];
+    const seenUrl = new Set();
+    let allResults = [];
+    for (const s of seasonsToFetch) {
+      const batchResults = await loadResource({
+        seriesName: title,
+        title,
+        type,
+        season: s,
+        episode,
+        id,
+        link,
+        searchMode: 'smart_stream',
+        matchStrictness: 'standard',
+        preferResolution: 'auto',
+        multiSource: (WidgetMetadata.globalParams.find(p => p.name === 'multiSource') || {}).value || 'enabled',
+        VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
+      });
+      for (const r of batchResults || []) {
+        // 跨季去重：以 URL 為主鍵。同一 URL 出現在多季可能是因為多站
+        // 都引用了同個 CDN 資源（例如「仁醫」「仁醫完結篇」會被不同
+        // 站歸到不同季，但 URL 是同一個）。
+        if (!r.url || seenUrl.has(r.url)) continue;
+        seenUrl.add(r.url);
+        // 補上 season：S1 結果中很多資源 _seasonFromItem=null（站方檔名
+        // 沒寫「第N季」），cleanResourceForOutput 不會設置 season 頂層字段。
+        // 分組時若沒 season 會 fallback 到外層 season，可能把 S1 資源
+        // 誤歸到 S2（在 season=2 載入時）。呼叫端已知是查詢哪一季，
+        // 直接補上保證分組正確。
+        if (r.season == null) r.season = s;
+        allResults.push(r);
+      }
+    }
+    const results = allResults;
 
     if (!results || !results.length) {
       // 沒搜到資源時仍回傳一個最小 VideoItem，UI 不會變空白。
@@ -3975,23 +4012,31 @@ async function loadDetail(link) {
       };
     }
 
-    // 把 loadResource 回傳的「所有站的 m3u8 來源」依集數切開成 (season, episode)
+    // 把 loadResource 回傳的「所有站的 m3u8 來源」依 (season, episode)
     // 群組，產生 episodeItems。每個 episodeItem 自己也是一條 VideoItem，
     // 它的 link 帶著原 link 的 metadata + 該集集數，REX 點擊該集時
     // 會用新 link 再進入 loadResource；loadResource 內的 cache key 帶季別，
     // 第二次請求會直接命中該集的快取。
+    //
+    // 分組鍵用「資源自己的 season」而非外層 season 變數：因為我們合併
+    // 了 S1+S2 兩批結果，每個資源的 .season 頂層字段（clean 階段提升的
+    // _seasonFromItem）才是它的真實歸屬季，外層 season 在合併後已不可靠。
+    // 缺 season 標記的資源（_seasonFromItem=null）用外層 season 兜底。
     const groups = new Map();
     for (const r of results) {
       const epLabel = episodeLabelOf(r);
-      const key = `s${season}e${epLabel ?? 'x'}`;
+      const resSeason = Number.isFinite(r.season) ? r.season : season;
+      const key = `s${resSeason}e${epLabel ?? 'x'}`;
       if (!groups.has(key)) {
-        groups.set(key, { episode: epLabel, resources: [] });
+        groups.set(key, { season: resSeason, episode: epLabel, resources: [] });
       }
       groups.get(key).resources.push(r);
     }
 
-    // 集數排序：可識別集數按數字排，無集數的（綜藝日期、單集）放最後。
+    // 集數排序：先按 season，再按 episode。season 排序確保 S1 在前 S2 在後，
+    // REX 客戶端的季下拉 UI 會按這個順序排。
     const sortedGroups = Array.from(groups.values()).sort((a, b) => {
+      if (a.season !== b.season) return a.season - b.season;
       if (a.episode == null && b.episode == null) return 0;
       if (a.episode == null) return 1;
       if (b.episode == null) return -1;
@@ -4002,7 +4047,7 @@ async function loadDetail(link) {
       const first = g.resources[0];
       const epLink = buildDetailLink({
         title,
-        season,
+        season: g.season,         // 用資源自己的 season，跨季載入 metadata
         episode: g.episode ?? undefined,
         type,
         id,
@@ -4019,7 +4064,7 @@ async function loadDetail(link) {
         title: displayTitle,
         mediaType: type,
         description: first?.description || title,
-        season,
+        season: g.season,         // 必須是資源歸屬季，客戶端用它過濾切換季別
         episode: g.episode ?? undefined,
         // 該集首選播放 URL；其他站的來源可透過 loadResource 重新取得。
         videoUrl: first?.url,
@@ -4037,16 +4082,22 @@ async function loadDetail(link) {
       };
     });
 
-    const mainLink = buildDetailLink({ title, season, type, id });
+    // 主 VideoItem 的 season 標籤：採「合併結果中實際存在且最小的季別」。
+    // 初次載入無 season → sortedGroups 第一個 = S1（有實際結果）。
+    // 切到 S2 載入時 → sortedGroups 第一個仍是 S1（合併進 S1+S2 後最小季），
+    //   顯示 S1 也合理，使用者看到「共 N 集」即知範圍。
+    const mainSeason = sortedGroups.length > 0 ? sortedGroups[0].season : season;
+
+    const mainLink = buildDetailLink({ title, season: mainSeason, type, id });
 
     return {
       id: mainLink,
       type: 'url',
       title,
       mediaType: type,
-      description: type === 'movie' ? `電影：${title}` : `${title}（第${season}季，共 ${episodeItems.length} 集）`,
+      description: type === 'movie' ? `電影：${title}` : `${title}（共 ${episodeItems.length} 集）`,
       link: mainLink,
-      season,
+      season: mainSeason,
       // 電影沒有 episodeItems；REX UI 會自動隱藏集數面板。
       ...(type === 'tv' ? { episodeItems } : {}),
     };
