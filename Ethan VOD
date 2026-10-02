@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.3.3",
+  version: "2.3.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2683,6 +2683,12 @@ async function loadResource(params, onStreamResult = null) {
     if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
       finalResults = r.kept;
       console.log(`🎯 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
+      // 進入此分支表示 filterBySequel 確實有做 drop（kept < before），
+      // 若同時也有 s4FallbackCandidates 表示 r.kept 不包含 S3 後半候選，
+      // 需要把 fallback 候選塞回去並排在最前。
+      if (r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
+        s4FallbackUsed = true;
+      }
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
       console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾無命中(${r.before}筆)，保留全部候選`);
     } else if (r.kept && r.kept.length === r.before && r.before > 0) {
@@ -2709,7 +2715,16 @@ async function loadResource(params, onStreamResult = null) {
           cand.description = `⚠️ 站方無「第${targetInfo.seasonNumber}季」資料，這是依片名推算的 S3 後半候選\n${cand.description}`;
         }
       }
-      finalResults = [...r.s4FallbackCandidates, ...finalResults];
+      // 純化：使用者搜第4季，要看到的每一條都跟 S3 後半相關，
+      // 不要混入 S1/S2 等無關季內容。S4 站方沒資料，S3 後半 (2020) 是
+      // 已知最接近的內容，列為唯一切分才不會讓使用者誤點。
+      //
+      // 僅在 s4FallbackCandidates.length > 0 時才純化，避免空清單。
+      if (r.s4FallbackCandidates.length > 0) {
+        finalResults = [...r.s4FallbackCandidates];
+      } else {
+        finalResults = [...r.s4FallbackCandidates, ...finalResults];
+      }
     }
   }
 
@@ -3482,7 +3497,18 @@ async function performBatchSearch(params) {
           cand.description = `⚠️ 站方無「第${targetInfo.seasonNumber}季」資料，這是依片名推算的 S3 後半候選\n${cand.description}`;
         }
       }
-      finalResults = [...r.s4FallbackCandidates, ...finalResults];
+      // 純化策略：使用者搜第4季時，要看到的每一條都跟 S3 後半相關，
+      // 不要混入 S1/S2 (2012/2014/2019) 等「無關季」內容。S4 站方沒資料，
+      // S3 後半 (2020) 是已知最接近的內容，列為唯一切分才不會讓使用者誤點。
+      //
+      // 風險：若 s4FallbackCandidates 為空陣列（罕見但可能），結果會變成空清單。
+      // 為避免空清單，僅在 s4FallbackCandidates.length > 0 時才純化。
+      if (r.s4FallbackCandidates.length > 0) {
+        finalResults = [...r.s4FallbackCandidates];
+        console.log(`🟢 S4 fallback 純化: 已用 ${r.s4FallbackCandidates.length} 條「最終季/第2期」候選完全取代 ${finalResults.length === r.s4FallbackCandidates.length ? r.kept.length : finalResults.length} 條 S1/S2 候選`);
+      } else {
+        finalResults = [...r.s4FallbackCandidates, ...finalResults];
+      }
     }
   }
 
