@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.8",
+  version: "2.1.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1268,13 +1268,15 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
             _updateRecency: vod_remarks.includes('更新') || vod_remarks.includes('第') ? 1 : 0,
             _year: itemYear,
             _area: itemArea,
+            // 站方原始片名，去重要用它分辨「同名但不同版本」。
+            _rawName: vod_name,
             _seasonMatch: matchInfo.seasonMatch,
             _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
             _versionAmbiguous: !yearConflict && isVersionAmbiguous(targetInfo, vod_name),
             _areaMismatch: areaMismatch,
             _areaMatch: areaMatch
           };
-          
+
           results.push(resource);
         }
       });
@@ -2485,7 +2487,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-debug-logs.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -2870,25 +2872,6 @@ function filterBySequel(results, targetInfo) {
     .filter(y => y && Number.isFinite(y));
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
-  // TEMP debug: 確認 sequelMatched 與 pooledYearMin 實際值
-  console.log(`[fbseq] before=${before} targetSeason=${targetSeason} sequelMatched=${sequelMatched.length} pooledYearMin=${pooledYearMin}`);
-  for (const sm of sequelMatched.slice(0, 5)) {
-    console.log(`  [sm] name="${sm.name}" _rawName="${sm._rawName}" _year=${sm._year}`);
-  }
-  // 印輸入的 _rawName 含「仁医2」「仁医完结」之類的
-  if (before > 0) {
-    let n = 0;
-    for (const r of results) {
-      const rn = r._rawName || '';
-      if (rn.includes('仁医2') || rn.includes('仁医完结') || rn.includes('仁醫2') || rn.includes('仁醫完')) {
-        console.log(`  [input] name="${r.name}" _rawName="${r._rawName}" _year=${r._year} extractSeq=${extractSequelNumber(r._rawName)}`);
-        n++;
-        if (n > 10) break;
-      }
-    }
-    console.log(`  matched samples count: ${n}`);
-  }
-
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
   const unversionedBases = new Map();
@@ -3250,10 +3233,6 @@ async function performBatchSearch(params) {
               }
             }
             const resources = extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
-            // TEMP debug: 看實際 _rawName 進 batch 是什麼
-            if (item.vod_name && (item.vod_name.includes('仁医') || item.vod_name.includes('仁醫'))) {
-              console.log(`  [batch] name="${site.title}" vod_name="${item.vod_name}" matched=${matchResult.match} -> first rawName=${resources[0]?._rawName} count=${resources.length}`);
-            }
             siteResults.push(...resources);
           }
         }
