@@ -149,7 +149,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 12,
+  WIDGET_VERSION: 13,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.2.8",
+  version: "2.2.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2514,7 +2514,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path-plus-wanjiepian-equals-sequel2-plus-explicitDifferentSeason-drop-plus-rule3-strict1Year-plus-stripSubtitle-tilde-plus-description-dot-sep-no-dash-no-sourceTag-no-finished-versionTag-with-year-koku-plus-movie-nonMainRelease-dotSuffix-plus-stripSubtitle-midEdition.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path-plus-wanjiepian-equals-sequel2-plus-explicitDifferentSeason-drop-plus-rule3-strict1Year-plus-stripSubtitle-tilde-plus-description-dot-sep-no-dash-no-sourceTag-no-finished-versionTag-with-year-koku-plus-movie-nonMainRelease-dotSuffix-plus-stripSubtitle-midEdition-plus-loadResource-filter-skip-for-batch-mode.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -2669,19 +2669,18 @@ async function loadResource(params, onStreamResult = null) {
   // 安全網：如果過濾後 0 筆，退而求其次 —— 不過濾全部推播，
   // 至少使用者會看到候選項目（會包含第一季內容，但比「空白」好）。
 // 續集季別過濾（共用 helper，cache 命中路徑與 batch 路徑都會經過）。
-  if (type === 'tv') {
+//
+// 為什麼 batch 模式跳過：performBatchSearch 內部（file 結尾的 batch 路徑）
+// 已套用 filterBySequel 並把結果回傳，loadResource 收到時 _rawName / _year
+// 都已被 cleanResourceForOutput 剝掉，再跑一次 filter 會全部 fall back 到
+// description 解析，雖然「碰巧」能正確判斷（description 還含「第三季」字
+// 樣），但屬於無謂的二次處理、浪費效能、也容易因 log 顯示「_rawName=undefined」
+// 誤導除錯。stream / auto 模式仍需在此 filter（performSmartSearch 內部不跑）。
+  if (type === 'tv' && searchMode !== 'batch') {
     const r = filterBySequel(finalResults, targetInfo);
     if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
       finalResults = r.kept;
       console.log(`🎯 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
-      console.log(`[stream dropped=${r.dropped.length}]`);
-      for (const d of r.dropped) {
-        console.log(`  ❌ name="${d.name}" desc="${d.description}" _year=${d._year} _rawName="${d._rawName}"`);
-      }
-      console.log(`[stream kept=${r.kept.length}]`);
-      for (const k of r.kept) {
-        console.log(`  ✅ name="${k.name}" desc="${k.description}" _year=${k._year} _rawName="${k._rawName}"`);
-      }
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
       console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾無命中(${r.before}筆)，保留全部候選`);
     } else if (r.kept && r.kept.length === r.before && r.before > 0) {
@@ -2899,14 +2898,6 @@ function filterBySequel(results, targetInfo) {
     .filter(y => y && Number.isFinite(y));
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
-  // TEMP debug: 確認 sequelMatched 與 pooledYearMin
-  console.log(`[fbseq] before=${before} sequelMatched=${sequelMatched.length} pooledYearMin=${pooledYearMin}`);
-  // 列出 S3 candidate (Sequel=3, targetSeason=3) 與 S1 candidate (Sequel=null, _year=2006) 各 3 個
-  const s3cands = results.filter(r => extractSequelNumber(r._rawName || '') === 3).slice(0, 3);
-  const s1cands = results.filter(r => extractSequelNumber(r._rawName || '') === null).slice(0, 3);
-  for (const s of s3cands) console.log(`  [s3-cand] "${s.name}" _rawName="${s._rawName}" _year=${s._year} desc="${s.description}" url=${s.url}`);
-  for (const s of s1cands) console.log(`  [s1-cand] "${s.name}" _rawName="${s._rawName}" _year=${s._year} desc="${s.description}" url=${s.url}`);
-
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
   const unversionedBases = new Map();
@@ -2947,7 +2938,6 @@ if (sequel === targetSeason) { kept.push(res); continue; }
     // 例外：target 沒寫季（_expectedSequel 補入），candidate sequel=null
     // 應該用規則 2 / 規則 3，不會走到這裡（sequel=null 跳過這條 if）。
     // 所以「sequel !== null 且 sequel !== targetSeason」可以無條件 drop。
-    console.log(`  [drop-ruleX-explicitDifferentSeason] name="${res.name}" rawName="${rawName}" sequel=${sequel} targetSeason=${targetSeason}`);
     dropped.push(res); continue;
   }
 
@@ -2975,7 +2965,6 @@ if (sequel === targetSeason) { kept.push(res); continue; }
       // 把「candYear == pooledYearMin - 1」當 borderline 留著會讓 S1 整季漏網
       // 混進 S2 結果（典型例子：「零之使魔」S1=2006、S2=2007，差 1 年）。
       if (candYear && candYear < pooledYearMin) {
-        console.log(`  [drop-rule3] name="${res.name}" rawName="${rawName}" candYear=${candYear} pooledYearMin=${pooledYearMin} (${candYear} < ${pooledYearMin})`);
         dropped.push(res); continue;
       }
       // DEBUG: 印出通過/沒通過規則 3 的情況，幫忙定位漏網之魚
@@ -3008,7 +2997,6 @@ if (sequel === targetSeason) { kept.push(res); continue; }
       const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
       // 候選年份 = pooledYearMin + 1 → 同時代另一版本嫌疑
       if (candYear && candYear === pooledYearMin + 1) {
-        console.log(`  [drop-rule3.6-sameEraVersion] name="${res.name}" rawName="${rawName}" candYear=${candYear} pooledYearMin=${pooledYearMin}`);
         dropped.push(res); continue;
       }
     }
@@ -3349,14 +3337,6 @@ async function performBatchSearch(params) {
     if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
       finalResults = r.kept;
       console.log(`🎯 第${targetInfo.seasonNumber}季過濾(batch): ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
-      console.log(`[batch dropped=${r.dropped.length}]`);
-      for (const d of r.dropped) {
-        console.log(`  ❌ name="${d.name}" desc="${d.description}" _year=${d._year} _rawName="${d._rawName}"`);
-      }
-      console.log(`[batch kept=${r.kept.length}]`);
-      for (const k of r.kept) {
-        console.log(`  ✅ name="${k.name}" desc="${k.description}" _year=${k._year} _rawName="${k._rawName}"`);
-      }
       console.log(`📊 第2季過濾後送往 forward app 的最終清單（confirm count）: ${finalResults.length}`);
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
       console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾(batch)無命中(${r.before}筆)，保留全部候選`);
