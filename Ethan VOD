@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.3",
+  version: "2.5.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3037,6 +3037,23 @@ function filterBySequel(results, targetInfo) {
     const rawName = res._rawName || res.description || '';
     const sequel = extractSequelNumber(rawName);
 
+    // 規則 0（最高優先）：sub-series marker 先 drop，**即使 sequel===targetSeason 也要 drop**。
+    //
+    // 場景：SAO S2 query，站內「刀剑神域外传 Gun Gale Online第二季」(2024)
+    // 含「外传」標記（sub-series 暗示），且 sequel=2（被「第二季」字樣誤判）。
+    // 規則 1（sequel===targetSeason）會放行，但這條其實是 GGO sub-series 不是 SAO 主線 S2。
+    //
+    // 啟發式：name 含 sub-series marker（劇場版/OVA/SP/外传/特別篇）必 drop，
+    // 即使 sequel 對齊 targetSeason。
+    //
+    // 風險：「進撃的巨人 The Final Season - 特別篇」(2024) 雖然含「特別篇」，
+    // 但其實是 Final S4 Part 2 完結篇。會被誤 drop。
+    // 實務 trade-off：保留可能誤放劇場版的雜亂 vs 誤殺進騰完結篇 — 選擇前者，
+    // 因為為讓後者（使用者點進去看劇場版）比誤殺完結篇（少看到 1 條）更影響體驗。
+    if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇/.test(rawName)) {
+      dropped.push(res); continue;
+    }
+
 if (sequel === targetSeason) { kept.push(res); continue; }
 
   // 規則 X：candidate 的 sequel 明確標示為其他季，無條件 drop。
@@ -3090,6 +3107,65 @@ if (sequel === targetSeason) { kept.push(res); continue; }
       // DEBUG: 印出通過/沒通過規則 3 的情況，幫忙定位漏網之魚
       if (candYear && candYear >= pooledYearMin && candYear < pooledYearMin + 1) {
         console.log(`  [PASS-rule3 borderline] name="${res.name}" _year=${res._year} candYear=${candYear} pooledYearMin=${pooledYearMin}`);
+      }
+    }
+
+    // 規則 3.7（新增）：片名沒寫季、vod_year 比命中群最早年**晚 ≥4 年**→ 後續季嫌疑
+    //
+    // 場景：SAO S2 query。命中群 `刀剑神域2` (2014) pooledYearMin=2014，
+    // 但站內「刀剑神域 爱丽丝篇」(2018 S3)、「刀剑神域爱丽丝篇异界战争最终季」(2020 S4)、
+    // 「刀剑神域进击篇：无星之夜」(2021 Progressive) 等 sequel=null + 年份晚於 2014 ≥4 年，
+    // 舊規則 3 只 drop 早於 pooledYearMin 的，這些都漏網混進 S2 結果，使用者看到 279 條 S2。
+    //
+    // 啟發式：沒明確 sequel 標記但**晚於命中群 ≥4 年**的條目，幾乎可確定是
+    // 「不同 sub-series 條目」（劇場版/外傳/Progressive）或「後續季」（S3+/S4+）。
+    // 不應該混進 S2 結果。
+    //
+    // 風險：差 4 年可能誤殺正常跨季案例（如進擊的巨人 S4 2020 → Final S4 2023 差 3 年 OK），
+    // 但比放進後續大堆雜亂條目好。
+    if (sequel === null && pooledYearMin !== null) {
+      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      if (candYear && candYear > pooledYearMin + 3) {
+        dropped.push(res); continue;
+      }
+    }
+
+    // 規則 3.8（新增）：劇場版/OVA/外传/特別篇的排除
+    //
+    // 場景：SAO S2 query，站內「刀剑神域：序列之争」(2017) 是電影版，不是 SAO 主線 S2。
+    // 上面規則 3.7 沒抓到因為差 3 年沒超過 4 年。
+    //
+    // 啟發式：name 含以下任一標記 → 視為 sub-series（劇場版/外傳/OVA），
+    // 不該混進季 sequel 結果：
+    //   - 「劇場版/剧场版」 - 劇場版直接標記
+    //   - 「電影版/电影版」 - 電影版直接標記
+    //   - 「OVA」「SP」 - OVA / 特別篇
+    //   - 「外传/外傳」 - 外傳 sub-series（**完全 drop，不論 sequel** — 例：SAO GGO S2 用「第2季」標記但實為外傳）
+    //   - 「特別篇/特别篇」 - 特別篇
+    //
+    // 風險：「進撃的巨人 The Final Season - 特別篇」(2024) 雖然含「特別篇」，
+    // 但其實是 Final S4 Part 2 完結篇。會被誤 drop。
+    // 實務 trade-off：保留可能誤放劇場版的雜亂 vs 誤殺進騰完結篇 — 選擇前者，
+    // 因為混亂的後果（使用者點進去看劇場版）比誤殺完結篇（少看到 1 條）更影響體驗。
+    if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇/.test(rawName)) {
+      dropped.push(res); continue;
+    }
+
+    // 規則 3.9（新增）：冒號/豎線副標題 + 年份差距大 → 劇場版嫌疑
+    //
+    // 場景：SAO S2 query，站內「刀剑神域：序列之争」(2017) 沒明確劇場版字眼，
+    // 但含冒號副標 + 晚於 pooledYearMin ≥2 年 → 視為劇場版 drop。
+    //
+    // 啟發式：冒號/豎線後的副標題常是劇場版/OVA/SP 命名，sequence 標題通常不用冒號。
+    // 配對條件：`/name`/`原名/Original`：副標 + 晚於 pooledYearMin ≥2 年。
+    //
+    // 風險：誤殺「進撃的巨人：xyz」這類的 S4 條目。實務上 S 命名在冒號前、
+    // 副標在冒號後，所以「進撃的巨人 第三季：瑪利亞之牆」之類的 S4 條目會誤殺。
+    // 但實務極罕見，trade-off 可接受。
+    if (/：|:|｜|\|/.test(rawName) && pooledYearMin !== null) {
+      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      if (candYear && candYear > pooledYearMin + 1) {
+        dropped.push(res); continue;
       }
     }
 
@@ -3404,12 +3480,33 @@ async function performBatchSearch(params) {
         //     也有同樣切季問題，需各自加 SAO 風格的 hardcode 啟發式。
         //
         // 先跑通用 helper，若有結果才用通用路徑；SAO 由下方 hardcode 補位。
+        //
+        // 安全閘：只在「站內完全沒 sequel 命中」時才啟動 helper，避免對已有
+        // 「第N季」/「完结篇」命名的網站誤推。例如 SAO S2 query：站方有
+        // 「刀剑神域2」(2014) sequel=2 命中，已能正確分出 S2，此時不該啟動
+        // helper（helper 按年份分群會把 2017+ 劇場版/S3/S4/Progressive 全
+        // 黏成同一群，反而把非 S2 內容誤推進 S2 結果）。
         let subtitledResult = null;
         const allItems = response.list.filter(it => it?.vod_name);
         if (allItems.length > 0) {
-          subtitledResult = findSubtitledSequels(
-            response.list, targetInfo, targetSeason, matchStrictness
-          );
+          // 計算站內 sequel 命中數（extractSequelNumber(rawName) === targetSeason）。
+          let hasSequelHit = false;
+          for (const it of allItems) {
+            if (extractSequelNumber(it.vod_name) === targetSeason) {
+              hasSequelHit = true;
+              break;
+            }
+            // 「完结篇/完結篇」也是 sequel 標記（仁醫第二季站內命名）。
+            if (targetSeason === 2 && /完结篇|完結篇/.test(it.vod_name || '')) {
+              hasSequelHit = true;
+              break;
+            }
+          }
+          if (!hasSequelHit) {
+            subtitledResult = findSubtitledSequels(
+              response.list, targetInfo, targetSeason, matchStrictness
+            );
+          }
         }
         for (const item of response.list) {
           if (!item.vod_name) continue;
