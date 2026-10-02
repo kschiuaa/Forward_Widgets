@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.4.0",
+  version: "2.4.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2873,23 +2873,10 @@ async function loadResource(params, onStreamResult = null) {
 // 正確解法：搜尋字串只放裸片名，續集識別交給 isSmartSeriesMatch 內的
 // season 比對 + sequel 邏輯處理。
 function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
-  let base = String(searchQuery)
+  const base = String(searchQuery)
     .replace(/(?:19|20)\d{2}\s*$/, '')  // 年份交給結果階段，這裡不帶
     .replace(/\s+$/, '')
     .trim();
-  // 搜尋字串要帶上季別，否則資源站一律回傳第一季，過濾階段必須在所有
-  // 季的內容裡抓正確版本，命中率被稀釋。
-  //
-  // 參數順序：targetSeason（從 params.season 解析）比 rawName 推導的
-  // seasonNumber 更權威 —— rawName 為「仁醫」+ season=2 時，rawName 沒有
-  // 「第2季」字眼，extractEnhancedInfo 推得 seasonNumber=1，會誤判為
-  // 第 1 季查詢；用 targetSeason 強制加 2 才會得到 S2 內容。
-  //
-  // 序號緊貼片名：「刀剑神域3」沒空格才會命中，「刀剑神域 3」五站零結果。
-  // 第 1 季不加分：原季多半沒有序號，加了反而查不到。
-  if (Number.isFinite(targetSeason) && targetSeason > 1) {
-    base += String(targetSeason);
-  }
   return base;
 }
 
@@ -2945,19 +2932,6 @@ function filterBySequel(results, targetInfo) {
   }
 
   const before = results.length;
-
-  // DEBUG: dump results 的 _rawName/_year 分組，定位「異界戰爭」系列 _year 真實值
-  const debugGrouped = {};
-  for (const r of results) {
-    const rn = r._rawName || r.description || '';
-    const y = r._year;
-    const k = `${rn.slice(0, 30)}|${y}`;
-    debugGrouped[k] = (debugGrouped[k] || 0) + 1;
-  }
-  console.log(`🔍 [filterBySequel] targetSeason=${targetSeason} before=${before}`);
-  for (const [k, n] of Object.entries(debugGrouped).sort((a, b) => b[1] - a[1]).slice(0, 20)) {
-    console.log(`    ${n}x: ${k}`);
-  }
 
   // 命中群：明確標為第 targetSeason 季的候選，用它們的年份決定 pooledYearMin。
   const sequelMatched = results.filter(res => {
@@ -3064,32 +3038,13 @@ if (sequel === targetSeason) { kept.push(res); continue; }
     //
     // 為什麼不直接用「baseName 跨站一致性」：仁醫 case 樂子的「仁医」vod_year
     // 就是 2012（韓版），跨站看起來 baseName 一致但其實是韓版，啟發式反被誤導。
-    // 規則 3.6（同時代另一版本嫌疑）已被取消。
-//
-// 原本設計是為了解決「仁醫 S2 韓版翻拍 2012」case：
-//   - user 搜「仁醫」+ season=2
-//   - 候選 _year 集合 {2009, 2011, 2012}，2012 = pooledYearMin(2011) + 1
-//   - 韓版 2012 被當成「同時代另一版本」drop
-//
-// 但對 SAO S3 case 造成誤殺：
-//   - user 搜「刀劍神域」+ season=3
-//   - sequelMatched「刀劍神域第三季」_year=2018，pooledYearMin=2018
-//   - 「刀劍神域愛麗絲篇異界戰爭」_year=2019 = 2018+1 → 被當「韓版翻拍」誤殺
-//
-// 但實際「異界戰爭」2019 是 SAO S3 第1期正片，不是翻拍。
-//
-// 原本嘗試用 _area 例外（候選與 sequelMatched 同地區則保留）：
-//   - SAO case「異界戰爭」_area 應為「jp」與 sequelMatched 一致 → 應放行
-//   - 但 VOD 站 dytt-hot/ffzy 對「愛麗麗姬篇」系列 metadata 不一致，
-//     不少條目 _area=null 或空字串導致例外不命中 → 仍被誤殺
-//
-// 結論：規則 3.6 在 SAO S3 case 誤殺成本太高（最多 17+ 條 S3 第1期內容），
-// 而「仁醫 韓版翻拍」只有 1 個案例。為不相稱的成本放棄這條規則。
-//
-// 風險：仁醫韓版可能進 S2 結果。使用者掃描會略過韓版（韓語發音 + 片名風格不同）。
-//
-// 規則保留：candYear < pooledYearMin (規則 3) 仍正常運作，可避免大部分
-// 跨年對位誤殺。
+    if (sequel === null && pooledYearMin !== null) {
+      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      // 候選年份 = pooledYearMin + 1 → 同時代另一版本嫌疑
+      if (candYear && candYear === pooledYearMin + 1) {
+        dropped.push(res); continue;
+      }
+    }
 
     // 片名沒寫季也沒年份、且跨多站回傳同一 baseName → 上一季嫌疑
     // （只有 1 站回的可能是另一季沒寫季的合法結果，2 站以上才殺）
