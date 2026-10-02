@@ -149,7 +149,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 13,
+  WIDGET_VERSION: 14,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.4",
+  version: "2.5.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1368,6 +1368,10 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
             _area: itemArea,
             // 站方原始片名，去重要用它分辨「同名但不同版本」。
             _rawName: vod_name,
+            // 所屬 VOD item 推論出的季別（sequel 序號）。
+            // loadDetail 內會用這個欄位把來自多季的資源分組到正確的 season。
+            // 不寫進 finalResults（fieldsToDelete 會清掉）以免影響排序邏輯。
+            _seasonFromItem: extractSequelNumber(vod_name),
             _seasonMatch: matchInfo.seasonMatch,
             _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
             _versionAmbiguous: !yearConflict && isVersionAmbiguous(targetInfo, vod_name),
@@ -2527,6 +2531,26 @@ function cleanResourceForOutput(resource) {
 }
 
 async function loadResource(params, onStreamResult = null) {
+  // REX 規範的 params.link 是 search:<title>?season=N&episode=M 格式。
+  // 解析後把 metadata 套到 season / episode / type 欄位，這樣 cache key
+  // 與後續搜尋邏輯都會以正確的季別運作 —— REX 切到第二季時重新呼叫
+  // loadResource，cache key (vod_smart_..._s${season}_...) 跟著變動，
+  // 不會再讀回第一季的結果。
+  //
+  // 優先順序：呼叫端已明確指定的 season/episode > link 解析出的。
+  // 原因：loadDetail 內部呼叫 loadResource 時，link 跟 season 都是同步
+  // 設定的；link 解析出來的只是備援。REX 直接呼叫 loadResource 時，
+  // 季別多半是從 link 拿（因為 REX 呼叫 loadResource 不一定會帶 season）。
+  if (params?.link && typeof params.link === 'string' && params.link.startsWith(DETAIL_LINK_PREFIX)) {
+    const meta = parseDetailLink(params.link);
+    if (meta) {
+      if (params.season == null && meta.season != null) params.season = meta.season;
+      if (params.episode == null && meta.episode != null) params.episode = meta.episode;
+      if ((params.type == null || params.type === 'tv') && meta.type === 'movie') params.type = meta.type;
+      if (!params.id && meta.id) params.id = meta.id;
+    }
+  }
+
   const {
     type = 'tv',
     season,
@@ -2829,7 +2853,7 @@ async function loadResource(params, onStreamResult = null) {
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
     '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
-    '_s4FallbackBoost'
+    '_s4FallbackBoost', '_seasonFromItem'
   ];
   
   finalResults.forEach(res => {
@@ -3758,7 +3782,7 @@ async function performBatchSearch(params) {
                          '_isVariety', '_episodeDate', '_confidence',
                          '_versionConflict', '_versionAmbiguous',
                          '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
-                         '_s4FallbackBoost'];
+                         '_s4FallbackBoost', '_seasonFromItem'];
   finalResults.forEach(res => {
     const cleaned = cleanResourceForOutput(res);
     Object.keys(res).forEach(k => delete res[k]);
@@ -3768,37 +3792,215 @@ async function performBatchSearch(params) {
   return finalResults.slice(0, 100);
 }
 
+// ==================== REX 規範：詳情頁與連結工具 ====================
+//
+// 設計目標：REX 詳細頁要能依季別正確載入播放源。
+//
+// 問題直觀：原本的 loadDetail 把 type 寫死成 movie、也沒傳 season 給
+// loadResource。進到 REX 詳細頁時，使用者從 S1 切到 S2 看到的是同一份
+// S1 結果，因為：
+//  1. loadDetail 寫死 type='movie'，不會進入 TV 季別過濾路徑
+//  2. 即使改成 tv，season 參數也沒傳入，內部 filter 預設為 1
+//  3. cache key (vod_smart_..._s${season}_...) 永遠是 S1，REX 切 S2
+//     也會讀到 S1 的 cache
+//
+// 解法：把 seriesName / season / episode / type 等資訊編進 link，
+// REX 切換季別時用新 link 重新呼叫 loadDetail（或由 REX 直接用
+// loadResource 帶新 params），新 link 解析後帶入正確的季別。
+//
+// 為什麼 link 格式是 search:xxx?season=N&episode=M：
+//  - search: 前綴保留向後相容（舊 link 不帶參數仍可解）
+//  - 將 metadata 編進 query string 讓 link 本身就是自描述的，
+//    即使被存進 storage 也不會失語意
+//  - season / episode 缺失時預設 1 / null，行為等同「不指定季別」
+//
+// 為什麼 loadDetail 還是要呼叫 loadResource：
+//  loadResource 內含複雜的搜尋/過濾/排序/快取邏輯，全部搬過來不划算；
+//  唯一要做的介面轉換是：把 episodeItems 攤平成 (season, episode)
+//  列表、把多個 m3u8 來源合併成一條可選的播放線路。
+
+const DETAIL_LINK_PREFIX = 'search:';
+
+function parseDetailLink(link) {
+  if (!link) return null;
+  const raw = String(link).trim();
+  if (!raw.startsWith(DETAIL_LINK_PREFIX)) return null;
+  const rest = raw.slice(DETAIL_LINK_PREFIX.length);
+  // query string 用 urlsearchparams 解。中文與空格由 encodeURIComponent
+  // 處理；不要在這裡直接 split('&')，使用者標題可能含 &。
+  const qIdx = rest.indexOf('?');
+  const titlePart = qIdx >= 0 ? rest.slice(0, qIdx) : rest;
+  const queryPart = qIdx >= 0 ? rest.slice(qIdx + 1) : '';
+  const title = decodeURIComponent(titlePart).trim();
+  if (!title) return null;
+
+  const meta = { title };
+  if (queryPart) {
+    const sp = new URLSearchParams(queryPart);
+    if (sp.has('season')) {
+      const s = parseInt(sp.get('season'), 10);
+      if (Number.isFinite(s) && s >= 1) meta.season = s;
+    }
+    if (sp.has('episode')) {
+      const e = parseInt(sp.get('episode'), 10);
+      if (Number.isFinite(e) && e >= 1) meta.episode = e;
+    }
+    if (sp.has('type')) {
+      const t = String(sp.get('type') || '').toLowerCase();
+      if (t === 'tv' || t === 'movie') meta.type = t;
+    }
+    if (sp.has('id')) meta.id = String(sp.get('id') || '');
+  }
+  return meta;
+}
+
+function buildDetailLink({ title, season, episode, type, id }) {
+  const enc = encodeURIComponent(String(title || '').trim());
+  const sp = new URLSearchParams();
+  if (season && Number.isFinite(season) && season >= 1) sp.set('season', String(season));
+  if (episode && Number.isFinite(episode) && episode >= 1) sp.set('episode', String(episode));
+  if (type === 'tv' || type === 'movie') sp.set('type', type);
+  if (id) sp.set('id', String(id));
+  const qs = sp.toString();
+  return `${DETAIL_LINK_PREFIX}${enc}${qs ? `?${qs}` : ''}`;
+}
+
 /**
- * REX 規範：詳情頁入口。給一個片名/連結，回傳 VideoItem[]。
- * 最小實作：直接呼叫 loadResource 取得資源，組裝出 VideoItem。
- * link 格式：`search:<title>` 表示用標題搜索；其餘當作直接 ID 透傳。
+ * REX 規範：詳情頁入口。
+ *
+ * 行為：解析 link 內含的 metadata，呼叫 loadResource 取得當季所有來源，
+ * 再把結果依集數分組為 episodeItems。每集可能有多個站的播放源，
+ * 主 VideoItem 帶 episodeItems 與正確的 season。
+ *
+ * link 格式：`search:<標題>[?season=N&episode=M&type=tv&id=...]`
+ *
+ * 切換季別：REX 詳細頁在切換季別時，可用新的 `search:<標題>?season=2`
+ * 重新呼叫 loadDetail；本函式會用新 season 重新搜尋，cache key
+ * (vod_smart_..._s${season}_...) 跟著變動，舊 S1 cache 不會被誤讀。
+ *
+ * 對應的 loadResource 入口：當 REX 用 loadResource(params) 帶新 link
+ * 進來，params.link 是 search: 開頭時，loadResource 也會從 link 解析
+ * 季別並套用，兩個入口共用同一條 loadResource 邏輯。
  *
  * @param {string} link
- * @returns {Promise<VideoItem[]|null>}
+ * @returns {Promise<VideoItem|VideoItem[]|null>}
  */
 async function loadDetail(link) {
   try {
-    const query = (link || '').replace(/^search:/, '').trim();
-    if (!query) return null;
+    const meta = parseDetailLink(link);
+    if (!meta) return null;
+
+    const title = meta.title;
+    const season = meta.season ?? 1;
+    const episode = meta.episode ?? null;
+    const type = meta.type || 'tv';
+    const id = meta.id || null;
+
+    console.log(`📡 [loadDetail] link="${link}" → title="${title}" season=${season} episode=${episode ?? '-'} type=${type}`);
 
     const results = await loadResource({
-      title: query,
-      type: 'movie',
-      searchMode: 'comprehensive',
+      seriesName: title,
+      title,
+      type,
+      season,
+      episode,
+      id,
+      // link 同步帶進去；loadResource 若收到 link 會再解析一次。
+      // 帶 link 也能讓 cache key 包含時出/集 metadata。
+      link,
+      searchMode: 'smart_stream',
       matchStrictness: 'standard',
       preferResolution: 'auto',
     });
 
-    if (!results || !results.length) return null;
+    if (!results || !results.length) {
+      // 沒搜到資源時仍回傳一個最小 VideoItem，UI 不會變空白。
+      // REX 詳細頁若無 episodeItems 會自動隱藏集數面板。
+      return {
+        id: buildDetailLink({ title, season, episode, type, id }),
+        type: 'url',
+        title,
+        mediaType: type,
+        description: '從 VOD 源未取得可用資源',
+        link,
+      };
+    }
 
-    return [{
-      id: `search:${query}`,
+    // 把 loadResource 回傳的「所有站的 m3u8 來源」依集數切開成 (season, episode)
+    // 群組，產生 episodeItems。每個 episodeItem 自己也是一條 VideoItem，
+    // 它的 link 帶著原 link 的 metadata + 該集集數，REX 點擊該集時
+    // 會用新 link 再進入 loadResource；loadResource 內的 cache key 帶季別，
+    // 第二次請求會直接命中該集的快取。
+    const groups = new Map();
+    for (const r of results) {
+      const epLabel = episodeLabelOf(r);
+      const key = `s${season}e${epLabel ?? 'x'}`;
+      if (!groups.has(key)) {
+        groups.set(key, { episode: epLabel, resources: [] });
+      }
+      groups.get(key).resources.push(r);
+    }
+
+    // 集數排序：可識別集數按數字排，無集數的（綜藝日期、單集）放最後。
+    const sortedGroups = Array.from(groups.values()).sort((a, b) => {
+      if (a.episode == null && b.episode == null) return 0;
+      if (a.episode == null) return 1;
+      if (b.episode == null) return -1;
+      return a.episode - b.episode;
+    });
+
+    const episodeItems = sortedGroups.map((g) => {
+      const first = g.resources[0];
+      const epLink = buildDetailLink({
+        title,
+        season,
+        episode: g.episode ?? undefined,
+        type,
+        id,
+      });
+      // 從第一個資源取首選線路當 episode 級入口播主源。
+      // REX 詳細頁若未另外呼叫 loadResource，可直接播這個 videoUrl。
+      // 若有呼叫 loadResource，videoUrl 仍保留，REX 可當 fallback。
+      const displayTitle = g.episode != null
+        ? `第${g.episode}集`
+        : (first?.description || '未命名');
+      return {
+        id: epLink,
+        type: 'url',
+        title: displayTitle,
+        mediaType: type,
+        description: first?.description || title,
+        season,
+        episode: g.episode ?? undefined,
+        // 該集首選播放 URL；其他站的來源可透過 loadResource 重新取得。
+        videoUrl: first?.url,
+        link: epLink,
+        // 攜帶該集的所有備選線路，方便 REX 直接顯示多源而不需再呼叫 loadResource。
+        // 自訂頂層欄位，REX 不會認得但不會破壞既有 schema。
+        // 為避免 REX 客戶端報「未知欄位」警告，這裡放在 description 字串裡。
+        ...(g.resources.length > 1 ? {
+          customLines: g.resources.map(r => ({
+            name: r.name,
+            url: r.url,
+            description: r.description,
+          }))
+        } : {})
+      };
+    });
+
+    const mainLink = buildDetailLink({ title, season, type, id });
+
+    return {
+      id: mainLink,
       type: 'url',
-      title: query,
-      mediaType: 'movie',
-      description: '從 VOD 源取得的資源列表',
-      videoUrl: results[0].url,
-    }];
+      title,
+      mediaType: type,
+      description: type === 'movie' ? `電影：${title}` : `${title}（第${season}季，共 ${episodeItems.length} 集）`,
+      link: mainLink,
+      season,
+      // 電影沒有 episodeItems；REX UI 會自動隱藏集數面板。
+      ...(type === 'tv' ? { episodeItems } : {}),
+    };
   } catch (e) {
     console.error('[loadDetail] 失敗:', e?.message || e);
     return null;
