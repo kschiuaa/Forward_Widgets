@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.8",
+  version: "2.5.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1222,6 +1222,11 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
  * 兩種來源都不認得時回傳 null，代表無法判斷，交由呼叫端決定如何處置。
  */
 function episodeLabelOf(resource) {
+  // 優先從頂層 episode 欄位讀（cache 命中後 _ep 已被 cleanResourceForOutput 移除，
+  // 只剩頂層 episode 可用）。舊的 _ep 仍是權威來源（搜尋階段還在物件上）。
+  if (resource?.episode !== null && resource?.episode !== undefined) {
+    return resource.episode;
+  }
   if (resource?._ep !== null && resource?._ep !== undefined) {
     return resource._ep;
   }
@@ -3916,7 +3921,21 @@ async function loadDetail(link) {
     if (!meta) return null;
 
     const title = meta.title;
-    const season = meta.season ?? 1;
+    // 沒帶 season 時先從標題推斷（「仁醫完結篇」「仁醫第二季」之類），
+    // 推斷不到才默認為 S1。
+    //
+    // 為什麼：REX 客戶端切換季別時呼叫 loadDetail，傳進來的 link 有時不帶
+    // season（特別是用戶從其他頁面進入的場景）。原本 ?? 1 會把這類請求一律當
+    // S1 處理 —— 即使標題已經明確標示第N季也回 S1 結果，使用者看到的播放源
+    // 列表永遠是 S1。
+    //
+    // 從 seriesName 推斷後，loadResource 內的 S2 過濾會被觸發，cache key
+    // 也會帶正確的 season。影片庫能在 REX 客戶端忘了帶季節參數時自我修正。
+    let season = meta.season;
+    if (season == null) {
+      const inferredInfo = extractEnhancedInfo(title);
+      season = inferredInfo.seasonNumber > 1 ? inferredInfo.seasonNumber : 1;
+    }
     const episode = meta.episode ?? null;
     const type = meta.type || 'tv';
     const id = meta.id || null;
