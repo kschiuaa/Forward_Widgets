@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.9",
+  version: "2.2.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -555,6 +555,13 @@ function parseChineseNumeral(text) {
  */
 function extractSequelNumber(name) {
   if (!name) return null;
+
+  // 「完結篇 / 完结篇」是 S2 常用替身：日劇「仁医完结篇」、「半泽直树完结篇」，
+  // extractSequelNumber 走完所有 fallback 都抓不到數字（沒「第X季」沒羅馬數字、
+  // 阿拉伯數字也會被「第02集」之類搶走），最後回 null，
+  // filterBySequel 拿不到 sequel=2 的命中樣本，規則 3 永遠 fallback。
+  // 把「完結篇」視為 sequel=2 提前返回，避免被下面的「第02集」誤抓。
+  if (/完结篇|完結篇/.test(name)) return 2;
 
   // 先抓「X季」（無「第」前綴）再處理 stripSeasonMarker。
   //
@@ -2487,7 +2494,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path-plus-wanjiepian-equals-sequel2.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -2871,6 +2878,9 @@ function filterBySequel(results, targetInfo) {
     .map(res => Number(res._year) || Number(extractVersionMarker(res._rawName || '')) || null)
     .filter(y => y && Number.isFinite(y));
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
+
+  // TEMP debug: 確認 sequelMatched 與 pooledYearMin
+  console.log(`[fbseq] before=${before} sequelMatched=${sequelMatched.length} pooledYearMin=${pooledYearMin}`);
 
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
