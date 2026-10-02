@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.2.9",
+  version: "2.3.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2395,7 +2395,8 @@ function cleanResourceForOutput(resource) {
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch', 
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep', 
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
-    '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName'
+    '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
+    '_s4FallbackBoost'
   ];
   
   // 版本資訊必須在欄位刪除前寫進描述。
@@ -2514,7 +2515,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel-rule2-strict-plus-sequelSkip-disabled-for-season2-plus-same-era-version-drop-plus-includeCheck-normalized-plus-rawName-on-tv-path-plus-wanjiepian-equals-sequel2-plus-explicitDifferentSeason-drop-plus-rule3-strict1Year-plus-stripSubtitle-tilde-plus-description-dot-sep-no-dash-no-sourceTag-no-finished-versionTag-with-year-koku-plus-movie-nonMainRelease-dotSuffix-plus-stripSubtitle-midEdition-plus-loadResource-filter-skip-for-batch-mode.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel+v1+s4-fallback-最終季+第2期.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -2678,18 +2679,46 @@ async function loadResource(params, onStreamResult = null) {
 // 誤導除錯。stream / auto 模式仍需在此 filter（performSmartSearch 內部不跑）。
   if (type === 'tv' && searchMode !== 'batch') {
     const r = filterBySequel(finalResults, targetInfo);
+    let s4FallbackUsed = false;
     if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
       finalResults = r.kept;
       console.log(`🎯 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
       console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾無命中(${r.before}筆)，保留全部候選`);
     } else if (r.kept && r.kept.length === r.before && r.before > 0) {
-      console.log(`🎯 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${r.before}（已是最終）`);
+      // 全部通過即「沒 S4 命中」+ 「全部候選都是 S1 沒人可殺」 —— 退回保留全部。
+      // log 寫明這是 fallback，不要讓人誤會成「filter 確認這就是答案」。
+      const poolYr = r.pooledYearMin ?? 'null';
+      console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${r.before}（無 targetSeason 命中群，pooledYearMin=${poolYr}，已是最終候選）`);
+      // 退化情境 (最常見：user 查 season>=4 但站方全名以季名命名)：把這些候選放到最前並加註。
+      if (r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
+        s4FallbackUsed = true;
+      }
+    } else if (r.kept && r.kept.length < r.before && r.before > 0 && r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
+      // S4 fallback 把候選抽出後 kept < before 的補接分支。
+      finalResults = r.kept;
+      s4FallbackUsed = true;
+    }
+    if (s4FallbackUsed) {
+      // 給 fallback 候選一個「最大 score」標記，確保後續 sort 不會被同分
+      // exact-match 的 S1 資源擠回中間位置（同一個 match 群分數相同）。
+      // 設在 description 改寫之後，避免誤觸 _finalScore 計算。
+      for (const cand of r.s4FallbackCandidates) {
+        cand._s4FallbackBoost = true;
+        if (cand.description && !cand.description.includes('⚠️')) {
+          cand.description = `⚠️ 站方無「第${targetInfo.seasonNumber}季」資料，這是依片名推算的 S3 後半候選\n${cand.description}`;
+        }
+      }
+      finalResults = [...r.s4FallbackCandidates, ...finalResults];
     }
   }
 
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
+    if (res._s4FallbackBoost) {
+      // _finalScore 之上再加極大值，確保 sort 始終在最前。
+      res._finalScore = 1000 + res._finalScore;
+    }
   });
   
   finalResults.sort((a, b) => {
@@ -2709,7 +2738,8 @@ async function loadResource(params, onStreamResult = null) {
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch',
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
-    '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName'
+    '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
+    '_s4FallbackBoost'
   ];
   
   finalResults.forEach(res => {
@@ -3016,7 +3046,49 @@ if (sequel === targetSeason) { kept.push(res); continue; }
     kept.push(res);
   }
 
-  return { kept, dropped, before, pooledYearMin };
+  // ----- 進階啟發式：當 targetSeason=4 且站方無「第4季」命中群時 -----
+  //
+  // 場景：user 查「刀劍神域」+ season=4，4 個站回的條目裡完全沒有任何
+  // 「第四季」字眼（實測 caiji/ffzy/lzi/rycj 4 站合計 43 條原始結果中
+  // 「第四季」=0 條），但站方把 SAO Alicization 後半命名為「爱丽丝篇 异界战争
+  // 最终季」/「异界战争 第2期」(2019-2020)，這其實就是 SAO 第4季實際內容。
+  // 預設 sort 把這幾條埋在 S1 全集之後，使用者根本看不到。
+  //
+  // 啟發式：沒 sequel=4 命中、且候選含「最终季 / 第2期 / 异界战争 後半」
+  // 字樣 → 把這些從 kept 抽出移到 s4FallbackCandidates，呼叫端會把它們
+  // 排在前面並在 description 加註「⚠️ S4 站方無對應資料，這是依片名鄰近
+  // 年份推算的 S3 後半候選」。
+  //
+  // 安全閘：只在「targetSeason 確實=4 且 sequel=4 命中=0」時啟動，避免
+  // 對 season=2/3 誤推；最終季/第2期 marker 出現也要至少 1 條才啟動，
+  // 避免無關查詢也被改 sort。
+  let s4FallbackCandidates = [];
+  if (targetSeason === 4 && sequelMatched.length === 0) {
+    s4FallbackCandidates = kept.filter(res => {
+      const nm = res._rawName || res.description || '';
+      // 「最終季/最終季」是 SAO S3 後半最常見標記。
+      // 為了保守避免誤判，純「最终季」可能出現在其他系列
+      // （如「進擊的巨人 最終季」是 S4 但不會同時含「异界战争」），故
+      // 只挑「最终季」伴隨「异界战争 / 爱丽丝」其一者；「第2期」則獨立成立
+      // （SAO 異界戰爭第2期 = 2020 = S3 後半）。
+      const hasFinalSeason = /(?:最終季|最终季)/.test(nm);
+      const hasSecondCour = /第\s*[2２]\s*期/.test(nm);
+      const hasAlicizationContext = /(?:异界战争|爱丽丝篇|愛麗絲篇|爱丽丝篇)/.test(nm);
+      if (hasSecondCour) return true;
+      if (hasFinalSeason && hasAlicizationContext) return true;
+      return false;
+    });
+    if (s4FallbackCandidates.length > 0) {
+      // 把這些從 kept 拿出，避免既被推進 kept 又被推到前面重複。
+      const s4Keys = new Set(s4FallbackCandidates.map(r => `${r.url}|${r.name}`));
+      kept = kept.filter(res => !s4Keys.has(`${res.url}|${res.name}`));
+      console.log(`🎯 S4 fallback: 從 kept 抽出 ${s4FallbackCandidates.length} 條「最終季/第2期」候選置前`);
+    } else {
+      s4FallbackCandidates = [];
+    }
+  }
+
+  return { kept, dropped, before, pooledYearMin, s4FallbackCandidates };
 }
 
 function filterByTargetVersion(results, targetInfo) {
@@ -3334,6 +3406,7 @@ async function performBatchSearch(params) {
   // 續集季別過濾（共用 helper，與串流路徑同源）。
   if (type === 'tv') {
     const r = filterBySequel(finalResults, targetInfo);
+    let s4FallbackUsed = false;
     if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
       finalResults = r.kept;
       console.log(`🎯 第${targetInfo.seasonNumber}季過濾(batch): ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
@@ -3341,26 +3414,54 @@ async function performBatchSearch(params) {
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
       console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾(batch)無命中(${r.before}筆)，保留全部候選`);
     } else if (r.kept && r.kept.length === r.before && r.before > 0) {
-      console.log(`🎯 第${targetInfo.seasonNumber}季過濾(batch): ${r.before} -> ${r.before}（已是最終）`);
+      // 全部通過即「沒 S4 命中」+ 「全部候選都是 S1 沒人可殺」 —— 退回保留全部。
+      // log 寫明這是 fallback，不要讓人誤會成「filter 確認這就是答案」。
+      const poolYr = r.pooledYearMin ?? 'null';
+      console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾(batch): ${r.before} -> ${r.before}（無 targetSeason 命中群，pooledYearMin=${poolYr}，已是最終候選）`);
+      if (r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
+        s4FallbackUsed = true;
+      }
+    } else if (r.kept && r.kept.length < r.before && r.before > 0 && r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
+      // S4 fallback 把候選抽出後 kept < before 的補接分支。
+      finalResults = r.kept;
+      s4FallbackUsed = true;
+    }
+    if (s4FallbackUsed) {
+      // 給 fallback 候選一個「最大 score」標記，確保後續 sort 不會被同分
+      // exact-match 的 S1 資源擠回中間位置（同一個 match 群分數相同）。
+      // 設在 description 改寫之後，避免誤觸 _finalScore 計算。
+      // 註：s4FallbackCandidates 已從 finalResults 抽出，這裡直接重組。
+      for (const cand of r.s4FallbackCandidates) {
+        cand._s4FallbackBoost = true;
+        if (cand.description && !cand.description.includes('⚠️')) {
+          cand.description = `⚠️ 站方無「第${targetInfo.seasonNumber}季」資料，這是依片名推算的 S3 後半候選\n${cand.description}`;
+        }
+      }
+      finalResults = [...r.s4FallbackCandidates, ...finalResults];
     }
   }
 
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
+    if (res._s4FallbackBoost) {
+      // _finalScore 之上再加極大值，確保 sort 始終在最前。
+      res._finalScore = 1000 + res._finalScore;
+    }
   });
-  
+
   finalResults.sort((a, b) => {
     const aMedia = isDirectMediaUrl(a.url) ? 0 : 1;
     const bMedia = isDirectMediaUrl(b.url) ? 0 : 1;
     if (aMedia !== bMedia) return aMedia - bMedia;
     return b._finalScore - a._finalScore;
   });
-  
+
   const fieldsToDelete = ['_finalScore', '_matchType', '_matchScore', '_seasonMatch',
                          '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
                          '_isVariety', '_episodeDate', '_confidence',
                          '_versionConflict', '_versionAmbiguous',
-                         '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName'];
+                         '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
+                         '_s4FallbackBoost'];
   finalResults.forEach(res => {
     const cleaned = cleanResourceForOutput(res);
     Object.keys(res).forEach(k => delete res[k]);
