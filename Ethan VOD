@@ -149,7 +149,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 14,
+  WIDGET_VERSION: 15,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.6",
+  version: "2.5.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1423,6 +1423,7 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           // 有幾個站同時存在日版與韓版、兩者檔名都只寫「仁医」且不帶年份欄位，
           // 只靠 _year 無法分辨，會被去重吃掉其中一版。
           _rawName: vod_name,
+          _seasonFromItem: extractSequelNumber(vod_name),
           _seasonMatch: matchInfo.seasonMatch,
           _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
           _versionAmbiguous: !yearConflict && isVersionAmbiguous(targetInfo, vod_name),
@@ -2469,13 +2470,30 @@ class SmartSearchExecutor {
 // ==================== 主函数模块 ====================
 function cleanResourceForOutput(resource) {
   const clean = { ...resource };
-  
+
+  // 把 _ep / _seasonFromItem 提升為頂層 episode / season。
+  //
+  // 為什麼：REX 客戶端的詳細頁 UI 會以 result.episode / result.season 為索引
+  // 過濾「當前集」的播放源。若物件不帶頂層 episode 數字，filter 結果為空陣列
+  // —— 使用者看到的播放源列表就變成空。season 同理：切換季別時客戶端會用
+  // result.season 判斷這條屬於哪一季，沒帶頂層欄位的話客戶端會誤判。
+  //
+  // 升級前 _ep / _seasonFromItem 已被 fieldsToDelete 清掉，client 端永遠
+  // 看不到。升級後兩個欄位都保留且不污染其它排序邏輯（_finalScore 計算只看
+  // resolution / isHD 等品質欄位）。
+  if (resource._ep != null && clean.episode == null) {
+    clean.episode = resource._ep;
+  }
+  if (resource._seasonFromItem != null && clean.season == null) {
+    clean.season = resource._seasonFromItem;
+  }
+
   const fieldsToDelete = [
-    '_finalScore', '_matchType', '_matchScore', '_seasonMatch', 
-    '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep', 
+    '_finalScore', '_matchType', '_matchScore', '_seasonMatch',
+    '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
     '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
-    '_s4FallbackBoost'
+    '_s4FallbackBoost', '_seasonFromItem'
   ];
   
   // 版本資訊必須在欄位刪除前寫進描述。
@@ -2500,25 +2518,6 @@ function cleanResourceForOutput(resource) {
     const versionTag = `[${parts.join(' - ')}]`;
     if (versionTag && !clean.description.includes(versionTag)) {
       clean.description = `${clean.description} ${versionTag}`;
-    }
-  }
-
-  // 季別標籤：_seasonFromItem 是 extractSequelNumber(vod_name) 推論出的
-  // 所屬 VOD item 序號。寫進 description 讓 UI（特別是 REX 詳細頁）能區分
-  // S1/S2/S3 的混雜結果。
-  //
-  // 為什麼 S1 也要標：原始 vod_name 「仁医」(2009) → sequel=null，本來就
-  // 不會標。但「仁医2」(2011) → sequel=2 會標，避免 REX 用戶在 S1/S2 結果
-  // 混雜時看到「仁医2 第01集」以為這是 S2 EP1 結果（事實是仁醫完結篇
-  // S2 EP1 的某站提供），這正是他要的；但 S1 結果被標 S1 後，使用者也
-  // 能在大量結果中一眼區分哪些屬於 S1。
-  //
-  // 為什麼不在每個結果都硬標：S1 結果通常佔大多數，全部加標會讓清單視覺
-  // 雜亂。只有 sequel !== null（非第 1 季）的才加，是合理的選擇。
-  if (resource._seasonFromItem && resource._seasonFromItem > 1) {
-    const seasonLabel = `[S${resource._seasonFromItem}]`;
-    if (!clean.description.includes(seasonLabel)) {
-      clean.description = `${seasonLabel} ${clean.description}`;
     }
   }
 
@@ -2647,26 +2646,7 @@ async function loadResource(params, onStreamResult = null) {
   }
   
   const targetInfo = extractEnhancedInfo(seriesName);
-  // 區分「明確指定 season=N」與「未指定」（REX 詳細頁常用 '' 表示未指定）。
-  //
-  // 原本 `season ? parseInt(season) : targetInfo.seasonNumber` 把空字串當成
-  // 「未指定」並 fallback 到 1 —— 但實際上 REX 詳細頁在切換 S2 時根本不會
-  // 更新 season（客戶端限制），始終傳 ''。如果繼續 fallback 到 1，使用者
-  // 從 S2 切回 S1 看到的仍是 S1 結果，從 S1 切到 S2 看到的還是 S1。
-  //
-  // 新邏輯：season 是空字串/null/undefined 時 seasonExplicit=false，
-  // 對應處理改為：搜尋字串不拼 sequel 序號、不套用 season > 1 過濾、
-  // 每個 resource 在 description 加上 [第N季] 標記讓 UI 識別所屬季別。
-  // 當 season 有值（含 '1'），照原本行為。
-  let targetSeason = null;
-  let seasonExplicit = false;
-  if (season !== '' && season != null) {
-    targetSeason = parseInt(season, 10);
-    if (Number.isFinite(targetSeason)) seasonExplicit = true;
-  }
-  if (targetSeason == null) {
-    targetSeason = targetInfo.seasonNumber;
-  }
+  let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
   const targetEpisode = episode ? parseInt(episode) : null;
 
   // 修正「仁医 / season=第二季」情境。
@@ -2978,6 +2958,13 @@ async function loadResource(params, onStreamResult = null) {
       searchTime: totalTime,
       cached: cachedResults.length > 0
     });
+  }
+
+  // 診斷：把最終物件結構 dump 出來，協助驗證客戶端拿到的物件完整性。
+  // 如果最終 finalResults 為 0 但過程中印出『總計: 33 個結果』，會在這裡再次印出確認。
+  console.log(`📤 [loadResource 出口] type=${type} season=${season} episode=${episode ?? '-'} length=${finalResults.length}`);
+  if (finalResults.length > 0) {
+    console.log(`📤 [loadResource 出口] 第一條物件欄位：${Object.keys(finalResults[0]).join(', ')}`);
   }
 
   return finalResults;
@@ -3364,7 +3351,7 @@ function filterByTargetVersion(results, targetInfo) {
 
 async function performSmartSearch(params, onStreamResult) {
   const {
-    seriesName: rawSeriesName,
+    seriesName,
     type = 'tv',
     VodData,
     matchStrictness = 'standard',
@@ -3372,26 +3359,8 @@ async function performSmartSearch(params, onStreamResult) {
     season
   } = params;
 
-  // 對齊 loadResource 的 fallback chain：REX 詳細頁可能用 title / name
-  // 帶進片名，不是 Forward 慣用的 seriesName。loadResource 內已有同樣
-  // 的 fallback，但這裡若不補，seriesName 變 undefined → extractEnhancedInfo
-  // 回空物件 → searchQuery 是空字串 → 所有站回 0 筆。
-  // 參見 loadResource line 2565-2575 的註解。
-  const seriesName =
-    rawSeriesName ||
-    params.episodeName ||
-    params.title ||
-    params.name ||
-    params.movieName ||
-    '';
-
   const targetEpisode = episode ? parseInt(episode, 10) : null;
   const startTime = Date.now();
-
-  if (!seriesName) {
-    console.log('🔍 performSmartSearch: seriesName 為空，提早返回');
-    return [];
-  }
 
   const siteManager = new SiteManager();
   const resourceSites = parseResourceSites(VodData);
@@ -3402,15 +3371,7 @@ async function performSmartSearch(params, onStreamResult) {
   // season 參數不會出現在 seriesName 裡，必須在這裡套用，否則搜尋字串
   // 永遠是裸片名。使用者切換季別時拿到的是第一季的內容，畫面看起來
   // 就完全沒有刷新。理由與寫法見 loadResource 內的說明。
-  let targetSeason = null;
-  let seasonExplicit = false;
-  if (season !== '' && season != null) {
-    targetSeason = parseInt(season, 10);
-    if (Number.isFinite(targetSeason)) seasonExplicit = true;
-  }
-  if (targetSeason == null) {
-    targetSeason = targetInfo.seasonNumber;
-  }
+  let targetSeason = season ? parseInt(season, 10) : targetInfo.seasonNumber;
   // 中文季別（「第二季」之類）容錯，理由見 loadResource。
   if (Number.isNaN(targetSeason) && typeof season === 'string') {
     const m = season.match(/\d+|[一二三四五六七八九十零]+/);
@@ -3455,35 +3416,18 @@ async function performSmartSearch(params, onStreamResult) {
 }
 
 async function performBatchSearch(params) {
-  const {
-    seriesName: rawSeriesName,
-    type = 'tv',
-    season,
-    episode,
+  const { 
+    seriesName, 
+    type = 'tv', 
+    season, 
+    episode, 
     VodData,
     matchStrictness = 'standard',
     preferResolution = 'auto'
   } = params;
 
-  // 對齊 loadResource 的 fallback chain。REX 詳細頁可能用 title / name
-  // 帶進片名（不是 Forward 慣用的 seriesName）；loadResource 內已有同樣
-  // 的 fallback chain，但這裡若不補，seriesName 變 undefined，搜尋送空字串，
-  // 所有站都回 0 筆。參見 loadResource 行 2565-2575 的註解。
-  const seriesName =
-    rawSeriesName ||
-    params.episodeName ||
-    params.title ||
-    params.name ||
-    params.movieName ||
-    '';
-
   console.log(`🔍 启动批量搜索: ${seriesName}`);
   const startTime = Date.now();
-
-  if (!seriesName) {
-    console.log('🔍 performBatchSearch: seriesName 為空，提早返回');
-    return [];
-  }
   
   const resourceSites = parseResourceSites(VodData);
   if (resourceSites.length === 0) {
@@ -3491,15 +3435,7 @@ async function performBatchSearch(params) {
   }
 
   const targetInfo = extractEnhancedInfo(seriesName);
-  let targetSeason = null;
-  let seasonExplicit = false;
-  if (season !== '' && season != null) {
-    targetSeason = parseInt(season, 10);
-    if (Number.isFinite(targetSeason)) seasonExplicit = true;
-  }
-  if (targetSeason == null) {
-    targetSeason = targetInfo.seasonNumber;
-  }
+  let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
   const targetEpisode = episode ? parseInt(episode) : null;
   // 中文季別容錯
   if (Number.isNaN(targetSeason) && typeof season === 'string') {
