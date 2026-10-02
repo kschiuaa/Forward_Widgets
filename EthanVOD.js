@@ -222,7 +222,20 @@ const CONFIG = {
     // （片名只差年份，文字比對分不出來）。
     AREA_MISMATCH_PENALTY: 150,
     AREA_MATCH_BONUS: 40,
-  }
+  },
+
+  // m3u8 廣告過濾 Worker
+  // 所有 m3u8 輸出 URL 會被 wrap 成 Worker URL,Player 拉到清流。
+  // ENABLED = false 可一鍵關閉,所有 URL 恢復原始 CDN 直連。
+  M3U8_FILTER: {
+    ENABLED: true,
+    WORKER_URL: 'https://ad-filter.kschiuaa.com',
+    // 為了 cache 命中穩定,base path 寫死。endpoint 內部模式見 Worker 端。
+    ENDPOINT: '/filter',
+    // 透傳 / 過濾 切換:debug 用。預設 'filter'。
+    // 'passthrough' = 走 Worker 但不過濾,只驗 Worker 通不通。
+    MODE: 'filter',
+  },
 };
 
 // ==================== 模組中繼資料 ====================
@@ -230,7 +243,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.6.0",
+  version: "2.7.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2526,6 +2539,13 @@ function cleanResourceForOutput(resource) {
     }
   }
 
+  // m3u8 過濾 wrap。customHeaders 保留在物件上(REX 客戶端會用),Worker 端
+  // 收到 m3u8 子請求時自動從 Referer 解析或回退到 customHeaders(Worker 端邏輯,
+  // 見 m3u8-ad-filter-worker.js)。
+  if (isM3U8Url(clean.url)) {
+    clean.url = wrapM3U8WithFilter(clean.url);
+  }
+
   fieldsToDelete.forEach(field => {
     if (field in clean) delete clean[field];
   });
@@ -2549,8 +2569,40 @@ function cleanResourceForOutput(resource) {
   } else if (clean.qualityScore > 15) {
     clean.recommended = '高品質';
   }
-  
+
   return clean;
+}
+
+// 把 m3u8 URL 包成 Worker URL。Player 拉到 m3u8 後,所有 .ts 子請求都會
+// 經 Worker 代理,由 Worker 端的 m3u8-ad-filter-worker.js 依 CONFIG.M3U8_FILTER
+// 設定的 pattern 去除廣告 segment。
+//
+// 守護設計：
+//  - ENABLED 為 false → 透傳
+//  - 非 m3u8 (mp4/flv/...) → 透傳
+//  - WORKER_URL 沒配 → 透傳(避免被 wrap 成相對路徑把播放搞壞)
+//  - URL 解析失敗 → 透傳(避免 IllegalArgumentException)
+function wrapM3U8WithFilter(url) {
+  if (!CONFIG.M3U8_FILTER?.ENABLED) return url;
+  if (!url) return url;
+  if (!isM3U8Url(url)) return url;
+  const base = (CONFIG.M3U8_FILTER.WORKER_URL || '').replace(/\/+$/, '');
+  if (!base) return url;
+  let inner;
+  try {
+    inner = new URL(url).toString();
+  } catch (e) {
+    return url;
+  }
+  let u;
+  try {
+    u = new URL(base + CONFIG.M3U8_FILTER.ENDPOINT);
+  } catch (e) {
+    return url;
+  }
+  u.searchParams.set('mode', CONFIG.M3U8_FILTER.MODE || 'filter');
+  u.searchParams.set('url', inner);
+  return u.toString();
 }
 
 async function loadResource(params, onStreamResult = null) {
