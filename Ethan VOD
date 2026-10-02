@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.7",
+  version: "2.5.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3936,6 +3936,11 @@ async function loadDetail(link) {
       searchMode: 'smart_stream',
       matchStrictness: 'standard',
       preferResolution: 'auto',
+      // loadDetail 不帶 multiSource/VodData，會被 loadResource 內的早期守衛
+      // 判為「multiSource !== 'enabled'」直接 return []，導致 REX 詳細頁
+      // 切換季別時永遠顯示「無搜到資源」。從 WidgetMetadata 全域參數讀取後帶進來。
+      multiSource: (WidgetMetadata.globalParams.find(p => p.name === 'multiSource') || {}).value || 'enabled',
+      VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
     });
 
     if (!results || !results.length) {
