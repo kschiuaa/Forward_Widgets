@@ -1,0 +1,18 @@
+# path: 路徑黑名單(組內任一 .ts URL 含子字串 → 砍整組)
+path:https://ad.
+path:/ads/
+path:?type=ad
+path:&type=ad
+path:/advert
+path:/sponsor
+path:/promo
+path:/ssp/
+path:/adsrv.
+
+# seq: 時長指紋(組內 EXTINF 序列命中 → 砍整組)
+seq:8.913044,7.608700,0.173911
+seq:0.173911,8.913044,7.608700
+
+# 沒前綴 → 當 path
+/adcdn/
+?adslot=
