@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.3.8",
+  version: "2.4.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2873,10 +2873,23 @@ async function loadResource(params, onStreamResult = null) {
 // 正確解法：搜尋字串只放裸片名，續集識別交給 isSmartSeriesMatch 內的
 // season 比對 + sequel 邏輯處理。
 function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
-  const base = String(searchQuery)
+  let base = String(searchQuery)
     .replace(/(?:19|20)\d{2}\s*$/, '')  // 年份交給結果階段，這裡不帶
     .replace(/\s+$/, '')
     .trim();
+  // 搜尋字串要帶上季別，否則資源站一律回傳第一季，過濾階段必須在所有
+  // 季的內容裡抓正確版本，命中率被稀釋。
+  //
+  // 參數順序：targetSeason（從 params.season 解析）比 rawName 推導的
+  // seasonNumber 更權威 —— rawName 為「仁醫」+ season=2 時，rawName 沒有
+  // 「第2季」字眼，extractEnhancedInfo 推得 seasonNumber=1，會誤判為
+  // 第 1 季查詢；用 targetSeason 強制加 2 才會得到 S2 內容。
+  //
+  // 序號緊貼片名：「刀剑神域3」沒空格才會命中，「刀剑神域 3」五站零結果。
+  // 第 1 季不加分：原季多半沒有序號，加了反而查不到。
+  if (Number.isFinite(targetSeason) && targetSeason > 1) {
+    base += String(targetSeason);
+  }
   return base;
 }
 
