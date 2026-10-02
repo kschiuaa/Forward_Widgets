@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.3.0",
+  version: "2.3.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2941,7 +2941,7 @@ function filterBySequel(results, targetInfo) {
     unversionedBases.set(base, (unversionedBases.get(base) || 0) + 1);
   }
 
-  const kept = [];
+  let kept = [];
   const dropped = [];
   for (const res of results) {
     const rawName = res._rawName || res.description || '';
@@ -3078,11 +3078,15 @@ if (sequel === targetSeason) { kept.push(res); continue; }
       if (hasFinalSeason && hasAlicizationContext) return true;
       return false;
     });
+    console.log(`🔬 S4 fallback diagnostic: kept.length=${kept.length}, sequelMatched.length=${sequelMatched.length}, targetSeason=${targetSeason}, s4FallbackMatched=${s4FallbackCandidates.length}`);
     if (s4FallbackCandidates.length > 0) {
       // 把這些從 kept 拿出，避免既被推進 kept 又被推到前面重複。
       const s4Keys = new Set(s4FallbackCandidates.map(r => `${r.url}|${r.name}`));
       kept = kept.filter(res => !s4Keys.has(`${res.url}|${res.name}`));
       console.log(`🎯 S4 fallback: 從 kept 抽出 ${s4FallbackCandidates.length} 條「最終季/第2期」候選置前`);
+      for (const c of s4FallbackCandidates.slice(0, 3)) {
+        console.log(`    候選: _rawName="${c._rawName}" _year=${c._year} url=${(c.url || '').slice(0, 80)}`);
+      }
     } else {
       s4FallbackCandidates = [];
     }
