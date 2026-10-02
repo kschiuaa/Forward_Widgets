@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.3.6",
+  version: "2.3.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2932,6 +2932,19 @@ function filterBySequel(results, targetInfo) {
   }
 
   const before = results.length;
+
+  // DEBUG: dump results 的 _rawName/_year 分組，定位「異界戰爭」系列 _year 真實值
+  const debugGrouped = {};
+  for (const r of results) {
+    const rn = r._rawName || r.description || '';
+    const y = r._year;
+    const k = `${rn.slice(0, 30)}|${y}`;
+    debugGrouped[k] = (debugGrouped[k] || 0) + 1;
+  }
+  console.log(`🔍 [filterBySequel] targetSeason=${targetSeason} before=${before}`);
+  for (const [k, n] of Object.entries(debugGrouped).sort((a, b) => b[1] - a[1]).slice(0, 20)) {
+    console.log(`    ${n}x: ${k}`);
+  }
 
   // 命中群：明確標為第 targetSeason 季的候選，用它們的年份決定 pooledYearMin。
   const sequelMatched = results.filter(res => {
