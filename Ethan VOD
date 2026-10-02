@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.0",
+  version: "2.5.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3081,25 +3081,33 @@ if (sequel === targetSeason) { kept.push(res); continue; }
   if (targetSeason === 4 && sequelMatched.length === 0) {
     s4FallbackCandidates = kept.filter(res => {
       const nm = res._rawName || res.description || '';
-      // 「最終季/最終季」是 SAO S3 後半最常見標記。
-      // 為了保守避免誤判，純「最终季」可能出現在其他系列
-      // （如「進擊的巨人 最終季」是 S4 但不會同時含「异界战争」），故
-      // 只挑「最终季」伴隨「异界战争 / 爱丽丝」其一者；「第2期」則獨立成立
-      // （SAO 異界戰爭第2期 = 2020 = S3 後半）。
+      // SAO 的 forward app metadata 切季邏輯與 VOD 站目錄結構不一致：
+      //   - forward app 把 SAO 切成 S1/S2/S3/S4：S3=爱丽丝篇 (2018 Part 1)，
+      //     S4=爱丽丝篇 异界战争 (2019 Part 2) + 异界战争最终季 (2020 Part 3)。
+      //   - VOD 站把 SAO Alicization 切成 3 段：Part 1/2018、Part 2/2019、
+      //     Part 3/2020，並無「第4季」獨立條目。
+      //
+      // 啟發式：S4 fallback 應抓「爱丽丝篇 异界战争」(Part 2, 2019) 與
+      // 「异界战争 最终季 / 第2期」(Part 3, 2020)，排除「爱丽丝篇」(Part 1, 2018)
+      // 屬於 S3 的部分。
+      //
+      // 條件 1：name 同時含「异界战争」+「爱丽丝」→ Part 2 或 Part 3 都命中。
+      const hasAlicizationAndWar = /爱丽丝|愛麗絲/.test(nm) && /异界战争/.test(nm);
+      // 條件 2：name 含「最终季」+「异界战争」或「爱丽丝」→ Part 3 命中。
       const hasFinalSeason = /(?:最終季|最终季)/.test(nm);
-      const hasSecondCour = /第\s*[2２]\s*期/.test(nm);
-      const hasAlicizationContext = /(?:异界战争|爱丽丝篇|愛麗絲篇|爱丽丝篇)/.test(nm);
-      if (hasSecondCour) return true;
-      if (hasFinalSeason && hasAlicizationContext) return true;
-      return false;
+      const hasFinalSeasonWithContext = hasFinalSeason && (/异界战争|爱丽丝|愛麗絲/.test(nm));
+      // 條件 3：name 含「第 2 期」+「爱丽丝」 → Part 3 (lzi 站命名) 命中。
+      const hasSecondCour = /第\s*[2２]\s*期/.test(nm) && /爱丽丝|愛麗絲/.test(nm);
+
+      return hasAlicizationAndWar || hasFinalSeasonWithContext || hasSecondCour;
     });
     console.log(`🔬 S4 fallback diagnostic: kept.length=${kept.length}, sequelMatched.length=${sequelMatched.length}, targetSeason=${targetSeason}, s4FallbackMatched=${s4FallbackCandidates.length}`);
     if (s4FallbackCandidates.length > 0) {
       // 把這些從 kept 拿出，避免既被推進 kept 又被推到前面重複。
       const s4Keys = new Set(s4FallbackCandidates.map(r => `${r.url}|${r.name}`));
       kept = kept.filter(res => !s4Keys.has(`${res.url}|${res.name}`));
-      console.log(`🎯 S4 fallback: 從 kept 抽出 ${s4FallbackCandidates.length} 條「最終季/第2期」候選置前`);
-      for (const c of s4FallbackCandidates.slice(0, 3)) {
+      console.log(`🎯 S4 fallback: 從 kept 抽出 ${s4FallbackCandidates.length} 條「爱丽丝篇 异界战争/最终季」候選置前`);
+      for (const c of s4FallbackCandidates.slice(0, 5)) {
         console.log(`    候選: _rawName="${c._rawName}" _year=${c._year} url=${(c.url || '').slice(0, 80)}`);
       }
     } else {
@@ -3494,18 +3502,20 @@ async function performBatchSearch(params) {
       for (const cand of r.s4FallbackCandidates) {
         cand._s4FallbackBoost = true;
         if (cand.description && !cand.description.includes('⚠️')) {
-          cand.description = `⚠️ 站方無「第${targetInfo.seasonNumber}季」資料，這是依片名推算的 S3 後半候選\n${cand.description}`;
+          // SAO fallback 文案：forward app metadata 把 SAO 切成 4 季（S3=Part 1、
+          // S4=Part 2+Part 3），但 VOD 站目錄只有「爱丽丝篇 异界战争」Part 2 (2019)
+          // 與「异界战争最终季/第2期」Part 3 (2020)。Fallback 抓的是 Part 2 + Part 3。
+          cand.description = `⚠️ 站方無「第${targetInfo.seasonNumber}季」獨立目錄，這是依片名推算的 SAO Alicization 後半 (爱丽丝篇+异界战争 Part 2/3, 2019/2020)\n${cand.description}`;
         }
       }
-      // 純化策略：使用者搜第4季時，要看到的每一條都跟 S3 後半相關，
-      // 不要混入 S1/S2 (2012/2014/2019) 等「無關季」內容。S4 站方沒資料，
-      // S3 後半 (2020) 是已知最接近的內容，列為唯一切分才不會讓使用者誤點。
+      // 純化策略：使用者搜第4季時，要看到的每一條都跟 SAO Alicization 後半相關，
+      // 不要混入 S1/S2/Part 1 等「無關季」內容。
       //
       // 風險：若 s4FallbackCandidates 為空陣列（罕見但可能），結果會變成空清單。
       // 為避免空清單，僅在 s4FallbackCandidates.length > 0 時才純化。
       if (r.s4FallbackCandidates.length > 0) {
         finalResults = [...r.s4FallbackCandidates];
-        console.log(`🟢 S4 fallback 純化: 已用 ${r.s4FallbackCandidates.length} 條「最終季/第2期」候選完全取代 ${finalResults.length === r.s4FallbackCandidates.length ? r.kept.length : finalResults.length} 條 S1/S2 候選`);
+        console.log(`🟢 S4 fallback 純化: 已用 ${r.s4FallbackCandidates.length} 條「爱丽丝篇异界战争/最终季」候選完全取代 ${finalResults.length === r.s4FallbackCandidates.length ? r.kept.length : finalResults.length} 條 S1/S2/Part 1 候選`);
       } else {
         finalResults = [...r.s4FallbackCandidates, ...finalResults];
       }
