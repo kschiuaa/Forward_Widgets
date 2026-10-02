@@ -149,7 +149,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 15,
+  WIDGET_VERSION: 16,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -4082,11 +4082,22 @@ async function loadDetail(link) {
       };
     });
 
-    // 主 VideoItem 的 season 標籤：採「合併結果中實際存在且最小的季別」。
-    // 初次載入無 season → sortedGroups 第一個 = S1（有實際結果）。
-    // 切到 S2 載入時 → sortedGroups 第一個仍是 S1（合併進 S1+S2 後最小季），
-    //   顯示 S1 也合理，使用者看到「共 N 集」即知範圍。
-    const mainSeason = sortedGroups.length > 0 ? sortedGroups[0].season : season;
+    // 主 VideoItem 的 season 標籤：採「當前請求的 season」。
+    //
+    // 重要：REX 客戶端的詳細頁切換季別時可能會用主 VideoItem.season
+    // 作為判斷「當前季」的依據。如果主 season 永遠是 sortedGroups
+    // 中的最小季（合併 S1+S2 結果後為 1），使用者切到 S2 時客戶端
+    // 還是認為當前是 S1，UI 顯示仍是 S1 的 episodeItems。
+    //
+    // 用當前請求的 season 作為主 season：初次載入（無 season 參數）
+    // → season 預設為 1 → mainSeason = 1。切換到 S2 → mainSeason = 2。
+    // 兩種情況下 REX 客戶端的內部「當前季」狀態都正確。
+    //
+    // 唯一例外：合併結果中完全沒有當前 season 的 episodeItem（罕見，
+    // 如使用者切到 S3 但 loadDetail 沒請求 S3）。這種情況下顯示
+    // sortedGroups 中的最小季，避免主 season 變 undefined。
+    const seasonsPresent = new Set(sortedGroups.map(g => g.season));
+    const mainSeason = seasonsPresent.has(season) ? season : (sortedGroups[0]?.season ?? season);
 
     const mainLink = buildDetailLink({ title, season: mainSeason, type, id });
 
