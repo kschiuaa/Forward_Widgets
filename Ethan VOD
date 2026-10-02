@@ -149,7 +149,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 14,
+  WIDGET_VERSION: 13,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -230,7 +230,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.4.2",
+  version: "2.5.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2515,7 +2515,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel+v2+part-marker-forced.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel+v1+s4-forced-batch.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -3042,29 +3042,6 @@ if (sequel === targetSeason) { kept.push(res); continue; }
       const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
       // 候選年份 = pooledYearMin + 1 → 同時代另一版本嫌疑
       if (candYear && candYear === pooledYearMin + 1) {
-        // 例外：候選片名若含「同 IP 後續 Part」字眼 (Part 2 / 第2期 / 最終季 /
-        // Part 3 / 第3期 / 最终章 / War of Underworld) + 目標 baseName 核心字，
-        // 視為同季的內部分季 (SAO S3 Part 2 = 2019、S3 Part 3 = 2020 屬於
-        // Alicization 故事線整體)，不是同時代另一地區版本（仁醫 2012 韓版）。
-        //
-        // 為什麼這條例外要假設：
-        //   - 韓版仁醫 (2012) 片名純「仁医」，沒「續集命名」字眼 → 仍會被規則 3.6 殺 ✓
-        //   - SAO S3 Part 2 「刀剑神域 爱丽丝篇 异界战争」含「异界战争」Part 標記 → 放行 ✓
-        //   - 進擊的巨人 S4 Part 2 「進撃の巨人 The Final Season Part 2」含「Final」→ 放行 ✓
-        //   - 鬼滅之刃「刀鍛冶の里」之類正篇續章沒 Part 標記 → 仍會被殺 (待後續觀察)
-        const candNm = res._rawName || res.description || '';
-        // baseName 比對必須先 normalizeTitleForMatch 處理簡轉繁、並去掉空白。
-        // target 是繁體「刀劍神域」、cand 是簡體「刀剑神域 爱丽丝篇 异界战争」，
-        // 不處理簡轉繁的話「刀剑神」.includes(「刀劍神」) 永遠 false，例外失效。
-        const candNmNorm = normalizeTitleForMatch(candNm);
-        const targetBaseCore = normalizeTitleForMatch(targetInfo.rawName || '').slice(0, 4);
-        const hasPartMarker = /(?:Part\s*[23]|第\s*[23]\s*期|第\s*3\s*部|最終季|最终季|最終章|最終篇|最终篇|最終回|完结篇|完結篇|异界战争|異界戰爭|異界战争|War\s*of\s*Underworld|Final\s*Season|Season\s*Final)/i.test(candNm);
-        const sharesBaseCore = targetBaseCore && candNmNorm.includes(targetBaseCore);
-        if (hasPartMarker && sharesBaseCore) {
-          // 放行：視為同 IP 後續 Part，進 kept。
-          console.log(`  [PASS-rule3.6 part-marker exception] name="${res.name}" _year=${res._year} targetBaseCore="${targetBaseCore}" candNm="${candNm}" candNmNorm="${candNmNorm}"`);
-          kept.push(res); continue;
-        }
         dropped.push(res); continue;
       }
     }
@@ -3270,9 +3247,7 @@ async function performBatchSearch(params) {
   // 與串流模式同樣帶上續集序號，理由見 loadResource 的 cacheKey 說明。
   const batchSequel = extractSequelNumber(targetInfo.rawName);
   const batchVersion = targetInfo.year ?? extractVersionMarker(targetInfo.rawName) ?? 'x';
-  // 把 widget 版本號塞進 cacheKey，確保 forced-logic 改版時舊 cache 不會誤用。
-  // CONFIG.WIDGET_VERSION 從 WidgetMetadata.version 注入 (loadResource 內)。
-  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}_v${CONFIG.WIDGET_VERSION}`;
+  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}`;
   let allResults = [];
 
   try {
@@ -3342,47 +3317,35 @@ async function performBatchSearch(params) {
             console.log(`🔍 [S4-cand] vod_name="${item.vod_name}" match=${matchResult.match} conf=${(matchResult.confidence || 0).toFixed(2)} type=${matchResult.type} sim=${(matchResult.similarity || 0).toFixed(2)} candSeason=${candidateInfo.seasonNumber}`);
           }
 
-          // 對「Part X（續集）」候選強制放行：
-//
-// 起始 log（s4-forced-batch.2026-10-02）只對 season>=4 啟動：站方把 SAO S3 後半
-// 命名為「刀剑神域爱丽丝篇异界战争最终季」(2020)，實際內容是 SAO 第四季。但
-// target 簡寫「刀劍神域」vs candidate 「刀剑神域爱丽丝篇异界战争最终季」相似度
-// 只有 0.286，被 matchResult.confidence >= 0.6 卡住 12 集全部進不來。
-//
-// 但這個問題不限於 S4，SAO S3 搜尋時 Part 2 「爱丽丝篇 异界战争」(2019)、
-// Part 3 「爱丽丝篇 异界战争 最终季」(2020) 都會被同樣機制卡住：
-//   - Part 2 sim ≈ 0.27（多了「异界战争」多 4 字）
-//   - Part 3 sim ≈ 0.27（更多字）
-//   兩個 < 0.6 都進不了 cache，使用者搜 S3 只看到 ffzy「刀劍神域第三季」
-//   25 條，遺漏 caiji Part 1 「爱丽丝篇」(2018) + Part 2 (2019) +
-//   Part 3 (2020)。
-//
-// 啟發式：candidate 含「Part 2 / 第2期 / Part 3 / 第3期 / 最終季 / 最終章 /
-// 完结篇 / 完結篇 / 异界战争 / War of Underworld / Final Season / Part.X」
-// 任一字眼 + 以 targetName 開頭 → 強制放行，讓同 IP 的內部分季也能命中。
-//
-// 風險控制：必須以 targetName 開頭（去掉空白後），避免其他動漫剛好含
-// 「异界战争」字眼（如「Re:0」劇場版）誤推。
-if (targetInfo.seasonNumber >= 2 && !matchResult.match) {
-  // 用 normalizeTitleForMatch 處理簡轉繁，去空白，讓 target 與 candidate
-  // 可以比較。targetInfo.rawName 是 Forward 傳入字串（繁體），item.vod_name
-  // 是站方回傳（簡體），不處理會誤判為不同前綴。
-  const candName = normalizeTitleForMatch(item.vod_name || '');
-  const tName = normalizeTitleForMatch(targetInfo.rawName || targetInfo.baseName || '');
-  // Part 標記不只限於「最終季/第2期」：SAO S3 Part 2 是「爱丽丝篇 异界战争」
-  // （2019）、Part 3 是「最终季」(2020)。搜 S3 應該把 Part 2 + Part 3 都納入。
-  //
-  // 判定條件：candidate 含「最終季/第2期/Part 2/Part 3/第3期/最終章/完结篇/
-  // 完結篇/异界战争/War of Underworld/Final Season/Part.X」任一字眼 →
-  // 強制放行。
-  const hasPartMarker = /最终季|最終季|第\s*[2２]\s*期|Part\s*[23]|第\s*3\s*期|最終章|最終章|最終篇|最终篇|最終回|完结篇|完結篇|异界战争|異界戰爭|異界战争|War\s*of\s*Underworld|Final\s*Season|Part\s*[0-9]/i.test(item.vod_name || '');
-  if (hasPartMarker && tName && candName.startsWith(tName)) {
-    console.log(`🟢 [S${targetInfo.seasonNumber}-part-forced] 放行 ${item.vod_name} (target=${tName}, cand=${candName}, sim=${(matchResult.similarity || 0).toFixed(2)})`);
-    matchResult.match = true;
-    matchResult.type = 'part_marker_forced';
-    matchResult.confidence = 0.80;
-  }
-}
+          // 對 S4 查詢的「最終季/第2期/爱丽丝篇/异界战争」候選強制放行：
+          // 站方把 SAO S3 後半命名為「刀剑神域爱丽丝篇异界战争最终季」(2020)，
+          // 實際內容是 SAO 第四季。但 target 簡寫「刀劍神域」vs candidate
+          // 「刀剑神域爱丽丝篇异界战争最终季」相似度只有 0.286，
+          // 被 matchResult.confidence >= 0.6 卡住 12 集全部進不來。
+          //
+          // 啟發式：candidate 含「最终季/第2期/爱丽丝篇/异界战争/愛麗絲」其一，
+          // 且片名前綴以 targetName 開頭 → 強制放行為 S4 fallback 候選。
+          //
+          // 風險控制：必須以 targetName 開頭（去掉空白後），避免其他動漫
+          // 剛好含「异界战争」字眼（如「Re:0」劇場版）誤推。
+          if (targetInfo.seasonNumber >= 4 && !matchResult.match) {
+            // 用 normalizeTitleForMatch 處理簡轉繁，去空白，讓 target 與 candidate
+            // 可以比較。targetInfo.rawName 是 Forward 傳入字串（繁體），item.vod_name
+            // 是站方回傳（簡體），不處理會誤判為不同前綴。
+            const candName = normalizeTitleForMatch(item.vod_name || '');
+            const tName = normalizeTitleForMatch(targetInfo.rawName || targetInfo.baseName || '');
+            // 必須同時含「最終季/最終季」或「第2期」其一，並且以 targetName 開頭。
+            // 只含「爱丽丝篇/异界战争」(2018/2019 S3 第1期) 不算 S4 fallback，
+            // 否則使用者點進去看到的還是 S3 內容，不是想要的 S4。
+            const hasFinalSeason = /最终季|最終季/.test(item.vod_name || '');
+            const hasSecondCour = /第\s*[2２]\s*期/.test(item.vod_name || '');
+            if ((hasFinalSeason || hasSecondCour) && tName && candName.startsWith(tName)) {
+              console.log(`🟢 [S4-forced] 放行 ${item.vod_name} (target=${tName}, cand=${candName}, sim=${(matchResult.similarity || 0).toFixed(2)})`);
+              matchResult.match = true;
+              matchResult.type = 's4_fallback_forced';
+              matchResult.confidence = 0.85;
+            }
+          }
 
           if (matchResult.match && matchResult.confidence >= 0.6) {
             // 年份歧異剔除：站內「仁医2012」與「仁医」並列時，
