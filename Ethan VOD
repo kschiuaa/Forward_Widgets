@@ -2904,8 +2904,8 @@ function filterBySequel(results, targetInfo) {
   // 列出 S3 candidate (Sequel=3, targetSeason=3) 與 S1 candidate (Sequel=null, _year=2006) 各 3 個
   const s3cands = results.filter(r => extractSequelNumber(r._rawName || '') === 3).slice(0, 3);
   const s1cands = results.filter(r => extractSequelNumber(r._rawName || '') === null).slice(0, 3);
-  for (const s of s3cands) console.log(`  [s3-cand] "${s.name}" _rawName="${s._rawName}" _year=${s._year}`);
-  for (const s of s1cands) console.log(`  [s1-cand] "${s.name}" _rawName="${s._rawName}" _year=${s._year}`);
+  for (const s of s3cands) console.log(`  [s3-cand] "${s.name}" _rawName="${s._rawName}" _year=${s._year} desc="${s.description}" url=${s.url}`);
+  for (const s of s1cands) console.log(`  [s1-cand] "${s.name}" _rawName="${s._rawName}" _year=${s._year} desc="${s.description}" url=${s.url}`);
 
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
