@@ -243,7 +243,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.0",
+  version: "2.7.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -308,6 +308,32 @@ WidgetMetadata = {
         { title: "停用 (保留原文)", value: "disabled" }
       ],
       value: "enabled"
+    },
+    {
+      name: "m3u8FilterEnabled",
+      title: "m3u8 廣告過濾",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用 (走 Worker 去廣告)", value: "enabled" },
+        { title: "停用 (原始 CDN 直連)", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      name: "m3u8FilterWorkerUrl",
+      title: "Worker URL",
+      type: "input",
+      value: "https://ad-filter.kschiuaa.com"
+    },
+    {
+      name: "m3u8FilterMode",
+      title: "過濾模式",
+      type: "enumeration",
+      enumOptions: [
+        { title: "過濾 (去除廣告段)", value: "filter" },
+        { title: "透傳 (只走 Worker 不過濾,debug)", value: "passthrough" }
+      ],
+      value: "filter"
     }
   ],
   modules: [
@@ -2634,7 +2660,10 @@ async function loadResource(params, onStreamResult = null) {
     VodData,
     matchStrictness = 'standard',
     preferResolution = 'auto',
-    searchMode = 'smart_stream'
+    searchMode = 'smart_stream',
+    m3u8FilterEnabled = 'enabled',
+    m3u8FilterWorkerUrl,
+    m3u8FilterMode = 'filter'
   } = params;
 
   // Forward 傳入片名的欄位名並非只有一種：詳細頁通常給 seriesName，
@@ -2651,6 +2680,21 @@ async function loadResource(params, onStreamResult = null) {
 
   if (multiSource !== "enabled" || !seriesName) {
     return [];
+  }
+
+  // 同步使用者設定到 CONFIG.M3U8_FILTER。
+  //
+  // cleanResourceForOutput 是純函式(沒接 params),但 m3u8 wrap 需要讀 user 設定。
+  // 解法:把 globalParams 寫進 CONFIG.M3U8_FILTER(模組級單一來源),
+  // cleanResourceForOutput 內直接讀。為何不在每次 wrap 即時讀 params:
+  // helper 同時被 loadResource 與 loadDetail 兩條路徑呼叫,參數簽名會不一致。
+  // 寫 CONFIG 一次,helper 就不必管來源。
+  CONFIG.M3U8_FILTER.ENABLED = (m3u8FilterEnabled === 'enabled');
+  if (m3u8FilterWorkerUrl && typeof m3u8FilterWorkerUrl === 'string' && m3u8FilterWorkerUrl.trim()) {
+    CONFIG.M3U8_FILTER.WORKER_URL = m3u8FilterWorkerUrl.trim();
+  }
+  if (m3u8FilterMode === 'passthrough' || m3u8FilterMode === 'filter') {
+    CONFIG.M3U8_FILTER.MODE = m3u8FilterMode;
   }
 
   // widget 版本升級時清掉舊 cache。
@@ -4033,6 +4077,9 @@ async function loadDetail(link) {
         preferResolution: 'auto',
         multiSource: (WidgetMetadata.globalParams.find(p => p.name === 'multiSource') || {}).value || 'enabled',
         VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
+        m3u8FilterEnabled: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterEnabled') || {}).value || 'enabled',
+        m3u8FilterWorkerUrl: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterWorkerUrl') || {}).value || '',
+        m3u8FilterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterMode') || {}).value || 'filter',
       });
       for (const r of batchResults || []) {
         // 跨季去重：以 URL 為主鍵。同一 URL 出現在多季可能是因為多站
