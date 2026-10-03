@@ -229,7 +229,7 @@ const CONFIG = {
   // ENABLED = false 可一鍵關閉,所有 URL 恢復原始 CDN 直連。
   M3U8_FILTER: {
     ENABLED: true,
-    WORKER_URL: 'https://ad-filter.kschiuaa.com',
+    WORKER_URL: 'https://m3u8-adfliter.kschiuaa.com',
     // 為了 cache 命中穩定,base path 寫死。endpoint 內部模式見 Worker 端。
     ENDPOINT: '/filter',
     // 透傳 / 過濾 切換:debug 用。預設 'filter'。
@@ -243,7 +243,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.1",
+  version: "2.7.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -323,7 +323,7 @@ WidgetMetadata = {
       name: "m3u8FilterWorkerUrl",
       title: "Worker URL",
       type: "input",
-      value: "https://ad-filter.kschiuaa.com"
+      value: "https://m3u8-adfliter.kschiuaa.com"
     },
     {
       name: "m3u8FilterMode",
