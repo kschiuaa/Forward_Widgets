@@ -269,7 +269,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.7",
+  version: "2.7.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2649,8 +2649,17 @@ function cleanResourceForOutput(resource) {
   // m3u8 過濾 wrap。customHeaders 保留在物件上(REX 客戶端會用),Worker 端
   // 收到 m3u8 子請求時自動從 Referer 解析或回退到 customHeaders(Worker 端邏輯,
   // 見 m3u8-ad-filter-worker.js)。
-  if (isM3U8Url(clean.url)) {
-    clean.url = wrapM3U8WithFilter(clean.url);
+  // 診斷：印出 wrap 前的 url 與 isM3U8Url 判斷結果，與 wrap 後的 url。
+  try {
+    const beforeUrl = clean.url;
+    const playable = isM3U8Url(beforeUrl);
+    console.log(`🔴 [cleanResourceForOutput] beforeWrap urlLen=${(beforeUrl || '').length} isM3U8Url=${playable}`);
+    if (playable) {
+      clean.url = wrapM3U8WithFilter(beforeUrl);
+      console.log(`🔴 [cleanResourceForOutput] afterWrap changed=${clean.url !== beforeUrl} newUrlLen=${(clean.url || '').length}`);
+    }
+  } catch (e) {
+    console.log(`🔴 [cleanResourceForOutput] wrap failed: ${e?.message || e}`);
   }
 
   fieldsToDelete.forEach(field => {
@@ -2727,16 +2736,24 @@ function wrapM3U8WithFilter(url, hint) {
   if (!isM3U8Url(url)) return url;
   const base = (CONFIG.M3U8_FILTER.WORKER_URL || '').replace(/\/+$/, '');
   if (!base) return url;
+  // 診斷：印出 base + endpoint 與 URL 構造是否成功
+  try {
+    console.log(`🟡 wrapM3U8WithFilter 構造前: base="${base}" endpoint="${CONFIG.M3U8_FILTER.ENDPOINT}" typeofURL=${typeof URL}`);
+  } catch {}
   let inner;
   try {
     inner = new URL(url).toString();
+    console.log(`🟡 wrapM3U8WithFilter inner URL OK: ${inner.slice(0, 80)}`);
   } catch (e) {
+    console.log(`🟡 wrapM3U8WithFilter inner URL FAILED: ${e?.message || e}`);
     return url;
   }
   let u;
   try {
     u = new URL(base + CONFIG.M3U8_FILTER.ENDPOINT);
+    console.log(`🟡 wrapM3U8WithFilter outer URL OK: ${u.origin}${u.pathname}`);
   } catch (e) {
+    console.log(`🟡 wrapM3U8WithFilter outer URL FAILED: ${e?.message || e}`);
     return url;
   }
   u.searchParams.set('mode', CONFIG.M3U8_FILTER.MODE || 'filter');
