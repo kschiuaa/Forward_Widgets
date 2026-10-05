@@ -153,7 +153,14 @@ const CONFIG = {
   // 使用者看到的會是錯的。
   // bump 到 17：wrap 邏輯變更（冪等化 + movie 分支補 wrap + Worker URL
   // 三層 fallback），舊 cache 裡存的是未包裝或二次包裝的 URL，必須清掉。
-  WIDGET_VERSION: 17,
+  // bump 到 18：即使 v17 已引入 syncWidgetVersion 完整清 cache，實機仍
+  // 觀察到 cache 內存著裸 CDN 的歷史 URL（推測是早期版本繞過 wrap 直接
+  // 寫 cache、或某次 import syncWidgetVersion 因 storage 失敗沒寫入
+  // version key 導致下次也沒清）。修法是在 smart / batch 兩條 cache 命中
+  // 路徑加「兜底 wrap」（主動呼叫 wrapM3U8WithFilter），對冪等邏輯已是
+  // 已 wrap 的 url 無副作用，對裸 CDN 會印 log 提醒有歷史 cache 異常。
+  // bump version 確保舊 cache 仍會被清掉一次，乾淨起步。
+  WIDGET_VERSION: 18,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -262,7 +269,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.5",
+  version: "2.7.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3002,7 +3009,24 @@ async function loadResource(params, onStreamResult = null) {
           cachedResults = [];
         } else {
           console.log(`💾 缓存命中: ${usable.length}个结果`);
-        
+
+          // 兜底 wrap：對 cache 內每條物件的 url 主動呼叫 wrapM3U8WithFilter。
+          // 與 batch 路徑同樣理由（見 performBatchSearch 內同段註解）。
+          // 冪等保證：已 wrap 的 url 會被 isAlreadyWrapped 擋下，無副作用。
+          let rewrapped = 0;
+          for (const r of usable) {
+            if (!r || !r.url || typeof r.url !== 'string') continue;
+            const before = r.url;
+            const after = wrapM3U8WithFilter(r.url);
+            if (after !== before) {
+              r.url = after;
+              rewrapped++;
+            }
+          }
+          if (rewrapped > 0) {
+            console.log(`🩹 smart cache 兜底 wrap: ${rewrapped}/${usable.length} 條裸 CDN 已修復`);
+          }
+
           if (onStreamResult) {
             const batchSize = 5;
             for (let i = 0; i < usable.length; i += batchSize) {
@@ -3739,6 +3763,29 @@ async function performBatchSearch(params) {
     const cached = parseCacheValue(await Widget.storage?.get?.(cacheKey));
     if (cached.length > 0) {
       console.log(`✅ 批量模式缓存命中: ${cached.length}个结果`);
+      // 兜底 wrap：cache 內 url 在歷史版本曾以裸 CDN 寫入（syncWidgetVersion
+      // 沒清乾淨、或 batch 路徑在某版繞過 wrap 直接 set），即使 v17 之後的
+      // wrap 邏輯是冪等的，也不會把已存的裸 url 變成 Worker URL —— 因為
+      // wrapM3U8WithFilter 從未被呼叫。必須在這裡主動呼叫一次才能讓歷史
+      // cache 自動恢復為 Worker URL。
+      //
+      // 冪等保證：對已 wrap 的 url，wrapM3U8WithFilter 內的 isAlreadyWrapped
+      // 會直接 return，不會二次包裝；只對裸 CDN 才會真正 wrap 並印 log。
+      let rewrapped = 0;
+      for (const r of cached) {
+        if (!r || !r.url || typeof r.url !== 'string') continue;
+        const before = r.url;
+        const after = wrapM3U8WithFilter(r.url);
+        if (after !== before) {
+          r.url = after;
+          rewrapped++;
+        }
+      }
+      if (rewrapped > 0) {
+        console.log(`🩹 batch cache 兜底 wrap: ${rewrapped}/${cached.length} 條裸 CDN 已修復`);
+        // 順手把修好的 cache 寫回 storage，下次命中直接是 Worker URL。
+        try { Widget.storage?.set?.(cacheKey, JSON.stringify(cached), CONFIG.CACHE_TTL); } catch {}
+      }
       allResults = cached;
     }
   } catch (e) {
