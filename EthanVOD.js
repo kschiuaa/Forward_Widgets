@@ -118,6 +118,8 @@ const CHINESE_NUM_MAP = {
 };
 
 // ==================== 最佳化配置 ====================
+const DEFAULT_WORKER_URL = 'https://m3u8-adfliter.kschiuaa.com';
+
 const CONFIG = {
   // 性能配置
   MAX_CONCURRENT_REQUESTS: 8,
@@ -149,7 +151,9 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  WIDGET_VERSION: 16,
+  // bump 到 17：wrap 邏輯變更（冪等化 + movie 分支補 wrap + Worker URL
+  // 三層 fallback），舊 cache 裡存的是未包裝或二次包裝的 URL，必須清掉。
+  WIDGET_VERSION: 17,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -235,6 +239,21 @@ const CONFIG = {
     // 透傳 / 過濾 切換:debug 用。預設 'filter'。
     // 'passthrough' = 走 Worker 但不過濾,只驗 Worker 通不通。
     MODE: 'filter',
+    // admin token(對應 Worker 的 ADMIN_TOKEN 環境變數)。
+    // 留空 = 不啟用 admin 功能,只能讀 patterns(GET /patterns)。
+    // 填了之後啟動時會自動驗證 token、載入 patterns 到記憶體,
+    // 程式內可呼叫 m3u8FilterAdmin.xxx() 操作(增/刪/reload/reset)。
+    //
+    // 取得 token 方式:
+    //   NAS 上:  cat /volume1/docker/ad-filter/.env
+    //   或重新生成: openssl rand -hex 32
+    ADMIN_TOKEN: '',
+
+    // 啟動時要不要自動載入 patterns(節省手動 sync)
+    AUTO_LOAD_PATTERNS: true,
+
+    // 啟動時自動驗證 admin token(失敗只在 console 警告,不擋啟動)
+    AUTO_VERIFY_TOKEN: true,
   },
 };
 
@@ -243,7 +262,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.2",
+  version: "2.7.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -334,6 +353,23 @@ WidgetMetadata = {
         { title: "透傳 (只走 Worker 不過濾,debug)", value: "passthrough" }
       ],
       value: "filter"
+    },
+    {
+      name: "m3u8FilterAdminToken",
+      title: "Worker Admin Token (選填)",
+      type: "input",
+      description: "填入後可從 console 呼叫 m3u8FilterAdmin.*() 動態管理 patterns。留空 = 唯讀模式。",
+      value: ""
+    },
+    {
+      name: "m3u8FilterAutoLoad",
+      title: "啟動時載入 patterns",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
     }
   ],
   modules: [
@@ -378,6 +414,12 @@ WidgetMetadata = {
 // 「無副檔名就放行」會讓站方自帶播放器頁（/share/xxx）混進結果，Forward 播不了，
 // 使用者點了只會看到轉圈後失敗。寧可少給可選項，也不要給必定失敗的選項。
 const PLAYABLE_EXT = /\.(m3u8|mp4|flv|mkv|avi|mov|ts)(?:$|[?#])/i;
+// 已 wrap 過的 Worker URL 形如
+//   http://host:8787/filter?mode=filter&url=https%3A%2F%2F...%2Findex.m3u8
+// 內層 m3u8 是 percent-encoded，後面接的是字面量「url=」而非 ?#，
+// 所以 PLAYABLE_EXT 不會匹配。若不補這條規則，排序階段會把已包裝的
+// 來源誤判為「非媒體直連」而往下排，或在 movie 分支被整條漏掉。
+const WRAPPED_FILTER_URL = /\/filter\?(?:.*&)?url=/i;
 const BLOCKED_URL = /(javascript:|data:)/i;
 
 function isPlayableUrl(url) {
@@ -385,7 +427,9 @@ function isPlayableUrl(url) {
   const u = url.trim();
   if (!u || BLOCKED_URL.test(u)) return false;
   if (!/^https?:\/\//i.test(u)) return false;
-  return PLAYABLE_EXT.test(u);
+  if (PLAYABLE_EXT.test(u)) return true;
+  if (WRAPPED_FILTER_URL.test(u)) return true;
+  return false;
 }
 
 // 相容舊呼叫點
@@ -1441,7 +1485,11 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
         const resource = {
           name: siteTitle,
           description: isMainRelease ? displayName : `${displayName}．${qualityText}`,
-          url: url.trim(),
+          // movie 分支必須在這裡 wrap。cleanResourceForOutput 雖然也會 wrap，
+          // 但它是搜尋結果清理階段才跑；movie 走的是直接 results.push 路徑，
+          // 漏掉會讓電影全部裸奔 CDN —— 「設定改了但播放沒走過濾伺服器」
+          // 正是這裡造成的。wrap 本身冪等，重複呼叫不會二次包裝。
+          url: wrapM3U8WithFilter(url.trim()),
 
           playerType: 'app',
           customHeaders: {
@@ -2608,9 +2656,35 @@ function cleanResourceForOutput(resource) {
 //  - 非 m3u8 (mp4/flv/...) → 透傳
 //  - WORKER_URL 沒配 → 透傳(避免被 wrap 成相對路徑把播放搞壞)
 //  - URL 解析失敗 → 透傳(避免 IllegalArgumentException)
+//  - 已經是 Worker URL → 原樣返回(冪等)
+//
+// 冪等是必要的：搜尋結果會被寫進 cache(CACHE_TTL 30 分鐘),cache 命中時
+// 物件裡的 url 已經是 wrap 過的。若不判重,每次命中都會再包一層：
+//   /filter?url=http.../filter%3Furl%3Dhttp...   ← 壞掉
+// 使用者症狀是「改設定後過濾時好時壞」,而且 30 分鐘後才會自己恢復。
+function isAlreadyWrapped(url) {
+  try {
+    const u = new URL(url);
+    const base = (CONFIG.M3U8_FILTER.WORKER_URL || '').replace(/\/+$/, '');
+    if (!base) return false;
+    let bu;
+    try { bu = new URL(base); } catch (e) { return false; }
+    // 同源 + 同 endpoint 才算已包裝，避免誤判其他站點的 /filter
+    if (u.origin !== bu.origin) return false;
+    const ep = (CONFIG.M3U8_FILTER.ENDPOINT || '').replace(/\/+$/, '');
+    if (ep && u.pathname !== bu.pathname.replace(/\/+$/, '') + ep) return false;
+    return !!u.searchParams.get('url');
+  } catch (e) {
+    return false;
+  }
+}
+
 function wrapM3U8WithFilter(url) {
   if (!CONFIG.M3U8_FILTER?.ENABLED) return url;
   if (!url) return url;
+  if (typeof url !== 'string') return url;
+  // 已被包裝過 → 不再包第二層
+  if (isAlreadyWrapped(url)) return url;
   if (!isM3U8Url(url)) return url;
   const base = (CONFIG.M3U8_FILTER.WORKER_URL || '').replace(/\/+$/, '');
   if (!base) return url;
@@ -2689,12 +2763,50 @@ async function loadResource(params, onStreamResult = null) {
   // cleanResourceForOutput 內直接讀。為何不在每次 wrap 即時讀 params:
   // helper 同時被 loadResource 與 loadDetail 兩條路徑呼叫,參數簽名會不一致。
   // 寫 CONFIG 一次,helper 就不必管來源。
-  CONFIG.M3U8_FILTER.ENABLED = (m3u8FilterEnabled === 'enabled');
-  if (m3u8FilterWorkerUrl && typeof m3u8FilterWorkerUrl === 'string' && m3u8FilterWorkerUrl.trim()) {
-    CONFIG.M3U8_FILTER.WORKER_URL = m3u8FilterWorkerUrl.trim();
+  //
+  // 優先級：params 顯式傳入 > globalParams 設定項 > 模組預設值。
+  //
+  // 為什麼一定要 fallback 到 globalParams：REX 客戶端在詳細頁切換集數時會
+  // 直接呼叫 loadResource(params)，params 裡只有 link / seriesName 等，
+  // 沒有 m3u8FilterWorkerUrl。原本的寫法 `m3u8FilterEnabled = 'enabled'`
+  // 在解構時就給了 default，掩盖了「參數根本沒來」這件事；
+  // 一旦使用者把設定改成 disabled 再呼叫，就會意外開啟過濾。
+  // 反過來 m3u8FilterWorkerUrl 沒 default，undefined 時 if 不成立，
+  // CONFIG 會停在「上一次有人寫進去的值」—— 可能是上一輪的雲端網址，
+  // 這正是「設定改了卻沒生效、看播放紀錄沒東西」的原因。
+  const gpValue = (name, fallback) => {
+    try {
+      const hit = (WidgetMetadata.globalParams || []).find(p => p.name === name);
+      const v = hit && hit.value != null ? String(hit.value).trim() : '';
+      return v || fallback;
+    } catch (e) {
+      return fallback;
+    }
+  };
+
+  // ENABLED 預設 'enabled'：使用者沒設定時維持過濾開啟（原本行為），
+  // 但 explicit 的 'disabled' 一定會被尊重。
+  const enabledParam = (m3u8FilterEnabled != null && m3u8FilterEnabled !== '')
+    ? m3u8FilterEnabled
+    : gpValue('m3u8FilterEnabled', 'enabled');
+  CONFIG.M3U8_FILTER.ENABLED = (enabledParam === 'enabled');
+
+  // WORKER_URL 三層 fallback。
+  const workerParam = (typeof m3u8FilterWorkerUrl === 'string' && m3u8FilterWorkerUrl.trim())
+    ? m3u8FilterWorkerUrl.trim()
+    : gpValue('m3u8FilterWorkerUrl', '');
+  if (workerParam) {
+    CONFIG.M3U8_FILTER.WORKER_URL = workerParam;
+  } else if (!CONFIG.M3U8_FILTER.WORKER_URL) {
+    // 連 globalParams 都空 → 退回模組預設，避免 wrap 出相對路徑
+    CONFIG.M3U8_FILTER.WORKER_URL = DEFAULT_WORKER_URL;
   }
-  if (m3u8FilterMode === 'passthrough' || m3u8FilterMode === 'filter') {
-    CONFIG.M3U8_FILTER.MODE = m3u8FilterMode;
+
+  const modeParam = (m3u8FilterMode === 'passthrough' || m3u8FilterMode === 'filter')
+    ? m3u8FilterMode
+    : gpValue('m3u8FilterMode', 'filter');
+  if (modeParam === 'passthrough' || modeParam === 'filter') {
+    CONFIG.M3U8_FILTER.MODE = modeParam;
   }
 
   // widget 版本升級時清掉舊 cache。
@@ -4235,9 +4347,171 @@ async function loadSubtitle(params) {
 // 對 Node / Forward 內部測試環境同樣有效：
 //   - globalThis.loadResource 在兩個環境都成立；
 //   - Node 沒有 `module` 也不會炸。
+
+// ==================== m3u8 Filter Admin ====================
+//
+// 提供一組 helper,讓 widget 載入後可以在 console / 其他 module 直接管理
+// Worker 上的 patterns。token 來自 WidgetMetadata 內的 m3u8FilterAdminToken。
+//
+// 用法:
+//   m3u8FilterAdmin.list()                            // 看現有 patterns
+//   m3u8FilterAdmin.addPath('/xxx/')                  // 加 URL pattern
+//   m3u8FilterAdmin.addSeq('8.9,7.6')                 // 加 seq fingerprint
+//   m3u8FilterAdmin.removePath(14)                    // 刪第 14 個
+//   m3u8FilterAdmin.removeSeq(0)                      // 刪第 0 個
+//   m3u8FilterAdmin.reload()                          // 熱重載(磁碟→記憶體)
+//   m3u8FilterAdmin.reset()                           // 重置為預設
+//   m3u8FilterAdmin.verify()                          // 驗證 token + 同步
+//
+// 注意:這組 helper 只在 widget 設定有填 token 時啟用。
+// 沒填 token 的話所有寫操作都會 refuse,只能唯讀 list() / version()。
+
+const m3u8FilterAdmin = (() => {
+  // 從 CONFIG 拿 URL / token
+  const cfg = CONFIG.M3U8_FILTER;
+  const base = cfg.WORKER_URL;
+  const token = cfg.ADMIN_TOKEN || '';
+  const autoLoad = cfg.AUTO_LOAD_PATTERNS !== false;
+  const autoVerify = cfg.AUTO_VERIFY_TOKEN !== false;
+
+  // 快取 patterns(避免每次 call 都打 Worker)
+  let cachePatterns = null;
+
+  function headers() {
+    const h = { 'Content-Type': 'application/json' };
+    if (token) h['Authorization'] = 'Bearer ' + token;
+    return h;
+  }
+
+  async function httpJson(method, path, body) {
+    const opts = { method, headers: headers() };
+    if (body) opts.body = JSON.stringify(body);
+    const r = await fetch(base + path, opts);
+    const text = await r.text();
+    let json;
+    try { json = JSON.parse(text); } catch (_) { json = { raw: text }; }
+    return { ok: r.ok, status: r.status, json };
+  }
+
+  function needAuth() {
+    if (!token) {
+      console.warn('[m3u8FilterAdmin] ADMIN_TOKEN 沒設定,操作被拒絕');
+      return false;
+    }
+    return true;
+  }
+
+  // 公開 API
+  return {
+    /** 唯讀 — 不需 token */
+    async list() {
+      const r = await httpJson('GET', '/version');
+      if (!r.ok) return null;
+      // 再拉一次 /patterns 拿完整內容
+      const p = await fetch(base + '/patterns');
+      const text = await p.text();
+      cachePatterns = text;
+      return { version: r.json, patterns: text };
+    },
+
+    /** 加 URL path pattern(token 必要) */
+    async addPath(pattern) {
+      if (!needAuth()) return null;
+      const r = await httpJson('POST', '/admin/patterns', { pattern });
+      console.log('[m3u8FilterAdmin] addPath:', r);
+      return r;
+    },
+
+    /** 加 seq fingerprint(token 必要) */
+    async addSeq(seq) {
+      if (!needAuth()) return null;
+      const r = await httpJson('POST', '/admin/seq', { seq });
+      console.log('[m3u8FilterAdmin] addSeq:', r);
+      return r;
+    },
+
+    /** 刪 URL pattern(token 必要,idx 是 list() 看到的編號) */
+    async removePath(idx) {
+      if (!needAuth()) return null;
+      const r = await httpJson('DELETE', '/admin/patterns/' + idx);
+      console.log('[m3u8FilterAdmin] removePath:', r);
+      return r;
+    },
+
+    /** 刪 seq fingerprint */
+    async removeSeq(idx) {
+      if (!needAuth()) return null;
+      const r = await httpJson('DELETE', '/admin/seq/' + idx);
+      console.log('[m3u8FilterAdmin] removeSeq:', r);
+      return r;
+    },
+
+    /** 熱重載磁碟 → 記憶體 */
+    async reload() {
+      if (!needAuth()) return null;
+      const r = await httpJson('POST', '/admin/reload');
+      console.log('[m3u8FilterAdmin] reload:', r);
+      return r;
+    },
+
+    /** 重置為預設值(危險!) */
+    async reset() {
+      if (!needAuth()) return null;
+      const r = await httpJson('POST', '/admin/reset');
+      console.log('[m3u8FilterAdmin] reset:', r);
+      return r;
+    },
+
+    /** 驗證 token 並抓一次 version / patterns */
+    async verify() {
+      if (!token) {
+        console.warn('[m3u8FilterAdmin] 沒設 token,跳過驗證');
+        return null;
+      }
+      const r = await httpJson('GET', '/version');
+      if (!r.ok) {
+        console.error('[m3u8FilterAdmin] 驗證失敗:', r);
+        return r;
+      }
+      const enabled = r.json.admin_enabled;
+      if (!enabled) {
+        console.error('[m3u8FilterAdmin] Worker 沒啟用 admin(ADMIN_TOKEN env 沒設)');
+        return r;
+      }
+      console.log('[m3u8FilterAdmin] 驗證 OK:', r.json);
+      return r;
+    },
+
+    /** 內部 — 啟動時跑一次(若啟用) */
+    async _bootstrap() {
+      if (!autoLoad && !autoVerify) return;
+      try {
+        if (token && autoVerify) await this.verify();
+        if (autoLoad) await this.list();
+      } catch (e) {
+        console.warn('[m3u8FilterAdmin] bootstrap 失敗(非致命):', e?.message || e);
+      }
+    },
+
+    /** 清快取,下次 list() 重新抓 */
+    invalidate() {
+      cachePatterns = null;
+    },
+
+    /** 取快取 */
+    getCached() {
+      return cachePatterns;
+    },
+  };
+})();
+
+// 啟動時自動跑 bootstrap(非同步,不擋 UI)
+m3u8FilterAdmin._bootstrap();
+
 if (typeof globalThis !== 'undefined') {
   globalThis.loadResource = loadResource;
   globalThis.loadDetail = loadDetail;
   globalThis.loadSubtitle = loadSubtitle;
   globalThis.WidgetMetadata = WidgetMetadata;
+  globalThis.m3u8FilterAdmin = m3u8FilterAdmin;
 }
