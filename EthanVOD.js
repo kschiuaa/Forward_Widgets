@@ -262,7 +262,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.4",
+  version: "2.7.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1437,7 +1437,14 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
             // url: url.trim()（裸 CDN 直連）。只有 movie 分支和
             // cleanResourceForOutput 有 wrap，所以劇集全部繞過過濾伺服器。
             // wrap 冪等，重複呼叫不會二次包裝。
-            url: wrapM3U8WithFilter(url.trim()),
+            //
+            // 附帶 site / name / episode：後台觀看紀錄靠這三個欄位才看得出
+            // 「誰在看、看的哪一集」，不帶就是一片空白。
+            url: wrapM3U8WithFilter(url.trim(), {
+              site: siteTitle,
+              name: toDisplayText(vod_name),
+              episode: toDisplayText(epName),
+            }),
 
             playerType: 'app',
             customHeaders: {
@@ -1497,7 +1504,12 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           // 但它是搜尋結果清理階段才跑；movie 走的是直接 results.push 路徑，
           // 漏掉會讓電影全部裸奔 CDN —— 「設定改了但播放沒走過濾伺服器」
           // 正是這裡造成的。wrap 本身冪等，重複呼叫不會二次包裝。
-          url: wrapM3U8WithFilter(url.trim()),
+          //
+          // site / name 讓後台觀看紀錄看得出來源；電影沒有集數，故不傳 episode。
+          url: wrapM3U8WithFilter(url.trim(), {
+            site: siteTitle,
+            name: toDisplayText(vod_name),
+          }),
 
           playerType: 'app',
           customHeaders: {
@@ -2687,7 +2699,7 @@ function isAlreadyWrapped(url) {
   }
 }
 
-function wrapM3U8WithFilter(url) {
+function wrapM3U8WithFilter(url, hint) {
   if (!CONFIG.M3U8_FILTER?.ENABLED) return url;
   if (!url) return url;
   if (typeof url !== 'string') return url;
@@ -2710,6 +2722,22 @@ function wrapM3U8WithFilter(url) {
   }
   u.searchParams.set('mode', CONFIG.M3U8_FILTER.MODE || 'filter');
   u.searchParams.set('url', inner);
+
+  // 附加觀看資訊（片名 / 站台 / 集數）。
+  //
+  // 為什麼必須加：後台明確支援從 query 讀取這些欄位，註解就寫著
+  // 「Forward widget 可在 URL 後面加」（ad-filter-local.js:3919），
+  // 但 wrap 原本只送 mode + url，後台因此永遠拿到空字串，
+  // 「觀看紀錄」頁顯示不出片名與集數。使用者看到的就是
+  // 「有請求進來，但不知道是誰在看、看的哪一集」。
+  //
+  // 冪等：isAlreadyWrapped 在最前面擋掉已包裝的 url，重跑不會疊加。
+  if (hint && typeof hint === 'object') {
+    if (hint.site) u.searchParams.set('site', String(hint.site));
+    if (hint.name) u.searchParams.set('name', String(hint.name));
+    if (hint.episode) u.searchParams.set('episode', String(hint.episode));
+  }
+
   // 診斷：wrap 真的執行了才印。這是「播放有沒有走過濾」的第一手證據 ——
   // 伺服器端沒有請求可能是 wrap 沒跑，也可能是跑了但網路到不了。
   console.log(`🔗 wrap m3u8 -> ${u.origin}${u.pathname} (mode=${CONFIG.M3U8_FILTER.MODE})`);
