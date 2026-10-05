@@ -262,7 +262,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.3",
+  version: "2.7.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1429,7 +1429,15 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
           const resource = {
             name: siteTitle,
             description: tail ? `${displayName}．${tail}` : displayName,
-            url: url.trim(),
+            // TV 分支必須在這裡 wrap，理由與 movie 分支相同：
+            // 這條路徑是直接 results.push，不經過 cleanResourceForOutput。
+            //
+            // 這是「設定改了但播放沒走過濾伺服器」的真正主因 ——
+            // loadResource 預設類型是 'tv'，而 TV 分支原本寫的是
+            // url: url.trim()（裸 CDN 直連）。只有 movie 分支和
+            // cleanResourceForOutput 有 wrap，所以劇集全部繞過過濾伺服器。
+            // wrap 冪等，重複呼叫不會二次包裝。
+            url: wrapM3U8WithFilter(url.trim()),
 
             playerType: 'app',
             customHeaders: {
@@ -2702,6 +2710,9 @@ function wrapM3U8WithFilter(url) {
   }
   u.searchParams.set('mode', CONFIG.M3U8_FILTER.MODE || 'filter');
   u.searchParams.set('url', inner);
+  // 診斷：wrap 真的執行了才印。這是「播放有沒有走過濾」的第一手證據 ——
+  // 伺服器端沒有請求可能是 wrap 沒跑，也可能是跑了但網路到不了。
+  console.log(`🔗 wrap m3u8 -> ${u.origin}${u.pathname} (mode=${CONFIG.M3U8_FILTER.MODE})`);
   return u.toString();
 }
 
@@ -2807,6 +2818,31 @@ async function loadResource(params, onStreamResult = null) {
     : gpValue('m3u8FilterMode', 'filter');
   if (modeParam === 'passthrough' || modeParam === 'filter') {
     CONFIG.M3U8_FILTER.MODE = modeParam;
+  }
+
+  // 診斷：把三層 fallback 的實際結果全部印出來。
+  //
+  // 為什麼需要：症狀是「改了設定但播放沒走過濾伺服器」，可能原因有四種
+  // （設定沒存進 globalParams / loadResource 沒帶 params / CONFIG 被舊值
+  // 殘留 / wrap 根本沒被呼叫），而這四種從外部症狀長得一樣，光看播放結果
+  // 分不出來。印出 source 才知道該修哪一層。
+  try {
+    const allGp = (WidgetMetadata && WidgetMetadata.globalParams) || [];
+    console.log('🔧 m3u8 filter 設定:', JSON.stringify({
+      enabled: CONFIG.M3U8_FILTER.ENABLED,
+      workerUrl: CONFIG.M3U8_FILTER.WORKER_URL,
+      mode: CONFIG.M3U8_FILTER.MODE,
+      endpoint: CONFIG.M3U8_FILTER.ENDPOINT,
+      // params 層有沒有值（沒值 = 走 globalParams）
+      fromParams: !!m3u8FilterWorkerUrl,
+      // globalParams 層的原始值（'' 代表 Forward 沒存到設定）
+      gpWorkerUrl: gpValue('m3u8FilterWorkerUrl', '(空)'),
+      gpEnabled: gpValue('m3u8FilterEnabled', '(空)'),
+      gpCount: allGp.length,
+      gpNames: allGp.map(p => p.name).join(','),
+    }));
+  } catch (e) {
+    console.log('🔧 m3u8 filter 設定診斷失敗:', e && e.message);
   }
 
   // widget 版本升級時清掉舊 cache。
