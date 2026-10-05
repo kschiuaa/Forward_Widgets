@@ -269,7 +269,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.6",
+  version: "2.7.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1406,9 +1406,15 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
     const isTV = playSource.includes('#');
 
     if (type === 'tv' && isTV) {
+      // 診斷：確認 TV 分支確實進入，wrap 應在 ep 處理時被呼叫。
+      console.log(`🟢 [extractPlayInfoForCache] TV 分支進入: ${vod_name} episodes=${playSource.split('#').filter(Boolean).length} site=${siteTitle}`);
       const episodes = playSource.split('#').filter(Boolean);
       episodes.forEach(ep => {
         const [epName, url] = ep.split('$');
+        // 診斷：印出每集原始 url 與 isPlayableUrl 判斷結果。
+        if (ep && (epName || url)) {
+          console.log(`🔵 [extractPlayInfoForCache] ep="${epName}" url="${url}" isPlayableUrl=${isPlayableUrl(url || '')}`);
+        }
         if (url && isPlayableUrl(url)) {
           const epMatch = epName.match(/第(\d+)(集|期)/);
           const episodeNumber = epMatch ? parseInt(epMatch[1]) : null;
@@ -2707,6 +2713,12 @@ function isAlreadyWrapped(url) {
 }
 
 function wrapM3U8WithFilter(url, hint) {
+  // 診斷：每次進入都印入口狀態（不管是已 wrap、early return、或真實 wrap）。
+  // 這條 log 的目的是確認 widget 真的有呼叫到 wrapM3U8WithFilter，方便與
+  // 「cache 內 url 已是裸 CDN」的問題對照。
+  try {
+    console.log(`🟡 wrapM3U8WithFilter 入口: enabled=${CONFIG.M3U8_FILTER?.ENABLED} urlLen=${(url || '').length} isAlreadyWrapped=${isAlreadyWrapped(url || '')} isM3U8Url=${isM3U8Url(url || '')}`);
+  } catch {}
   if (!CONFIG.M3U8_FILTER?.ENABLED) return url;
   if (!url) return url;
   if (typeof url !== 'string') return url;
