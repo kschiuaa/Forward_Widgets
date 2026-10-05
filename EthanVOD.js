@@ -160,7 +160,12 @@ const CONFIG = {
   // 路徑加「兜底 wrap」（主動呼叫 wrapM3U8WithFilter），對冪等邏輯已是
   // 已 wrap 的 url 無副作用，對裸 CDN 會印 log 提醒有歷史 cache 異常。
   // bump version 確保舊 cache 仍會被清掉一次，乾淨起步。
-  WIDGET_VERSION: 18,
+  // bump 到 19：v18 之前的 wrap 函式在 REX runtime（vm 沙箱）會 throw
+  // ReferenceError: Can't find variable: URL，因為沙箱沒有 URL 全域物件。
+  // 整段 try/catch 把 throw 吃掉後靜默 return 裸 CDN，導致 wrap 從未跑。
+  // 修法：HAS_URL 偵測 + 字串拼接 fallback。對「已 wrap 的 url」仍走
+  // isAlreadyWrapped 冪等檢查；對裸 CDN 字串拼接後就是 Worker URL。
+  WIDGET_VERSION: 19,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -269,7 +274,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.8",
+  version: "2.7.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1406,15 +1411,9 @@ function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
     const isTV = playSource.includes('#');
 
     if (type === 'tv' && isTV) {
-      // 診斷：確認 TV 分支確實進入，wrap 應在 ep 處理時被呼叫。
-      console.log(`🟢 [extractPlayInfoForCache] TV 分支進入: ${vod_name} episodes=${playSource.split('#').filter(Boolean).length} site=${siteTitle}`);
       const episodes = playSource.split('#').filter(Boolean);
       episodes.forEach(ep => {
         const [epName, url] = ep.split('$');
-        // 診斷：印出每集原始 url 與 isPlayableUrl 判斷結果。
-        if (ep && (epName || url)) {
-          console.log(`🔵 [extractPlayInfoForCache] ep="${epName}" url="${url}" isPlayableUrl=${isPlayableUrl(url || '')}`);
-        }
         if (url && isPlayableUrl(url)) {
           const epMatch = epName.match(/第(\d+)(集|期)/);
           const episodeNumber = epMatch ? parseInt(epMatch[1]) : null;
@@ -2649,17 +2648,8 @@ function cleanResourceForOutput(resource) {
   // m3u8 過濾 wrap。customHeaders 保留在物件上(REX 客戶端會用),Worker 端
   // 收到 m3u8 子請求時自動從 Referer 解析或回退到 customHeaders(Worker 端邏輯,
   // 見 m3u8-ad-filter-worker.js)。
-  // 診斷：印出 wrap 前的 url 與 isM3U8Url 判斷結果，與 wrap 後的 url。
-  try {
-    const beforeUrl = clean.url;
-    const playable = isM3U8Url(beforeUrl);
-    console.log(`🔴 [cleanResourceForOutput] beforeWrap urlLen=${(beforeUrl || '').length} isM3U8Url=${playable}`);
-    if (playable) {
-      clean.url = wrapM3U8WithFilter(beforeUrl);
-      console.log(`🔴 [cleanResourceForOutput] afterWrap changed=${clean.url !== beforeUrl} newUrlLen=${(clean.url || '').length}`);
-    }
-  } catch (e) {
-    console.log(`🔴 [cleanResourceForOutput] wrap failed: ${e?.message || e}`);
+  if (isM3U8Url(clean.url)) {
+    clean.url = wrapM3U8WithFilter(clean.url);
   }
 
   fieldsToDelete.forEach(field => {
@@ -2704,30 +2694,54 @@ function cleanResourceForOutput(resource) {
 // 物件裡的 url 已經是 wrap 過的。若不判重,每次命中都會再包一層：
 //   /filter?url=http.../filter%3Furl%3Dhttp...   ← 壞掉
 // 使用者症狀是「改設定後過濾時好時壞」,而且 30 分鐘後才會自己恢復。
+// 環境兼容：REX runtime（vm 沙箱）沒有 URL 全域物件。
+// 用 typeof 偵測，存在就走原生 URL（語意乾淨），不存在就走字串 fallback。
+//
+// 為什麼這層偵測是關鍵：原版用 `new URL()` 在 vm 沙箱會拋 ReferenceError，
+// 被 try/catch 吃掉後靜默 return 裸 CDN —— 「設定改了但播放沒走過濾」幾個月
+// 都找不出原因，就是這條 try/catch 把整個 wrap 失敗吞掉了。
+const HAS_URL = (typeof URL !== 'undefined');
+
 function isAlreadyWrapped(url) {
+  if (!url || typeof url !== 'string') return false;
+  if (HAS_URL) {
+    try {
+      const u = new URL(url);
+      const base = (CONFIG.M3U8_FILTER.WORKER_URL || '').replace(/\/+$/, '');
+      if (!base) return false;
+      let bu;
+      try { bu = new URL(base); } catch (e) { return false; }
+      // 同源 + 同 endpoint 才算已包裝，避免誤判其他站點的 /filter
+      if (u.origin !== bu.origin) return false;
+      const ep = (CONFIG.M3U8_FILTER.ENDPOINT || '').replace(/\/+$/, '');
+      if (ep && u.pathname !== bu.pathname.replace(/\/+$/, '') + ep) return false;
+      return !!u.searchParams.get('url');
+    } catch (e) {
+      return false;
+    }
+  }
+  // Fallback（REX runtime / vm 沙箱沒有 URL 全域）：
+  // 用正則拆 url 與 base，比對 origin 與 path + endpoint，並確認 query 內有 url= 參數。
   try {
-    const u = new URL(url);
     const base = (CONFIG.M3U8_FILTER.WORKER_URL || '').replace(/\/+$/, '');
     if (!base) return false;
-    let bu;
-    try { bu = new URL(base); } catch (e) { return false; }
-    // 同源 + 同 endpoint 才算已包裝，避免誤判其他站點的 /filter
-    if (u.origin !== bu.origin) return false;
-    const ep = (CONFIG.M3U8_FILTER.ENDPOINT || '').replace(/\/+$/, '');
-    if (ep && u.pathname !== bu.pathname.replace(/\/+$/, '') + ep) return false;
-    return !!u.searchParams.get('url');
+    const ep = (CONFIG.M3U8_FILTER.ENDPOINT || '').replace(/^\/+|\/+$/g, '');
+    const bm = base.match(/^([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/[^\/]+)(\/.*)?$/);
+    if (!bm) return false;
+    const baseOrigin = bm[1];
+    const basePath = (bm[2] || '').replace(/\/+$/, '');
+    const um = url.match(/^([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/[^\/]+)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
+    if (!um || um[1] !== baseOrigin) return false;
+    const urlPath = (um[2] || '').replace(/\/+$/, '');
+    const expectedPath = basePath + (ep ? '/' + ep.replace(/^\/+/, '') : '');
+    if (urlPath !== expectedPath.replace(/\/+$/, '')) return false;
+    return /(?:^|&)url=/.test(um[3] || '');
   } catch (e) {
     return false;
   }
 }
 
 function wrapM3U8WithFilter(url, hint) {
-  // 診斷：每次進入都印入口狀態（不管是已 wrap、early return、或真實 wrap）。
-  // 這條 log 的目的是確認 widget 真的有呼叫到 wrapM3U8WithFilter，方便與
-  // 「cache 內 url 已是裸 CDN」的問題對照。
-  try {
-    console.log(`🟡 wrapM3U8WithFilter 入口: enabled=${CONFIG.M3U8_FILTER?.ENABLED} urlLen=${(url || '').length} isAlreadyWrapped=${isAlreadyWrapped(url || '')} isM3U8Url=${isM3U8Url(url || '')}`);
-  } catch {}
   if (!CONFIG.M3U8_FILTER?.ENABLED) return url;
   if (!url) return url;
   if (typeof url !== 'string') return url;
@@ -2736,48 +2750,46 @@ function wrapM3U8WithFilter(url, hint) {
   if (!isM3U8Url(url)) return url;
   const base = (CONFIG.M3U8_FILTER.WORKER_URL || '').replace(/\/+$/, '');
   if (!base) return url;
-  // 診斷：印出 base + endpoint 與 URL 構造是否成功
+  const ep = (CONFIG.M3U8_FILTER.ENDPOINT || '').replace(/^\/+/, '');
+  const mode = CONFIG.M3U8_FILTER.MODE || 'filter';
+
+  let finalUrl;
+  if (HAS_URL) {
+    // 原生路徑（瀏覽器 / Node.js）—— 語意乾淨、走 URL.searchParams。
+    let inner;
+    try { inner = new URL(url).toString(); } catch (e) { return url; }
+    let u;
+    try { u = new URL(base + '/' + ep); } catch (e) { return url; }
+    u.searchParams.set('mode', mode);
+    u.searchParams.set('url', inner);
+    if (hint && typeof hint === 'object') {
+      if (hint.site) u.searchParams.set('site', String(hint.site));
+      if (hint.name) u.searchParams.set('name', String(hint.name));
+      if (hint.episode) u.searchParams.set('episode', String(hint.episode));
+    }
+    finalUrl = u.toString();
+  } else {
+    // Fallback 路徑（REX runtime / vm 沙箱沒有 URL 全域）：
+    // 純字串拼接 + encodeURIComponent。
+    // 為什麼不再 try/catch 整段拼接：純字串處理不可能 throw，唯一風險是
+    // base 沒 scheme；`base` 已在入口驗證為非空字串，isAlreadyWrapped 的
+    // fallback 正則也保證 base 符合 scheme://host 格式。
+    const parts = [];
+    parts.push('mode=' + encodeURIComponent(mode));
+    parts.push('url=' + encodeURIComponent(url));
+    if (hint && typeof hint === 'object') {
+      if (hint.site) parts.push('site=' + encodeURIComponent(String(hint.site)));
+      if (hint.name) parts.push('name=' + encodeURIComponent(String(hint.name)));
+      if (hint.episode) parts.push('episode=' + encodeURIComponent(String(hint.episode)));
+    }
+    finalUrl = base + '/' + ep + '?' + parts.join('&');
+  }
+
+  // 診斷：wrap 真的執行了才印。這是「播放有沒有走過濾」的第一手證據。
   try {
-    console.log(`🟡 wrapM3U8WithFilter 構造前: base="${base}" endpoint="${CONFIG.M3U8_FILTER.ENDPOINT}" typeofURL=${typeof URL}`);
+    console.log(`🔗 wrap m3u8 (HAS_URL=${HAS_URL}) -> ${(finalUrl || '').slice(0, 120)}`);
   } catch {}
-  let inner;
-  try {
-    inner = new URL(url).toString();
-    console.log(`🟡 wrapM3U8WithFilter inner URL OK: ${inner.slice(0, 80)}`);
-  } catch (e) {
-    console.log(`🟡 wrapM3U8WithFilter inner URL FAILED: ${e?.message || e}`);
-    return url;
-  }
-  let u;
-  try {
-    u = new URL(base + CONFIG.M3U8_FILTER.ENDPOINT);
-    console.log(`🟡 wrapM3U8WithFilter outer URL OK: ${u.origin}${u.pathname}`);
-  } catch (e) {
-    console.log(`🟡 wrapM3U8WithFilter outer URL FAILED: ${e?.message || e}`);
-    return url;
-  }
-  u.searchParams.set('mode', CONFIG.M3U8_FILTER.MODE || 'filter');
-  u.searchParams.set('url', inner);
-
-  // 附加觀看資訊（片名 / 站台 / 集數）。
-  //
-  // 為什麼必須加：後台明確支援從 query 讀取這些欄位，註解就寫著
-  // 「Forward widget 可在 URL 後面加」（ad-filter-local.js:3919），
-  // 但 wrap 原本只送 mode + url，後台因此永遠拿到空字串，
-  // 「觀看紀錄」頁顯示不出片名與集數。使用者看到的就是
-  // 「有請求進來，但不知道是誰在看、看的哪一集」。
-  //
-  // 冪等：isAlreadyWrapped 在最前面擋掉已包裝的 url，重跑不會疊加。
-  if (hint && typeof hint === 'object') {
-    if (hint.site) u.searchParams.set('site', String(hint.site));
-    if (hint.name) u.searchParams.set('name', String(hint.name));
-    if (hint.episode) u.searchParams.set('episode', String(hint.episode));
-  }
-
-  // 診斷：wrap 真的執行了才印。這是「播放有沒有走過濾」的第一手證據 ——
-  // 伺服器端沒有請求可能是 wrap 沒跑，也可能是跑了但網路到不了。
-  console.log(`🔗 wrap m3u8 -> ${u.origin}${u.pathname} (mode=${CONFIG.M3U8_FILTER.MODE})`);
-  return u.toString();
+  return finalUrl;
 }
 
 async function loadResource(params, onStreamResult = null) {
