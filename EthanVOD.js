@@ -479,72 +479,107 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   pushAlias(hit.title);
   pushAlias(hit.original_title);
 
+  // v2.8.11 早寫入 cache：search 拿到 hit 立即寫入（至少 2 個，baseName
+  // + hit.name + original_name）。這讓 race 4s 內 caller 至少能拿到
+  // 早期別名（沒 CN 但有 baseName 繁簡變體），alt_titles background 跑
+  // 完再覆蓋。
+  //
+  // 為什麼這段重要：log 顯示 TMDB search + alt_titles 兩條 request 串行
+  // 8005ms 才完成。原本 race 4s → timeout → tryExpand 拿空 → 0 筆。
+  // 早寫入 + race 4s → cacheWatchP ~1500ms 看到早期 2 別名 → race
+  // 命中 → tryExpand 拿到別名（雖然沒 CN，至少「陰屍路」轉「阴尸路」
+  // 對 VOD 站可能仍 0 筆，但 batch 第一次結果出來了）。
+  if (aliases.length >= 1) {
+    _tmdbAliasCache.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
+    _tmdbAliasRecent.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
+    _enforceTmdbAliasCacheLimit();
+    _storeTmdbAliasCache(cacheKey, [...aliases]).catch(() => {});
+    console.log(`[TMDB-diag] ✓ 早寫入 cache（hit 內欄位，n=${aliases.length}），alt_titles 仍在背景 fetch`);
+  }
+
   // 第二步：拿 alternative_titles（多地區別名：CN/HK/TW/SG）
-  // 這是 v2.8.5 加回來的。我之前為了快砍掉，但少了 CN「行尸走肉」會
-  // 導致 VOD 站 0 筆結果。v2.8.4 已修好 race 條件（Promise.race 三方
-  // 都能正常 fire），所以 alt_titles 第二次 request 雖然慢 600ms，
-  // 但 cache 寫入是 fire-and-forget，不影響 batch 結束時間。
+  // 這是 v2.8.5 加回來的。v2.8.11 改成 fire-and-forget：IIFE 跑完
+  // 直接覆蓋 cache 與 storage（CN 別名優先），caller 不 await。
+  //
+  // 重要：覆蓋 cache 時**完整保留**早期別名（baseName + hit 內 name），
+  // 把 CN/TW/HK/SG 別名 push 到前面（CN 排第一），這樣 tryExpand 拿到
+  // 的 aliases 陣列第一個非空且非原名的中文別名就是「行尸走肉」。
   const altUrl = `https://api.themoviedb.org/3/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}/` +
     `alternative_titles?api_key=${encodeURIComponent(apiKey)}`;
 
-  try {
-    const t0 = Date.now();
-    const resp2 = await Widget.http.get(altUrl, {
-      timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
-      headers: { 'Accept': 'application/json' }
-    });
-    console.log(`[TMDB-diag] alt resp after ${Date.now() - t0}ms: typeof=${typeof resp2}`);
-    const altData = _unwrapHttpResponse(resp2);
-    const titles = Array.isArray(altData?.titles) ? altData.titles
-                  : Array.isArray(altData?.results) ? altData.results
-                  : [];
-    console.log(`[TMDB-diag] alt titles count=${titles.length}`);
+  (async () => {
+    let finalAliases;
+    try {
+      const t0 = Date.now();
+      const resp2 = await Widget.http.get(altUrl, {
+        timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+        headers: { 'Accept': 'application/json' }
+      });
+      console.log(`[TMDB-diag] alt resp after ${Date.now() - t0}ms: typeof=${typeof resp2}`);
+      const altData = _unwrapHttpResponse(resp2);
+      const titles = Array.isArray(altData?.titles) ? altData.titles
+                    : Array.isArray(altData?.results) ? altData.results
+                    : [];
+      console.log(`[TMDB-diag] alt titles count=${titles.length}`);
 
-    // 第三步：篩選我們關心的地區（CN/TW/HK/SG），並**優先放 CN 別名**。
-    //
-    // 為什麼要把 CN 排第一：tryExpandWithTMDBAliases 內的挑選邏輯是
-    // 「拿第一個簡體化後 ≠ baseSimp 的別名」。如果 CN 別名排後面，
-    // 前面可能卡到一個英文別名（"The Walking Dead"）就被挑走，導致
-    // 沒走到 CN「行尸走肉」→ VOD 站 0 筆結果。
-    //
-    // TMDB 的 /alternative_titles response 順序不固定，必須在這裡
-    // 明確分桶。
-    const regions = CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN', 'TW', 'HK', 'SG'];
-    const regionSet = new Set(regions);
-    // 用 region 當 key 存，後續依 regions 順序合併，CN 一定最先
-    const byRegion = new Map();
-    for (const t of titles) {
-      if (!t?.title) continue;
-      const title = String(t.title).trim();
-      if (!title) continue;
-      const region = String(t.iso_3166_1 || '').toUpperCase();
-      if (!regionSet.has(region)) continue;
-      if (!byRegion.has(region)) byRegion.set(region, []);
-      byRegion.get(region).push(title);
+      // 第三步：篩選我們關心的地區（CN/TW/HK/SG），並**優先放 CN 別名**。
+      //
+      // 為什麼要把 CN 排第一：tryExpandWithTMDBAliases 內的挑選邏輯是
+      // 「拿第一個簡體化後 ≠ baseSimp 的別名」。如果 CN 別名排後面，
+      // 前面可能卡到一個英文別名（"The Walking Dead"）就被挑走，導致
+      // 沒走到 CN「行尸走肉」→ VOD 站 0 筆結果。
+      //
+      // TMDB 的 /alternative_titles response 順序不固定，必須在這裡
+      // 明確分桶。
+      const regions = CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN', 'TW', 'HK', 'SG'];
+      const regionSet = new Set(regions);
+      const byRegion = new Map();
+      for (const t of titles) {
+        if (!t?.title) continue;
+        const title = String(t.title).trim();
+        if (!title) continue;
+        const region = String(t.iso_3166_1 || '').toUpperCase();
+        if (!regionSet.has(region)) continue;
+        if (!byRegion.has(region)) byRegion.set(region, []);
+        byRegion.get(region).push(title);
+      }
+      // 把 CN/TW/HK/SG 別名合併到 aliases 前面（CN 排第一）
+      const merged = [...aliases];
+      const seenLocal = new Set(merged.map(a => normalizeForMatching(a)));
+      for (const r of regions) {
+        const list = byRegion.get(r);
+        if (!list) continue;
+        for (const title of list) {
+          const tn = normalizeForMatching(title);
+          if (seenLocal.has(tn)) continue;
+          seenLocal.add(tn);
+          merged.unshift(title);
+        }
+      }
+      finalAliases = merged;
+    } catch (e) {
+      console.log(`[TMDB-diag] alt_titles EXCEPTION: ${e?.message || e}`);
+      finalAliases = aliases;  // 退路：保留早期別名
     }
-    // 先放 CN 別名（簡體中文，VOD 站最愛），再放其他地區
-    for (const r of regions) {
-      const list = byRegion.get(r);
-      if (!list) continue;
-      for (const title of list) pushAlias(title);
+
+    if (!finalAliases || finalAliases.length === 0) {
+      console.log(`[TMDB-diag] hit 內無可用的 name/title 欄位`);
+      return;
     }
-  } catch (e) {
-    console.log(`[TMDB-diag] alt_titles EXCEPTION: ${e?.message || e}`);
-    // 不 return — hit 內欄位已收集，繼續寫 cache
-  }
 
-  if (aliases.length === 0) {
-    console.log(`[TMDB-diag] hit 內無可用的 name/title 欄位`);
-    return;
-  }
+    // 覆蓋內存 + storage（IIFE 完成才執行）
+    _tmdbAliasCache.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
+    _tmdbAliasRecent.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
+    _enforceTmdbAliasCacheLimit();
+    try {
+      await _storeTmdbAliasCache(cacheKey, finalAliases);
+    } catch (_) {}
 
-  // 寫入內存 + storage
-  _tmdbAliasCache.set(cacheKey, { aliases, ts: Date.now() });
-  _tmdbAliasRecent.set(cacheKey, { aliases, ts: Date.now() });
-  _enforceTmdbAliasCacheLimit();
-  await _storeTmdbAliasCache(cacheKey, aliases);
+    console.log(`[TMDB-diag] ✓ "${baseName}" → ${finalAliases.length} 別名（背景完成）:`, finalAliases);
+  })();
 
-  console.log(`[TMDB-diag] ✓ "${baseName}" → ${aliases.length} 別名:`, aliases);
+  // IIFE 已啟動；caller 不 await，return void
+  console.log(`[TMDB-diag] inflight kickoff 完成（早寫入 n=${aliases.length}，alt_titles background 跑）`);
 }
 
 /**
@@ -897,7 +932,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.10",
+  version: "2.8.11",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4149,13 +4184,12 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   const baseName = String(targetInfo.baseName || '').trim();
   if (!baseName || baseName.length < 2) return false;
 
-  // 同步等 TMDB 別名（最多 4.0s）。失敗 / timeout → 回 []（走 fallback）。
+  // 同步等 TMDB 別名（最多 6.0s）。失敗 / timeout → 回 []（走 fallback）。
   //
-  // v2.8.10 修法：原 1.5s 在 TMDB search + alt_titles 兩條 request 串行
-  // 各 1~3 秒下，幾乎一定 timeout → race 拿空 → tryExpand 拿空別名
-  // return false → VOD 站 0 筆。拉到 4s 覆蓋最壞 2 條 6s 串行裡
-  // 大部分 case。
-  const aliases = await getTMDBAliasesBlocking(baseName, type, 4000);
+  // v2.8.11 修法：v2.8.10 設 4s 還是不夠（log 顯示串行 8s）。拉到 6s
+  // 覆蓋大部分 case（4 別名 6s 內到）。早寫入 cache 策略保留，
+  // race 2~3s 內 caller 至少能拿到早期 2 別名。
+  const aliases = await getTMDBAliasesBlocking(baseName, type, 6000);
   if (!Array.isArray(aliases) || aliases.length === 0) return false;
 
   // 站方幾乎都是簡體中文，因此優先挑「**含中文字**且跟 baseName 簡體
