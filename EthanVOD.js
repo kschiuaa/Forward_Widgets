@@ -168,7 +168,7 @@ const CONFIG = {
   // bump 到 20：新增 m3u8FilterTsMode UI 開關，給使用者切換 ts 走原站
   // (hybrid) / 全代理 (proxy) / 全絕對 (absolute)。對應 Worker 端
   // ?rewrite= query 參數；Worker 行程不用重啟即可切換。
-  WIDGET_VERSION: 21,
+  WIDGET_VERSION: 23,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -254,21 +254,15 @@ const CONFIG = {
     // 透傳 / 過濾 切換:debug 用。預設 'filter'。
     // 'passthrough' = 走 Worker 但不過濾,只驗 Worker 通不通。
     MODE: 'filter',
-    // admin token(對應 Worker 的 ADMIN_TOKEN 環境變數)。
+    // admin 認證(對應 Worker 的 ADMIN_USER / ADMIN_PASS 環境變數)。
     // 留空 = 不啟用 admin 功能,只能讀 patterns(GET /patterns)。
-    // 填了之後啟動時會自動驗證 token、載入 patterns 到記憶體,
+    // 填了之後啟動時會自動登入拿 session cookie,console 印對接狀態
     // 程式內可呼叫 m3u8FilterAdmin.xxx() 操作(增/刪/reload/reset)。
     //
-    // 取得 token 方式:
-    //   NAS 上:  cat /volume1/docker/ad-filter/.env
-    //   或重新生成: openssl rand -hex 32
-    ADMIN_TOKEN: '',
-
-    // 啟動時要不要自動載入 patterns(節省手動 sync)
-    AUTO_LOAD_PATTERNS: true,
-
-    // 啟動時自動驗證 admin token(失敗只在 console 警告,不擋啟動)
-    AUTO_VERIFY_TOKEN: true,
+    // 注意:Worker 用 cookie session(帳密 → admin_session),不是 Bearer token。
+    // 設定填這兩欄後 widget 會自動 POST /admin/login 拿 cookie。
+    ADMIN_USER: '',
+    ADMIN_PASS: '',
 
     // ts 影片段要由 Worker 代理,還是播放器直連原站 CDN。
     // 'hybrid' (預設)  → m3u8 playlist 走 Worker(過濾),.ts 走原站(快)
@@ -286,7 +280,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.11",
+  version: "2.7.13",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -357,8 +351,8 @@ WidgetMetadata = {
       title: "m3u8 廣告過濾",
       type: "enumeration",
       enumOptions: [
-        { title: "啟用 (走 Worker 去廣告)", value: "enabled" },
-        { title: "停用 (原始 CDN 直連)", value: "disabled" }
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
       ],
       value: "enabled"
     },
@@ -369,20 +363,17 @@ WidgetMetadata = {
       value: "https://m3u8-adfliter.kschiuaa.com"
     },
     {
-      name: "m3u8FilterMode",
-      title: "過濾模式",
-      type: "enumeration",
-      enumOptions: [
-        { title: "過濾 (去除廣告段)", value: "filter" },
-        { title: "透傳 (只走 Worker 不過濾,debug)", value: "passthrough" }
-      ],
-      value: "filter"
+      name: "m3u8FilterAdminUser",
+      title: "Worker 管理帳號 (選填)",
+      type: "input",
+      description: "填入後可從 console 呼叫 m3u8FilterAdmin.*() 動態管理 patterns。留空 = 唯讀模式。需要同時填寫管理密碼。",
+      value: ""
     },
     {
-      name: "m3u8FilterAdminToken",
-      title: "Worker Admin Token (選填)",
+      name: "m3u8FilterAdminPass",
+      title: "Worker 管理密碼 (選填)",
       type: "input",
-      description: "填入後可從 console 呼叫 m3u8FilterAdmin.*() 動態管理 patterns。留空 = 唯讀模式。",
+      description: "管理帳號的密碼。Widget 啟動時會自動登入取得 session cookie。",
       value: ""
     },
     {
@@ -2874,7 +2865,9 @@ async function loadResource(params, onStreamResult = null) {
     searchMode = 'smart_stream',
     m3u8FilterEnabled = 'enabled',
     m3u8FilterWorkerUrl,
-    m3u8FilterMode = 'filter'
+    m3u8FilterMode = 'filter',
+    m3u8FilterAdminUser,
+    m3u8FilterAdminPass
   } = params;
 
   // Forward 傳入片名的欄位名並非只有一種：詳細頁通常給 seriesName，
@@ -2939,12 +2932,28 @@ async function loadResource(params, onStreamResult = null) {
     CONFIG.M3U8_FILTER.WORKER_URL = DEFAULT_WORKER_URL;
   }
 
+  // m3u8 過濾模式 (filter / passthrough)。
+  // UI 已隱藏（永遠 'filter'），但 params 仍可覆寫（debug 用）：
+  //   對單一 widget 設定：loadResource({ m3u8FilterMode: 'passthrough', ... })
+  //   對全域設定：globalParams.m3u8FilterMode = 'passthrough'
   const modeParam = (m3u8FilterMode === 'passthrough' || m3u8FilterMode === 'filter')
     ? m3u8FilterMode
     : gpValue('m3u8FilterMode', 'filter');
   if (modeParam === 'passthrough' || modeParam === 'filter') {
     CONFIG.M3U8_FILTER.MODE = modeParam;
   }
+
+  // Admin 帳密(用於 /admin/login 拿 session cookie)。
+  // 三層 fallback：params 顯式傳入 > globalParams 設定 > 模組預設空。
+  // 留空 = 不啟用 admin 功能(只能唯讀 /patterns)。
+  const userParam = (typeof m3u8FilterAdminUser === 'string' && m3u8FilterAdminUser.trim())
+    ? m3u8FilterAdminUser.trim()
+    : gpValue('m3u8FilterAdminUser', '');
+  const passParam = (typeof m3u8FilterAdminPass === 'string')
+    ? m3u8FilterAdminPass
+    : gpValue('m3u8FilterAdminPass', '');
+  if (userParam) CONFIG.M3U8_FILTER.ADMIN_USER = userParam;
+  if (passParam) CONFIG.M3U8_FILTER.ADMIN_PASS = passParam;
 
   // ts 走向：對應 Worker 端 ?rewrite= 參數。
   //
@@ -2978,6 +2987,8 @@ async function loadResource(params, onStreamResult = null) {
       mode: CONFIG.M3U8_FILTER.MODE,
       endpoint: CONFIG.M3U8_FILTER.ENDPOINT,
       tsMode: CONFIG.M3U8_FILTER.TS_MODE,
+      adminUser: CONFIG.M3U8_FILTER.ADMIN_USER || '(空)',
+      adminPassSet: !!CONFIG.M3U8_FILTER.ADMIN_PASS,  // 不印明碼,只印有沒有設
       // params 層有沒有值（沒值 = 走 globalParams）
       fromParams: !!m3u8FilterWorkerUrl,
       // globalParams 層的原始值（'' 代表 Forward 沒存到設定）
@@ -4573,7 +4584,8 @@ async function loadSubtitle(params) {
 // ==================== m3u8 Filter Admin ====================
 //
 // 提供一組 helper,讓 widget 載入後可以在 console / 其他 module 直接管理
-// Worker 上的 patterns。token 來自 WidgetMetadata 內的 m3u8FilterAdminToken。
+// Worker 上的 patterns。認證走帳密 → session cookie(對應 Worker 的
+// ADMIN_USER / ADMIN_PASS + /admin/login)。
 //
 // 用法:
 //   m3u8FilterAdmin.list()                            // 看現有 patterns
@@ -4583,26 +4595,51 @@ async function loadSubtitle(params) {
 //   m3u8FilterAdmin.removeSeq(0)                      // 刪第 0 個
 //   m3u8FilterAdmin.reload()                          // 熱重載(磁碟→記憶體)
 //   m3u8FilterAdmin.reset()                           // 重置為預設
-//   m3u8FilterAdmin.verify()                          // 驗證 token + 同步
+//   m3u8FilterAdmin.login()                           // 強制重新登入
+//   m3u8FilterAdmin.logout()                          // 登出(清 cookie)
 //
-// 注意:這組 helper 只在 widget 設定有填 token 時啟用。
-// 沒填 token 的話所有寫操作都會 refuse,只能唯讀 list() / version()。
+// 注意:這組 helper 只在 widget 設定有填帳密時啟用。
+// 沒填帳密的話所有寫操作都會 refuse,只能唯讀 list() / version()。
 
 const m3u8FilterAdmin = (() => {
-  // 從 CONFIG 拿 URL / token
+  // 從 CONFIG 拿 URL / 帳密
   const cfg = CONFIG.M3U8_FILTER;
   const base = cfg.WORKER_URL;
-  const token = cfg.ADMIN_TOKEN || '';
-  const autoLoad = cfg.AUTO_LOAD_PATTERNS !== false;
-  const autoVerify = cfg.AUTO_VERIFY_TOKEN !== false;
+  const user = cfg.ADMIN_USER || '';
+  const pass = cfg.ADMIN_PASS || '';
 
-  // 快取 patterns(避免每次 call 都打 Worker)
-  let cachePatterns = null;
+  // 啟動時自動行為:有帳密 → 登入 + 抓 patterns 印給 console 看
+  // (純診斷用途,結果不存 cache,過濾邏輯在 Worker 端獨立運作)
+  const autoBootstrap = true;
 
+  // 記住 session cookie,跨 request 帶過去(Worker 用 admin_session cookie)
+  let sessionCookie = '';
+
+  /** 帶 Content-Type + session cookie 的 headers */
   function headers() {
     const h = { 'Content-Type': 'application/json' };
-    if (token) h['Authorization'] = 'Bearer ' + token;
+    if (sessionCookie) h['Cookie'] = sessionCookie;
     return h;
+  }
+
+  /** 登入 — 拿 admin_session cookie(存到 closure,後續請求自動帶) */
+  async function login() {
+    if (!user || !pass) {
+      return { ok: false, status: 0, json: { error: 'no_credentials' } };
+    }
+    const r = await fetch(base + '/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user, pass })
+    });
+    const setCookie = r.headers.get('set-cookie') || '';
+    // 抽出 admin_session=...; 段(可能帶 ; HttpOnly 等屬性)
+    const m = setCookie.match(/admin_session=[^;]+/);
+    if (m) sessionCookie = m[0];
+    const text = await r.text();
+    let json;
+    try { json = JSON.parse(text); } catch (_) { json = { raw: text }; }
+    return { ok: r.ok, status: r.status, json, hasSession: !!sessionCookie };
   }
 
   async function httpJson(method, path, body) {
@@ -4615,9 +4652,14 @@ const m3u8FilterAdmin = (() => {
     return { ok: r.ok, status: r.status, json };
   }
 
+  /** 需要 admin 權限 — 沒帳密或沒 session 就拒絕 */
   function needAuth() {
-    if (!token) {
-      console.warn('[m3u8FilterAdmin] ADMIN_TOKEN 沒設定,操作被拒絕');
+    if (!user || !pass) {
+      console.warn('[m3u8FilterAdmin] 管理帳密沒設定,操作被拒絕');
+      return false;
+    }
+    if (!sessionCookie) {
+      console.warn('[m3u8FilterAdmin] 尚未登入,操作被拒絕(請先 m3u8FilterAdmin.login())');
       return false;
     }
     return true;
@@ -4625,18 +4667,38 @@ const m3u8FilterAdmin = (() => {
 
   // 公開 API
   return {
-    /** 唯讀 — 不需 token */
+    /** 唯讀 — 不需登入。拿 version + 完整 patterns 文字(給 console debug 看) */
     async list() {
       const r = await httpJson('GET', '/version');
       if (!r.ok) return null;
       // 再拉一次 /patterns 拿完整內容
       const p = await fetch(base + '/patterns');
       const text = await p.text();
-      cachePatterns = text;
       return { version: r.json, patterns: text };
     },
 
-    /** 加 URL path pattern(token 必要) */
+    /** 強制重新登入(帳密 / session 過期時用) */
+    async login() {
+      const r = await login();
+      if (r.ok && r.hasSession) {
+        console.log('[m3u8FilterAdmin] 登入成功,session 已保存');
+      } else {
+        console.error('[m3u8FilterAdmin] 登入失敗:', r);
+      }
+      return r;
+    },
+
+    /** 登出(只清本地 cookie,Worker 那邊要等到 cookie 過期 / 改密碼才失效) */
+    async logout() {
+      // Worker 端 logout endpoint(可選)
+      if (sessionCookie) {
+        await httpJson('POST', '/admin/logout').catch(() => {});
+      }
+      sessionCookie = '';
+      console.log('[m3u8FilterAdmin] 已登出');
+    },
+
+    /** 加 URL path pattern(需登入) */
     async addPath(pattern) {
       if (!needAuth()) return null;
       const r = await httpJson('POST', '/admin/patterns', { pattern });
@@ -4644,7 +4706,7 @@ const m3u8FilterAdmin = (() => {
       return r;
     },
 
-    /** 加 seq fingerprint(token 必要) */
+    /** 加 seq fingerprint(需登入) */
     async addSeq(seq) {
       if (!needAuth()) return null;
       const r = await httpJson('POST', '/admin/seq', { seq });
@@ -4652,7 +4714,7 @@ const m3u8FilterAdmin = (() => {
       return r;
     },
 
-    /** 刪 URL pattern(token 必要,idx 是 list() 看到的編號) */
+    /** 刪 URL pattern(需登入,idx 是 list() 看到的編號) */
     async removePath(idx) {
       if (!needAuth()) return null;
       const r = await httpJson('DELETE', '/admin/patterns/' + idx);
@@ -4684,46 +4746,48 @@ const m3u8FilterAdmin = (() => {
       return r;
     },
 
-    /** 驗證 token 並抓一次 version / patterns */
+    /** 登入並抓一次 version / patterns */
     async verify() {
-      if (!token) {
-        console.warn('[m3u8FilterAdmin] 沒設 token,跳過驗證');
+      if (!user || !pass) {
+        console.warn('[m3u8FilterAdmin] 沒設帳密,跳過驗證');
         return null;
       }
-      const r = await httpJson('GET', '/version');
-      if (!r.ok) {
-        console.error('[m3u8FilterAdmin] 驗證失敗:', r);
-        return r;
+      const loginR = await login();
+      if (!loginR.ok) {
+        console.error('[m3u8FilterAdmin] 登入失敗:', loginR);
+        return loginR;
       }
-      const enabled = r.json.admin_enabled;
-      if (!enabled) {
-        console.error('[m3u8FilterAdmin] Worker 沒啟用 admin(ADMIN_TOKEN env 沒設)');
-        return r;
+      const v = await httpJson('GET', '/version');
+      if (v.ok && v.json && v.json.admin_enabled) {
+        console.log('[m3u8FilterAdmin] 登入 + 驗證 OK:', v.json);
+      } else {
+        console.warn('[m3u8FilterAdmin] Worker 沒啟用 admin(ADMIN_USER / ADMIN_PASS env 沒設?)');
       }
-      console.log('[m3u8FilterAdmin] 驗證 OK:', r.json);
-      return r;
+      return v;
     },
 
-    /** 內部 — 啟動時跑一次(若啟用) */
+    /** 內部 — 啟動時跑一次(有帳密就登入 + 抓 patterns 印給 console 看) */
     async _bootstrap() {
-      if (!autoLoad && !autoVerify) return;
+      if (!autoBootstrap) return;
+      if (!user || !pass) return;  // 沒設帳密 = 跳過
       try {
-        if (token && autoVerify) await this.verify();
-        if (autoLoad) await this.list();
+        await this.verify();   // 登入 + 印 admin_enabled / version
+        await this.list();     // 拉一次 patterns 文字(console 可看)
       } catch (e) {
         console.warn('[m3u8FilterAdmin] bootstrap 失敗(非致命):', e?.message || e);
       }
     },
 
-    /** 清快取,下次 list() 重新抓 */
-    invalidate() {
-      cachePatterns = null;
-    },
-
-    /** 取快取 */
-    getCached() {
-      return cachePatterns;
-    },
+    /** debug — 看目前 session 狀態 */
+    status() {
+      return {
+        workerUrl: base,
+        hasUser: !!user,
+        hasPass: !!pass,
+        hasSession: !!sessionCookie,
+        sessionPreview: sessionCookie ? sessionCookie.slice(0, 40) + '...' : '(none)'
+      };
+    }
   };
 })();
 
