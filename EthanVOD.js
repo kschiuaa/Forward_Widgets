@@ -1006,7 +1006,11 @@ const CONFIG = {
   //     標記的來源（同樣搜慶餘年，其他站都帶著）。
   //   - areaLabel 對未正規化的地區字串直接原樣輸出，簽名站的简体
   //     「中国大陆」會變成全站唯一的簡體字串；改走 toDisplayText。
-  WIDGET_VERSION: 31,
+  // bump 到 32：新增「簽名型來源走不走廣告過濾」開關 (m3u8FilterAdapterMode)。
+  // 金牌影視 / jpyy 這類站的 m3u8 是自己簽發的延遲 token，串流本身沒有
+  // 廣告片頭，讓它們繞過濾廣告伺服器純粹白繞（多一次往返、拉長啟動時間）。
+  // 預設 'skip'；與全站總開關 m3u8FilterEnabled 分層，可獨立控制。
+  WIDGET_VERSION: 32,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1128,6 +1132,20 @@ const CONFIG = {
     // 對應過濾廣告伺服器端 ?rewrite= 參數(同名字)。伺服器端 URI_REWRITE_MODE
     // 環境變數作為全域預設；widget 傳 query 可以單連線覆寫。
     TS_MODE: 'hybrid',
+
+    // ★ 簽名型 adapter 站（金牌影視 / jpyy 等）要不要走過濾廣告伺服器。
+    //
+    // 為什麼需要這個開關：這類站的 m3u8 是自己簽發的延遲 token，
+    // 而且串流本身沒有夾帶廣告片頭 —— 讓它們繞一圈過濾廣告伺服器
+    // 純粹是白繞：多一次網路往返、拉長啟動時間，換不到任何去廣告效果。
+    //
+    // 預設 'skip'（不走）。因為「不過濾」的代價是使用者自己看不到差異，
+    // 而「多繞一圈」的代價是每集都要多等 —— 預設應該選對多數站沒有廣告的
+    // 那一側。若使用者之後發現某些 adapter 站其實有廣告，再改成 'filter'。
+    //
+    // 對照：m3u8FilterEnabled 是全站總開關（關掉的話 MacCMS 站也不過濾），
+    // 這裡只影響 _adapterSite 標記的資源，兩者層級不同、可同時生效。
+    ADAPTER_MODE: 'skip',
   },
 
   // ==================== TMDB 跨地區別名 ====================
@@ -1180,7 +1198,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.9.8",
+  version: "2.9.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1311,6 +1329,30 @@ WidgetMetadata = {
         { title: "全直連 (不過濾,debug 用)", value: "absolute" }
       ],
       value: "hybrid"
+    },
+    {
+      // 簽名型 adapter 站（金牌影視 / jpyy 等）要不要繞開過濾廣告伺服器。
+      //
+      // 與上面「ts 分片走哪」是不同層級的東西：那個決定「已經在過濾
+      // 伺服器上的連線，ts 要不要也走伺服器」；這個決定「這條 url 要不要
+      // 進過濾伺服器」。所以兩者可以自由組合。
+      //
+      // 預設「直接播放（跳過過濾）」的理由：
+      //   這類站的 m3u8 是自己簽發的延遲 token，串流本身沒有夾帶廣告片頭，
+      //   讓它繞一圈純粹白繞 —— 多一次往返、拉長啟動時間，換不到任何效果。
+      //   「不過濾」的代價對使用者不可見，「多繞一圈」的代價每集都要多等，
+      //   預設應該站在後者不成立的那一側。
+      //
+      // 若日後發現某些 adapter 站確實有廣告，切成「照常過濾」即可，
+      // 其他 MacCMS 站的設定完全不受影響。
+      name: "m3u8FilterAdapterMode",
+      title: "簽名型來源走不走廣告過濾",
+      type: "enumeration",
+      enumOptions: [
+        { title: "直接播放 (跳過過濾,推薦 — 這類站沒廣告)", value: "skip" },
+        { title: "照常過濾 (與其他站相同)", value: "filter" }
+      ],
+      value: "skip"
     },
     {
       // 跨地區別名查詢（TMDB）開關。
@@ -2615,6 +2657,9 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         description: tail ? `${displayName}．${tail}` : displayName,
         url: wrapM3U8WithFilter(url.trim(), {
           site: siteTitle, name: displayName, episode: epLabel,
+          // 標記這是簽名型 adapter 站的資源，讓 wrap 能依 ADAPTER_MODE 決定
+          // 要不要繞開過濾廣告伺服器（見 shouldSkipFilterForAdapter）。
+          adapter: true,
         }),
         playerType: 'app',
         customHeaders: { 'X-Forward-Skip-Redirect-Probe': '1' },
@@ -4557,7 +4602,11 @@ function cleanResourceForOutput(resource) {
   // 收到 m3u8 子請求時自動從 Referer 解析或回退到 customHeaders(伺服器端邏輯,
   // 見 m3u8-ad-filter-worker.js)。
   if (isM3U8Url(clean.url)) {
-    clean.url = wrapM3U8WithFilter(clean.url);
+    // 帶上 adapter 標記：這是最後一道關卡，所有資源（含 cache 回放、
+    // 含前面漏包的歷史 cache）都會走到這裡。沒帶的話「adapter 跳過
+    // 過濾」設定會在這裡被無聲蓋掉 —— 使用者改了設定卻看到 url 還是被包。
+    // _adapterSite 這時還沒被 fieldsToDelete 清掉（清欄位在下一行之後）。
+    clean.url = wrapM3U8WithFilter(clean.url, { adapter: !!clean._adapterSite });
   }
 
   fieldsToDelete.forEach(field => {
@@ -4649,10 +4698,34 @@ function isAlreadyWrapped(url) {
   }
 }
 
+/**
+ * 簽名型 adapter 站是否應該跳過過濾廣告伺服器。
+ *
+ * 只看 CONFIG.M3U8_FILTER.ADAPTER_MODE：
+ *   'skip'   (預設) → 不包裝，這類站的 m3u8 直接給播放器
+ *   'filter'         → 照常包裝，與 MacCMS 站待遇相同
+ *
+ * 為什麼是獨立於 m3u8FilterEnabled 的開關：總開關關掉是「所有站都不過濾」，
+ * 使用者通常只想讓沒有廣告的 adapter 站繞開，不想連其他站的過濾也一併犧牲。
+ * 兩層分開才能各自獨立控制。
+ */
+function shouldSkipFilterForAdapter() {
+  return (CONFIG.M3U8_FILTER?.ADAPTER_MODE || 'skip') === 'skip';
+}
+
 function wrapM3U8WithFilter(url, hint) {
   if (!CONFIG.M3U8_FILTER?.ENABLED) return url;
   if (!url) return url;
   if (typeof url !== 'string') return url;
+  // ★ 簽名型 adapter 站可選擇跳過過濾廣告伺服器。
+  //
+  // 判斷放在最前面（早於 isAlreadyWrapped），因為 skip 的語意是
+  // 「這條根本不該經過伺服器」：若先放行已包裝的 url，cache 裡
+  // 早期版本包過的 adapter 連結會繼續留在結果裡，設定改了也沒用。
+  //
+  // isAdapterSite 只認 _adapterSite 這個明確標記，不從 URL 反推來源 ——
+  // 反推會誤傷 MacCMS 站的 /filter 端點（isAlreadyWrapped 註解提過同樣的坑）。
+  if (hint && hint.adapter && shouldSkipFilterForAdapter()) return url;
   // 已被包裝過 → 不再包第二層
   if (isAlreadyWrapped(url)) return url;
   if (!isM3U8Url(url)) return url;
@@ -4748,7 +4821,10 @@ async function loadResource(params, onStreamResult = null) {
     m3u8FilterWorkerUrl,
     m3u8FilterMode = 'filter',
     m3u8FilterAdminUser,
-    m3u8FilterAdminPass
+    m3u8FilterAdminPass,
+    m3u8FilterTsMode,
+    // 簽名型 adapter 站是否跳過過濾廣告伺服器（'skip' | 'filter'）
+    m3u8FilterAdapterMode
   } = params;
 
   // Forward 傳入片名的欄位名並非只有一種：詳細頁通常給 seriesName，
@@ -4854,6 +4930,18 @@ async function loadResource(params, onStreamResult = null) {
     CONFIG.M3U8_FILTER.TS_MODE = 'hybrid';
   }
 
+  // 簽名型 adapter 站要不要走過濾廣告伺服器。
+  //
+  // 三層 fallback 同上（params 顯式 > globalParams > 模組預設 'skip'）。
+  // 驗證比 TS_MODE 嚴格：這裡只有兩種語意相反的狀態（跳過 / 不跳過），
+  // 寫錯時寧可退回預設的 'skip' —— 因為 adapter 站本來就沒廣告，
+  // 退回 skip 只是多繞一圈但能播；退回 filter 反而可能把有廣告的內容放行。
+  const adapterFilterParam = (typeof m3u8FilterAdapterMode === 'string' && m3u8FilterAdapterMode.trim())
+    ? m3u8FilterAdapterMode.trim()
+    : gpValue('m3u8FilterAdapterMode', 'skip');
+  CONFIG.M3U8_FILTER.ADAPTER_MODE =
+    (adapterFilterParam === 'filter' || adapterFilterParam === 'skip') ? adapterFilterParam : 'skip';
+
   // 同步使用者設定到 CONFIG.TMDB（TMDB 跨地區別名查詢）。
   //
   // 與 m3u8 filter 一樣：三層 fallback，param 顯式 > globalParams > 預設。
@@ -4887,6 +4975,9 @@ async function loadResource(params, onStreamResult = null) {
       mode: CONFIG.M3U8_FILTER.MODE,
       endpoint: CONFIG.M3U8_FILTER.ENDPOINT,
       tsMode: CONFIG.M3U8_FILTER.TS_MODE,
+      // adapter 站是否繞開過濾伺服器。印出來是因為「改了設定但 url 還是被包」
+      // 光看播放結果分不出來，得知道實際生效值。
+      adapterMode: CONFIG.M3U8_FILTER.ADAPTER_MODE,
       adminUser: CONFIG.M3U8_FILTER.ADMIN_USER || '(空)',
       adminPassSet: !!CONFIG.M3U8_FILTER.ADMIN_PASS,  // 不印明碼,只印有沒有設
       // params 層有沒有值（沒值 = 走 globalParams）
@@ -4895,6 +4986,7 @@ async function loadResource(params, onStreamResult = null) {
       gpWorkerUrl: gpValue('m3u8FilterWorkerUrl', '(空)'),
       gpEnabled: gpValue('m3u8FilterEnabled', '(空)'),
       gpTsMode: gpValue('m3u8FilterTsMode', '(空)'),
+      gpAdapterMode: gpValue('m3u8FilterAdapterMode', '(空)'),
       gpCount: allGp.length,
       gpNames: allGp.map(p => p.name).join(','),
     }));
@@ -5091,7 +5183,9 @@ targetInfo.searchQuery = aliasQ;
           for (const r of usable) {
             if (!r || !r.url || typeof r.url !== 'string') continue;
             const before = r.url;
-            const after = wrapM3U8WithFilter(r.url);
+            // 帶上 _adapterSite：讓「adapter 站跳過過濾」設定在 cache 路徑
+            // 也生效。這裡沒有 hint.site 可傳，只能從資源物件上的標記判斷。
+            const after = wrapM3U8WithFilter(r.url, { adapter: !!r._adapterSite });
             if (after !== before) {
               r.url = after;
               rewrapped++;
@@ -6082,7 +6176,9 @@ targetInfo.searchQuery = aliasQ;
       for (const r of cached) {
         if (!r || !r.url || typeof r.url !== 'string') continue;
         const before = r.url;
-        const after = wrapM3U8WithFilter(r.url);
+        // 同 smart cache 路徑：帶上 adapter 標記，讓跳過設定在 batch cache
+        // 生效（否則這裡會把 adapter 的 url 又包回去，設定形同失效）。
+        const after = wrapM3U8WithFilter(r.url, { adapter: !!r._adapterSite });
         if (after !== before) {
           r.url = after;
           rewrapped++;
@@ -6662,6 +6758,9 @@ async function loadDetail(link) {
         m3u8FilterEnabled: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterEnabled') || {}).value || 'enabled',
         m3u8FilterWorkerUrl: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterWorkerUrl') || {}).value || '',
         m3u8FilterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterMode') || {}).value || 'filter',
+        // 簽名型 adapter 站是否繞開過濾廣告伺服器。漏了這行會讓「相關作品」
+        // 走預設 'skip'，使用者設成 'filter' 也不生效。
+        m3u8FilterAdapterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterAdapterMode') || {}).value || 'skip',
       });
       for (const r of batchResults || []) {
         // 跨季去重：以 URL 為主鍵。同一 URL 出現在多季可能是因為多站
