@@ -444,15 +444,33 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
                   : [];
     console.log(`[TMDB-diag] alt titles count=${titles.length}`);
 
-    // 第三步：篩選我們關心的地區（CN/TW/HK/SG）
-    const regions = new Set(CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN', 'TW', 'HK', 'SG']);
+    // 第三步：篩選我們關心的地區（CN/TW/HK/SG），並**優先放 CN 別名**。
+    //
+    // 為什麼要把 CN 排第一：tryExpandWithTMDBAliases 內的挑選邏輯是
+    // 「拿第一個簡體化後 ≠ baseSimp 的別名」。如果 CN 別名排後面，
+    // 前面可能卡到一個英文別名（"The Walking Dead"）就被挑走，導致
+    // 沒走到 CN「行尸走肉」→ VOD 站 0 筆結果。
+    //
+    // TMDB 的 /alternative_titles response 順序不固定，必須在這裡
+    // 明確分桶。
+    const regions = CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN', 'TW', 'HK', 'SG'];
+    const regionSet = new Set(regions);
+    // 用 region 當 key 存，後續依 regions 順序合併，CN 一定最先
+    const byRegion = new Map();
     for (const t of titles) {
       if (!t?.title) continue;
       const title = String(t.title).trim();
       if (!title) continue;
       const region = String(t.iso_3166_1 || '').toUpperCase();
-      if (!regions.has(region)) continue;
-      pushAlias(title);
+      if (!regionSet.has(region)) continue;
+      if (!byRegion.has(region)) byRegion.set(region, []);
+      byRegion.get(region).push(title);
+    }
+    // 先放 CN 別名（簡體中文，VOD 站最愛），再放其他地區
+    for (const r of regions) {
+      const list = byRegion.get(r);
+      if (!list) continue;
+      for (const title of list) pushAlias(title);
     }
   } catch (e) {
     console.log(`[TMDB-diag] alt_titles EXCEPTION: ${e?.message || e}`);
@@ -823,7 +841,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.5",
+  version: "2.8.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
