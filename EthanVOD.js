@@ -312,18 +312,24 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
 
   // Race：cache 出現資料 vs in-flight 完成 vs 整體 timeout。
   // 三者任一先發生就 return。
+  const startTs = Date.now();
   const timeoutP = new Promise((resolve) => {
-    setTimeout(() => resolve({ kind: 'timeout', aliases: [] }), maxWaitMs);
+    setTimeout(() => {
+      console.log(`[TMDB-diag] getTMDBAliasesBlocking: timeoutP fired after ${Date.now() - startTs}ms`);
+      resolve({ kind: 'timeout', aliases: [] });
+    }, maxWaitMs);
   });
   const cacheWatchP = new Promise((resolve) => {
-    const deadline = Date.now() + maxWaitMs;
+    const deadline = startTs + maxWaitMs;
     const tick = () => {
       const c = _tmdbAliasCache.get(cacheKey);
       if (c?.aliases) {
+        console.log(`[TMDB-diag] cacheWatchP: cache hit after ${Date.now() - startTs}ms (n=${c.aliases.length})`);
         resolve({ kind: 'cache', aliases: c.aliases });
         return;
       }
       if (Date.now() >= deadline) {
+        console.log(`[TMDB-diag] cacheWatchP: deadline hit after ${Date.now() - startTs}ms`);
         resolve({ kind: 'timeout', aliases: [] });
         return;
       }
@@ -331,12 +337,19 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
     };
     tick();
   });
-  const inflightDoneP = inflightP.then(() => ({
-    kind: 'inflight',
-    aliases: (_tmdbAliasCache.get(cacheKey)?.aliases) || []
-  })).catch(() => ({ kind: 'inflight', aliases: [] }));
+  const inflightDoneP = inflightP.then(() => {
+    const a = (_tmdbAliasCache.get(cacheKey)?.aliases) || [];
+    console.log(`[TMDB-diag] inflightDoneP: inflight done after ${Date.now() - startTs}ms, cache.aliases=${a.length}`);
+    return { kind: 'inflight', aliases: a };
+  }).catch((e) => {
+    console.log(`[TMDB-diag] inflightDoneP: rejected after ${Date.now() - startTs}ms: ${e?.message || e}`);
+    return { kind: 'inflight', aliases: [] };
+  });
 
   const result = await Promise.race([cacheWatchP, inflightDoneP, timeoutP]);
+  if (CONFIG.TMDB.VERBOSE) {
+    console.log(`[TMDB-diag] getTMDBAliasesBlocking result: kind=${result.kind}, n=${result.aliases.length}, elapsed=${Date.now() - startTs}ms`);
+  }
   return (result && result.aliases) || [];
 }
 
@@ -390,61 +403,41 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const hit = searchData.results[0];
   const tmdbId = hit?.id;
   if (!tmdbId) return;
-  console.log(`[TMDB-diag] hit: "${hit.name || hit.title || hit.original_name}" id=${tmdbId}`);
+  console.log(`[TMDB-diag] hit: "${hit.name || hit.title || hit.original_name}" id=${tmdbId}, name=${hit.name}, original_name=${hit.original_name}`);
 
-  // 第二步：拿 alternative_titles
-  const altUrl = `https://api.themoviedb.org/3/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}/` +
-    `${type === 'movie' ? 'alternative_titles' : 'alternative_titles'}` +
-    `?api_key=${encodeURIComponent(apiKey)}`;
-
-  let altData;
-  try {
-    const resp2 = await Widget.http.get(altUrl, {
-      timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
-      headers: { 'Accept': 'application/json' }
-    });
-    console.log(`[TMDB-diag] alt resp: typeof=${typeof resp2}, keys=${resp2 && typeof resp2 === 'object' && !Array.isArray(resp2) ? Object.keys(resp2).slice(0, 8).join(',') : 'n/a'}`);
-    altData = _unwrapHttpResponse(resp2);
-    console.log(`[TMDB-diag] alt unwrapped keys: ${altData ? Object.keys(altData).join(',') : 'null'}, titles.len=${altData?.titles?.length}, results.len=${altData?.results?.length}`);
-  } catch (e) {
-    console.log(`[TMDB-diag] alt_titles EXCEPTION: ${e?.message || e}`);
-    return;
-  }
-
-  // movie: titles[] ； tv: results[]。版本差異兼容。
-  const titles = Array.isArray(altData?.titles) ? altData.titles
-                : Array.isArray(altData?.results) ? altData.results
-                : [];
-  if (titles.length === 0) {
-    console.log(`[TMDB-diag] alt titles 空陣列`);
-    return;
-  }
-
-  // 第三步：篩選我們關心的地區（CN/TW/HK/SG）+ 收集所有中文別名
-  const regions = new Set(CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN', 'TW', 'HK', 'SG']);
+  // 從第一筆 search hit 內已拿到的欄位抽別名（不需要打第二次 alt_titles）。
+  // TMDB search 回傳的每個 hit 都有: name, original_name (TV)；title, original_title (movie)。
+  // 對中文劇，這些欄位本身就是不同語系的譯名。alt_titles 端點是「歷史所有
+  // 翻譯清單」，但對首播/常用別名用不到 — 90% 的 case search hit 內已含
+  // 我們要的繁中、英文、原文。砍掉第二次 request → 從 2 個 → 1 個，
+  // 搜尋延遲從 ~700ms → ~350ms。
   const seen = new Set();
   const aliases = [];
-  // 把原文列進去，避免被 alias 篩選後又把原本砍掉
-  seen.add(normalizeForMatching(baseName));
-  aliases.push(baseName);
+  const pushAlias = (s) => {
+    const t = String(s || '').trim();
+    if (!t) return;
+    if (seen.has(normalizeForMatching(t))) return;
+    seen.add(normalizeForMatching(t));
+    aliases.push(t);
+  };
+  // 原文（用戶輸入或 cache key）放第一位
+  pushAlias(baseName);
+  pushAlias(hit.name);
+  pushAlias(hit.original_name);
+  pushAlias(hit.title);
+  pushAlias(hit.original_title);
 
-  for (const t of titles) {
-    if (!t?.title) continue;
-    // 英文/韓文/日文原文我們不要 —— 站台只認中文關鍵字
-    const title = String(t.title).trim();
-    if (!title) continue;
-    const region = String(t.iso_3166_1 || '').toUpperCase();
-    if (!regions.has(region)) continue;
-    // 過濾跟原本重複的（換行變體、空格變體都會被 normalize 折成同樣）
-    if (seen.has(normalizeForMatching(title))) continue;
-    seen.add(normalizeForMatching(title));
-    aliases.push(title);
-  }
-
+  // TV 還可能帶 known_for_department 之類的，但常規 TV/movie hit 上面 4 個欄位已足。
   if (aliases.length === 0) {
-    console.log(`[TMDB-diag] 無符合地區的 alias`);
+    console.log(`[TMDB-diag] hit 內無可用的 name/title 欄位`);
     return;
   }
+
+  // （可選）打第二次 alt_titles 拿更全的清單。但會增加 700ms 延遲且
+  // 對 Forward runtime 不友善（pending request 在 batch 結束時可能
+  // 被 abort，導致 cache 永遠不寫入）。目前選擇：只從 hit 內抽就夠。
+  // 註：fetchTMDBAliasesAsync 的舊版這裡會打 alt_titles 端點；若
+  // 之後要回來可從 git history 取回。
 
   // 寫入內存 + storage
   _tmdbAliasCache.set(cacheKey, { aliases, ts: Date.now() });
@@ -805,7 +798,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.3",
+  version: "2.8.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -825,6 +818,7 @@ WidgetMetadata = {
       name: "VodData",
       title: "自訂源設定",
       type: "input",
+      description: "留空 = 使用下方預設源。手動填寫時,每行一個源,格式為「站名,API URL」(以 http 開頭),例:我的源A,https://abc.com/api.php/provide/vod。以 # 開頭為註解停用。需為 MacCMS 採集介面(/api.php/provide/vod)。僅站名等於 預設源名(電影天堂/非凡資源/如意資源/樂子)會獲得排序加成。",
       value: RESOURCE_SITES
     },
     {
