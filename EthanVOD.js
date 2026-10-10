@@ -236,6 +236,82 @@ function getTMDBAliasesFast(baseName, type) {
 }
 
 /**
+ * v2.9.2 新增：啟動時一次性從 storage 預載所有已 cache 的 CN 簡體別名到內存。
+ *
+ * 目的：cold caller 第一個搜就能命中 in-memory cache（不再等 200ms storage 讀
+ * + race 6s TMDB 慢回）。後續 caller 同步命中。
+ *
+ * 限制：
+ *   - 只載入「aliases 內有 CN 簡體」的（v2.8.15 早寫入版本的 stale cache 跳過）
+ *   - 啟動時 1 次性載入，新寫入的 entry 由 IIFE 寫入（in-memory + storage）
+ *   - storage 讀失敗不影響（內存 cache 仍會由 IIFE 填充）
+ */
+async function _preloadTmdbAliasCacheFromStorage() {
+  if (!Widget?.storage?.keys || !Widget?.storage?.get) return;
+  let keys = [];
+  try {
+    keys = await Widget.storage.keys();
+  } catch (e) {
+    return;
+  }
+  if (!Array.isArray(keys) || keys.length === 0) return;
+  const aliasKeys = keys.filter(k => typeof k === 'string' && k.startsWith('tmdb_alias_'));
+  console.log(`[TMDB-diag] 預載 storage: ${aliasKeys.length} 個 tmdb_alias_* key`);
+  let loaded = 0, skipped = 0;
+  for (const key of aliasKeys) {
+    try {
+      const stored = await _readTmdbAliasCache(key);
+      if (!stored?.aliases?.length) { skipped++; continue; }
+      // 只載入有 CN 簡體的（v2.8.15 早寫入版本會被 quality check 跳過）
+      const hasCnSimp = stored.aliases.some(a => {
+        const t = String(a || '').trim();
+        return /[一-鿿]/.test(t) && convertChinese(t, false) === t;
+      });
+      if (!hasCnSimp) { skipped++; continue; }
+      _tmdbAliasCache.set(key, { aliases: stored.aliases, ts: stored.ts || Date.now() });
+      loaded++;
+    } catch (e) { skipped++; }
+  }
+  console.log(`[TMDB-diag] 預載完成: ${loaded} 個有效（${skipped} 跳過）`);
+}
+
+/**
+ * v2.9.2 新增：清掉 storage 內的 stale tmdb_alias entry
+ * （v2.8.15 早寫入但 IIFE 沒覆蓋完成的，只有 baseName + hit 內欄位，無 CN 簡體）。
+ *
+ * 為什麼要清：cold caller 拿到這種 stale 進 tryExpand → 無 CN 簡體別名 →
+ * return false → fallback。預先清掉可讓 cold caller 直接走 TMDB 完整路徑。
+ */
+async function _purgeStaleTmdbAliasCache() {
+  if (!Widget?.storage?.keys) return;
+  let keys = [];
+  try {
+    keys = await Widget.storage.keys();
+  } catch (e) {
+    return;
+  }
+  if (!Array.isArray(keys) || keys.length === 0) return;
+  const aliasKeys = keys.filter(k => typeof k === 'string' && k.startsWith('tmdb_alias_'));
+  let purged = 0;
+  for (const key of aliasKeys) {
+    try {
+      const stored = await _readTmdbAliasCache(key);
+      if (!stored?.aliases?.length) continue;
+      const hasCnSimp = stored.aliases.some(a => {
+        const t = String(a || '').trim();
+        return /[一-鿿]/.test(t) && convertChinese(t, false) === t;
+      });
+      if (!hasCnSimp) {
+        // stale — 刪除
+        try { await Widget.storage.delete(key); } catch (_) {}
+        purged++;
+      }
+    } catch (_) {}
+  }
+  console.log(`[TMDB-diag] 清除 stale tmdb_alias: ${purged} 個`);
+}
+
+/**
  * 阻塞介面：第一次搜尋時同步等 TMDB，確保這次搜尋就吃到別名。
  *
  * 設計目標：使用者首次搜某片名時，原本會因 cache miss 走純繁簡邏輯，
@@ -303,6 +379,7 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
         const r = await _readTmdbAliasCache(cacheKey);
         _storageResult = r;
         _storageDone = true;
+        console.log(`[TMDB-diag] storage read done: n=${r?.aliases?.length || 0}`);
       });
       const _storageDeadlineP = Promise.resolve().then(() => new Promise(resolve => {
         const startT = Date.now();
@@ -317,13 +394,17 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
       await Promise.race([_storageReadP, _storageDeadlineP]);
       const stored = _storageResult;
       if (stored?.aliases?.length) {
-        // 品質檢查：只有 1 個別名的 storage cache 視為 stale ——
-        // 那是 v2.8.4 之前的版本只拿 hit 內欄位的產物（baseName + original_name），
-        // 沒 CN/HK 多地區別名。對中文劇來說等同無用，繼續走第 4 步 fetch。
-        // （v2.8.5+ 會把 alt_titles 拿進來，正常會有 3~10 個別名）
-        if (stored.aliases.length < 2) {
-          console.log(`[TMDB-diag] storage cache stale (only ${stored.aliases.length} alias): "${stored.aliases.join(', ')}"，重新 fetch`);
+        // 品質檢查：只有 1 個別名，或無 CN 簡體別名的 storage cache 視為 stale —
+        // 那是 v2.8.15 之後「早寫入但 IIFE 未覆蓋」或舊版本只拿 hit 內欄位的產物
+        // （無 CN/HK 多地區別名）。對中文劇來說等同無用，繼續走第 4 步 fetch。
+        const hasCnSimp = stored.aliases.some(a => {
+          const t = String(a || '').trim();
+          return /[一-鿿]/.test(t) && convertChinese(t, false) === t;
+        });
+        if (stored.aliases.length < 2 || !hasCnSimp) {
+          console.log(`[TMDB-diag] storage cache stale (n=${stored.aliases.length}, hasCnSimp=${hasCnSimp}): "${stored.aliases.join(', ')}"，重新 fetch`);
         } else {
+          console.log(`[TMDB-diag] ✓ storage cache hit (n=${stored.aliases.length}): ${JSON.stringify(stored.aliases)}`);
           _tmdbAliasCache.set(cacheKey, { aliases: stored.aliases, ts: stored.ts || Date.now() });
           _tmdbAliasRecent.set(cacheKey, { aliases: stored.aliases, ts: Date.now() });
           return stored.aliases;
@@ -587,7 +668,7 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
         return;
       }
 
-      // 覆蓋內存 + storage
+      // 覆蓋內存 + storage（storage 寫 fire-and-forget，inflightP 立即 resolve）
       console.log(`[TMDB-diag] IIFE 覆蓋 cache，finalAliases=${JSON.stringify(finalAliases)}`);
       try {
         _tmdbAliasCache.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
@@ -598,9 +679,9 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
       const cachedAfterSet = _tmdbAliasCache.get(cacheKey);
       console.log(`[TMDB-diag] IIFE 寫入後 cache 確認：${JSON.stringify(cachedAfterSet?.aliases || [])} (n=${cachedAfterSet?.aliases?.length})`);
       _enforceTmdbAliasCacheLimit();
-      try {
-        await _storeTmdbAliasCache(cacheKey, finalAliases);
-      } catch (_) {}
+      // v2.9.2：storage 寫 fire-and-forget，inflightP 立即 resolve。
+      // race 6s 內 caller 拿得到完整 CN 別名。storage 寫失敗不影響功能。
+      _storeTmdbAliasCache(cacheKey, finalAliases).catch(() => {});
 
       console.log(`[TMDB-diag] ✓ "${baseName}" → ${finalAliases.length} 別名:`, finalAliases);
     } catch (e) {
@@ -961,7 +1042,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.9.1",
+  version: "2.9.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3755,6 +3836,16 @@ async function loadResource(params, onStreamResult = null) {
   // 要等到該站搜失敗才知道它不收 type，白白浪費一次請求。
   await loadRejectingTypeSites();
 
+  // v2.9.2：啟動時預載 storage 內已有 CN 簡體別名的 TMDB cache 到 in-memory
+  // 避免 cold caller 等 200ms storage 讀 + 6s race TMDB 慢回
+  await _preloadTmdbAliasCacheFromStorage();
+
+  // v2.9.2：清掉 v2.8.15 早寫入但 IIFE 沒覆蓋完成的 stale entry
+  // （只有 baseName + hit 內欄位，無 CN 簡體）— 否則 cold caller 拿 stale
+  // 進 tryExpand → 無 bestAlias → fallback。v2.9.2+ cold caller 會被
+  // quality check 識別為 stale 重新 fetch，但主動清更快且省一次 TMDB 打。
+  await _purgeStaleTmdbAliasCache();
+
   // 記錄 Forward 實際帶進來的片名相關欄位。
   // 詳細頁切換作品時，Forward 不一定會更新所有欄位，需要實際觀察才知道
   // 哪些欄位跟著換、哪些停留在舊片 —— 這是判斷「播放源沒刷新」的依據。
@@ -4218,6 +4309,10 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   // v2.8.15：早寫入 + IIFE fire-and-forget 模式。cacheWatchP 條件放寬為
   // 「cache 內有 CN 簡體別名」才 fire，所以 race 6s 內 caller 拿到
   // 早寫入或 IIFE 覆蓋後的別名（含 CN）。
+  //
+  // v2.9.2：保留 6s 短 race — TMDB search 可能 14s+，但 caller 不能等
+  // 那麼久（用戶體驗）。6s 內拿到 CN 別名就 fire，否則 fallback。
+  // IIFE 仍 fire-and-forget 跑完，cache 留給下次 caller。
   const aliases = await getTMDBAliasesBlocking(baseName, type, 6000);
   if (!Array.isArray(aliases) || aliases.length === 0) return false;
 
