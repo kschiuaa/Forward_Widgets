@@ -1035,7 +1035,29 @@ const CONFIG = {
   //   每處都是多跳網路鏈，串起來會超過串流模式的 hard 上限，
   //   導致整個 adapter 來源被靜靜丟棄。改用 _adapterPool（併發上限 4，
   //   見 ADAPTERS.DETAIL_CONCURRENCY），實測 3.6s → 0.31s。
-  WIDGET_VERSION: 35,
+  // bump 到 36：補上 Forward 契約必填欄位 id / type / title。
+  // 實測症狀：DecodingError.dataCorrupted: Data was corrupted.
+  // Path: [0].id. Debug description: Invalid id format —— Swift runtime 把
+  // loadResource 回傳的陣列解碼成 VideoItemChild，該型別要求 id 必填，
+  // 而舊輸出只有 name/description/url，整批結果在 UI 載入失敗。
+  // 同時修正三處資料正確性：規則 0/3.8 補 `＊` 外傳標記、adapter 路徑
+  // 補 sub-series 過濾（MacCMS 迴圈有、adapter 分支沒有）、_adapterSafeRemark
+  // 過濾「第12集(完結)」這種帶尾綴的重複標記。cache schema 變更必須 bump，
+  // 否則舊 cache 讀回來仍沒有 id，decode 錯誤不會消失。
+  // bump 到 37：純效能最佳化，不改變任何輸出內容。
+  //   (1) /detail 端點加 30s 短 TTL 快取 —— 同一次搜尋對同一 vodId 會打兩次
+  //       detail（一次取播放清單、一次取 vip 前綴），原本第二次必定重新下載，
+  //       實測單獨就佔 1.3 秒。只快取 player_jx 前綴這種非短效資料，
+  //       播放 token 不走這條路徑，所以結果與原本逐位元組相同。
+  //   (2) adapter 各站由「逐站 await」改為併發（_adapterPool），總時間
+  //       從 sum(各站) 變成 max(各站)。
+  //   (3) _agePlayUrls 逐來源循序試改成併發發出、依序取第一個成功，
+  //       輸出順序與結果與原本完全相同。
+  //   (4) TMDB 別名擴充原本每次搜尋跑兩次（loadResource + 下游路徑各一次），
+  //       改成上游算完把 query 傳給下游，只跑一次。
+  // cache 內容格式未變，但因 (4) 改變了搜尋 query 的來源，仍需 bump 一次
+  // 讓舊 cache 清掉，避免使用者拿到舊別名邏輯的結果。
+  WIDGET_VERSION: 37,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1072,6 +1094,25 @@ const CONFIG = {
     //
     // 若換站點後開始看到 429，先把這裡調小，而不是改回循序。
     DETAIL_CONCURRENCY: 4,
+    // 同時查詢幾個 adapter 站。
+    //
+    // ★ 原本各站是「一站跑完才換下一站」，總時間 = 各站耗時相加
+    //   （實測 jpyy +330ms、agedm +1804ms 串起來共 1.8s）。改成併發後
+    //   = max(各站)，實測降到 max 而非 sum。
+    //
+    //   刻意只給 2（而非全開）：不同站點雖然打不同網域，但同時打滿
+    //   仍可能撞到各自的限流。2 已能把兩個站的成本疊在一起。
+    SITE_CONCURRENCY: 2,
+    // detail 端點的短 TTL 快取（毫秒）。
+    //
+    // ★ 這是最大的單項提速：搜尋流程會對同一個 vodId 打兩次
+    //   /detail（一次取播放清單、一次取 vip 前綴），因為前一次早已
+    //   回來、_ADAPTER_INFLIGHT 共用不到，所以第二次必定重新下載。
+    //   實測這一項單獨就佔 1.3 秒。
+    //
+    //   只給「非短效憑證」的 detail 用：這裡重放的 player_jx 前綴是
+    //   站方固定設定；播放 token 不走這個快取（見 _ADAPTER_GET 說明）。
+    DETAIL_CACHE_TTL: 30000,
   },
 
   // 流式搜尋配置
@@ -1232,7 +1273,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.0.1",
+  version: "3.0.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2646,6 +2687,12 @@ function _adapterSafeRemark(raw) {
   // 不過濾的話描述會變成「凡人修仙傳．第195集．第195集」—— 同一句
   // 話印兩次。跟上面的「更新至N集」是同一個道理。
   if (/^第?\s*\d+\s*[集期話]$/.test(s)) return '';
+  // 「第12集(完結)」「第12集（完結）」「第12集 完結」「第12集[完結]」
+  // —— 同一種狀態標記，只是多帶了完結註記。上面那條規則要求整串結束於
+  // 「集/期/話」，因此這類帶尾綴的形式會漏過，實測輸出成
+  // 「五等分的新娘．第80集．第12集(完結)」—— 旁邊已經有第 80 集，
+  // 再補一個「第12集(完結)」是同一件事講兩次。
+  if (/^第?\s*\d+\s*[集期話]\s*[(（\[【]?\s*(完結|完结|更新完|已完結|已完结)?\s*[)）\]】]?$/.test(s)) return '';
   return toDisplayText(s);
 }
 
@@ -3069,6 +3116,15 @@ function parseCacheValue(raw) {
 }
 
 /**
+ * URL 存活探測的跨搜尋共用表：url → Promise<boolean>。
+ *
+ * 存在的理由見 probeUrlsAlive 內的說明 —— probe 是 fire-and-forget 的背景
+ * 任務，上一季的 probe 還在飛時使用者切到下一季，同一批 CDN 路徑會被再打
+ * 一次 HEAD。這裡讓後到的 probe 共用前一次的 Promise，並在結束後清除。
+ */
+const _PROBE_INFLIGHT = new Map();
+
+/**
  * 並行探測一組 URL，回傳對應位置的 boolean（true=活著，false=失效/timeout）。
  * 用於 cache 寫入前過濾，避免把死 URL 寫進 cache 讓下次進入還會拿到舊失效 URL。
  * HEAD 探測比 GET 省頻寬；CDN 對 HEAD 通常也會回正確狀態碼。
@@ -3082,41 +3138,92 @@ async function probeUrlsAlive(urls, opts = {}) {
   // 沒 Widget.http：無法探測，全部視為活著（不擋 cache）
   if (!Widget?.http?.request) return urls.map(() => true);
 
-  const results = new Array(urls.length);
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < urls.length) {
-      const i = cursor++;
-      const u = urls[i];
-      try {
-        // request 走 HEAD；Widget.http.get 在某些 runtime 不支援 method 參數，
-        // 失敗/超時/非 2xx 都視為失效
-        const resp = await Widget.http.request({
-          url: u,
-          method: 'HEAD',
-          timeout,
-        });
-        const code = resp?.statusCode ?? 0;
-        results[i] = code >= 200 && code < 400;
-      } catch (_) {
-        // 某些 CDN 不接受 HEAD，會在 GET 時回 405/200，這裡先標失效
-        // 讓 probe 函式可以 fallback 到 GET 重試
-        results[i] = false;
-      }
-    }
-  };
-  const workers = Array.from({ length: Math.min(concurrency, urls.length) }, worker);
-  await Promise.all(workers);
-
-  // 第二輪：HEAD 失敗的用 GET 重試一次（CDN 常見：HEAD 拒絕但 GET 200）
+  // ★ 同一 URL 在同一輪只打一次 HEAD（保險層）。
   //
-  // 註：原本這層 fallback 設計是為了兼容「CDN 不接受 HEAD 但 GET 200」
-  // 的情況，但實機 100 筆規模時全部跑 GET 會把總探測時間從 1x 拉到 2x
-  // （probe 用滿了 forward 的 HTTP timeout），使用者體感卡頓。改為直接
-  // 接受 HEAD 結果就好 —— 失效的不寫 cache，下次重搜時自然會重新探測。
-  // 真正「播一會斷線重頭」的 CDN 502 不會被 HEAD 放行（502 ≥ 400），
-  // 所以這層簡化不會讓壞 URL 進 cache。
-  return results;
+  // 去重不能改變回傳陣列長度（呼叫端用 index 對應），所以這裡建
+  // 一張「位置 → 唯一 URL index」的對照表，worker 只對唯一 URL 發請求，
+  // 結果再廣播回所有相同的位置。
+  const uniqueUrls = [];
+  const posToUnique = new Array(urls.length);
+  const seen = new Map();
+  for (let i = 0; i < urls.length; i++) {
+    const u = urls[i];
+    let uIdx = seen.get(u);
+    if (uIdx === undefined) {
+      uIdx = uniqueUrls.length;
+      uniqueUrls.push(u);
+      seen.set(u, uIdx);
+    }
+    posToUnique[i] = uIdx;
+  }
+
+  // ★★ 跨搜尋共用：同一支片子的不同集常共用 CDN 路徑，且 probe 是
+  //   fire-and-forget 的背景任務。上一季（S1）的 probe 還在飛、使用者就
+  //   切到下一季（S2），S2 的 probe 會對同一批 URL 再打一次 HEAD ——
+  //   實測 log 裡同一個「…/8719_dba5ff02」出現 2~3 次 HEAD 就是這樣來的。
+  //
+  //   重打不只是浪費頻寬，還會延長背景 probe 的存活時間，讓它更容易撞上
+  //   使用者切換造成的 CancellationError。這裡用 module 級的 in-flight
+  //   表讓後到的 probe 直接共用前一次的結果。
+  const startProbe = (u) => {
+    const p = (async () => {
+      try {
+        const resp = await Widget.http.request({ url: u, method: 'HEAD', timeout });
+        const code = resp?.statusCode ?? 0;
+        return code >= 200 && code < 400;
+      } catch (_) {
+        // 某些 CDN 不接受 HEAD，會在 GET 時回 405/200 → 標失效，
+        // 不寫 cache，下次重搜時自然重新探測。
+        return false;
+      }
+    })();
+    _PROBE_INFLIGHT.set(u, p);
+    // 探測結束後（含取消）都要清掉，否則 table 會無限成長且回傳過期結果。
+    p.finally(() => _PROBE_INFLIGHT.delete(u));
+    return p;
+  };
+
+  // 每個「唯一 URL」只對應一個 Promise：已在飛就沿用，沒有才啟動。
+  //
+  // ★ 啟動必須分批，不能先全部 startProbe 再分批 await —— 那樣只是限制
+  //   「等待」，10 個請求還是會同時發出去，等於併發上限失效（實測
+  //   peak=10 > concurrency=4）。必須每批真的只啟動 concurrency 個。
+  const uniquePromises = new Array(uniqueUrls.length);
+  const borrowed = [];             // 沿用既有 in-flight 的索引（不佔本輪額度）
+  const todo = [];                 // 本輪要啟動的索引
+  for (let k = 0; k < uniqueUrls.length; k++) {
+    const existing = _PROBE_INFLIGHT.get(uniqueUrls[k]);
+    if (existing) {
+      uniquePromises[k] = existing;
+      borrowed.push(k);
+    } else {
+      todo.push(k);
+    }
+  }
+
+  // 分批啟動 + 等待，維持「最多 concurrency 個同時在飛」。
+  // （一次把 30 個 HEAD 全打出去會撞滿 Forward 的 HTTP 連線。）
+  for (let k = 0; k < todo.length; k += concurrency) {
+    const batch = todo.slice(k, k + concurrency);
+    for (const i of batch) uniquePromises[i] = startProbe(uniqueUrls[i]);
+    await Promise.all(batch.map(i => uniquePromises[i]));
+  }
+
+  // 沿用既有 in-flight 的那些不佔用本輪額度，但還是要等它們收斂。
+  await Promise.all(borrowed.map(i => uniquePromises[i]));
+
+  const uniqueResults = await Promise.all(uniquePromises);
+
+  // 廣播回原順序，長度與輸入一致。
+  //
+  // 註：HEAD 失敗不再 fallback 到 GET 重試。原本有這層 fallback 是為了兼容
+  // 「CDN 不接受 HEAD 但 GET 200」，但實機 100 筆規模時全部跑 GET 會把總探測
+  // 時間從 1x 拉到 2x（probe 用滿了 forward 的 HTTP timeout），使用者體感卡頓。
+  // 失效的不寫 cache，下次重搜時自然會重新探測；而「播一會斷線重頭」的
+  // CDN 502 不會被 HEAD 放行（502 ≥ 400），所以這層簡化不會讓壞 URL 進 cache。
+  const out = new Array(urls.length);
+  for (let i = 0; i < urls.length; i++) out[i] = uniqueResults[posToUnique[i]];
+  return out;
 }
 
 async function loadRejectingTypeSites() {
@@ -3328,13 +3435,36 @@ function _adapterBuildHeader(sentQuery, site) {
  * 進行中的 adapter HTTP 請求，key = `站id|完整網址`。
  *
  * 只記錄「還沒回來的」請求，完成後立刻刪除（見 _adapterGet 裡的 finally）。
- * 刻意不做結果快取：播放 token 短效，跨請求重放會拿到死掉的網址。
  */
 const _ADAPTER_INFLIGHT = new Map();
 
 /**
+ * 極短 TTL 的 detail 回應快取，key = `站id|完整網址`。
+ *
+ * 為什麼需要：搜尋流程對同一個 vodId 會打兩次 `/detail/{vodId}` ——
+ *   1. _ageEpisodes 展開 playlists 抓播放 token
+ *   2. _agePlayUrls 為了拿 player_jx 的 vip/zj 前綴又打一次
+ * 第二次的用途「只有」取前綴（站方設定，非短效憑證），但因為
+ * _ADAPTER_INFLIGHT 只共用「進行中」的請求，detail 早已回來，
+ * 所以第二次必定是真的重新下載 —— 實測這一項就吃掉 1.3 秒
+ * （+511ms → +1804ms，佔整次搜尋 1.7s 的 76%）。
+ *
+ * 為什麼這樣安全：這不是「跨請求重放 token」。
+ *   - 播放 token 來自第 1 次呼叫寫進 nid 的 sources JSON，不走這個快取
+ *   - 快取只回應第 2 次呼叫要的 player_jx 前綴（站方固定設定）
+ * TTL 取 30s：只覆蓋「同一次搜尋內相隔數百毫秒的兩次呼叫」這個情境，
+ * 遠短於 token 的實際壽命，不會讓使用者拿到過期 token。
+ */
+const _ADAPTER_DETAIL_CACHE = new Map();
+// TTL 取自 CONFIG（在 CONFIG 定義之後才讀取，故用延遲 getter 的等價寫法）。
+const _ADAPTER_DETAIL_TTL = CONFIG.ADAPTERS?.DETAIL_CACHE_TTL ?? 30000;
+
+/**
  * 帶簽名的 GET。
  * site 設定可覆寫 httpGet（如某站需特殊 header / 不需簽名）。
+ *
+ * opts.cacheTtl：>0 時把回應存進極短 TTL 快取（見 _ADAPTER_DETAIL_CACHE）。
+ * 只給「確定是 idempotent 且非短效憑證」的端點用，例如 /detail。
  */
 async function _adapterGet(site, endpoint, query, opts = {}) {
   const qs = Object.keys(query).map(k => `${k}=${query[k]}`).join('&');
@@ -3342,6 +3472,16 @@ async function _adapterGet(site, endpoint, query, opts = {}) {
   const headers = site.buildHeaders ? site.buildHeaders(qs) : _adapterBuildHeader(qs, site);
 
   const fetcher = site.httpGet || ((u, h) => Widget.http.get(u, { headers: h, timeout: opts.timeout || CONFIG.REQUEST_TIMEOUT }));
+
+  const ttl = opts.cacheTtl || 0;
+  const cacheKey = `${site.id}|${url}`;
+
+  // 極短 TTL 快取命中：直接回放，省掉一次完整 RTT。
+  if (ttl > 0) {
+    const hit = _ADAPTER_DETAIL_CACHE.get(cacheKey);
+    if (hit && (Date.now() - hit.ts) < ttl) return hit.val;
+    if (hit) _ADAPTER_DETAIL_CACHE.delete(cacheKey);
+  }
 
   // ★ 併發去重。搜尋流程會對同一個 vodId 打兩次 detail：一次在
   //   _ageEpisodes 展開清單、一次在 _adapterResolvePlay 前重新確認。
@@ -3370,6 +3510,18 @@ async function _adapterGet(site, endpoint, query, opts = {}) {
     if (payload && typeof payload === 'object' && payload.code != null && payload.code !== 200) {
       if (site.DEBUG) console.warn(`[adapter:${site.id}] code=${payload.code} ${payload.msg || ''}`);
       return null;
+    }
+    // ★ 只有明確指定 cacheTtl 的端點才存進短 TTL 快取。
+    //   預設（ttl=0）維持「絕不重放結果」的舊語意，token 安全。
+    if (ttl > 0 && payload != null) {
+      _ADAPTER_DETAIL_CACHE.set(cacheKey, { val: payload, ts: Date.now() });
+      // 順手回收：避免長時間使用後 Map 無上限成長。
+      if (_ADAPTER_DETAIL_CACHE.size > 40) {
+        const now = Date.now();
+        for (const [k, v] of _ADAPTER_DETAIL_CACHE) {
+          if (now - v.ts > ttl) _ADAPTER_DETAIL_CACHE.delete(k);
+        }
+      }
     }
     return payload;
   })();
@@ -3489,7 +3641,11 @@ async function _ageSearch(site, keyword) {
 async function _ageEpisodes(site, vodId) {
   // 傳 {} 而非省略：_adapterGet 會直接 Object.keys(query)，給 null 會炸。
   // 詳情頁是路徑式（/detail/{id}），沒有 query 參數。
-  const j = await _adapterGet(site, `/detail/${vodId}`, {});
+  //
+  // ★ 速度：帶 cacheTtl。_agePlayUrls 換播放 URL 時需要同一份 detail 的
+  //   player_jx 前綴，會再打一次同一個網址。短 TTL 快取直接回放，
+  //   省掉一次完整 RTT（實測這一項單獨佔 1.3 秒）。
+  const j = await _adapterGet(site, `/detail/${vodId}`, {}, { cacheTtl: _ADAPTER_DETAIL_TTL });
   const root = j?.data || j;
   const playlists = root?.video?.playlists || {};
   if (!playlists || typeof playlists !== 'object') return [];
@@ -3597,12 +3753,27 @@ async function _agePlayUrls(site, vodId, nid) {
   // 再取一次 detail：player_jx / player_vip 只在 detail 回應裡，
   // 沒存起來的話這裡就沒有前綴可用。延遲換取的設計本來就是
   // 「用到才換」，多這一次請求是必要的。
-  const j = await _adapterGet(site, `/detail/${vodId}`, {});
+  //
+  // ★ 速度：走 cacheTtl。剛才 _ageEpisodes 才剛抓過同一個 /detail，
+  //   短 TTL 快取會直接回放，省掉一次完整 RTT（實測省 1.3 秒）。
+  //   這裡只用到 player_jx 的 vip/zj 前綴（站方固定設定），
+  //   不是短效憑證，重放安全；播放 token 來自上一步存進 nid 的
+  //   sources JSON，完全不受這個快取影響。
+  const j = await _adapterGet(site, `/detail/${vodId}`, {}, { cacheTtl: _ADAPTER_DETAIL_TTL });
   const root = j?.data || j;
   const jx = root?.player_jx || {};
   if (!jx.vip && !jx.zj) return [];
 
-  // 依序試各來源，第一個解析成功的就是它。
+  // 依來源順序試，第一個解析成功的就是它。
+  //
+  // ★ 速度：原本是「試一個失敗才試下一個」的循序迴圈，最壞情況
+  //   N 個壞源 = N 次完整 RTT 串起來（解析服務在第三方 wuzhoupai，
+  //   單源 ~1s，2 個壞源就是 2 秒白等）。
+  //
+  //   改成「併發發出去、依原順序取第一個成功」：延遲上限從 sum 降成
+  //   max，並且維持「優先用站方排在前面的源」這個行為
+  //   （Promise.all + 依序掃描，結果與循序版本完全相同）。
+  const ordered = [];
   for (const s of sources) {
     const token = s && s.t;
     if (!token) continue;
@@ -3610,27 +3781,36 @@ async function _agePlayUrls(site, vodId, nid) {
     // 站方改了 VIP 清單也不該讓已建好的 token 突然走錯前綴。
     const prefix = s.v ? jx.vip : jx.zj;
     if (!prefix) continue;
+    ordered.push({ prefix, token });
+  }
+  if (ordered.length === 0) return [];
 
-    let html;
+  const probe = async ({ prefix, token }) => {
     try {
       const resp = await Widget.http.get(prefix + token, {
         headers: { 'User-Agent': site.ua, 'Referer': 'https://m.agedm.io/' },
         timeout: CONFIG.REQUEST_TIMEOUT,
       });
-      html = resp;
+      let html = resp;
       if (resp && typeof resp === 'object' && 'data' in resp) html = resp.data;
+      if (typeof html !== 'string' || !html) return null;
+      // 站方在頁面裡用單引號包住 Vurl。正則寬鬆一點：站方改引號樣式時
+      // 寧可寬鬆也不要整個功能壞掉（抓不到就續試下一個來源）。
+      const m = html.match(/Vurl\s*=\s*['"]([^'"]+)['"]/);
+      if (!m || !m[1].trim()) return null;
+      return { url: m[1].trim(), resolution: 1080, resolutionName: 'AGE' };
     } catch (e) {
-      continue;   // 換下一個來源，不要讓整條來源消失
+      return null;   // 這個源壞了，改用下一個
     }
-    if (typeof html !== 'string' || !html) continue;
+  };
 
-    // 站方在頁面裡用單引號包住 Vurl。正則寬鬆一點：站方改引號樣式時
-    // 寧可寬鬆也不要整個功能壞掉（抓不到就續試下一個來源）。
-    const m = html.match(/Vurl\s*=\s*['"]([^'"]+)['"]/);
-    if (!m || !m[1].trim()) continue;
-
-    return [{ url: m[1].trim(), resolution: 1080, resolutionName: 'AGE' }];
-  }
+  // 併發發出所有探測，但「結果」依 ordered 順序取第一個成功 ——
+  // 與循序版本輸出完全相同，只是把所有 RTT 疊在一起。
+  const probed = await _adapterPool(
+    ordered.map(o => async () => await probe(o)),
+    ordered.length,
+  );
+  for (const r of probed) if (r) return [r];
   return [];
 }
 
@@ -4361,7 +4541,10 @@ class SmartSearchExecutor {
     if (this.adapterSites && this.adapterSites.length > 0) {
       const runAdapters = (async () => {
         const out = [];
-        for (const site of this.adapterSites) {
+        // ★ 速度：各站併發。與 batch 路徑同樣的理由 ——
+        //   原本逐站 await 讓總時間變成 sum，實測 jpyy(+330ms) 跑完
+        //   agedm 才開始。站點彼此無相依，併發後變成 max。
+        const perSite = async (site) => {
           try {
             const items = await _adapterSearch(
               site,
@@ -4370,7 +4553,7 @@ class SmartSearchExecutor {
               this.type,
               this.targetEpisode
             );
-            if (!items || items.length === 0) continue;
+            if (!items || items.length === 0) return [];
 
             // 標記目標集，讓 extractPlayInfoForCache 只換那一集的 URL
             for (const it of items) it._adapterTargetEpisode = this.targetEpisode;
@@ -4394,10 +4577,17 @@ class SmartSearchExecutor {
               CONFIG.ADAPTERS?.DETAIL_CONCURRENCY ?? 4,
             );
             for (const res of settled) if (res) out.push(...res);
+            return out;
           } catch (e) {
             console.warn(`[adapter:${site.id}] 串流模式失敗: ${e?.message || e}`);
+            return [];
           }
-        }
+        };
+        const perSiteSettled = await _adapterPool(
+          this.adapterSites.map(site => async () => await perSite(site)),
+          CONFIG.ADAPTERS?.SITE_CONCURRENCY ?? 2,
+        );
+        for (const r of perSiteSettled) if (r && r.length) out.push(...r);
         return out;
       })();
 
@@ -5044,6 +5234,56 @@ function cleanResourceForOutput(resource) {
     clean.recommended = '高品質';
   }
 
+  // ===== Forward 契約欄位（id / type / title）=====
+  //
+  // 為什麼必須補：Forward 客戶端的 Swift runtime 會把 loadResource 回傳的
+  // 陣列解碼成原生 VideoItemChild，而該型別要求 `id`(必填字串)、`type`、
+  // `title` 都是必填。只輸出 name/description/url 時，Swift 端在第一筆
+  // 元素的 `.id` 就會丟出：
+  //
+  //   DecodingError.dataCorrupted: Data was corrupted.
+  //   Path: [0].id. Debug description: Invalid id format
+  //
+  // 整批結果因此在 UI 上載入失敗（而且失敗在「上一輪」的結果上，看起來像
+  // 隨機）。這與 CancellationError 是兩件事 —— 後者只是使用者中途切換
+  // 分頁/季別造成的正常中止。
+  //
+  // 這裡採「最小補充」策略：只補欄位，不動現有的 name/description/url，
+  // 避免影響已驗證過的 UI 顯示。
+  {
+    // 用「原始(未 wrap)url + 集數」當 id。因為 wrapM3U8WithFilter 會改寫
+    // clean.url，而過濾伺服器每次呼叫產生的 t/sign 參數都不同 —— 若拿
+    // wrap 後的 url 當 id，同一條資源在 cache 命中前後會拿到不同 id，
+    // 客戶端會當成兩筆。
+    //
+    // ★ 冪等性：loadResource 會把 cleaned 的欄位寫回原 res 物件
+    //   （Object.assign(res, cleaned)），因此同一筆資源可能「清兩次」。
+    //   第二次進來時 resource.url 已經是 wrap 過的，若直接拿它算 id，
+    //   得到的值會和第一次不同 —— 快取命中前後 id 漂移。
+    //   所以先檢查有沒有既存 id（resource.id 是上次算出來的），有就沿用。
+    if (typeof resource.id === 'string' && resource.id) {
+      clean.id = resource.id;
+    } else {
+      const rawUrl = typeof resource.url === 'string' ? resource.url : '';
+      const epPart = clean.episode != null ? String(clean.episode) : '';
+      const idBase = rawUrl || `${resource._rawName || clean.name || 'item'}|${epPart}`;
+      clean.id = `forward-vod-${idBase}`;
+    }
+    // 這批資源都是可直接播放的直連 m3u8/mp4，對應契約裡的 "url" 型別。
+    clean.type = 'url';
+    // title 優先用站方原始片名，其次用描述第一行去掉集數後的片名。
+    let title = String(resource._rawName || '').trim();
+    if (!title) {
+      const firstLine = String(clean.description || '').split('\n')[0].trim();
+      // 去掉「．第12集」「 第2季．第12集」這類尾綴，只留片名。
+      title = firstLine
+        .replace(/[．·]\s*第\s*[0-9一二三四五六七八九十百零]+\s*[集季話].*$/u, '')
+        .replace(/\s*第\s*[0-9一二三四五六七八九十百零]+\s*季.*$/u, '')
+        .trim();
+    }
+    clean.title = title || String(clean.name || '視頻資源');
+  }
+
   return clean;
 }
 
@@ -5503,11 +5743,11 @@ async function loadResource(params, onStreamResult = null) {
   applyDetailVersion(params, targetInfo);
   targetInfo.searchQuery = buildSearchQuery(targetInfo.searchQuery, targetInfo, targetSeason);
 
-  // TMDB 跨地區別名擴充。
+// TMDB 跨地區別名擴充。
   //
   // 為什麼這裡呼叫：loadResource / performSmartSearch / performBatchSearch 三
   // 條路徑都需要，因為 SmartSearchExecutor 內部讀的就是 this.targetInfo.searchQuery。
-//
+  //
   // 為什麼不會拖慢 hot path：tryExpandWithTMDBAliases 內部最長只等 1.5s
   // 且有 cache 命中短路；cache hit 時（同一片名第二次、或已預熱）立即
   // 回傳；只有在「這部片第一次被搜時」才會同步等 TMDB（單次成本），
@@ -5515,12 +5755,25 @@ async function loadResource(params, onStreamResult = null) {
   //
   // 安全保證：對 type === 'variety' 跟沒開 TMDB 的情況一律放行；
   // try/catch 確保 TMDB 任何意外錯誤都不會中斷搜尋主流程。
-  try {
-    await tryExpandWithTMDBAliases(targetInfo, type);
-    console.log(`[TMDB-diag] tryExpand returned, _aliasSearchQuery="${targetInfo._aliasSearchQuery || '(空)'}", searchQuery="${targetInfo.searchQuery}"`);
-  } catch (e) {
-    console.log(`[TMDB-diag] tryExpand THREW: ${e?.message || e}`);
-    if (CONFIG.TMDB?.VERBOSE) console.warn('[TMDB] expand 失敗,繼續原 query:', e?.message || e);
+  //
+  // ★ 速度：`_tmdbAliasSearchQuery` 標記「本次搜尋已跑過 TMDB」。
+  //   loadResource 與 performBatchSearch/performSmartSearch 各自呼叫一次，
+  //   cache miss 時等於把整段 TMDB 流程（內含多次 API request）跑兩次，
+  //   而第二次必定是純重複（此時 cache 已被第一次填好）。跳過它。
+  if (!targetInfo._tmdbAliasSearchQuery && !params?._preSearchQuery) {
+    try {
+      await tryExpandWithTMDBAliases(targetInfo, type);
+      targetInfo._tmdbAliasSearchQuery = true;
+      console.log(`[TMDB-diag] tryExpand returned, _aliasSearchQuery="${targetInfo._aliasSearchQuery || '(空)'}", searchQuery="${targetInfo.searchQuery}"`);
+    } catch (e) {
+      targetInfo._tmdbAliasSearchQuery = true;
+      console.log(`[TMDB-diag] tryExpand THREW: ${e?.message || e}`);
+      if (CONFIG.TMDB?.VERBOSE) console.warn('[TMDB] expand 失敗,繼續原 query:', e?.message || e);
+    }
+  } else if (params?._preSearchQuery) {
+    // ★ 上游（loadResource）已完成 TMDB 擴充並把最終 query 傳下來，
+    //   直接沿用，不要再跑一次整段 TMDB 流程。
+    targetInfo.searchQuery = params._preSearchQuery;
   }
   if (targetInfo._aliasSearchQuery) {
     const aliasQ = String(targetInfo._aliasSearchQuery)
@@ -5637,14 +5890,31 @@ targetInfo.searchQuery = aliasQ;
   }
   
   let finalResults = [];
-  
+
+  // ★ 速度：把 loadResource 已做過 TMDB 擴充的結果傳給下游搜尋路徑。
+  //   loadResource 與 performBatchSearch/performSmartSearch 各自從
+  //   seriesName 重建一份 targetInfo 並各跑一次 TMDB 擴充，cache miss 時
+  //   等於整段 TMDB 流程（多次 API request）跑兩次，而第二次必定是
+  //   純重複（此時 cache 已被第一次填好）。
+  //
+  //   傳 _preSearchQuery 下去，下游直接沿用、不再重跑。
+  //   無條件傳（不只是有別名時）：下游自己 rebuild 出來的 searchQuery
+  //   與這裡完全相同（兩邊呼叫的是同一組 applyDetailVersion +
+  //   buildSearchQuery，type/season 來自同一份 params），
+  //   所以沿用上游結果不會改變任何搜尋行為，只是省掉重複的 TMDB 呼叫。
+  //   沒有 _preSearchQuery 時（獨立呼叫 performBatchSearch）行為不變。
+  const _searchParams = {
+    ...params,
+    _preSearchQuery: targetInfo.searchQuery,
+  };
+
   if (searchMode === 'smart_stream' || searchMode === 'auto') {
     console.log('🎯 使用智能流式搜索模式');
-    finalResults = await performSmartSearch(params, onStreamResult);
+    finalResults = await performSmartSearch(_searchParams, onStreamResult);
   } else {
     // 'batch' 為預設,涵蓋未來任何未知值(寬鬆驗證一致)
     console.log('🔍 使用批量搜索模式');
-    finalResults = await performBatchSearch(params);
+    finalResults = await performBatchSearch(_searchParams);
   }
   
   if (type === 'tv' && targetEpisode) {
@@ -6113,11 +6383,18 @@ function filterBySequel(results, targetInfo) {
     // 但其實是 Final S4 Part 2 完結篇。會被誤 drop。
     // 實務 trade-off：保留可能誤放劇場版的雜亂 vs 誤殺進騰完結篇 — 選擇前者，
     // 因為為讓後者（使用者點進去看劇場版）比誤殺完結篇（少看到 1 條）更影響體驗。
-    if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇/.test(rawName)) {
+// ★ `＊` / `∽` 是簽名型 adapter 站（jpyy / agedm）用來標示「外傳篇」
+    //   的站方符號，例如「五等分的新娘＊」。它不是片名的一部分，且
+    //   extractSequelNumber 對它回 null（`＊` 非數字）→ 走不到規則 1/規則 X，
+    //   只會被「candYear < pooledYearMin」或「> pooledYearMin + 3」攔截。
+    //   「五等分的新娘＊」的 _year 是 2024（比 pooledYearMin 2021 晚 3 年，
+    //   剛好沒超過 +3 的門檻）→ 整條漏網混進第 2 季結果。
+    //   舊規則的正則漏了這個符號，是實測漏網的直接原因。
+    if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇|[＊∽]/.test(rawName)) {
       dropped.push(res); continue;
     }
 
-if (sequel === targetSeason) { kept.push(res); continue; }
+    if (sequel === targetSeason) { kept.push(res); continue; }
 
   // 規則 X：candidate 的 sequel 明確標示為其他季，無條件 drop。
   //
@@ -6210,7 +6487,7 @@ if (sequel === targetSeason) { kept.push(res); continue; }
     // 但其實是 Final S4 Part 2 完結篇。會被誤 drop。
     // 實務 trade-off：保留可能誤放劇場版的雜亂 vs 誤殺進騰完結篇 — 選擇前者，
     // 因為混亂的後果（使用者點進去看劇場版）比誤殺完結篇（少看到 1 條）更影響體驗。
-    if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇/.test(rawName)) {
+    if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇|[＊∽]/.test(rawName)) {
       dropped.push(res); continue;
     }
 
@@ -6404,11 +6681,11 @@ async function performSmartSearch(params, onStreamResult) {
   applyDetailVersion(params, targetInfo);
   targetInfo.searchQuery = buildSearchQuery(targetInfo.searchQuery, targetInfo, targetSeason);
 
-  // TMDB 跨地區別名擴充。
+// TMDB 跨地區別名擴充。
   //
   // 為什麼這裡呼叫：loadResource / performSmartSearch / performBatchSearch 三
   // 條路徑都需要，因為 SmartSearchExecutor 內部讀的就是 this.targetInfo.searchQuery。
-//
+  //
   // 為什麼不會拖慢 hot path：tryExpandWithTMDBAliases 內部最長只等 1.5s
   // 且有 cache 命中短路；cache hit 時（同一片名第二次、或已預熱）立即
   // 回傳；只有在「這部片第一次被搜時」才會同步等 TMDB（單次成本），
@@ -6416,12 +6693,25 @@ async function performSmartSearch(params, onStreamResult) {
   //
   // 安全保證：對 type === 'variety' 跟沒開 TMDB 的情況一律放行；
   // try/catch 確保 TMDB 任何意外錯誤都不會中斷搜尋主流程。
-  try {
-    await tryExpandWithTMDBAliases(targetInfo, type);
-    console.log(`[TMDB-diag] tryExpand returned, _aliasSearchQuery="${targetInfo._aliasSearchQuery || '(空)'}", searchQuery="${targetInfo.searchQuery}"`);
-  } catch (e) {
-    console.log(`[TMDB-diag] tryExpand THREW: ${e?.message || e}`);
-    if (CONFIG.TMDB?.VERBOSE) console.warn('[TMDB] expand 失敗,繼續原 query:', e?.message || e);
+  //
+  // ★ 速度：`_tmdbAliasSearchQuery` 標記「本次搜尋已跑過 TMDB」。
+  //   loadResource 與 performBatchSearch/performSmartSearch 各自呼叫一次，
+  //   cache miss 時等於把整段 TMDB 流程（內含多次 API request）跑兩次，
+  //   而第二次必定是純重複（此時 cache 已被第一次填好）。跳過它。
+  if (!targetInfo._tmdbAliasSearchQuery && !params?._preSearchQuery) {
+    try {
+      await tryExpandWithTMDBAliases(targetInfo, type);
+      targetInfo._tmdbAliasSearchQuery = true;
+      console.log(`[TMDB-diag] tryExpand returned, _aliasSearchQuery="${targetInfo._aliasSearchQuery || '(空)'}", searchQuery="${targetInfo.searchQuery}"`);
+    } catch (e) {
+      targetInfo._tmdbAliasSearchQuery = true;
+      console.log(`[TMDB-diag] tryExpand THREW: ${e?.message || e}`);
+      if (CONFIG.TMDB?.VERBOSE) console.warn('[TMDB] expand 失敗,繼續原 query:', e?.message || e);
+    }
+  } else if (params?._preSearchQuery) {
+    // ★ 上游（loadResource）已完成 TMDB 擴充並把最終 query 傳下來，
+    //   直接沿用，不要再跑一次整段 TMDB 流程。
+    targetInfo.searchQuery = params._preSearchQuery;
   }
   if (targetInfo._aliasSearchQuery) {
     const aliasQ = String(targetInfo._aliasSearchQuery)
@@ -6513,11 +6803,11 @@ async function performBatchSearch(params) {
   applyDetailVersion(params, targetInfo);
   targetInfo.searchQuery = buildSearchQuery(targetInfo.searchQuery, targetInfo, targetSeason);
 
-  // TMDB 跨地區別名擴充。
+// TMDB 跨地區別名擴充。
   //
   // 為什麼這裡呼叫：loadResource / performSmartSearch / performBatchSearch 三
   // 條路徑都需要，因為 SmartSearchExecutor 內部讀的就是 this.targetInfo.searchQuery。
-//
+  //
   // 為什麼不會拖慢 hot path：tryExpandWithTMDBAliases 內部最長只等 1.5s
   // 且有 cache 命中短路；cache hit 時（同一片名第二次、或已預熱）立即
   // 回傳；只有在「這部片第一次被搜時」才會同步等 TMDB（單次成本），
@@ -6525,12 +6815,25 @@ async function performBatchSearch(params) {
   //
   // 安全保證：對 type === 'variety' 跟沒開 TMDB 的情況一律放行；
   // try/catch 確保 TMDB 任何意外錯誤都不會中斷搜尋主流程。
-  try {
-    await tryExpandWithTMDBAliases(targetInfo, type);
-    console.log(`[TMDB-diag] tryExpand returned, _aliasSearchQuery="${targetInfo._aliasSearchQuery || '(空)'}", searchQuery="${targetInfo.searchQuery}"`);
-  } catch (e) {
-    console.log(`[TMDB-diag] tryExpand THREW: ${e?.message || e}`);
-    if (CONFIG.TMDB?.VERBOSE) console.warn('[TMDB] expand 失敗,繼續原 query:', e?.message || e);
+  //
+  // ★ 速度：`_tmdbAliasSearchQuery` 標記「本次搜尋已跑過 TMDB」。
+  //   loadResource 與 performBatchSearch/performSmartSearch 各自呼叫一次，
+  //   cache miss 時等於把整段 TMDB 流程（內含多次 API request）跑兩次，
+  //   而第二次必定是純重複（此時 cache 已被第一次填好）。跳過它。
+  if (!targetInfo._tmdbAliasSearchQuery && !params?._preSearchQuery) {
+    try {
+      await tryExpandWithTMDBAliases(targetInfo, type);
+      targetInfo._tmdbAliasSearchQuery = true;
+      console.log(`[TMDB-diag] tryExpand returned, _aliasSearchQuery="${targetInfo._aliasSearchQuery || '(空)'}", searchQuery="${targetInfo.searchQuery}"`);
+    } catch (e) {
+      targetInfo._tmdbAliasSearchQuery = true;
+      console.log(`[TMDB-diag] tryExpand THREW: ${e?.message || e}`);
+      if (CONFIG.TMDB?.VERBOSE) console.warn('[TMDB] expand 失敗,繼續原 query:', e?.message || e);
+    }
+  } else if (params?._preSearchQuery) {
+    // ★ 上游（loadResource）已完成 TMDB 擴充並把最終 query 傳下來，
+    //   直接沿用，不要再跑一次整段 TMDB 流程。
+    targetInfo.searchQuery = params._preSearchQuery;
   }
   if (targetInfo._aliasSearchQuery) {
     const aliasQ = String(targetInfo._aliasSearchQuery)
@@ -6625,7 +6928,16 @@ targetInfo.searchQuery = aliasQ;
         if (sites.length === 0) return [];
 
         const adapterResults = [];
-        for (const site of sites) {
+        // ★ 速度：各站併發，不再一站跑完才換下一站。
+        //
+        //   原本是 `for (const site of sites) { await _adapterSearch(...) }`，
+        //   實測 jpyy 跑完(+330ms)之後 agedm 才開始，等於把兩站的
+        //   耗時相加。改成併發後總時間 = max(各站) 而非 sum。
+        //
+        //   為什麼安全：站點之間沒有任何相依關係（各打各的 API），
+        //   輸出結果在下游是合併後再排序，順序不影響結果集合。
+        //   併發度由 _adapterPool 控制，避免一次打太多觸發 429。
+        const perSite = async (site) => {
           try {
             const items = await _adapterSearch(
               site,
@@ -6634,7 +6946,39 @@ targetInfo.searchQuery = aliasQ;
               type,
               targetEpisode
             );
-            if (!items || items.length === 0) continue;
+            if (!items || items.length === 0) return [];
+
+            // ★ sub-series 過濾（MacCMS 迴圈在 6869 行有同款檢查，
+            //   但簽名型 adapter 走的是這條獨立分支，完全繞過了它）。
+            //
+            //   沒有這道閘門的實測後果：搜「五等分的新娘」第 2 季時，
+            //   「五等分的新娘＊」（2024 外傳）與「五等分的新娘劇場版」
+            //   直接混進結果，使用者看到的第一條就是外傳。
+            //
+            //   為什麼 filterBySequel 沒擋下來：`＊` 讓 extractSequelNumber
+            //   回 null（走不到規則 1/規則 X），而 _year=2024 比
+            //   pooledYearMin=2021 剛好晚 3 年、沒超過規則 3.7 的 +3 門檻。
+            //   劇場版則是因為 _rawName 是簡體「五等分的新娘剧场版」、
+            //   而規則 0 的正則寫了「劇場版」繁體字才沒被規則 0 命中。
+            //
+            //   season=1（S1）時不過濾：那時使用者就是要看整個系列，
+            //   劇場版/外傳反而是合理的入口。
+            if (Number(targetInfo.seasonNumber) >= 1) {
+              const usable = items.filter(it => {
+                const rawName = it.vod_name || '';
+                const looksLikeSpinOff = /剧场版|劇場版|电影版|電影版|外传|外傳|特別篇|特别篇|总集篇|總集篇|番外|电影解说|電影解說|[＊∽]/u.test(rawName);
+                const looksLikeOAD = /(^|[^0-9第])OAD($|[^0-9])|^OAD[0-9]|OAD版|OAD化/.test(rawName);
+                const looksLikeSP = /(^|[^0-9第])SP($|[^0-9])|^SP[0-9]/u.test(rawName);
+                return !(looksLikeSpinOff || looksLikeOAD || looksLikeSP);
+              });
+              if (usable.length !== items.length && CONFIG.DEBUG) {
+                const droppedNames = items.filter(it => !usable.includes(it)).map(it => it.vod_name).join(', ');
+                console.log(`🔌 [adapter:${site.id}] season=${targetInfo.seasonNumber} 濾掉 sub-series: ${items.length - usable.length} 條（${droppedNames}）`);
+              }
+              items.length = 0;
+              items.push(...usable);
+              if (items.length === 0) return [];
+            }
 
             // 標記目標集，讓 extractPlayInfoForCache 只換那一集的 URL
             for (const it of items) it._adapterTargetEpisode = targetEpisode;
@@ -6652,14 +6996,21 @@ targetInfo.searchQuery = aliasQ;
             );
             const siteOut = [];
             for (const res of settled) if (res) siteOut.push(...res);
-            adapterResults.push(...siteOut);
             stats.success++;
             console.log(`🔌 [adapter:${site.id}] ${site.title} 回傳 ${siteOut.length} 條`);
+            return siteOut;
           } catch (e) {
             stats.failed++;
             console.warn(`🔌 [adapter:${site.id}] ${site.title} 失敗: ${e?.message || e}`);
+            return [];
           }
-        }
+        };
+        // 併發跑各站；_adapterPool 已經有「單筆失敗不影響整批」的保護。
+        const perSiteSettled = await _adapterPool(
+          sites.map(site => async () => await perSite(site)),
+          CONFIG.ADAPTERS?.SITE_CONCURRENCY ?? 2,
+        );
+        for (const r of perSiteSettled) if (r && r.length) adapterResults.push(...r);
         return adapterResults;
       });
     }
