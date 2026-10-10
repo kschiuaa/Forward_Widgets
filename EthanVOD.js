@@ -1136,7 +1136,11 @@ const CONFIG = {
   //       行為完全不變，仍然嚴格比對。
   //   實測三個片名由 0 筆恢復為：咒術迴戰 47 集、間諜家家酒 12 集、
   //   鋼之鍊金術師 51 集。
-  WIDGET_VERSION: 38,
+  //   bump 到 39：語言版本（粵語/國語）從 1 維。
+  //   去重鍵新增語言維度 + 版本標記顯示語言，舊 cache 裡缺這個維度，
+  //   會讓已合併掉的語言版本永遠補不回來（只會繼續維持合併狀態）。
+  //   必須清掉重搜，否則使用者看不到粵語/國語兩版。
+  WIDGET_VERSION: 39,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1372,7 +1376,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.0.4",
+  version: "3.0.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4332,6 +4336,58 @@ function extractVersionMarker(name) {
   return m[1];
 }
 
+// ==================== 語言版本（粵語 / 國語）====================
+//
+// 為什麼需要：部分站（實測金牌影視）把同一部的不同語言版本存成
+// 「兩筆完全獨立的條目」，而不是同一筆下的多個播放源：
+//
+//   轻功(粤语)  vodId=108388   ← 粵語版
+//   轻功(国语)  vodId=108385   ← 國語版
+//
+// 兩筆的 vod_area、vod_year、vodSub、外傳名完全相同，只差片名尾端的
+// 語言標記與 vodId。這是「版本」的維度，不是「來源」的維度 —— 使用者
+// 想要的是能挑語言，而不是兩筆同名來源擠在一起。
+//
+// ★ 沒有這個維度的後果（實測）：
+//   去重鍵 generateContentKey = [站名, _year, 集數, 播放源]。兩筆的
+//   _year 同為 2022、播放源同為「[金牌影視]」，集數相同 → 鍵完全相同
+//   → smartDeduplicate 只保留分數較高的一筆，另一個語言版本被整批刪掉。
+//   使用者看到的是「只有粵語或只有國語」，完全不知道還有另一個版本。
+//
+// ★ 只認「明確的語言標記」，不做模糊推斷：
+//   「汉语普通话,国语」這種站方語言欄位全站一致（粵語站的國語版也寫
+//   「粤语」），拿它當鍵會讓兩筆再次撞在一起、反而害我們白改。
+//   真正區分兩者的是片名尾綴，所以只從片名抽。
+const LANGUAGE_TAGS = [
+  // 「国粤双语」「粵國雙語」代表兩種都有，是獨立的一類，不可與單語版合併。
+  { re: /国粤双语|粵國雙語|粤国双语|國粵雙語|国粤|國粵|粤语国语|粵語國語/, label: '國粵雙語' },
+  { re: /粤语|粵語|广东话|廣東話|港配|粤配|粵配/, label: '粵語' },
+  { re: /国语|國語|国配|國配|台配|台语|台語|汉语普通话/, label: '國語' },
+  { re: /英语|英語|英配|英配字幕/, label: '英語' },
+  { re: /日语|日語|日配/, label: '日語' },
+  { re: /韩语|韓語|韩配|韓配/, label: '韓語' },
+  { re: /泰语|泰語|泰配/, label: '泰語' },
+  { re: /中文字幕|中字|中英/, label: '中字' },
+];
+
+/**
+ * 從站方片名抽出語言版本標記。
+ *
+ * 只認片名尾端明確寫出的語言（"轻功(粤语)" → '粵語'），抽不到就回 null。
+ * 回 null 的資源維持原行為，不會因為多了一個鍵而彼此被拆開。
+ *
+ * 回傳值一律經 toDisplayText 轉繁體，讓版本標記與畫面上的其他文字一致
+ * （站方片名是简体「粤语」，畫面其他地方是繁體「粵語」，混排很突兀）。
+ */
+function extractLanguageTag(name) {
+  const t = String(name || '');
+  if (!t) return null;
+  for (const { re, label } of LANGUAGE_TAGS) {
+    if (re.test(t)) return label;
+  }
+  return null;
+}
+
 // 目標片名自帶年份時（「仁醫2012」），候選年份不同即為另一版本。
 function isConflictingVersion(targetInfo, candidateName) {
   const targetYear = extractVersionMarker(targetInfo.rawName) || targetInfo.year;
@@ -5145,10 +5201,24 @@ class SmartSearchExecutor {
     // 統一填 'x'，兩者會撞成同一個鍵，只留分數較高的韓版 —— 日版 22 筆被
     // 整批吃掉，使用者看到的永遠是錯的版本。
     // 同一個站不可能有兩個同名同集數的片子，原始片名可以安全地區分。
+    //
+    // ★ 語言版本必須是獨立的硬性維度，否則整組資源會被吃掉一版。
+    //
+    //   實測金牌影視把「轻功(粤语)」(vodId=108388) 與「轻功(国语)」
+    //   (vodId=108385) 存成兩筆獨立條目，兩者的 _year 同為 2022、
+    //   播放源同為「[金牌影視]」、集數相同 —— 上面的 versionKey 取到
+    //   _year 就已經完全相同，兩筆的鍵撞在一起，smartDeduplicate 只留
+    //   分數較高的一筆。使用者要的是「能挑語言」，看到卻永遠只有一個
+    //   語言，另一版被靜靜刪掉且無任何提示。
+    //
+    //   抽不到語言標記時回 'x'，維持既有行為 —— 沒有語言維度的站
+    //   （幾乎所有 MacCMS 站）不會因為多了一個鍵而被拆開。
     const versionKey = resource._year || resource._rawName || 'x';
+    const langKey = extractLanguageTag(resource._rawName || resource._versionLabel) || 'x';
     return [
       resource.name,
       versionKey,
+      langKey,
       episodeKeyOf(resource),
       playSourceKeyOf(resource)
     ].join('|');
@@ -5285,11 +5355,19 @@ function cleanResourceForOutput(resource) {
   //   獨立成一行後與第一行的正片資訊分層更清楚。
   const itemYear = resource._year || extractVersionMarker(resource._rawName) || null;
   const itemArea = resource._area || null;
-  if (itemYear || itemArea) {
+  // ★ 語言版本也進版本標記。片名「轻功(粤语)」與「轻功(国语)」在描述上
+  //   幾乎一樣（同年、同地區、同播放源），去重鍵分開之後兩筆都會留著，
+  //   但沒有標記時使用者在來源列表裡根本分不出哪一筆是哪個語言 ——
+  //   只會看到兩列看起來一模一樣的項目。標記必須跟著版本走。
+  //
+  //   語言抽不到時不加，維持原本「[2019年 - 國語]」的輸出不變。
+  const itemLang = extractLanguageTag(resource._rawName || resource._versionLabel);
+  if (itemYear || itemArea || itemLang) {
     const parts = [];
     if (itemYear) parts.push(`${itemYear}年`);
     const label = areaLabel(itemArea);
     if (label) parts.push(label);
+    if (itemLang) parts.push(itemLang);
     const versionTag = `[${parts.join(' - ')}]`;
     // includes 檢查是為了冪等：同一筆資源可能被 clean 兩次
     // （cache 命中路徑 + 輸出路徑），重複換行會多出一個空行。
