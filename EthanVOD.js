@@ -243,6 +243,25 @@ function getTMDBAliasesFast(baseName, type) {
  * @param {number} maxWaitMs  最長等多久。預設 1500。
  * @returns {Promise<string[]>} 別名陣列（cache miss + TMDB timeout 時可能空陣列）
  */
+
+// Forward widget runtime **沒有全域 setTimeout / setInterval**（直接調會拋
+// `Can't find variable: setTimeout`）。Widget.http.get 跟 Widget.storage
+// 都回 Promise，所以延遲/timeout/輪詢這類需求用「Promise + microtask」模擬。
+//
+// 設計選擇：用 microtask (`queueMicrotask` / `Promise.resolve().then`)
+// 代替 setTimeout。微任務比 setTimeout(0) 還快（沒 macro task 排隊），
+// 在 Forward 這個 async runtime 內行為等價甚至更即時。
+//
+// 對 `Promise.race` 的 timeout 用途：原本 30ms 的 tick 改成 1 個 microtask
+// 排程後立即跑 callback，行為跟 setTimeout 0 接近；差異只在於 race 競爭
+// 順序，但 race 結果取決於第一個 resolve，跟排程機制無關。
+function _defer(fn, delayMs) {
+  // delayMs 在 Forward runtime 內不準（沒 setTimeout 就沒辦法精準延遲），
+  // 保留參數只是為了跟 setTimeout 簽名一致；實際立即排進 microtask queue。
+  try { return Promise.resolve().then(fn); }
+  catch (e) { return fn(); }
+}
+
 async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
   if (!CONFIG.TMDB?.ENABLED || !CONFIG.TMDB.API_KEY) return [];
   const base = String(baseName || '').trim();
@@ -265,12 +284,28 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
   // 3. 先快速讀 storage（storage 通常 < 100ms，因為是同步 in-process impl）
   if (Widget?.storage?.get) {
     try {
-      const stored = await Promise.race([
-        _readTmdbAliasCache(cacheKey),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('storage-timeout')), Math.min(200, maxWaitMs))
-        )
-      ]);
+      // Forward runtime 沒有 setTimeout，所以用 microtask + deadline 計時模擬
+      // 「最多等 N ms」。storage 通常 < 100ms 完成，microtask 立即跑即可。
+      let _storageDone = false;
+      let _storageResult = null;
+      const _stMicrotask = Promise.resolve().then(() => undefined);
+      const _storageReadP = Promise.resolve().then(async () => {
+        const r = await _readTmdbAliasCache(cacheKey);
+        _storageResult = r;
+        _storageDone = true;
+      });
+      const _storageDeadlineP = Promise.resolve().then(() => new Promise(resolve => {
+        const startT = Date.now();
+        const checkDeadline = () => {
+          if (_storageDone) return resolve();
+          if (Date.now() - startT >= Math.min(200, maxWaitMs)) return resolve();
+          // microtask 立即排程，busy loop 直到 storage 完成或 deadline
+          Promise.resolve().then(checkDeadline);
+        };
+        checkDeadline();
+      }));
+      await Promise.race([_storageReadP, _storageDeadlineP]);
+      const stored = _storageResult;
       if (stored?.aliases?.length) {
         // 品質檢查：只有 1 個別名的 storage cache 視為 stale ——
         // 那是 v2.8.4 之前的版本只拿 hit 內欄位的產物（baseName + original_name），
@@ -320,13 +355,26 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
 
   // Race：cache 出現資料 vs in-flight 完成 vs 整體 timeout。
   // 三者任一先發生就 return。
+  //
+  // v2.8.9 修法：Forward runtime 沒有全域 setTimeout，所以把原本的
+  // setTimeout 30ms 輪詢 / 1500ms 整體 timeout 都改用 microtask +
+  // Date.now() deadline。microtask 立即排進 queue，busy loop 期間
+  // 其他 async 任務（_fetchTMDBAliasesAsync 的 Promise 鏈）能正常
+  // resolve。cache 寫入後 tick 會看到並 resolve race。
   const startTs = Date.now();
+  // timeoutP：deadline 到期時 resolve（不再用 setTimeout）
   const timeoutP = new Promise((resolve) => {
-    setTimeout(() => {
-      console.log(`[TMDB-diag] getTMDBAliasesBlocking: timeoutP fired after ${Date.now() - startTs}ms`);
-      resolve({ kind: 'timeout', aliases: [] });
-    }, maxWaitMs);
+    const waitDeadline = () => {
+      if (Date.now() - startTs >= maxWaitMs) {
+        console.log(`[TMDB-diag] getTMDBAliasesBlocking: timeoutP fired after ${Date.now() - startTs}ms`);
+        resolve({ kind: 'timeout', aliases: [] });
+        return;
+      }
+      Promise.resolve().then(waitDeadline);
+    };
+    waitDeadline();
   });
+  // cacheWatchP：30ms 輪詢改 microtask tick（cache 寫入或 deadline 到期）
   const cacheWatchP = new Promise((resolve) => {
     const deadline = startTs + maxWaitMs;
     const tick = () => {
@@ -341,7 +389,7 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
         resolve({ kind: 'timeout', aliases: [] });
         return;
       }
-      setTimeout(tick, 30);
+      Promise.resolve().then(tick);
     };
     tick();
   });
@@ -849,7 +897,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.8",
+  version: "2.8.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
