@@ -150,18 +150,16 @@ async function _loadTmdbAliasCacheFromStorage() {
 
 async function _storeTmdbAliasCache(cacheKey, aliases) {
   if (!Widget?.storage?.set || !aliases || aliases.length === 0) return;
-  // 5s timeout — storage 卡住不能阻塞 inflightP（會讓 race 6s timeout 觸發）
+  // 5s timeout — storage 卡住不能阻塞 inflightP
+  // v2.9.3：改用 _timeoutSignal（setTimeout）而非 microtask busy-loop
   try {
     const startTs = Date.now();
-    const writeP = Widget.storage.set(cacheKey, JSON.stringify({ aliases, ts: Date.now() }), CONFIG.TMDB.CACHE_TTL);
-    const timeoutP = new Promise((_, reject) => {
-      const tick = () => {
-        if (Date.now() - startTs >= 5000) return reject(new Error('storage timeout'));
-        Promise.resolve().then(tick);
-      };
-      tick();
-    });
-    await Promise.race([writeP, timeoutP]);
+    const writeP = Widget.storage.set(cacheKey, JSON.stringify({ aliases, ts: Date.now() }), CONFIG.TMDB.CACHE_TTL)
+      .catch(() => {});
+    const sig = _timeoutSignal(5000);
+    await Promise.race([writeP, sig.promise]);
+    sig.cancel();
+    if (Date.now() - startTs >= 5000) console.log('[TMDB-diag] storage write timeout (已放棄)');
   } catch (e) { /* 寫 storage 失敗不影響功能 */ }
 }
 
@@ -334,18 +332,75 @@ async function _purgeStaleTmdbAliasCache() {
 // `Can't find variable: setTimeout`）。Widget.http.get 跟 Widget.storage
 // 都回 Promise，所以延遲/timeout/輪詢這類需求用「Promise + microtask」模擬。
 //
-// 設計選擇：用 microtask (`queueMicrotask` / `Promise.resolve().then`)
-// 代替 setTimeout。微任務比 setTimeout(0) 還快（沒 macro task 排隊），
-// 在 Forward 這個 async runtime 內行為等價甚至更即時。
+// ────────────────────────────────────────────────────────────────────
+// v2.9.3 關鍵修正：不要再用「無限排 microtask」當計時器。
 //
-// 對 `Promise.race` 的 timeout 用途：原本 30ms 的 tick 改成 1 個 microtask
-// 排程後立即跑 callback，行為跟 setTimeout 0 接近；差異只在於 race 競爭
-// 順序，但 race 結果取決於第一個 resolve，跟排程機制無關。
+// 舊做法（busy-loop）：
+//     const tick = () => {
+//       if (Date.now() - start >= maxMs) return resolve();
+//       Promise.resolve().then(tick);   // ← 無限自我排隊
+//     };
+//
+// 這會造成 **microtask starvation**：JS 引擎在進入下一個 macrotask
+// （也就是網路 I/O 的回調）之前，會先把 microtask queue 清空。這個無限
+// 鏈讓引擎永遠排不到 I/O 回應，於是 `Widget.http.get` 的 resolve 被餓死。
+//
+// 實測證據（端點本身很快，用 curl 量）：
+//     search/tv            ~0.9s
+//     alternative_titles   ~0.9s
+// 但 busy-loop 版本在 Forward 內量到 5.0s / 17.0s，且 race 一定 timeout。
+//
+// 正確做法：**事件驅動 + 單次真正的 timeout**，不要輪詢。
+// 這裡用 setTimeout（Forward 有），並保留 microtask fallback。
+// ────────────────────────────────────────────────────────────────────
 function _defer(fn, delayMs) {
-  // delayMs 在 Forward runtime 內不準（沒 setTimeout 就沒辦法精準延遲），
-  // 保留參數只是為了跟 setTimeout 簽名一致；實際立即排進 microtask queue。
+  // 首選 setTimeout：會讓出事件迴圈，I/O 回調才排得進來。
+  if (typeof setTimeout === 'function') {
+    try { return new Promise(resolve => setTimeout(() => { try { resolve(fn()); } catch (e) { /* 忽略 */ } }, Math.max(0, delayMs || 0))); }
+    catch (e) { /* 落到 microtask */ }
+  }
+  // 沒有 setTimeout 的環境：退化成 microtask（單次，不 busy-loop）。
   try { return Promise.resolve().then(fn); }
-  catch (e) { return fn(); }
+  catch (e) { return Promise.resolve(fn); }
+}
+
+/**
+ * 建立一個「會自己到點 resolve」的 timeout promise。
+ * 用 setTimeout（讓出事件迴圈），不會像 busy-loop 那樣餓死 I/O。
+ * 回傳 { promise, cancel }，cancel 可在提早 resolve 時清掉計時器避免洩漏。
+ */
+function _timeoutSignal(ms) {
+  let timer = null;
+  let settled = false;
+  let resolveFn = null;
+  const promise = new Promise((resolve) => {
+    resolveFn = (v) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) { try { clearTimeout(timer); } catch (e) {} timer = null; }
+      resolve(v);
+    };
+    if (typeof setTimeout === 'function') {
+      try { timer = setTimeout(() => resolveFn(undefined), ms); return; }
+      catch (e) { timer = null; }
+    }
+    // 沒有 setTimeout 的環境：有限的 microtask 退場計數器。
+    //
+    // 舊版是「無限 busy-loop」→ microtask starvation → 餓死網路 I/O。
+    // 這裡刻意保留「不 await」語義：只排一個有限的 tick 鏈（上限 ~200 次），
+    // 到點就讓出事件迴圈，避免再次餓死 I/O。缺 setTimeout 時寧可提早
+    // resolve（退化成沒 timeout），也不要卡死整條搜尋流程。
+    let ticks = 0;
+    const MAX_TICKS = 200;
+    const t0 = Date.now();
+    const step = () => {
+      if (settled) return;
+      if (ticks++ >= MAX_TICKS || Date.now() - t0 >= (ms || 0)) { resolveFn(undefined); return; }
+      Promise.resolve().then(step);
+    };
+    try { Promise.resolve().then(step); } catch (e) { resolveFn(undefined); }
+  });
+  return { promise, cancel: () => resolveFn(undefined) };
 }
 
 async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
@@ -367,31 +422,17 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
     return recent.aliases || [];
   }
 
-  // 3. 先快速讀 storage（storage 通常 < 100ms，因為是同步 in-process impl）
+  // 3. 讀 storage（v2.9.3：改用事件驅動 timeout，不再 busy-loop 排 microtask，
+  //    否則會 microtask starvation 把 storage/http 的 I/O 回調餓死）
   if (Widget?.storage?.get) {
     try {
-      // Forward runtime 沒有 setTimeout，所以用 microtask + deadline 計時模擬
-      // 「最多等 N ms」。storage 通常 < 100ms 完成，microtask 立即跑即可。
-      let _storageDone = false;
       let _storageResult = null;
-      const _stMicrotask = Promise.resolve().then(() => undefined);
-      const _storageReadP = Promise.resolve().then(async () => {
-        const r = await _readTmdbAliasCache(cacheKey);
-        _storageResult = r;
-        _storageDone = true;
-        console.log(`[TMDB-diag] storage read done: n=${r?.aliases?.length || 0}`);
-      });
-      const _storageDeadlineP = Promise.resolve().then(() => new Promise(resolve => {
-        const startT = Date.now();
-        const checkDeadline = () => {
-          if (_storageDone) return resolve();
-          if (Date.now() - startT >= Math.min(200, maxWaitMs)) return resolve();
-          // microtask 立即排程，busy loop 直到 storage 完成或 deadline
-          Promise.resolve().then(checkDeadline);
-        };
-        checkDeadline();
-      }));
-      await Promise.race([_storageReadP, _storageDeadlineP]);
+      const _storageReadP = _readTmdbAliasCache(cacheKey)
+        .then(r => { _storageResult = r; })
+        .catch(() => {});
+      const _storageSig = _timeoutSignal(Math.min(200, maxWaitMs));
+      await Promise.race([_storageReadP, _storageSig.promise]);
+      _storageSig.cancel();
       const stored = _storageResult;
       if (stored?.aliases?.length) {
         // 品質檢查：只有 1 個別名，或無 CN 簡體別名的 storage cache 視為 stale —
@@ -444,63 +485,28 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
     });
   }
 
-  // Race：cache 出現資料 vs in-flight 完成 vs 整體 timeout。
-  // 三者任一先發生就 return。
+  // Race：in-flight 完成（含 CN 別名已寫入 cache）vs 整體 timeout。
   //
-  // v2.8.9 修法：Forward runtime 沒有全域 setTimeout，所以把原本的
-  // setTimeout 30ms 輪詢 / 1500ms 整體 timeout 都改用 microtask +
-  // Date.now() deadline。microtask 立即排進 queue，busy loop 期間
-  // 其他 async 任務（_fetchTMDBAliasesAsync 的 Promise 鏈）能正常
-  // resolve。cache 寫入後 tick 會看到並 resolve race。
+  // v2.9.3 修法：拿掉 cacheWatchP / timeoutP 兩個「無限排 microtask」的
+  // busy-loop。舊版會造成 microtask starvation：引擎在處理下一個 macrotask
+  // （= 網路 I/O 回調）前必須清空 microtask queue，而無限鏈讓它永遠清不空，
+  // 導致 Widget.http.get 的 resolve 被餓死。
+  // 實測證據（curl 量同一組端點）：search 0.9s、alternative_titles 0.9s；
+  // 但 busy-loop 版本在 Forward 內量到 12s / 5s，race 必然 timeout。
+  //
+  // 新版純事件驅動：
+  //   - inflightDoneP：_fetchTMDBAliasesAsync 完成後讀 cache.aliases
+  //     （IIFE 保證 resolve 前已寫入含 CN 的 cache）
+  //   - timeoutP：單一 setTimeout（讓出事件迴圈，I/O 才排得進來）
   const startTs = Date.now();
-  // timeoutP：deadline 到期時 resolve（不再用 setTimeout）
-  const timeoutP = new Promise((resolve) => {
-    const waitDeadline = () => {
-      if (Date.now() - startTs >= maxWaitMs) {
-        console.log(`[TMDB-diag] getTMDBAliasesBlocking: timeoutP fired after ${Date.now() - startTs}ms`);
-        resolve({ kind: 'timeout', aliases: [] });
-        return;
-      }
-      Promise.resolve().then(waitDeadline);
-    };
-    waitDeadline();
+  const timeoutSig = _timeoutSignal(maxWaitMs);
+  const timeoutP = timeoutSig.promise.then(() => {
+    console.log(`[TMDB-diag] getTMDBAliasesBlocking: timeoutP fired after ${Date.now() - startTs}ms`);
+    return { kind: 'timeout', aliases: [] };
   });
-  // cacheWatchP：microtask tick（cache 寫入含 CN 或 deadline 到期）
-  //
-  // v2.8.15：早寫入階段 cache 內只有 hit 內欄位（無 CN），cacheWatchP
-  // 看到要**等 CN 別名**（IIFE 覆蓋 cache 後）才 fire。否則 race
-  // 拿到早寫入的 2 個無 CN 別名 → tryExpand 拿空 → 0 筆。
-  const cacheWatchP = new Promise((resolve) => {
-    const deadline = startTs + maxWaitMs;
-    const tick = () => {
-      const c = _tmdbAliasCache.get(cacheKey);
-      if (c?.aliases && c.aliases.length > 0) {
-        // 要求至少 1 個別名含中文字且是簡體（CN 別名）
-        // v2.8.15：簡化條件 — CN 別名本身就是簡體，所以「含中文字 + 簡體化後等於原值」
-        // 表示該別名是簡體中文（CN），可作 bestAlias 候選
-        const hasCnAlias = c.aliases.some(a => {
-          const t = String(a || '').trim();
-          if (!/[一-鿿]/.test(t)) return false;  // 不含中文
-          return convertChinese(t, false) === t;  // 簡體化後 == 原值（已是簡體）
-        });
-        if (hasCnAlias) {
-          console.log(`[TMDB-diag] cacheWatchP: cache hit (含 CN 簡體) after ${Date.now() - startTs}ms (n=${c.aliases.length})`);
-          resolve({ kind: 'cache', aliases: c.aliases });
-          return;
-        }
-        // 沒 CN 簡體 — 早寫入階段還沒覆蓋；繼續等
-      }
-      if (Date.now() >= deadline) {
-        console.log(`[TMDB-diag] cacheWatchP: deadline hit after ${Date.now() - startTs}ms`);
-        resolve({ kind: 'timeout', aliases: [] });
-        return;
-      }
-      Promise.resolve().then(tick);
-    };
-    tick();
-  });
-  // v2.8.14 簡化：inline await 後 inflightP resolve 保證 cache 已覆蓋。
-  // 直接讀 cache.aliases 即可。
+  // cacheWatchP 已刪除（v2.9.3）：原本用無限 microtask busy-loop 輪詢 cache，
+  // 會 microtask starvation 餓死網路 I/O。其用途（等 cache 有 CN 別名）已被
+  // inflightDoneP 完全涵蓋 —— IIFE 保證 inflightP resolve 前 cache 已寫入含 CN。
   const inflightDoneP = inflightP.then(() => {
     const a = (_tmdbAliasCache.get(cacheKey)?.aliases) || [];
     console.log(`[TMDB-diag] inflightDoneP: inflight done after ${Date.now() - startTs}ms, cache.aliases=${a.length}`);
@@ -510,7 +516,9 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
     return { kind: 'inflight', aliases: [] };
   });
 
-  const result = await Promise.race([cacheWatchP, inflightDoneP, timeoutP]);
+  const result = await Promise.race([inflightDoneP, timeoutP]);
+  // race 已定案 → 清掉 timeout 計時器，避免留下無用的 pending timer
+  timeoutSig.cancel();
   if (CONFIG.TMDB.VERBOSE) {
     console.log(`[TMDB-diag] getTMDBAliasesBlocking result: kind=${result.kind}, n=${result.aliases.length}, elapsed=${Date.now() - startTs}ms`);
   }
@@ -521,18 +529,46 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const apiKey = CONFIG.TMDB.API_KEY;
   if (!apiKey) return;
 
-  // 第一步：search 找 tmdb id。繁體中文出發，TMDB 對 zh-TW 友善。
-  const searchUrl = `https://api.themoviedb.org/3/search/${type === 'movie' ? 'movie' : 'tv'}` +
+  // 第一步：search 找 tmdb id。
+  //
+  // v2.9.3：同時打 zh-CN + zh-TW 兩個 search。
+  //
+  // 為什麼要 zh-CN：實測 `search/tv?query=陰屍路&language=zh-CN` 直接回
+  // `name=行尸走肉`（簡體）—— 正是我們要的 CN 別名；而 zh-TW 只回繁體。
+  // 有了 zh-CN 結果就能寫 cache 給 caller，**不必再等 alternative_titles**
+  // （那一步在 Forward 內實測要 5s，是整體延遲的大頭）。
+  //
+  // 失敗時退回單一 zh-TW search（維持相容）。
+  const searchUrlBase = (lang) =>
+    `https://api.themoviedb.org/3/search/${type === 'movie' ? 'movie' : 'tv'}` +
     `?api_key=${encodeURIComponent(apiKey)}` +
     `&query=${encodeURIComponent(baseName)}` +
-    `&language=${encodeURIComponent(CONFIG.TMDB.SEARCH_LANGUAGE || 'zh-TW')}`;
+    `&language=${encodeURIComponent(lang)}`;
+  const searchUrl = searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE || 'zh-TW');
+  const searchUrlCn = searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE_CN || 'zh-CN');
 
   let searchData;
+  let resp;
   try {
-    const resp = await Widget.http.get(searchUrl, {
+    // zh-CN 與 zh-TW 並行打：zh-CN 拿到結果就不用等 zh-TW（省一輪 RTT）
+    const cnP = Widget.http.get(searchUrlCn, {
       timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
       headers: { 'Accept': 'application/json' }
+    }).then(_unwrapHttpResponse).catch((e) => {
+      console.log(`[TMDB-diag] zh-CN search EXCEPTION: ${e?.message || e}`);
+      return null;
     });
+    const cnData = await cnP;
+    if (cnData?.results?.length) {
+      searchData = cnData;
+      resp = { __zhCn: true };
+      console.log(`[TMDB-diag] zh-CN search hit n=${cnData.results.length}（不需等 alternative_titles）`);
+    } else {
+      resp = await Widget.http.get(searchUrl, {
+        timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+        headers: { 'Accept': 'application/json' }
+      });
+    }
     // v25 patch 3：Forward 的 Widget.http.get 回傳值有三種可能：
     //   (1) 已自動 parse 的 object    → { results: [...] }
     //   (2) string body               → 要 safeJsonParse
@@ -541,17 +577,21 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     //
     // 診斷 log（v25 patch 4，永遠印，不只在 VERBOSE 下）— 確認 Forward
     // response 真實結構，方便往後 debug。
-    if (resp && typeof resp === 'object' && !Array.isArray(resp) && 'data' in resp) {
-      const d = resp.data;
-      const dType = typeof d;
-      const dIsString = dType === 'string';
-      const dKeys = (d && typeof d === 'object' && !Array.isArray(d)) ? Object.keys(d).slice(0, 8).join(',') : 'n/a';
-      const dPreview = dIsString ? d.slice(0, 80) : (d ? JSON.stringify(d).slice(0, 80) : 'null');
-      console.log(`[TMDB-diag] wrap: statusCode=${resp.statusCode}, dType=${dType}, dIsString=${dIsString}, dKeys=${dKeys}, dPreview=${dPreview}`);
-    } else {
-      console.log(`[TMDB-diag] no wrap: typeof=${typeof resp}, keys=${resp && typeof resp === 'object' ? Object.keys(resp).slice(0, 5).join(',') : 'n/a'}`);
+    //
+    // v2.9.3：zh-CN 命中時 searchData 已就緒，resp 是佔位物件 → 跳過這段診斷
+    if (!searchData) {
+      if (resp && typeof resp === 'object' && !Array.isArray(resp) && 'data' in resp) {
+        const d = resp.data;
+        const dType = typeof d;
+        const dIsString = dType === 'string';
+        const dKeys = (d && typeof d === 'object' && !Array.isArray(d)) ? Object.keys(d).slice(0, 8).join(',') : 'n/a';
+        const dPreview = dIsString ? d.slice(0, 80) : (d ? JSON.stringify(d).slice(0, 80) : 'null');
+        console.log(`[TMDB-diag] wrap: statusCode=${resp.statusCode}, dType=${dType}, dIsString=${dIsString}, dKeys=${dKeys}, dPreview=${dPreview}`);
+      } else {
+        console.log(`[TMDB-diag] no wrap: typeof=${typeof resp}, keys=${resp && typeof resp === 'object' ? Object.keys(resp).slice(0, 5).join(',') : 'n/a'}`);
+      }
+      searchData = _unwrapHttpResponse(resp);
     }
-    searchData = _unwrapHttpResponse(resp);
     console.log(`[TMDB-diag] search unwrapped: type=${typeof searchData}, results.len=${searchData?.results?.length}, topKeys=${searchData && typeof searchData === 'object' ? Object.keys(searchData).slice(0, 5).join(',') : 'n/a'}`);
   } catch (e) {
     console.log(`[TMDB-diag] search EXCEPTION: ${e?.message || e}`);
@@ -587,6 +627,18 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   pushAlias(hit.title);
   pushAlias(hit.original_title);
 
+  // v2.9.3：若 hit 內已經有「簡體中文」別名（例如 zh-CN search 回的
+  // name=行尸走肉），把它排到 aliases 最前面 —— tryExpand 取第一個符合
+  // 條件的別名，排前面才能立刻被選中，不必等 alternative_titles。
+  const firstSimpIdx = aliases.findIndex(a => {
+    const t = String(a || '').trim();
+    return /[一-鿿]/.test(t) && convertChinese(t, false) === t;
+  });
+  if (firstSimpIdx > 0) {
+    const simp = aliases.splice(firstSimpIdx, 1)[0];
+    aliases.unshift(simp);
+  }
+
   // v2.8.15 修法：早寫入 + fire-and-forget IIFE + inflightP 等 IIFE 寫完 cache
   //
   // v2.8.14 inline await 整個流程 30s+：search 就要 20s，alt_titles 雖然 2ms
@@ -612,6 +664,20 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   _tmdbAliasRecent.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
   _enforceTmdbAliasCacheLimit();
   _storeTmdbAliasCache(cacheKey, [...aliases]).catch(() => {});
+
+  // v2.9.3 短路：已經有簡體中文別名時，**不等** alternative_titles 就 return。
+  //
+  // 理由：alt_titles 在 Forward 內實測要 ~5s（curl 只要 0.9s，差額來自
+  // busy-loop 造成的 I/O starvation）。既然 zh-CN search 已給了可用的簡體
+  // 別名，等 alt_titles 只會延遲 caller，沒有實質收益。
+  const hasSimpNow = aliases.some(a => {
+    const t = String(a || '').trim();
+    return /[一-鿿]/.test(t) && convertChinese(t, false) === t;
+  });
+  if (hasSimpNow) {
+    console.log(`[TMDB-diag] ✓ hit 已含簡體別名，略過 alternative_titles（省 ~5s）`);
+    return;
+  }
 
   const altUrl = `https://api.themoviedb.org/3/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}/` +
     `alternative_titles?api_key=${encodeURIComponent(apiKey)}`;
@@ -1022,6 +1088,12 @@ const CONFIG = {
     // search 預設帶 language=zh-TW 以命中台/港繁體片名，alternative_titles
     // 同時拿 CN + HK + TW。地區設定跟 alternative_titles 的 iso_3166_1 對應。
     SEARCH_LANGUAGE: 'zh-TW',
+    // v2.9.3：並行再打一次 zh-CN search。
+    //
+    // 實測 `search/tv?query=陰屍路&language=zh-CN` 直接回 `name=行尸走肉`
+    // （簡體），正是 VOD 站要的片名。有了它就不必等 alternative_titles
+    // （Forward 內實測 ~5s），整體延遲從 ~17s 降到 ~1s。
+    SEARCH_LANGUAGE_CN: 'zh-CN',
     ALT_TITLE_LANGS: ['zh-CN', 'zh-TW', 'zh-HK', 'en'],
     ALT_TITLE_REGIONS: ['CN'],
     // 別名 cache TTL（秒）。片名別名極少改，7 天綽綽有餘。
@@ -1042,7 +1114,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.9.2",
+  version: "2.9.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4306,13 +4378,9 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
 
   // 同步等 TMDB 別名（最多 6s）。失敗 / timeout → 回 []（走 fallback）。
   //
-  // v2.8.15：早寫入 + IIFE fire-and-forget 模式。cacheWatchP 條件放寬為
-  // 「cache 內有 CN 簡體別名」才 fire，所以 race 6s 內 caller 拿到
-  // 早寫入或 IIFE 覆蓋後的別名（含 CN）。
-  //
-  // v2.9.2：保留 6s 短 race — TMDB search 可能 14s+，但 caller 不能等
-  // 那麼久（用戶體驗）。6s 內拿到 CN 別名就 fire，否則 fallback。
-  // IIFE 仍 fire-and-forget 跑完，cache 留給下次 caller。
+  // v2.9.3：6s 是**上限**，不是實際延遲。因為 busy-loop 已移除，
+  // I/O 不再被餓死 —— 實測 zh-CN search 命中時 total ≈ 1s 就 return。
+  // 6s 只是網路異常時的保險上限，逾時就走 fallback（不影響正確性）。
   const aliases = await getTMDBAliasesBlocking(baseName, type, 6000);
   if (!Array.isArray(aliases) || aliases.length === 0) return false;
 
