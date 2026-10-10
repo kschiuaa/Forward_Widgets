@@ -152,14 +152,16 @@ async function _storeTmdbAliasCache(cacheKey, aliases) {
   if (!Widget?.storage?.set || !aliases || aliases.length === 0) return;
   // 5s timeout — storage 卡住不能阻塞 inflightP
   // v2.9.3：改用 _timeoutSignal（setTimeout）而非 microtask busy-loop
+  // v2.9.4：直接 await 寫入。storage 是 in-process 同步實作，log 顯示
+  // setItem 同一 tick 內完成，不需要 timeout race（舊版的 cancel() 反而
+  // 可能在寫入完成前就結束等待）。寫入是 fire-and-forget 呼叫端使用，
+  // 這裡的 await 不會阻塞 inflightP。
   try {
-    const startTs = Date.now();
-    const writeP = Widget.storage.set(cacheKey, JSON.stringify({ aliases, ts: Date.now() }), CONFIG.TMDB.CACHE_TTL)
-      .catch(() => {});
-    const sig = _timeoutSignal(5000);
-    await Promise.race([writeP, sig.promise]);
-    sig.cancel();
-    if (Date.now() - startTs >= 5000) console.log('[TMDB-diag] storage write timeout (已放棄)');
+    await Promise.resolve(Widget.storage.set(
+      cacheKey,
+      JSON.stringify({ aliases, ts: Date.now() }),
+      CONFIG.TMDB.CACHE_TTL
+    )).catch(() => {});
   } catch (e) { /* 寫 storage 失敗不影響功能 */ }
 }
 
@@ -384,21 +386,17 @@ function _timeoutSignal(ms) {
       try { timer = setTimeout(() => resolveFn(undefined), ms); return; }
       catch (e) { timer = null; }
     }
-    // 沒有 setTimeout 的環境：有限的 microtask 退場計數器。
+    // 沒有 setTimeout：永遠 pending。**絕對不能用 microtask 假裝計時**。
     //
-    // 舊版是「無限 busy-loop」→ microtask starvation → 餓死網路 I/O。
-    // 這裡刻意保留「不 await」語義：只排一個有限的 tick 鏈（上限 ~200 次），
-    // 到點就讓出事件迴圈，避免再次餓死 I/O。缺 setTimeout 時寧可提早
-    // resolve（退化成沒 timeout），也不要卡死整條搜尋流程。
-    let ticks = 0;
-    const MAX_TICKS = 200;
-    const t0 = Date.now();
-    const step = () => {
-      if (settled) return;
-      if (ticks++ >= MAX_TICKS || Date.now() - t0 >= (ms || 0)) { resolveFn(undefined); return; }
-      Promise.resolve().then(step);
-    };
-    try { Promise.resolve().then(step); } catch (e) { resolveFn(undefined); }
+    // v2.9.4 修掉 v2.9.3 缺陷：v2.9.3 在此用「有限 microtask 鏈」當退場計時器，
+    // 實測 `timeoutP fired after 0ms` —— N 個 microtask 會在**同一個 tick 內
+    // 連續跑完**，`Date.now()` 幾乎沒前進，tick 計數先達標 → timeout 立刻
+    // resolve → race 0ms 結束 → caller 永遠拿不到別名（搜尋永遠 0 筆）。
+    //
+    // microtask 排程無法模擬「經過 N 毫秒」，任何基於它的 deadline 都是假的。
+    // 沒有 setTimeout 就不假裝計時：timeout 永遠 pending，race 由
+    // inflightDoneP 收尾（search 本身有 REQUEST_TIMEOUT 保護，不會真的卡死）。
+    console.log('[TMDB-diag] 無 setTimeout，timeout 降級為 pending（由 inflight 或 http timeout 收尾）');
   });
   return { promise, cancel: () => resolveFn(undefined) };
 }
@@ -422,18 +420,17 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
     return recent.aliases || [];
   }
 
-  // 3. 讀 storage（v2.9.3：改用事件驅動 timeout，不再 busy-loop 排 microtask，
-  //    否則會 microtask starvation 把 storage/http 的 I/O 回調餓死）
+  // 3. 讀 storage
+  //
+  // v2.9.4：直接 await，不用 timeout race。
+  //
+  // 為什麼不需要 timeout：Forward 的 storage 是 in-process 同步實作，
+  // log 顯示每次 getItem 都在同一個 tick 內完成。若它真的卡住，那本來
+  // 就會卡住整條流程，加 timeout 也救不了（而且舊版的 cancel() 反而會
+  // 在 storage 回來之前就讓 race 結束 → 讀不到 cache）。
   if (Widget?.storage?.get) {
     try {
-      let _storageResult = null;
-      const _storageReadP = _readTmdbAliasCache(cacheKey)
-        .then(r => { _storageResult = r; })
-        .catch(() => {});
-      const _storageSig = _timeoutSignal(Math.min(200, maxWaitMs));
-      await Promise.race([_storageReadP, _storageSig.promise]);
-      _storageSig.cancel();
-      const stored = _storageResult;
+      const stored = await _readTmdbAliasCache(cacheKey);
       if (stored?.aliases?.length) {
         // 品質檢查：只有 1 個別名，或無 CN 簡體別名的 storage cache 視為 stale —
         // 那是 v2.8.15 之後「早寫入但 IIFE 未覆蓋」或舊版本只拿 hit 內欄位的產物
@@ -498,6 +495,15 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
   //   - inflightDoneP：_fetchTMDBAliasesAsync 完成後讀 cache.aliases
   //     （IIFE 保證 resolve 前已寫入含 CN 的 cache）
   //   - timeoutP：單一 setTimeout（讓出事件迴圈，I/O 才排得進來）
+  //
+  // v2.9.4：Forward runtime 實際上沒有 setTimeout，_timeoutSignal 的
+  // fallback 是「永不 resolve」。v2.9.3 那個 microtask 計數器因為 N 個
+  // microtask 在同一 tick 內跑完，deadline 是假的 → 實測 `timeoutP fired
+  // after 0ms` → race 0ms 結束 → caller 拿不到別名 → 搜尋 0 筆。
+  //
+  // 現在：沒有 setTimeout 時 timeout 永不觸發，完全交給 inflightP 收尾；
+  // inflightP 內 Widget.http.get 自帶 REQUEST_TIMEOUT（2500ms），
+  // 所以最壞 ~2.5s 一定返回 —— 不卡死，也不餓死 I/O。
   const startTs = Date.now();
   const timeoutSig = _timeoutSignal(maxWaitMs);
   const timeoutP = timeoutSig.promise.then(() => {
@@ -1114,7 +1120,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.9.3",
+  version: "2.9.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
