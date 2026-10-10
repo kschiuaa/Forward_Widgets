@@ -897,7 +897,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.9",
+  version: "2.8.10",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4149,8 +4149,13 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   const baseName = String(targetInfo.baseName || '').trim();
   if (!baseName || baseName.length < 2) return false;
 
-  // 同步等 TMDB 別名（最多 1.5s）。失敗 / timeout → 回 []（走 fallback）。
-  const aliases = await getTMDBAliasesBlocking(baseName, type, 1500);
+  // 同步等 TMDB 別名（最多 4.0s）。失敗 / timeout → 回 []（走 fallback）。
+  //
+  // v2.8.10 修法：原 1.5s 在 TMDB search + alt_titles 兩條 request 串行
+  // 各 1~3 秒下，幾乎一定 timeout → race 拿空 → tryExpand 拿空別名
+  // return false → VOD 站 0 筆。拉到 4s 覆蓋最壞 2 條 6s 串行裡
+  // 大部分 case。
+  const aliases = await getTMDBAliasesBlocking(baseName, type, 4000);
   if (!Array.isArray(aliases) || aliases.length === 0) return false;
 
   // 站方幾乎都是簡體中文，因此優先挑「**含中文字**且跟 baseName 簡體
