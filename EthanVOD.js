@@ -963,7 +963,13 @@ const CONFIG = {
   // performSmartSearch、performBatchSearch）的 call site 都用 try/catch
   // 包起來保護，TMD 意外錯誤不影響原本搜尋流程。Hot path 速度：只有在
   // 「這部片第一次被搜時」多等 ≤1.5s，其他情境 0 成本。
-  WIDGET_VERSION: 26,
+  // bump 到 27：新增「簽名型站 adapter」管線（ADAPTER_SITES / CONFIG.ADAPTERS）。
+  // 這條管線與既有 MacCMS 來源完全並行：adapter 產出的 item 會被偽裝成
+  // MacCMS 欄位，因此下游去重 / 年份季別過濾 / m3u8 wrap 全部共用同一套
+  // 邏輯。extractPlayInfoForCache 改為 async（新增 adapter 分支會 await
+  // 換 URL），舊 cache 內的結果格式雖仍可讀，但 adapter 的延遲 token
+  // 不可跨版本重用，故一併清掉。
+  WIDGET_VERSION: 27,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -975,6 +981,23 @@ const CONFIG = {
 
   // 主力源配置：內容豐富且實測可回傳結果的站，可獲得排序加成
   MAIN_SOURCES: ['非凡資源', '電影天堂', '如意資源', '樂子'],
+
+  // ===== 簽名型站 adapter =====
+  //
+  // 與 RESOURCE_SITES（MacCMS）完全並行的第二條來源管線。兩者互不影響：
+  // adapter 掛掉只是少一個來源，MacCMS 結果照常回傳。
+  ADAPTERS: {
+    // 主開關。globalParams.jpyyEnabled 為 'disabled' 時完全跳過。
+    ENABLED: true,
+    // DEBUG: true 會在 console 印 adapter 的搜尋耗時與命中數。
+    DEBUG: false,
+    // 每個站最多處理幾筆搜尋結果。
+    // 理由：簽名站一筆結果要 2 次請求（詳情頁 + 換 URL），12 筆就是 24 次；
+    // 這裡限制「真正進入換算流程」的筆數，避免拖累 MacCMS 的搜尋。
+    MAX_ITEMS_PER_SITE: 5,
+    // 換 URL 的單次逾時。簽名站偶發慢，給比一般站寬裕的值。
+    RESOLVE_TIMEOUT: 5000,
+  },
 
   // 流式搜尋配置
   STREAMING: {
@@ -1120,7 +1143,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.9.6",
+  version: "2.9.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1284,6 +1307,43 @@ WidgetMetadata = {
       type: "input",
       description: "v3 API Key。留空 = 純繁簡模式，行為與舊版一致。",
       value: ""
+    },
+    {
+      // 簽名型站（金牌影視等）adapter 開關。
+      //
+      // 與上方「自訂源設定」（MacCMS）是兩條完全獨立的管線：
+      // 這裡停用只影響簽名站，MacCMS 來源照常運作；反之亦然。
+      //
+      // 停用的時機：站方改版造成簽名失效（搜尋結果恆為空）時，先關這裡
+      // 讓 widget 回到純 MacCMS 行為，不必改程式碼。
+      name: "jpyyEnabled",
+      title: "簽名型站(金牌影視等)",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      // 簽名站搜尋時，同時查詢的站數上限（防止新增太多站拖慢首屏）。
+      // 每個簽名站首屏固定 3 次請求，這個值直接決定額外請求量。
+      name: "adapterSiteLimit",
+      title: "簽名型站 同時查詢站數",
+      type: "input",
+      description: "最多同時查詢幾個簽名型站。預設 1（只查金牌影視）。新增站點後可調高，每加 1 站首屏多約 3 次請求。",
+      value: "1"
+    },
+    {
+      // adapter 詳細日誌。除錯用（站方改版時需要看簽名是否過關）。
+      name: "adapterDebug",
+      title: "簽名型站 除錯日誌",
+      type: "enumeration",
+      enumOptions: [
+        { title: "關閉", value: "disabled" },
+        { title: "開啟", value: "enabled" }
+      ],
+      value: "disabled"
     }
   ],
   modules: [
@@ -2073,9 +2133,21 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       /完结篇|完結篇/.test(candidateInfo.rawName)) {
     candidateSequel = targetInfo._expectedSequel;
   }
-  const sequelShapeMismatch = (targetSequel === null) && (candidateSequel !== null);
+  // ★ 序號 1 = 原版，不是續集。
+  //   站方對「第一部」的兩種常見命名：「庆余年1」「无间道1」—— 序號從 1
+  //   起算，2 才是續集。若把 1 當成「有續集序號」，target「庆余年」
+  //   （無序號）對上 candidate「庆余年1」會觸發 sequelShapeMismatch 而被
+  //   判成 sequel_conflict → 整條被殺。使用者搜「庆余年」卻拿不到第一季，
+  //   正是這個原因（實測金牌影視命中此情形）。
+  //
+  //   語意上也站得住：序號 1 的作品就是原版本身，與無序號同義。
+  //   這裡正規化成 null，讓「無序號 target ↔ 序號1 candidate」正常比對。
+  if (candidateSequel === 1) candidateSequel = null;
+  // target 端同理：使用者輸入「庆余年1」時不應被當成有續集序號。
+  const targetSequelNorm = targetSequel === 1 ? null : targetSequel;
+  const sequelShapeMismatch = (targetSequelNorm === null) && (candidateSequel !== null);
   const sequelConflict = sequelShapeMismatch ||
-    (targetSequel !== null && candidateSequel !== null && targetSequel !== candidateSequel);
+    (targetSequelNorm !== null && candidateSequel !== null && targetSequelNorm !== candidateSequel);
 
   // 季度衝突：使用者選第一季，候選卻是第二季，就不是他要的內容。
   //
@@ -2100,7 +2172,7 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   if (sequelConflict) {
     return {
       match: false, type: 'sequel_conflict', score: 0,
-      similarity, sequelTarget: targetSequel, sequelCandidate: candidateSequel,
+      similarity, sequelTarget: targetSequelNorm, sequelCandidate: candidateSequel,
       seasonMatch: false, confidence: 0
     };
   }
@@ -2300,9 +2372,97 @@ function filterByEpisode(results, targetEpisode) {
   });
 }
 
-function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
+async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
   const { vod_name, vod_play_url, vod_play_from, vod_remarks = '' } = item;
   if (!vod_name || !vod_play_url) return [];
+
+  // ===== 簽名型 adapter 站的獨立分支 =====
+  //
+  // 這些站的 vod_play_url 裡放的不是真實 m3u8，而是延遲 token
+  // （見 _adapterBuildPlayUrl）。原因與好處見該函式註解：一集一 URL、
+  // token 短效，全量預取既貴又易過期。
+  //
+  // 這裡必須獨立處理而不能沿用 MacCMS 路徑，原因有三：
+  //  1. isPlayableUrl 會把 token 判為不可播（URL 沒 .m3u8 副檔名），
+  //     沿用既有路徑會被整個丟棄。
+  //  2. 清晰度是執行期才知道 —— 簽名站在換 URL 時才回傳多檔
+  //     （藍光1080/高清720/標清480），列表階段沒有這個資訊。
+  //  3. 一集一 URL 意味著要把 36 集全部換完才有完整列表。
+  if (item._adapterDelay) {
+    const episodes = String(vod_play_url).split('#').filter(Boolean).map(seg => {
+      const i = seg.indexOf('$');
+      return { name: seg.slice(0, i), token: seg.slice(i + 1) };
+    });
+    if (episodes.length === 0) return [];
+
+    // 使用者要播的那一集（沒指定就取最後一集，與 MacCMS movie 分支一致）
+    const wantEp = item._adapterTargetEpisode;
+    let idx = wantEp != null ? episodes.findIndex(e => parseInt(e.name, 10) === wantEp) : -1;
+    if (idx < 0) idx = episodes.length - 1;
+
+    const resolved = await _adapterResolvePlay(episodes[idx].token);
+    if (!resolved || resolved.length === 0) return [];
+
+    const out = [];
+    for (const r of resolved) {
+      const url = r?.url;
+      if (!url || !isPlayableUrl(url)) continue;
+      // 簽名站回傳的是 resolutionName（蓝光/高清/标清）+ resolution（數字）。
+      // 兩者都餵進 extractResolutionInfo，才能拿到與 MacCMS 站一致的
+      // label / level / qualityScore，讓下游排序與清晰度偏好照常運作。
+      //
+      // ★ 數字必須補 "p" 後綴：extractResolutionInfo 的正則是 /1080[Pp]/、
+      //   /720[Pp]/…，光傳 "1080" 不會命中，會全部落到 label='未知'、
+      //   qualityScore=0，排序時被當成最差的來源。
+      //
+      // ★ 站方的「高清」「标清」不在正則中，因此以數字為準、不靠中文標籤
+      //   猜測 —— 「高清」在不同站可能指 720 也可能指 1080，數字才是權威。
+      const resName = r.resolutionName || '';
+      const resInfo = extractResolutionInfo(vod_name, `${resName} ${r.resolution || 0}p`);
+      const displayName = toDisplayText(vod_name);
+      const epLabel = toDisplayText(episodes[idx].name);
+      const remark = toDisplayText(vod_remarks);
+      const tail = [epLabel, remark].filter(Boolean).join('．');
+      const epNumber = parseInt(episodes[idx].name, 10);
+
+      out.push({
+        name: siteTitle,
+        description: tail ? `${displayName}．${tail}` : displayName,
+        url: wrapM3U8WithFilter(url.trim(), {
+          site: siteTitle, name: displayName, episode: epLabel,
+        }),
+        playerType: 'app',
+        customHeaders: { 'X-Forward-Skip-Redirect-Probe': '1' },
+        resolution: resInfo.label,
+        resolutionLevel: resInfo.level,
+        isHD: resInfo.isHD,
+        is4K: resInfo.is4K,
+        qualityTags: resInfo.tags,
+        qualityScore: resInfo.qualityScore,
+        isHttps: url.startsWith('https'),
+
+        // ★ episode 必須是「頂層」欄位。REX 客戶端以 result.episode 過濾
+        //   當前集，只給 _ep 的話過濾後會是空陣列（cleanResourceForOutput
+        //   會把 _ep 提升為 episode，但那是輸出階段；此處 resources 直接
+        //   進 cache/stream，仍需自帶）。理由見 cleanResourceForOutput 註解。
+        episode: Number.isFinite(epNumber) ? epNumber : null,
+
+        // 保留 adapter 身分，供去重與 log 判斷
+        _adapterSite: item._adapterSite,
+        _matchType: matchInfo?.type,
+        _matchScore: matchInfo?.score,
+        _confidence: matchInfo?.confidence,
+        _isMainSource: true,
+        _hasEpInfo: episodes.length > 1,
+        _rawName: vod_name,
+        _seasonFromItem: extractSequelNumber(vod_name),
+        _ep: Number.isFinite(epNumber) ? epNumber : null,
+        _areaMismatch: false,
+        _areaMatch: false,
+      });
+    }
+    return out;
+  }
 
   // 站台已標註的年份與地區：片名文字只差一個年份時（「仁医2009」對
   // 「仁医2012」），只有這些欄位能分辨是日版還是韓版。
@@ -3084,6 +3244,45 @@ async function _adapterResolvePlay(token) {
   }
 }
 
+// ---------- 開關與站點選取 ----------
+
+/**
+ * 讀 globalParams 的字串設定。
+ * 與 loadResource 內的 gpValue 同思路，但這裡不重複實作 —— 直接沿用
+ * WidgetMetadata.globalParams 的 value，使用者改了設定立即生效。
+ */
+function _adapterGp(name, fallback = '') {
+  try {
+    const hit = (WidgetMetadata?.globalParams || []).find(p => p.name === name);
+    const v = hit && hit.value != null ? String(hit.value).trim() : '';
+    return v || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+/** adapter 整體是否啟用。預設啟用；站方改版失效時可從設定關掉。 */
+function _adapterIsEnabled(params) {
+  if (CONFIG.ADAPTERS?.ENABLED === false) return false;
+  const p = params?.jpyyEnabled;
+  const setting = (p != null && p !== '') ? p : _adapterGp('jpyyEnabled', 'enabled');
+  return setting === 'enabled';
+}
+
+/**
+ * 選取本次要查詢的簽名型站。
+ *
+ * adapterSiteLimit 限制同時查詢幾站 —— 每站首屏固定 3 次請求，
+ * 這個值直接決定額外請求量。新增站點後可調高。
+ */
+function _adapterActiveSites(params) {
+  const limit = parseInt(_adapterGp('adapterSiteLimit', '1'), 10);
+  const n = Number.isFinite(limit) && limit > 0 ? limit : 1;
+  const debug = _adapterGp('adapterDebug', 'disabled') === 'enabled';
+  if (debug) CONFIG.ADAPTERS.DEBUG = true;
+  return ADAPTER_SITES.slice(0, n);
+}
+
 const WIDGET_VERSION_KEY = 'vod_widget_version';
 
 // 版本變更時清掉舊 cache。詳見 loadResource 內 syncWidgetVersion 的說明。
@@ -3664,15 +3863,15 @@ class SmartSearchExecutor {
           matchedItems.push({ item, matchResult });
 
           if (matchResult.confidence >= 0.9) {
-            const resources = extractPlayInfoForCache(item, site.title, this.type, matchResult, this.targetInfo);
+            const resources = await extractPlayInfoForCache(item, site.title, this.type, matchResult, this.targetInfo);
             siteResults.push(...this.processImmediateResults(resources, site, onResultCallback));
           }
         }
       }
-      
+
       for (const { item, matchResult } of matchedItems) {
         if (matchResult.confidence < 0.9) {
-          const resources = extractPlayInfoForCache(item, site.title, this.type, matchResult, this.targetInfo);
+          const resources = await extractPlayInfoForCache(item, site.title, this.type, matchResult, this.targetInfo);
           siteResults.push(...this.processImmediateResults(resources, site, onResultCallback));
         }
       }
@@ -5556,8 +5755,59 @@ targetInfo.searchQuery = aliasQ;
 
   if (allResults.length === 0) {
     const stats = { total: resourceSites.length, success: 0, failed: 0 };
-    
-    const requestTasks = resourceSites.map(site => async () => {
+    const requestTasks = [];
+
+    // ===== 簽名型 adapter 站（與 MacCMS 並行，互不影響）=====
+    //
+    // 走與 MacCMS 完全相同的下游：item 已被 _adapterSearch 偽裝成
+    // MacCMS 欄位，dedup / 年份季別過濾 / m3u8 wrap 全部共用。
+    //
+    // 刻意不塞進 requestTasks 陣列：adapter 一筆結果要 2 次請求
+    // （詳情頁 + 換 URL），並發跑會佔滿連線拖慢 MacCMS 站。獨立一條
+    // task、內部自己控制節奏，並在失敗時靜默回傳 []。
+    const adapterEnabled = _adapterIsEnabled(params);
+    if (adapterEnabled) {
+      requestTasks.push(async () => {
+        const sites = _adapterActiveSites(params);
+        if (sites.length === 0) return [];
+
+        const adapterResults = [];
+        for (const site of sites) {
+          try {
+            const items = await _adapterSearch(
+              site,
+              targetInfo.searchQuery || targetInfo.baseName,
+              targetInfo,
+              type,
+              targetEpisode
+            );
+            if (!items || items.length === 0) continue;
+
+            // 標記目標集，讓 extractPlayInfoForCache 只換那一集的 URL
+            for (const it of items) it._adapterTargetEpisode = targetEpisode;
+
+            const siteOut = [];
+            for (const item of items) {
+              const candidateInfo = extractEnhancedInfo(item.vod_name);
+              const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness);
+              const res = await extractPlayInfoForCache(
+                item, site.title, type, matchResult, targetInfo
+              );
+              siteOut.push(...res);
+            }
+            adapterResults.push(...siteOut);
+            stats.success++;
+            console.log(`🔌 [adapter:${site.id}] ${site.title} 回傳 ${siteOut.length} 條`);
+          } catch (e) {
+            stats.failed++;
+            console.warn(`🔌 [adapter:${site.id}] ${site.title} 失敗: ${e?.message || e}`);
+          }
+        }
+        return adapterResults;
+      });
+    }
+
+    const macTasks = resourceSites.map(site => async () => {
       try {
         const retries = site.isMain ? CONFIG.RETRY_ATTEMPTS : 1;
         const response = await fetchWithSmartRetry(
@@ -5768,7 +6018,7 @@ targetInfo.searchQuery = aliasQ;
                 continue;
               }
             }
-            const resources = extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
+            const resources = await extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
             siteResults.push(...resources);
           }
         }
@@ -5783,6 +6033,7 @@ targetInfo.searchQuery = aliasQ;
         return [];
       }
     });
+    requestTasks.push(...macTasks);
 
     const results = await Promise.allSettled(requestTasks.map(task => task()));
     
