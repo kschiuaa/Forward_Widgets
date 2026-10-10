@@ -1120,7 +1120,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.9.5",
+  version: "2.9.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2634,6 +2634,456 @@ function rememberRejectingTypeSite(siteValue) {
   }
 }
 
+// ==================== 簽名型 VOD 站 Adapter ====================
+//
+// 為什麼需要這一層：
+// 除了 MacCMS 採集站（/api.php/provide/vod，列表就帶 vod_play_url），
+// 還有一類「自製 API + 簽名」的站（金牌影視 jpyy 即為代表）。兩者差異：
+//
+//   MacCMS：GET ?ac=detail&wd=xxx → {data:{list:[{vod_play_url}]}}，一次搞定。
+//   簽名站：搜尋 → 詳情頁抓集數 → 逐集換播放連結，欄位名完全不同
+//          （vodId/vodName/vodArea…），且請求必須帶 sign/deviceId/t。
+//
+// 兩者管線無法共用，但**輸出格式可以對齊** —— 只要讓 adapter 把自己
+// 吐出的結果轉成 MacCMS 的 item 形狀（vod_name / vod_play_url /
+// vod_play_from / vod_year / vod_area），後面整套既有邏輯
+// （isSmartSeriesMatch / extractPlayInfoForCache / 去重 / 年份季別
+// 過濾 / m3u8 wrap）完全不用動。新增一個站 = 在 ADAPTER_SITES 加一筆
+// 設定，不需要新增任何程式碼路徑。
+//
+// 設計要點：
+//  1. 簽名純 JS 實作 —— widget 跑在 vm 沙箱，沒有 require('crypto')。
+//  2. 每個站可覆寫任何環節（search/list/episodes/playUrl），預設
+//     實作對應 jpyy 這類「同簽名協定」站；不同協定只要寫自己的函式即可。
+//  3. 任何 adapter 失敗一律靜默丟棄，絕不影響 MacCMS 主流程。
+
+// ---------- 純 JS UTF-8 / MD5 / SHA1（沙箱可用） ----------
+//
+// 刻意不使用 unescape(encodeURIComponent(s))：unescape 在部分沙箱
+// （vm context / 嚴格 CSP）不可用，而簽名是硬需求，不能依賴它。
+function _utf8Bytes(str) {
+  const out = [];
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 0x80) {
+      out.push(c);
+    } else if (c < 0x800) {
+      out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+      const c2 = str.charCodeAt(i + 1);
+      if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+        const cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+        out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+        i++;
+        continue;
+      }
+      out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    } else {
+      out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    }
+  }
+  return out;
+}
+
+function _md5Hex(str) {
+  const bytes = _utf8Bytes(str);
+  const bitLen = bytes.length * 8;
+  const words = [];
+  for (let i = 0; i < bytes.length; i++) words[i >> 2] |= bytes[i] << ((i % 4) * 8);
+  words[bytes.length >> 2] |= 0x80 << ((bytes.length % 4) * 8);
+  // 補到 ≡14 (mod 16) words，再塞 2 個 length words = 整數個 64 bytes 區塊
+  while (words.length % 16 !== 14) words.push(0);
+  words.push(bitLen >>> 0, Math.floor(bitLen / 0x100000000) >>> 0);
+
+  const add32 = (a, b) => (a + b) | 0;
+  const rol = (n, c) => (n << c) | (n >>> (32 - c));
+  const FF = (b, c, d) => (b & c) | (~b & d);
+  const GG = (b, c, d) => (b & d) | (c & ~d);
+  const HH = (b, c, d) => b ^ c ^ d;
+  const II = (b, c, d) => c ^ (b | ~d);
+  const K = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+  ];
+  const S = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+  ];
+
+  let a0 = 0x67452301 | 0, b0 = 0xefcdab89 | 0, c0 = 0x98badcfe | 0, d0 = 0x10325476 | 0;
+  for (let i = 0; i < words.length; i += 16) {
+    const M = words.slice(i, i + 16);
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let j = 0; j < 64; j++) {
+      let F, g;
+      if (j < 16) { F = FF(B, C, D); g = j; }
+      else if (j < 32) { F = GG(B, C, D); g = (5 * j + 1) % 16; }
+      else if (j < 48) { F = HH(B, C, D); g = (3 * j + 5) % 16; }
+      else { F = II(B, C, D); g = (7 * j) % 16; }
+      // 標準順序：F + A + K + M 全部在 rotate 之前加完，rotate 後只補 B
+      F = add32(add32(add32(F, A), K[j]), M[g]);
+      F = add32(B, rol(F, S[j]));
+      A = D; D = C; C = B; B = F;
+    }
+    a0 = add32(a0, A); b0 = add32(b0, B); c0 = add32(c0, C); d0 = add32(d0, D);
+  }
+  const le = n => [n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff]
+    .map(b => (b & 0xff).toString(16).padStart(2, '0')).join('');
+  return le(a0) + le(b0) + le(c0) + le(d0);
+}
+
+function _sha1Hex(str) {
+  const bytes = _utf8Bytes(str);
+  const bitLen = bytes.length * 8;
+  const words = [];
+  // ★ SHA1 是 big-endian 組字（MD5 是 little-endian）—— 兩者相反，
+  //   沿用 MD5 的寫法會算出「看起來像雜湊但完全錯誤」的結果。
+  for (let i = 0; i < bytes.length; i++) words[i >> 2] |= bytes[i] << ((3 - (i % 4)) * 8);
+  words[bytes.length >> 2] |= 0x80 << ((3 - (bytes.length % 4)) * 8);
+  while (words.length % 16 !== 14) words.push(0);
+  words.push(Math.floor(bitLen / 0x100000000) >>> 0, bitLen >>> 0);
+
+  const rol = (n, c) => (n << c) | (n >>> (32 - c));
+  let h0 = 0x67452301 | 0, h1 = 0xefcdab89 | 0, h2 = 0x98badcfe | 0, h3 = 0x10325476 | 0, h4 = 0xc3d2e1f0 | 0;
+  const K = [0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6];
+  for (let i = 0; i < words.length; i += 16) {
+    const M = words.slice(i, i + 16);
+    const w = M.slice();
+    for (let j = 16; j < 80; j++) w[j] = rol(w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16], 1) | 0;
+    let A = h0, B = h1, C = h2, D = h3, E = h4;
+    for (let j = 0; j < 80; j++) {
+      let F, k;
+      if (j < 20) { F = (B & C) | (~B & D); k = 0; }
+      else if (j < 40) { F = B ^ C ^ D; k = 1; }
+      else if (j < 60) { F = (B & C) | (B & D) | (C & D); k = 2; }
+      else { F = B ^ C ^ D; k = 3; }
+      const tmp = (rol(A, 5) | 0) + (F | 0) + E + K[k] + w[j] | 0;
+      E = D; D = C; C = rol(B, 30) | 0; B = A; A = tmp;
+    }
+    h0 = (h0 + A) | 0; h1 = (h1 + B) | 0; h2 = (h2 + C) | 0; h3 = (h3 + D) | 0; h4 = (h4 + E) | 0;
+  }
+  const be = n => ((n >>> 24) & 0xff).toString(16).padStart(2, '0') + ((n >>> 16) & 0xff).toString(16).padStart(2, '0')
+    + ((n >>> 8) & 0xff).toString(16).padStart(2, '0') + (n & 0xff).toString(16).padStart(2, '0');
+  return [h0, h1, h2, h3, h4].map(be).join('');
+}
+
+// ---------- 簽名協定的預設實作（對應 jpyy / 金牌影視這類站） ----------
+//
+// ★★ 簽名的兩條鐵則（實測結論，不可「順手優化」）★★
+//
+// 規則 1：簽名對象 = **實際送出的 query 字串原樣**，一個字都不能差。
+//   站方拿收到的 query 重算後比對字面。簽 A 送 B → code 122001。
+//
+// 規則 2：**非 ASCII 值一律用原始字元**（area=美国 / lang=英语 /
+//   v_class=科幻 / 搜尋 keyword 都屬此類）。實測三種組合：
+//     簽原始 + 送編碼 → 200 ✅
+//     簽編碼 + 送編碼 → 122001 ❌  ← 先 encodeURIComponent 再簽一定失敗
+//     簽原始 + 送原始 → 200 ✅
+//   這是這類站最容易踩的坑。
+//
+// 參數順序不影響（站方對收到的字串重算），但**不可出現重複 key**
+// —— 例如 base 已含 sort=1 又 append sort=4，送出兩個 sort 會簽不過。
+
+function _adapterRandomId() {
+  // deviceId 只要看起來像 UUID 即可，站方不驗格式
+  const hex = n => Math.floor(Math.random() * (1 << (4 * n))).toString(16);
+  return `${hex(8)}-${hex(4)}-4${hex(3)}-${((Math.random() * 4) | 0) + 8}${hex(3)}-${hex(12)}`;
+}
+
+/**
+ * 建立簽名 header。
+ * @param {string} sentQuery 將實際送出的 query 字串（原樣，未編碼）
+ * @param {object} site      站點設定（需含 signKey / signAlgo）
+ */
+function _adapterBuildHeader(sentQuery, site) {
+  const t = Date.now();
+  const key = site.signKey || '';
+  const signStr = sentQuery + `&key=${key}` + `&t=${t}`;
+  const algo = site.signAlgo || 'sha1-md5';
+  const sign = algo === 'md5' ? _md5Hex(signStr)
+    : algo === 'sha256-md5' ? _md5Hex(signStr)  // 預留：站方改演算法時只改這裡
+    : _sha1Hex(_md5Hex(signStr));
+
+  const headers = {
+    'User-Agent': site.ua || API_USER_AGENT,
+    t: String(t),
+    sign,
+  };
+  if (site.deviceHeader !== false) headers.deviceId = _adapterRandomId();
+  return headers;
+}
+
+/**
+ * 帶簽名的 GET。
+ * site 設定可覆寫 httpGet（如某站需特殊 header / 不需簽名）。
+ */
+async function _adapterGet(site, endpoint, query, opts = {}) {
+  const qs = Object.keys(query).map(k => `${k}=${query[k]}`).join('&');
+  const url = site.base + endpoint + (qs ? '?' + qs : '');
+  const headers = site.buildHeaders ? site.buildHeaders(qs) : _adapterBuildHeader(qs, site);
+
+  const fetcher = site.httpGet || ((u, h) => Widget.http.get(u, { headers: h, timeout: opts.timeout || CONFIG.REQUEST_TIMEOUT }));
+  const resp = await fetcher(url, headers);
+
+  // 統一處理三種回傳：字串 / {data:物件} / {data:字串}
+  let payload = resp;
+  if (resp && typeof resp === 'object' && 'data' in resp) payload = resp.data;
+  if (typeof payload === 'string') {
+    const txt = payload;
+    try { payload = JSON.parse(txt); }
+    catch { return site.parseError ? site.parseError(txt) : { __html: txt }; }
+  }
+  if (payload && typeof payload === 'object' && payload.code != null && payload.code !== 200) {
+    if (site.DEBUG) console.warn(`[adapter:${site.id}] code=${payload.code} ${payload.msg || ''}`);
+    return null;
+  }
+  return payload;
+}
+
+/**
+ * 預設搜尋：video/searchByWordPageable
+ * 回傳 { items: [...] }，item 已轉成 MacCMS 欄位名。
+ */
+async function _adapterDefaultSearch(site, keyword) {
+  const j = await _adapterGet(site, '/api/mw-movie/anonymous/video/searchByWordPageable', {
+    keyword, pageNum: 1, pageSize: 12, type: 'false',
+  });
+  const list = j?.data?.list || [];
+  return list.map(it => site.toMacItem ? site.toMacItem(it) : ({
+    vod_id: String(it.vodId),
+    vod_name: it.vodName,
+    vod_pic: it.vodPic,
+    vod_year: String(it.vodPubdate || '').slice(0, 4) || '',
+    vod_area: it.vodArea || '',
+    vod_remarks: it.vodDoubanScore ? String(it.vodDoubanScore) : (it.vodVersion || ''),
+  }));
+}
+
+/**
+ * 預設集數：抓行動版詳情頁 HTML 的 episodeList。
+ * 這類站沒有「直接回集數」的 API（實測 /vod/list 只回簽名錯誤）。
+ */
+async function _adapterDefaultEpisodes(site, vodId) {
+  const origin = site.base.replace(/^https?:\/\//, '').replace(/^www\./, '');
+  const url = `${site.mobileBase || `https://m.${origin}`}/detail/${vodId}`;
+  const resp = await Widget.http.get(url, { headers: { 'User-Agent': site.ua || API_USER_AGENT } });
+  let html = resp;
+  if (resp && typeof resp === 'object' && 'data' in resp) html = resp.data;
+  if (typeof html !== 'string') return [];
+
+  const m = html.match(site.episodeRegex || /episodeList.*?\[.*?\}\]\}/);
+  if (!m) return [];
+  try {
+    return JSON.parse('{"' + m[0].replace(/\\"/g, '"')).episodeList;
+  } catch (e) {
+    return [];
+  }
+}
+
+/**
+ * 預設播放連結：逐集換 URL，回傳多清晰度。
+ * 這類站的清單只有最高畫質，其餘要逐集換 —— 見 _adapterBuildPlayUrl。
+ */
+async function _adapterDefaultPlayUrls(site, vodId, nid) {
+  const j = await _adapterGet(site, '/api/mw-movie/anonymous/v2/video/episode/url', { id: vodId, nid });
+  return j?.data?.list || [];
+}
+
+// ---------- 簽名型站點清單 ----------
+//
+// 新增同協定站：複製一個物件、改 id/base/signKey 即可，零程式碼改動。
+// 協定不同的站（如非簽名但非 MacCMS）：覆寫 buildHeaders / search /
+// episodes / playUrls 其中任一即可，框架不變。
+//
+// ⚠️ signKey 屬於站方公開前端常數，非秘密憑證。若站方改 key 只需更新
+//   這裡，不需動任何程式邏輯。
+const ADAPTER_SITES = [
+  {
+    id: 'jpyy',
+    title: '金牌影視',
+    base: 'https://www.jiabaide.cn',
+    signKey: 'cb808529bae6b6be45ecfab29a4889bc',
+    // 這類站回傳的資料比 MacCMS 站豐富（豆瓣評分、地區、多清晰度），
+    // 給予排序加成。
+    isMain: true,
+  },
+];
+
+// ---------- 篩選分類表 ----------
+//
+// 給「瀏覽分類」用（XPTV filterList 等價物）。key 是 type1。
+const ADAPTER_FILTERS = {
+  1: [
+    { key: 'type', name: '類型', value: [
+      { n: '全部', v: '' }, { n: '喜劇', v: '22' }, { n: '動作', v: '23' },
+      { n: '科幻', v: '30' }, { n: '愛情', v: '26' }, { n: '懸疑', v: '27' },
+      { n: '劇情', v: '37' }, { n: '恐怖', v: '36' }, { n: '動畫', v: '33' },
+    ] },
+    { key: 'area', name: '地區', value: [
+      { n: '全部', v: '' }, { n: '中國大陸', v: '中国大陆' }, { n: '香港', v: '中国香港' },
+      { n: '台灣', v: '中国台湾' }, { n: '美國', v: '美国' }, { n: '日本', v: '日本' },
+      { n: '韓國', v: '韩国' },
+    ] },
+    { key: 'year', name: '年份', value: [
+      { n: '全部', v: '' }, { n: '2026', v: '2026' }, { n: '2025', v: '2025' },
+      { n: '2024', v: '2024' }, { n: '2023', v: '2023' }, { n: '2020', v: '2020' },
+    ] },
+    { key: 'sort', name: '排序', value: [
+      { n: '最近更新', v: '1' }, { n: '人氣高低', v: '2' }, { n: '評分高低', v: '4' },
+    ] },
+  ],
+  2: [
+    { key: 'type', name: '類型', value: [
+      { n: '全部', v: '' }, { n: '國產劇', v: '14' }, { n: '歐美劇', v: '15' },
+      { n: '港台劇', v: '16' }, { n: '日韓劇', v: '62' }, { n: '其他劇', v: '68' },
+    ] },
+    { key: 'area', name: '地區', value: [
+      { n: '全部', v: '' }, { n: '中國大陸', v: '中国大陆' }, { n: '香港', v: '中国香港' },
+      { n: '台灣', v: '中国台湾' }, { n: '日本', v: '日本' }, { n: '韓國', v: '韩国' },
+      { n: '美國', v: '美国' },
+    ] },
+    { key: 'year', name: '年份', value: [
+      { n: '全部', v: '' }, { n: '2026', v: '2026' }, { n: '2025', v: '2025' },
+      { n: '2024', v: '2024' }, { n: '2023', v: '2023' }, { n: '2020', v: '2020' },
+    ] },
+    { key: 'sort', name: '排序', value: [
+      { n: '最近更新', v: '1' }, { n: '人氣高低', v: '2' }, { n: '評分高低', v: '4' },
+    ] },
+  ],
+};
+
+// ---------- 併入既有管線的轉換層 ----------
+
+/**
+ * 把 adapter 的搜尋結果包成 MacCMS item 陣列。
+ *
+ * 為什麼要「偽裝成 MacCMS」：下游 isSmartSeriesMatch / extractPlayInfoForCache
+ * / 去重 / 年份季別過濾全部只認 MacCMS 欄位。偽裝成同一形狀後，這些
+ * 邏輯零改動即可套用在 adapter 結果上 —— 新增站點不需要新增程式路徑。
+ *
+ * 播放連結採「延遲換取」：vod_play_url 先填 episode 元件，待使用者
+ * 實際要播哪一集時才呼叫 playUrls 換真實 m3u8。理由見 _adapterSearch。
+ */
+function _adapterBuildPlayUrl(site, vodId, episodes, targetEpisode) {
+  if (!episodes || episodes.length === 0) return '';
+
+  // 單集電影：站方 episodeList 只有一筆
+  if (episodes.length === 1) {
+    const ep = episodes[0];
+    return `${ep.name || '正片'}$${encodeURIComponent(JSON.stringify({ s: site.id, v: vodId, n: ep.nid, e: 0 }))}`;
+  }
+
+  // 多集影集：取目標集（缺��落在最後一集，與 forward 預設一致）
+  let ep = null;
+  if (targetEpisode != null) {
+    ep = episodes.find(e => parseInt(e.name, 10) === targetEpisode) || null;
+  }
+  if (!ep) ep = episodes[episodes.length - 1];
+
+  return episodes.map(e => {
+    const payload = encodeURIComponent(JSON.stringify({
+      s: site.id, v: vodId, n: e.nid, e: episodes.indexOf(e),
+    }));
+    return `${e.name}$${payload}`;
+  }).join('#');
+}
+
+/**
+ * 執行單一 adapter 站的搜尋，回傳 MacCMS 形狀的 item 陣列。
+ *
+ * 請求量控制（重要）：簽名站一集一 URL，全量換完一部 36 集要 36 次請求。
+ * 但使用者只需要「當前要播的那一集」，所以：
+ *   - search → 1 次
+ *   - episodes（詳情頁）→ 1 次
+ *   - playUrls（只換 targetEpisode）→ 1 次
+ * 首屏固定 3 次請求，其餘集數延後到使用者切集時才換。
+ */
+async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode) {
+  const t0 = Date.now();
+  let items;
+  try {
+    items = (site.search || _adapterDefaultSearch)(site, searchQuery);
+    items = await items;
+  } catch (e) {
+    console.warn(`[adapter:${site.id}] search 失敗: ${e?.message || e}`);
+    return [];
+  }
+  if (!Array.isArray(items) || items.length === 0) return [];
+
+  const out = [];
+  for (const item of items) {
+    if (!item?.vod_name) continue;
+    // 命中判斷仍走既有 isSmartSeriesMatch —— adapter 不另立一套比對邏輯，
+    // 否則繁簡、地區、季別的處理會和 MacCMS 站不一致。
+    const candidateInfo = extractEnhancedInfo(item.vod_name);
+    const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, 'standard');
+    if (!matchResult.match || matchResult.confidence < 0.6) continue;
+
+    let playUrl = '';
+    try {
+      const eps = await (site.episodes || _adapterDefaultEpisodes)(site, item.vod_id);
+      playUrl = _adapterBuildPlayUrl(site, item.vod_id, eps, targetEpisode);
+    } catch (e) {
+      // 詳情頁失敗 = 這筆沒有可播資源，跳過而非送出空播放項
+      console.warn(`[adapter:${site.id}] episodes 失敗 id=${item.vod_id}: ${e?.message || e}`);
+      continue;
+    }
+    if (!playUrl) continue;
+
+    out.push({
+      ...item,
+      vod_play_url: playUrl,
+      vod_play_from: site.title,
+      // ★ 標記：url 是延遲 token 而非真實 m3u8。extractPlayInfoForCache
+      //   的 isPlayableUrl 會把它判為不可播，因此必須在該處特判並還原。
+      _adapterSite: site.id,
+      _adapterDelay: true,
+      vod_content_note: item.vod_remarks || '',
+    });
+  }
+
+  if (CONFIG.ADAPTERS?.DEBUG) {
+    console.log(`[adapter:${site.id}] "${searchQuery}" → ${out.length}/${items.length} 筆, ${Date.now() - t0}ms`);
+  }
+  return out;
+}
+
+/**
+ * 還原延遲播放 token → 真實 m3u8。
+ *
+ * 為什麼延遲：簽名站的播放連結帶短效 token 且一集一 URL，全量預取在
+ * 36 集規模下是 36 次請求、且 token 可能在使用者切集前就過期。延遲換取
+ * 讓首屏只花 3 次請求，且 token 永遠是「剛簽發」的，較不會失效。
+ *
+ * 回傳 { url, resolution, resolutionName }[] —— 多清晰度。
+ */
+async function _adapterResolvePlay(token) {
+  let t;
+  try {
+    t = JSON.parse(decodeURIComponent(token));
+  } catch (e) {
+    return [];
+  }
+  const site = ADAPTER_SITES.find(s => s.id === t.s);
+  if (!site) return [];
+
+  try {
+    const list = await (site.playUrls || _adapterDefaultPlayUrls)(site, t.v, t.n);
+    return list;
+  } catch (e) {
+    console.warn(`[adapter:${site.id}] playUrls 失敗: ${e?.message || e}`);
+    return [];
+  }
+}
+
 const WIDGET_VERSION_KEY = 'vod_widget_version';
 
 // 版本變更時清掉舊 cache。詳見 loadResource 內 syncWidgetVersion 的說明。
@@ -4047,6 +4497,18 @@ async function loadResource(params, onStreamResult = null) {
     if (aliasQ) {
       console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
       targetInfo.searchQuery = aliasQ;
+targetInfo.searchQuery = aliasQ;
+// v2.9.6：別名被採用時必須同步改比對用的名稱，否則搜尋拿得到結果
+// 但過濾階段會把它們全部殺掉。
+//
+// 實測：「陰屍路」(港譯) → TMDB 別名「行尸走肉」。站方確實回傳
+// 「行尸走肉第十一季」等 20 筆，但 isSmartSeriesMatch 拿的是
+// targetInfo.baseName（仍是「阴尸路」）去比對「行屍走肉」——
+// 字面完全不同 → type=none → 0 筆。
+//
+// 只改 searchQuery 等於「用別名去搜，再用原名去篩」，這正是本 bug
+// 的本質。兩邊必須是同一個名字。
+  applyAliasNameToTarget(targetInfo, aliasQ);
   }
   }
 
@@ -4403,6 +4865,48 @@ function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
  *
  * @returns true 表示已經替換；false 表示沒命中別名（hot path 走原 query）
  */
+/**
+ * TMDB 別名被採用時，同步更新「用於比對」的名稱欄位。
+ *
+ * v2.9.6 新增。解決的 bug：
+ *   「陰屍路」(港譯) → TMDB 別名「行尸走肉」
+ *   站方確實回傳「行尸走肉第十一季」等 20 筆，
+ *   但 isSmartSeriesMatch 拿 targetInfo.baseName（仍是「阴尸路」）
+ *   去比對候選「行屍走肉」→ 字面不同 → type=none → 0 筆。
+ *
+ * 也就是「用別名去搜，卻用原名去篩」。搜得到、篩不掉，等於沒搜。
+ *
+ * 改了什麼：
+ *   - baseName：isSmartSeriesMatch / extractEnhancedInfo 比對用的主名稱
+ *   - rawName  ：若 rawName 只是片名本身（沒有 season 等修飾）才同步，
+ *                避免動到「仁醫完結篇」這種帶續集資訊的原始輸入
+ *   - _aliasSearchQuery 保留，方便日後除錯
+ *
+ * 為什麼不動 seasonNumber / year / region：
+ *   這些描述的是「使用者要看哪一季、哪個版本」，跟片名叫什麼無關。
+ *   別名擴充只是換了搜尋用的名字，不該改變使用者的意圖。
+ */
+function applyAliasNameToTarget(targetInfo, aliasQ) {
+  if (!targetInfo) return;
+  const alias = String(aliasQ || '').trim();
+  if (!alias) return;
+
+  // 別名本身可能帶季度（「行尸走肉第十一季」），baseName 要去掉季度，
+  // 否則跟候選「行尸走肉第十一季」比對時 baseName 不一致。
+  const parsed = extractEnhancedInfo(alias);
+  if (!parsed || !parsed.baseName) return;
+
+  targetInfo.baseName = parsed.baseName;
+  // rawName 若是純片名（沒帶季度/序號修飾），一併同步讓日後的
+  // extractSequelNumber(targetInfo.rawName) 不會讀到過期值。
+  if (!/[第[Ss]eason\s*[0-9零一二三四五六七八九十]|第[一二三四五六七八九十零\d]+[季部季]/.test(String(targetInfo.rawName || ''))) {
+    targetInfo.rawName = alias;
+  }
+
+  // 正規化名稱同步，讓 cacheKey 與站方比對都吃同一個名字。
+  targetInfo._aliasBaseName = parsed.baseName;
+}
+
 async function tryExpandWithTMDBAliases(targetInfo, type) {
   if (!targetInfo || !CONFIG.TMDB?.ENABLED || !CONFIG.TMDB.API_KEY) return false;
   const baseName = String(targetInfo.baseName || '').trim();
@@ -4892,6 +5396,18 @@ async function performSmartSearch(params, onStreamResult) {
     if (aliasQ) {
       console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
       targetInfo.searchQuery = aliasQ;
+targetInfo.searchQuery = aliasQ;
+// v2.9.6：別名被採用時必須同步改比對用的名稱，否則搜尋拿得到結果
+// 但過濾階段會把它們全部殺掉。
+//
+// 實測：「陰屍路」(港譯) → TMDB 別名「行尸走肉」。站方確實回傳
+// 「行尸走肉第十一季」等 20 筆，但 isSmartSeriesMatch 拿的是
+// targetInfo.baseName（仍是「阴尸路」）去比對「行屍走肉」——
+// 字面完全不同 → type=none → 0 筆。
+//
+// 只改 searchQuery 等於「用別名去搜，再用原名去篩」，這正是本 bug
+// 的本質。兩邊必須是同一個名字。
+  applyAliasNameToTarget(targetInfo, aliasQ);
   }
 }
 
@@ -4984,6 +5500,18 @@ async function performBatchSearch(params) {
     if (aliasQ) {
       console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
       targetInfo.searchQuery = aliasQ;
+targetInfo.searchQuery = aliasQ;
+// v2.9.6：別名被採用時必須同步改比對用的名稱，否則搜尋拿得到結果
+// 但過濾階段會把它們全部殺掉。
+//
+// 實測：「陰屍路」(港譯) → TMDB 別名「行尸走肉」。站方確實回傳
+// 「行尸走肉第十一季」等 20 筆，但 isSmartSeriesMatch 拿的是
+// targetInfo.baseName（仍是「阴尸路」）去比對「行屍走肉」——
+// 字面完全不同 → type=none → 0 筆。
+//
+// 只改 searchQuery 等於「用別名去搜，再用原名去篩」，這正是本 bug
+// 的本質。兩邊必須是同一個名字。
+  applyAliasNameToTarget(targetInfo, aliasQ);
   }
 }
 
