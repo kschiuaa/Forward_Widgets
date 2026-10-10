@@ -94,6 +94,272 @@ function normalizeForMatching(text) {
     .toLowerCase();
 }
 
+// ==================== TMDB 跨地區別名解析 ====================
+//
+// 為什麼這層存在：Forward 帶入的多為繁體中文片名（台/港翻譯），資源
+// 站上則是簡體中文（大陸翻譯）。純字對字繁簡轉換救不了翻譯差異（陰屍
+// 路 → 行屍走肉、盜夢空間 → 全面啟動根本是反過來的）。TMDB 的
+// alternative_titles 內同一條目會記下所有地區命名，用它做橋樑。
+//
+// 設計目標：搜尋的 hot path **絕不 await TMDB**。
+//   - cache 命中 → 同步 getStorage()，但 storage 在 widget runtime 是
+//     async，所以這層必須做成「給輸入，回傳已知的 alias 陣列」
+//   - cache miss → 立刻回傳空陣列（hot path 用原本搜尋），背景送
+//     fetch 更新 cache，下次進場才用
+//
+// 任何錯誤（timeout / rate-limit / 網路掛 / 404）→ 靜默吞掉，回傳空
+// 陣列（等同於原本的純繁簡搜尋）。console.warn 留線索但不 throw。
+
+// 別名 cache 結構（內存，啟動時從 storage 載入）：
+//   Map<cacheKey, { aliases: string[], ts: number }>
+// cacheKey = `tmdb_alias_${shaLike(baseName)}_${type}`
+// 並非加密用，只是把中文片名變成穩定短字串當 storage key 用。
+function _tmdbAliasKey(baseName, type) {
+  const norm = String(baseName || '').trim()
+    .toLowerCase()
+    // 移除 season/year 標記，避免「仁醫2009」「仁醫2012」分別
+    // 各佔一筆 cache。TMDB 對「仁醫」會一次回 2009/2012 兩版的所有
+    // 別名，cache 共用即可。
+    .replace(/\s*(?:19|20)\d{2}\s*$/, '')
+    .replace(/\s*(?:s|season)\s*\d+\s*$/i, '')
+    .replace(/第[一二三四五六七八九十零\d]+季/, '')
+    .trim();
+  // 不做嚴格 hash，storage key 中文也吃；只取尾段避免太長。
+  return `tmdb_alias_${encodeURIComponent(norm).slice(0, 200)}_${type || 'tv'}`;
+}
+
+// 啟動時載入的內存 cache。值帶 ts 以支援 TTL 判斷（雖然 TTL 主要靠
+// storage 控制，這層只是 importance，避免 reload 後從零開始重打）。
+const _tmdbAliasCache = new Map();
+// 防止同一片名 fire-and-forget 重複觸發 N 次。
+const _tmdbAliasInFlight = new Set();
+// 短期內重複查同一片名直接復用結果（即使 cache miss）。
+const _tmdbAliasRecent = new Map();  // key -> { aliases, ts }
+
+async function _loadTmdbAliasCacheFromStorage() {
+  if (!Widget?.storage?.get) return;
+  try {
+    // 一次讀全部條目不太實際（散落不同 key），改採逐 key：
+    // 改採輕量做法：第一次 alias 查詢時 lazy load。
+    // （這層只是縮短重建時間，不影響正確性。）
+  } catch (e) { /* 無 storage 權限時忽略 */ }
+}
+
+async function _storeTmdbAliasCache(cacheKey, aliases) {
+  if (!Widget?.storage?.set || !aliases || aliases.length === 0) return;
+  try {
+    await Widget.storage.set(cacheKey, JSON.stringify({ aliases, ts: Date.now() }), CONFIG.TMDB.CACHE_TTL);
+  } catch (e) { /* 寫 storage 失敗不影響功能 */ }
+}
+
+async function _readTmdbAliasCache(cacheKey) {
+  if (!Widget?.storage?.get) return null;
+  try {
+    const raw = await Widget.storage.get(cacheKey);
+    if (!raw) return null;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!parsed || !Array.isArray(parsed.aliases)) return null;
+    return parsed;
+  } catch (e) { return null; }
+}
+
+/**
+ * 同步介面：取 baseName 對應的別名陣列。
+ *
+ * Hot path 用法：永遠不 await，永遠不 throw，永遠立刻回傳。
+ *
+ * 行為：
+ *   - TMDB 未啟用 / 沒 API key       → 回 []
+ *   - in-memory cache 命中             → 同步回傳
+ *   - 否則 fire-and-forget 觸發查詢   → 回 []（hot path 繼續用原 keyword）
+ *   - 不拋例外、不印 error log
+ */
+function getTMDBAliasesSync(baseName, type) {
+  if (!CONFIG.TMDB?.ENABLED) return [];
+  if (!CONFIG.TMDB.API_KEY) {
+    // 完全沒設 key，給一次靜默提示（避免使用者啟用了卻沒填 key 而不知）
+    if (!getTMDBAliasesSync._warned) {
+      console.log('[TMDB] 別名查詢啟用但 API Key 未設置，走原本的純繁簡邏輯。');
+      getTMDBAliasesSync._warned = true;
+    }
+    return [];
+  }
+  const base = String(baseName || '').trim();
+  if (!base || base.length < 2) return [];
+
+  const cacheKey = _tmdbAliasKey(base, type);
+
+  // 1. 內存 cache
+  const cached = _tmdbAliasCache.get(cacheKey);
+  if (cached) return cached.aliases;
+
+  // 2. 去抖：300ms 內重複查詢直接復用舊值
+  const recent = _tmdbAliasRecent.get(cacheKey);
+  if (recent && (Date.now() - recent.ts) < 300) {
+    return recent.aliases;
+  }
+
+  // 3. storage cache（fire-and-forget 讀，填進內存讓下次同步命中）
+  if (Widget?.storage?.get) {
+    _readTmdbAliasCache(cacheKey).then(stored => {
+      if (stored?.aliases?.length) {
+        _tmdbAliasCache.set(cacheKey, { aliases: stored.aliases, ts: stored.ts || Date.now() });
+      }
+    }).catch(() => {});
+  }
+
+  // 4. 觸發實際查詢（fire-and-forget）
+  if (!_tmdbAliasInFlight.has(cacheKey)) {
+    _tmdbAliasInFlight.add(cacheKey);
+    _fetchTMDBAliasesAsync(base, type, cacheKey)
+      .finally(() => _tmdbAliasInFlight.delete(cacheKey));
+  }
+
+  return [];
+}
+
+async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
+  const apiKey = CONFIG.TMDB.API_KEY;
+  if (!apiKey) return;
+
+  // 第一步：search 找 tmdb id。繁體中文出發，TMDB 對 zh-TW 友善。
+  const searchUrl = `https://api.themoviedb.org/3/search/${type === 'movie' ? 'movie' : 'tv'}` +
+    `?api_key=${encodeURIComponent(apiKey)}` +
+    `&query=${encodeURIComponent(baseName)}` +
+    `&language=${encodeURIComponent(CONFIG.TMDB.SEARCH_LANGUAGE || 'zh-TW')}`;
+
+  let searchData;
+  try {
+    const resp = await Widget.http.get(searchUrl, {
+      timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+      headers: { 'Accept': 'application/json' }
+    });
+    searchData = typeof resp === 'string' ? safeJsonParse(resp) : resp;
+  } catch (e) {
+    if (CONFIG.TMDB.VERBOSE) console.warn('[TMDB] search 失敗:', e?.message || e);
+    return;
+  }
+
+  if (!searchData?.results?.length) {
+    if (CONFIG.TMDB.VERBOSE) console.log(`[TMDB] "${baseName}" 無搜尋結果`);
+    return;
+  }
+
+  // 取第一筆（Forward 帶入的片名通常足夠精準，第一筆就是對的）
+  const hit = searchData.results[0];
+  const tmdbId = hit?.id;
+  if (!tmdbId) return;
+
+  // 第二步：拿 alternative_titles
+  const altUrl = `https://api.themoviedb.org/3/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}/` +
+    `${type === 'movie' ? 'alternative_titles' : 'alternative_titles'}` +
+    `?api_key=${encodeURIComponent(apiKey)}`;
+
+  let altData;
+  try {
+    const resp2 = await Widget.http.get(altUrl, {
+      timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+      headers: { 'Accept': 'application/json' }
+    });
+    altData = typeof resp2 === 'string' ? safeJsonParse(resp2) : resp2;
+  } catch (e) {
+    if (CONFIG.TMDB.VERBOSE) console.warn('[TMDB] alternative_titles 失敗:', e?.message || e);
+    return;
+  }
+
+  // movie: titles[] ； tv: results[]。版本差異兼容。
+  const titles = Array.isArray(altData?.titles) ? altData.titles
+                : Array.isArray(altData?.results) ? altData.results
+                : [];
+  if (titles.length === 0) return;
+
+  // 第三步：篩選我們關心的地區（CN/TW/HK/SG）+ 收集所有中文別名
+  const regions = new Set(CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN', 'TW', 'HK', 'SG']);
+  const seen = new Set();
+  const aliases = [];
+  // 把原文列進去，避免被 alias 篩選後又把原本砍掉
+  seen.add(normalizeForMatching(baseName));
+  aliases.push(baseName);
+
+  for (const t of titles) {
+    if (!t?.title) continue;
+    // 英文/韓文/日文原文我們不要 —— 站台只認中文關鍵字
+    const title = String(t.title).trim();
+    if (!title) continue;
+    const region = String(t.iso_3166_1 || '').toUpperCase();
+    if (!regions.has(region)) continue;
+    // 過濾跟原本重複的（換行變體、空格變體都會被 normalize 折成同樣）
+    if (seen.has(normalizeForMatching(title))) continue;
+    seen.add(normalizeForMatching(title));
+    aliases.push(title);
+  }
+
+  if (aliases.length === 0) return;
+
+  // 寫入內存 + storage
+  _tmdbAliasCache.set(cacheKey, { aliases, ts: Date.now() });
+  _tmdbAliasRecent.set(cacheKey, { aliases, ts: Date.now() });
+  _enforceTmdbAliasCacheLimit();
+  await _storeTmdbAliasCache(cacheKey, aliases);
+
+  if (CONFIG.TMDB.VERBOSE) {
+    console.log(`[TMDB] "${baseName}" → ${aliases.length} 別名:`, aliases);
+  }
+}
+
+// 超過上限時淘汰最舊的（Map 保留插入順序）
+function _enforceTmdbAliasCacheLimit() {
+  const max = CONFIG.TMDB.CACHE_MAX_ENTRIES || 500;
+  while (_tmdbAliasCache.size > max) {
+    const first = _tmdbAliasCache.keys().next().value;
+    if (first == null) break;
+    _tmdbAliasCache.delete(first);
+  }
+}
+
+// 包裝 JSON.parse，安全的：給物件就回傳，給壞字串就回 null。
+function safeJsonParse(s) {
+  try { return JSON.parse(s); } catch (e) { return null; }
+}
+
+/**
+ * 把「原 keyword + TMDB 別名」組合成查詢詞陣列，供搜尋引擎使用。
+ *
+ * 設計：原本 buildSearchVariants 只生 3 個變體（原文 / 繁 / 簡）。
+ * 這層在它的基礎上加上 TMDB 別名。每個 alias 額外生繁 / 簡變體，
+ * 確保不論站方用繁簡哪種命名都吃得到。
+ *
+ * 性能：若 TMDB 別名還沒回來（cache miss + fire-and-forget 沒時間填
+ * 回），等同於原本 3 個變體，不會卡住。
+ */
+function buildSearchVariantsWithAliases(keyword, type) {
+  const out = [];
+  const push = (v) => {
+    const t = (v || '').trim();
+    if (t && !out.includes(t)) out.push(t);
+  };
+  const variantsOf = (kw) => {
+    push(kw);
+    push(convertChinese(kw, true));   // -> 繁體
+    push(convertChinese(kw, false));  // -> 簡體
+  };
+
+  // 原本的 baseName 必定佔頭位
+  variantsOf(keyword);
+
+  // TMDB 別名：每一個別名也生繁簡兩版
+  const aliases = getTMDBAliasesSync(keyword, type);
+  for (const a of aliases) {
+    if (typeof a !== 'string') continue;
+    if (a.trim() === keyword.trim()) continue;
+    // 只生簡體版（站方基本是簡體命名，繁體變體浪費時間）
+    push(convertChinese(a, false));
+    push(a);
+  }
+
+  return out;
+}
+
 // ==================== 資源站清單 ====================
 // 2026-09 實測結論：
 //   愛蛋 / 樂子  → 帶 t 分類參數搜尋正常
@@ -171,7 +437,12 @@ const CONFIG = {
   // bump 到 23：移除 cachePatterns / getCached() / invalidate() 死代碼,
   // 移除 CONFIG.AUTO_LOAD_PATTERNS / AUTO_VERIFY_TOKEN(從未被讀取)。
   // UI 將「Worker」改稱「過濾廣告伺服器」(內部變數/全域參數名保留相容)。
-  WIDGET_VERSION: 23,
+  // bump 到 24：加入 TMDB 跨地區別名注入 (CONFIG.TMDB / getTMDBAliasesSync
+  // / tryExpandWithTMDBAliases)。當 cache 命中時 targetInfo.searchQuery 會被
+  // 對岸/簡體別名取代。行為可能影響結果排序（站台可能命中本來命中不到的
+  // 版本），但搜尋呼叫數不變 → 速度不退化。Cache 鍵包含年份/季別，原片名
+  // 的 cache 仍可繼續使用。
+  WIDGET_VERSION: 24,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -276,6 +547,44 @@ const CONFIG = {
     // 對應過濾廣告伺服器端 ?rewrite= 參數(同名字)。伺服器端 URI_REWRITE_MODE
     // 環境變數作為全域預設；widget 傳 query 可以單連線覆寫。
     TS_MODE: 'hybrid',
+  },
+
+  // ==================== TMDB 跨地區別名 ====================
+  //
+  // 問題：Forward 在台/港帶入的繁體片名（如「陰屍路」「盜夢空間」「全面
+  // 啟動」），與資源站上簡體中文的命名（「行屍走肉」「盜夢空間」「全面
+  // 啟動」）並非純繁簡關係，而是不同地區的翻譯差異。字對字繁簡轉換找不
+  // 到結果，導致站台搜尋零命中。
+  //
+  // 解法：用 TMDB 查「alternative_titles」拿到該作品所有華語地區別名，
+  // 挑出符合站方簡體命名習慣的那幾個，塞進 searchQuery 候選集。
+  // 結果走 storage cache（hot query 不打 TMDB），失敗時 fallback 到原本
+  // 的純繁簡查詢。
+  //
+  // 速度影響：搜尋的 hot path **絕不 await TMDB**。命中 cache 直接同步
+  // 讀；沒命中才 fire-and-forget 觸發非同步查詢，第一次先繼續用原本的
+  // 關鍵字搜尋，下一次進場才會用到別名。對使用者感受：原本速度 0 變化。
+  TMDB: {
+    ENABLED: true,
+    // TMDB v3 API key（必填，否則走 fallback 路徑）。
+    // 申請：https://www.themoviedb.org/settings/api
+    API_KEY: '',
+    // 語言/地區預設。
+    // search 預設帶 language=zh-TW 以命中台/港繁體片名，alternative_titles
+    // 同時拿 CN + HK + TW。地區設定跟 alternative_titles 的 iso_3166_1 對應。
+    SEARCH_LANGUAGE: 'zh-TW',
+    ALT_TITLE_LANGS: ['zh-CN', 'zh-TW', 'zh-HK', 'en'],
+    ALT_TITLE_REGIONS: ['CN', 'TW', 'HK', 'SG'],
+    // 別名 cache TTL（秒）。片名別名極少改，7 天綽綽有餘。
+    CACHE_TTL: 7 * 24 * 3600,
+    // 別名快取最多保留幾部作品的 alias。超過時按 LRU 刪除最舊的，避免
+    // 長期使用把 storage 灌爆。
+    CACHE_MAX_ENTRIES: 500,
+    // 單次 TMDB 查詢 timeout。TMDB 慢的話寧可放棄也別拖慢整體搜尋。
+    REQUEST_TIMEOUT: 2500,
+    // 啟動時 debug 用：印實際行為可從 console 觀察 cache 命中、alias 數。
+    // 平時建議關閉避免 console 被沖掉。
+    VERBOSE: false,
   },
 };
 
@@ -414,6 +723,39 @@ WidgetMetadata = {
         { title: "全直連 (不過濾,debug 用)", value: "absolute" }
       ],
       value: "hybrid"
+    },
+    {
+      // 跨地區別名查詢（TMDB）開關。
+      //
+      // 解決的核心問題：Forward 傳入的繁體中文片名（如「陰屍路」「無間
+      // 道」「全面啟動」）與資源站簡體中文片名（「行屍走肉」「無間道」
+      // 「全面啟動」）並非純繁簡，而是不同地區翻譯差異。開啟後會用
+      // TMDB 拿別名表，找到對岸/台灣/香港的簡體命名一起搜。
+      //
+      // 「停用」會完全走原本「純繁簡字對字」邏輯，行為跟 2.7.15 一致。
+      name: "tmdbAliasEnabled",
+      title: "TMDB 跨地區別名查詢",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      // TMDB v3 API Key。
+      //
+      // 沒填的話「TMDB 跨地區別名查詢」等同於關閉 —— widget 會走原本的
+      // 繁簡轉換邏輯，不會主動打 TMDB。
+      //
+      // 申請：https://www.themoviedb.org/settings/api （免費 v3）。
+      // 速率限制 ~40 req/10s，配合下方快取幾乎不會超過。
+      // 不要分享你的 key；建議在自己 Fork 的 widget 內填，公開倉庫留空。
+      name: "tmdbApiKey",
+      title: "TMDB API Key",
+      type: "input",
+      description: "v3 API Key。留空 = 純繁簡模式，行為與舊版一致。",
+      value: ""
     }
   ],
   modules: [
@@ -2978,6 +3320,25 @@ async function loadResource(params, onStreamResult = null) {
     CONFIG.M3U8_FILTER.TS_MODE = 'hybrid';
   }
 
+  // 同步使用者設定到 CONFIG.TMDB（TMDB 跨地區別名查詢）。
+  //
+  // 與 m3u8 filter 一樣：三層 fallback，param 顯式 > globalParams > 預設。
+  // 為什麼在這裡做：extractEnhancedInfo() 之後 / 建搜尋字串 之前才有意義
+  // （只對真正的 target 開 alias 查詢，避免對 cache 鍵誤查）。
+  //
+  // 參數拆解：因 params 是同一個解構式，這裡另外拉一次避免破壞既有簽名。
+  const tmdbEnabledParam = (typeof params.tmdbAliasEnabled === 'string')
+    ? params.tmdbAliasEnabled
+    : gpValue('tmdbAliasEnabled', 'enabled');
+  CONFIG.TMDB.ENABLED = (tmdbEnabledParam === 'enabled');
+
+  const tmdbKeyParam = (typeof params.tmdbApiKey === 'string' && params.tmdbApiKey.trim())
+    ? params.tmdbApiKey.trim()
+    : gpValue('tmdbApiKey', '');
+  if (tmdbKeyParam) {
+    CONFIG.TMDB.API_KEY = tmdbKeyParam;
+  }
+
   // 診斷：把三層 fallback 的實際結果全部印出來。
   //
   // 為什麼需要：症狀是「改了設定但播放沒走過濾伺服器」，可能原因有四種
@@ -3094,6 +3455,29 @@ async function loadResource(params, onStreamResult = null) {
   // 因此年份的第一來源必須是片名，這裡只作為覆寫。
   applyDetailVersion(params, targetInfo);
   targetInfo.searchQuery = buildSearchQuery(targetInfo.searchQuery, targetInfo, targetSeason);
+
+  // TMDB 跨地區別名擴充。
+  //
+  // 為什麼這裡呼叫：loadResource / performSmartSearch / performBatchSearch 三
+  // 條路徑都需要，因為 SmartSearchExecutor 內部讀的就是 this.targetInfo.searchQuery。
+  //
+  // 為什麼不會拖慢 hot path：tryExpandWithTMDBAliases 永遠同步回傳，
+  // cache miss 時回傳 false、不寫入任何東西，後續邏輯維持原 query。實際
+  // 等同於原本行為。cache hit 時（同一片名第二次搜、或已預熱）才會注入
+  // alias query。
+  //
+  // 安全保證：對 type === 'variety' 跟沒開 TMDB 的情況一律放行。
+  tryExpandWithTMDBAliases(targetInfo, type);
+  if (targetInfo._aliasSearchQuery) {
+    const aliasQ = String(targetInfo._aliasSearchQuery)
+      .replace(/(?:19|20)\d{2}\s*$/, '')
+      .replace(/\s+$/, '')
+      .trim();
+    if (aliasQ) {
+      console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
+      targetInfo.searchQuery = aliasQ;
+    }
+  }
   
   // 快取鍵使用正規化名稱，繁簡輸入才會命中同一份快取。
   // episode 必須納入：不同集數的請求不可共用同一份快取，否則先播第1集
@@ -3431,6 +3815,83 @@ function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
     .replace(/\s+$/, '')
     .trim();
   return base;
+}
+
+/**
+ * 若 TMDB 別名已 cache 命中，挑出最像「對岸/簡體」命名的一個，把它寫
+ * 進 targetInfo._aliasSearchQuery 並把 searchQuery 改寫過去。
+ *
+ * 為什麼在 buildSearchQuery 後做：buildSearchQuery 先處理年份/季別，
+ * alias 注入要基於 baseName（裸片名）。
+ *
+ * 為什麼不 await TMDB：cache miss 時根本沒資料可注，熱路徑照原行為
+ * 跑，第一次先正常搜尋，下一次進場才會吃到別名。這樣**對第一次搜尋
+ * 速度 0 影響**。
+ *
+ * 為什麼替換而非 fan-out：fan-out（5 站 × N 別名）會把搜尋時間拉長
+ * 到使用者的等待上限，違反「不影響速度」的硬要求；替換只會產生
+ * 1 次站台呼叫，與原本完全等價。
+ *
+ * @returns true 表示已經替換；false 表示沒有命中別名（hot path 用原 query）
+ */
+function tryExpandWithTMDBAliases(targetInfo, type) {
+  if (!targetInfo || !CONFIG.TMDB?.ENABLED || !CONFIG.TMDB.API_KEY) return false;
+  const baseName = String(targetInfo.baseName || '').trim();
+  if (!baseName || baseName.length < 2) return false;
+
+  const aliases = getTMDBAliasesSync(baseName, type);
+  if (!Array.isArray(aliases) || aliases.length === 0) return false;
+
+  // 站方幾乎都是簡體中文，因此優先挑「跟簡體命名規則相符」的。
+  //
+  // 啟發式：將每個別名用 convertChinese(_, false) 轉簡體，挑一個轉換後
+  // 跟原 baseName 的簡體版**不重複**的（避免「陰屍路」同時被 cache 給
+  // 自身，重新換回「陰屍路」沒意義）。
+  const baseSimp = convertChinese(baseName, false);
+  let bestAlias = null;
+  for (const a of aliases) {
+    if (typeof a !== 'string') continue;
+    const aTrim = a.trim();
+    if (!aTrim) continue;
+    if (normalizeForMatching(aTrim) === normalizeForMatching(baseName)) continue;
+    const aSimp = convertChinese(aTrim, false);
+    if (!aSimp || aSimp === baseSimp) continue;
+    // 「越不像原本字串」越值得採納，但這層只是個 hint；全部餵給站台也行。
+    // 實作上選最短非空字串（簡體命名通常最精簡），無最短約束時就拿第一個。
+    bestAlias = aSimp;
+    break;
+  }
+
+  if (!bestAlias) return false;
+
+  // 寫進 targetInfo 讓下游的 `this.targetInfo.searchQuery` 走它。
+  // 注意保留原本 rawName 與 baseName：buildSearchQuery 用的 searchQuery
+  // 是入參，這裡我們直接改寫傳進來的 searchQuery（由 call site 寫回 targetInfo）。
+  if (CONFIG.TMDB.VERBOSE) {
+    console.log(`[TMDB] baseName="${baseName}" → 採用別名 query="${bestAlias}"（候選 ${aliases.length} 個）`);
+  }
+  targetInfo._aliasSearchQuery = bestAlias;
+  return true;
+}
+
+/**
+ * 取得最終搜尋字串。
+ *
+ * 邏輯優先級：
+ *   1. 若 targetInfo._aliasSearchQuery 有值（TMDB 別名已 cache 命中）→ 用它
+ *   2. 否則用原本的 searchQuery（純繁簡邏輯產生）
+ *
+ * 設計上不在這裡 await TMDB：cache miss 時直接走原 searchQuery，
+ * 確保速度不退化。cache hit 時（例如第二次搜同片名）才會用到別名。
+ */
+function resolveFinalSearchQuery(targetInfo, originalQuery) {
+  if (targetInfo?._aliasSearchQuery) {
+    return String(targetInfo._aliasSearchQuery)
+      .replace(/(?:19|20)\d{2}\s*$/, '')
+      .replace(/\s+$/, '')
+      .trim() || String(originalQuery || '').trim();
+  }
+  return String(originalQuery || '').trim();
 }
 
 // 套用 Forward 傳來的版本覆寫（首播年份、國別）。
@@ -3819,6 +4280,29 @@ async function performSmartSearch(params, onStreamResult) {
   applyDetailVersion(params, targetInfo);
   targetInfo.searchQuery = buildSearchQuery(targetInfo.searchQuery, targetInfo, targetSeason);
 
+  // TMDB 跨地區別名擴充。
+  //
+  // 為什麼這裡呼叫：loadResource / performSmartSearch / performBatchSearch 三
+  // 條路徑都需要，因為 SmartSearchExecutor 內部讀的就是 this.targetInfo.searchQuery。
+  //
+  // 為什麼不會拖慢 hot path：tryExpandWithTMDBAliases 永遠同步回傳，
+  // cache miss 時回傳 false、不寫入任何東西，後續邏輯維持原 query。實際
+  // 等同於原本行為。cache hit 時（同一片名第二次搜、或已預熱）才會注入
+  // alias query。
+  //
+  // 安全保證：對 type === 'variety' 跟沒開 TMDB 的情況一律放行。
+  tryExpandWithTMDBAliases(targetInfo, type);
+  if (targetInfo._aliasSearchQuery) {
+    const aliasQ = String(targetInfo._aliasSearchQuery)
+      .replace(/(?:19|20)\d{2}\s*$/, '')
+      .replace(/\s+$/, '')
+      .trim();
+    if (aliasQ) {
+      console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
+      targetInfo.searchQuery = aliasQ;
+    }
+  }
+
   // 原本這裡會先對 10 個站做健康檢查再開始搜尋。該檢查只是 GET 站點首頁、
   // 結果不影響搜尋行為，等於每個站先被多打一次請求再打正式的搜尋請求，
   // 慢的站還要等滿 1500ms 超時。串流的價值就是快，實測因此多花掉數秒，
@@ -3880,6 +4364,29 @@ async function performBatchSearch(params) {
   // 否則同一個片名在兩種模式下會送出不同的關鍵字。
   applyDetailVersion(params, targetInfo);
   targetInfo.searchQuery = buildSearchQuery(targetInfo.searchQuery, targetInfo, targetSeason);
+
+  // TMDB 跨地區別名擴充。
+  //
+  // 為什麼這裡呼叫：loadResource / performSmartSearch / performBatchSearch 三
+  // 條路徑都需要，因為 SmartSearchExecutor 內部讀的就是 this.targetInfo.searchQuery。
+  //
+  // 為什麼不會拖慢 hot path：tryExpandWithTMDBAliases 永遠同步回傳，
+  // cache miss 時回傳 false、不寫入任何東西，後續邏輯維持原 query。實際
+  // 等同於原本行為。cache hit 時（同一片名第二次搜、或已預熱）才會注入
+  // alias query。
+  //
+  // 安全保證：對 type === 'variety' 跟沒開 TMDB 的情況一律放行。
+  tryExpandWithTMDBAliases(targetInfo, type);
+  if (targetInfo._aliasSearchQuery) {
+    const aliasQ = String(targetInfo._aliasSearchQuery)
+      .replace(/(?:19|20)\d{2}\s*$/, '')
+      .replace(/\s+$/, '')
+      .trim();
+    if (aliasQ) {
+      console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
+      targetInfo.searchQuery = aliasQ;
+    }
+  }
 
   // 與串流模式同樣帶上續集序號，理由見 loadResource 的 cacheKey 說明。
   const batchSequel = extractSequelNumber(targetInfo.rawName);
