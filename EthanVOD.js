@@ -405,12 +405,8 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   if (!tmdbId) return;
   console.log(`[TMDB-diag] hit: "${hit.name || hit.title || hit.original_name}" id=${tmdbId}, name=${hit.name}, original_name=${hit.original_name}`);
 
-  // 從第一筆 search hit 內已拿到的欄位抽別名（不需要打第二次 alt_titles）。
-  // TMDB search 回傳的每個 hit 都有: name, original_name (TV)；title, original_title (movie)。
-  // 對中文劇，這些欄位本身就是不同語系的譯名。alt_titles 端點是「歷史所有
-  // 翻譯清單」，但對首播/常用別名用不到 — 90% 的 case search hit 內已含
-  // 我們要的繁中、英文、原文。砍掉第二次 request → 從 2 個 → 1 個，
-  // 搜尋延遲從 ~700ms → ~350ms。
+  // 收集別名（用 Set 去重）。先放第一筆 hit 內已拿到的欄位，
+  // 再合併 alt_titles 第二次 request 拿到的多地區別名。
   const seen = new Set();
   const aliases = [];
   const pushAlias = (s) => {
@@ -427,17 +423,46 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   pushAlias(hit.title);
   pushAlias(hit.original_title);
 
-  // TV 還可能帶 known_for_department 之類的，但常規 TV/movie hit 上面 4 個欄位已足。
+  // 第二步：拿 alternative_titles（多地區別名：CN/HK/TW/SG）
+  // 這是 v2.8.5 加回來的。我之前為了快砍掉，但少了 CN「行尸走肉」會
+  // 導致 VOD 站 0 筆結果。v2.8.4 已修好 race 條件（Promise.race 三方
+  // 都能正常 fire），所以 alt_titles 第二次 request 雖然慢 600ms，
+  // 但 cache 寫入是 fire-and-forget，不影響 batch 結束時間。
+  const altUrl = `https://api.themoviedb.org/3/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}/` +
+    `alternative_titles?api_key=${encodeURIComponent(apiKey)}`;
+
+  try {
+    const t0 = Date.now();
+    const resp2 = await Widget.http.get(altUrl, {
+      timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+      headers: { 'Accept': 'application/json' }
+    });
+    console.log(`[TMDB-diag] alt resp after ${Date.now() - t0}ms: typeof=${typeof resp2}`);
+    const altData = _unwrapHttpResponse(resp2);
+    const titles = Array.isArray(altData?.titles) ? altData.titles
+                  : Array.isArray(altData?.results) ? altData.results
+                  : [];
+    console.log(`[TMDB-diag] alt titles count=${titles.length}`);
+
+    // 第三步：篩選我們關心的地區（CN/TW/HK/SG）
+    const regions = new Set(CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN', 'TW', 'HK', 'SG']);
+    for (const t of titles) {
+      if (!t?.title) continue;
+      const title = String(t.title).trim();
+      if (!title) continue;
+      const region = String(t.iso_3166_1 || '').toUpperCase();
+      if (!regions.has(region)) continue;
+      pushAlias(title);
+    }
+  } catch (e) {
+    console.log(`[TMDB-diag] alt_titles EXCEPTION: ${e?.message || e}`);
+    // 不 return — hit 內欄位已收集，繼續寫 cache
+  }
+
   if (aliases.length === 0) {
     console.log(`[TMDB-diag] hit 內無可用的 name/title 欄位`);
     return;
   }
-
-  // （可選）打第二次 alt_titles 拿更全的清單。但會增加 700ms 延遲且
-  // 對 Forward runtime 不友善（pending request 在 batch 結束時可能
-  // 被 abort，導致 cache 永遠不寫入）。目前選擇：只從 hit 內抽就夠。
-  // 註：fetchTMDBAliasesAsync 的舊版這裡會打 alt_titles 端點；若
-  // 之後要回來可從 git history 取回。
 
   // 寫入內存 + storage
   _tmdbAliasCache.set(cacheKey, { aliases, ts: Date.now() });
@@ -798,7 +823,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.4",
+  version: "2.8.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
