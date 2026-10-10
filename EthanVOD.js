@@ -361,14 +361,19 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     //   (2) string body               → 要 safeJsonParse
     //   (3) Forward 包裝 { data, code, headers } → data 可能是 string 或 object
     // 沒做 unwrap 時 results 會 undefined 然後被當成「無搜尋結果」靜默退出。
+    //
+    // 診斷 log（v25 patch 4，永遠印，不只在 VERBOSE 下）— 確認 Forward
+    // response 真實結構，方便往後 debug。
+    console.log(`[TMDB-diag] search resp: typeof=${typeof resp}, isNull=${resp == null}, keys=${resp && typeof resp === 'object' && !Array.isArray(resp) ? Object.keys(resp).slice(0, 8).join(',') : 'n/a'}, hasData=${resp && 'data' in resp}, hasCode=${resp && 'code' in resp}, codeType=${resp && typeof resp.code}`);
     searchData = _unwrapHttpResponse(resp);
+    console.log(`[TMDB-diag] search unwrapped: type=${typeof searchData}, results.len=${searchData?.results?.length}`);
   } catch (e) {
-    if (CONFIG.TMDB.VERBOSE) console.warn('[TMDB] search 失敗:', e?.message || e);
+    console.log(`[TMDB-diag] search EXCEPTION: ${e?.message || e}`);
     return;
   }
 
   if (!searchData?.results?.length) {
-    if (CONFIG.TMDB.VERBOSE) console.log(`[TMDB] "${baseName}" 無搜尋結果 (searchData type=${typeof searchData}, has results=${!!searchData?.results})`);
+    console.log(`[TMDB-diag] "${baseName}" 無搜尋結果 (searchData type=${typeof searchData}, has results=${!!searchData?.results}, topKeys=${searchData && typeof searchData === 'object' ? Object.keys(searchData).slice(0, 5).join(',') : 'n/a'})`);
     return;
   }
 
@@ -376,6 +381,7 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const hit = searchData.results[0];
   const tmdbId = hit?.id;
   if (!tmdbId) return;
+  console.log(`[TMDB-diag] hit: "${hit.name || hit.title || hit.original_name}" id=${tmdbId}`);
 
   // 第二步：拿 alternative_titles
   const altUrl = `https://api.themoviedb.org/3/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}/` +
@@ -388,9 +394,11 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
       timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
       headers: { 'Accept': 'application/json' }
     });
+    console.log(`[TMDB-diag] alt resp: typeof=${typeof resp2}, keys=${resp2 && typeof resp2 === 'object' && !Array.isArray(resp2) ? Object.keys(resp2).slice(0, 8).join(',') : 'n/a'}`);
     altData = _unwrapHttpResponse(resp2);
+    console.log(`[TMDB-diag] alt unwrapped keys: ${altData ? Object.keys(altData).join(',') : 'null'}, titles.len=${altData?.titles?.length}, results.len=${altData?.results?.length}`);
   } catch (e) {
-    if (CONFIG.TMDB.VERBOSE) console.warn('[TMDB] alternative_titles 失敗:', e?.message || e);
+    console.log(`[TMDB-diag] alt_titles EXCEPTION: ${e?.message || e}`);
     return;
   }
 
@@ -398,7 +406,10 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const titles = Array.isArray(altData?.titles) ? altData.titles
                 : Array.isArray(altData?.results) ? altData.results
                 : [];
-  if (titles.length === 0) return;
+  if (titles.length === 0) {
+    console.log(`[TMDB-diag] alt titles 空陣列`);
+    return;
+  }
 
   // 第三步：篩選我們關心的地區（CN/TW/HK/SG）+ 收集所有中文別名
   const regions = new Set(CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN', 'TW', 'HK', 'SG']);
@@ -421,7 +432,10 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     aliases.push(title);
   }
 
-  if (aliases.length === 0) return;
+  if (aliases.length === 0) {
+    console.log(`[TMDB-diag] 無符合地區的 alias`);
+    return;
+  }
 
   // 寫入內存 + storage
   _tmdbAliasCache.set(cacheKey, { aliases, ts: Date.now() });
@@ -429,9 +443,7 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   _enforceTmdbAliasCacheLimit();
   await _storeTmdbAliasCache(cacheKey, aliases);
 
-  if (CONFIG.TMDB.VERBOSE) {
-    console.log(`[TMDB] "${baseName}" → ${aliases.length} 別名:`, aliases);
-  }
+  console.log(`[TMDB-diag] ✓ "${baseName}" → ${aliases.length} 別名:`, aliases);
 }
 
 /**
