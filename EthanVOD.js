@@ -892,7 +892,7 @@ const RESOURCE_SITES = `
 樂子,https://cj.lziapi.com/api.php/provide/vod
 `;
 
-// 中文數字映射
+// 中文數字映射（單字，保留給舊呼叫端相容；複合數字請用 parseChineseNumeral）
 const CHINESE_NUM_MAP = {
   '一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
   '六': 6, '七': 7, '八': 8, '九': 9, '十': 10
@@ -1120,7 +1120,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.9.4",
+  version: "2.9.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1817,11 +1817,16 @@ function extractEnhancedInfo(seriesName) {
     region = 'jp';
   }
 
-  const chineseMatch = rawName.match(/第([一二三四五六七八九十零\d]+)[季部季]/);
+  const chineseMatch = rawName.match(/第([一二三四五六七八九十零〇两\d]+)[季部季]/);
   if (chineseMatch) {
     const val = chineseMatch[1];
-    seasonNumber = CHINESE_NUM_MAP[val] || parseInt(val) || 1;
-    baseName = rawName.replace(/第[一二三四五六七八九十零\d]+[季部季]/, '');
+    // v2.9.5：用 parseChineseNumeral 處理複合數字（「十一」「二十三」）。
+    // 舊的 CHINESE_NUM_MAP 只有單字表，遇到「十一」得 undefined，
+    // `|| 1` 讓 season 靜默變成 1 → 與目標 season=11 判為 season_conflict
+    // → 全部候選被殺（實測 20 筆 → 0 筆）。
+    const parsed = parseChineseNumeral(val);
+    seasonNumber = Number.isFinite(parsed) ? parsed : (parseInt(val, 10) || 1);
+    baseName = rawName.replace(/第[一二三四五六七八九十零〇两\d]+[季部季]/, '');
   } else {
     const englishMatch = rawName.match(/[Ss]eason\s*(\d+)/i) || rawName.match(/[Ss](\d+)/);
     if (englishMatch) {
@@ -2197,6 +2202,27 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
                (targetIsFinale && targetSequel === null)));
 
     if (coreMatches && (sequelCompatible || (finaleMatches && targetIsFinale === false))) {
+      // v2.9.5：擋掉「衍生作 / 兄弟作」（spin-off）。
+      //
+      // 實測「行尸走肉」（target, S11）比對站方結果時，下列都通過 coreMatches
+      // 而被誤放行：行尸走肉：存活之人、行尸走肉：死亡之城、
+      // 行尸走肉：达里尔·迪克森。這些是 TMDB 上的**不同作品**，
+      // 使用者要看第十一季卻被推到死亡之城，內容完全不符。
+      //
+      // stripSubtitle 只處理「：副標題」形式，碰上「存活之人」這種
+      // 沒有冒號的衍生作就失效，所以額外比對副標題文字本身：
+      // 目標沒有副標題、候選卻有 → 判定為衍生作。
+      const targetSub = String(targetInfo.baseName || '').split(/[：:]/).slice(1).join('').trim();
+      const candidateSub = String(candidateInfo.baseName || '').split(/[：:]/).slice(1).join('').trim();
+      if (!targetSub && candidateSub) {
+        return {
+          match: false, type: 'spin_off', score: 0,
+          similarity: similarity, seasonMatch: false,
+          targetSub: '', candidateSub: candidateSub,
+          confidence: 0
+        };
+      }
+
       return {
         match: true,
         type: 'fallback',
