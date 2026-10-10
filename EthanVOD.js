@@ -272,9 +272,17 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
         )
       ]);
       if (stored?.aliases?.length) {
-        _tmdbAliasCache.set(cacheKey, { aliases: stored.aliases, ts: stored.ts || Date.now() });
-        _tmdbAliasRecent.set(cacheKey, { aliases: stored.aliases, ts: Date.now() });
-        return stored.aliases;
+        // 品質檢查：只有 1 個別名的 storage cache 視為 stale ——
+        // 那是 v2.8.4 之前的版本只拿 hit 內欄位的產物（baseName + original_name），
+        // 沒 CN/HK 多地區別名。對中文劇來說等同無用，繼續走第 4 步 fetch。
+        // （v2.8.5+ 會把 alt_titles 拿進來，正常會有 3~10 個別名）
+        if (stored.aliases.length < 2) {
+          console.log(`[TMDB-diag] storage cache stale (only ${stored.aliases.length} alias): "${stored.aliases.join(', ')}"，重新 fetch`);
+        } else {
+          _tmdbAliasCache.set(cacheKey, { aliases: stored.aliases, ts: stored.ts || Date.now() });
+          _tmdbAliasRecent.set(cacheKey, { aliases: stored.aliases, ts: Date.now() });
+          return stored.aliases;
+        }
       }
     } catch (e) {
       // storage timeout，不影響 — 直接進第 4 步打 TMDB
@@ -690,7 +698,7 @@ const CONFIG = {
   // performSmartSearch、performBatchSearch）的 call site 都用 try/catch
   // 包起來保護，TMD 意外錯誤不影響原本搜尋流程。Hot path 速度：只有在
   // 「這部片第一次被搜時」多等 ≤1.5s，其他情境 0 成本。
-  WIDGET_VERSION: 25,
+  WIDGET_VERSION: 26,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -841,7 +849,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.6",
+  version: "2.8.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4095,13 +4103,23 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   const aliases = await getTMDBAliasesBlocking(baseName, type, 1500);
   if (!Array.isArray(aliases) || aliases.length === 0) return false;
 
-  // 站方幾乎都是簡體中文，因此優先挑「跟簡體命名規則相符」的。
+  // 站方幾乎都是簡體中文，因此優先挑「**含中文字**且跟 baseName 簡體
+  // 版不同」的別名。
   //
-  // 啟發式：將每個別名用 convertChinese(_, false) 轉簡體，挑一個轉換後
-  // 跟原 baseName 的簡體版**不重複**的（避免「陰屍路」同時被 cache 給
-  // 自身，重新換回「陰屍路」沒意義）。
+  // 三條過濾條件（任一 fail 就跳過這個 alias）：
+  //   1. 跟 baseName 原文同名（去重）
+  //   2. 跟 baseName 的簡體版同名（CN 繁體混標時會撞到，視為無新資訊）
+  //   3. **不含任何中文字**（VOD 站中文字典認不出英文片名）
+  //
+  // 第一條成立的別名直接挑走（break）。aliases 陣列內 CN 排第一，
+  // 所以對中文劇幾乎一定挑到「行尸走肉」這類 CN 別名。
+  //
+  // 退路：如果全部 alias 都不含中文（罕見），fallback 拿第一個非空
+  // 非原名的 alias 湊合。
   const baseSimp = convertChinese(baseName, false);
+  const hasChinese = (s) => /[一-鿿]/.test(s);
   let bestAlias = null;
+  let fallbackAlias = null;
   for (const a of aliases) {
     if (typeof a !== 'string') continue;
     const aTrim = a.trim();
@@ -4109,11 +4127,14 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
     if (normalizeForMatching(aTrim) === normalizeForMatching(baseName)) continue;
     const aSimp = convertChinese(aTrim, false);
     if (!aSimp || aSimp === baseSimp) continue;
-    // 「越不像原本字串」越值得採納，但這層只是個 hint；全部餵給站台也行。
-    // 實作上選最短非空字串（簡體命名通常最精簡），無最短約束時就拿第一個。
-    bestAlias = aSimp;
+    // 第一個 fallback 候選（任何非空非原名）
+    if (!fallbackAlias) fallbackAlias = aTrim;
+    // 必須含中文字 — VOD 站用中文字典
+    if (!hasChinese(aTrim)) continue;
+    bestAlias = aTrim;
     break;
   }
+  if (!bestAlias) bestAlias = fallbackAlias;
 
   if (!bestAlias) return false;
 
