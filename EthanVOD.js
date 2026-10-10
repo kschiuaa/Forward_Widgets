@@ -150,8 +150,18 @@ async function _loadTmdbAliasCacheFromStorage() {
 
 async function _storeTmdbAliasCache(cacheKey, aliases) {
   if (!Widget?.storage?.set || !aliases || aliases.length === 0) return;
+  // 5s timeout — storage 卡住不能阻塞 inflightP（會讓 race 6s timeout 觸發）
   try {
-    await Widget.storage.set(cacheKey, JSON.stringify({ aliases, ts: Date.now() }), CONFIG.TMDB.CACHE_TTL);
+    const startTs = Date.now();
+    const writeP = Widget.storage.set(cacheKey, JSON.stringify({ aliases, ts: Date.now() }), CONFIG.TMDB.CACHE_TTL);
+    const timeoutP = new Promise((_, reject) => {
+      const tick = () => {
+        if (Date.now() - startTs >= 5000) return reject(new Error('storage timeout'));
+        Promise.resolve().then(tick);
+      };
+      tick();
+    });
+    await Promise.race([writeP, timeoutP]);
   } catch (e) { /* 寫 storage 失敗不影響功能 */ }
 }
 
@@ -951,7 +961,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.15",
+  version: "2.9.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4222,8 +4232,8 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   // 第一條成立的別名直接挑走（break）。aliases 陣列內 CN 別名排第一。
   const baseSimp = convertChinese(baseName, false);
   const hasChinese = (s) => /[一-鿿]/.test(s);
+  const isSimpChinese = (s) => hasChinese(s) && convertChinese(s, false) === s;
   let bestAlias = null;
-  let fallbackAlias = null;
   for (const a of aliases) {
     if (typeof a !== 'string') continue;
     const aTrim = a.trim();
@@ -4231,17 +4241,15 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
     if (normalizeForMatching(aTrim) === normalizeForMatching(baseName)) continue;
     const aSimp = convertChinese(aTrim, false);
     if (!aSimp || aSimp === baseSimp) continue;
-    // 第一個 fallback 候選（任何非空非原名）
-    if (!fallbackAlias) fallbackAlias = aTrim;
-    // 必須含中文字 — VOD 站用中文字典
-    if (!hasChinese(aTrim)) continue;
+    // 必須是簡體中文（VOD 站字典認得）
+    if (!isSimpChinese(aTrim)) continue;
     bestAlias = aTrim;
     break;
   }
-  if (!bestAlias) bestAlias = fallbackAlias;
-
+  // 退路：所有 alias 都不符合嚴格條件（罕見）→ return false 走原 searchQuery
+  // 不要 fallback 到英文別名，VOD 站用中文字典認不出。
   if (!bestAlias) {
-    console.log(`[TMDB-diag] tryExpand: 無 bestAlias（aliases=${aliases.length} 個，fallbackAlias=${fallbackAlias}），return false`);
+    console.log(`[TMDB-diag] tryExpand: 無 CN 簡體別名（aliases=${aliases.length} 個），return false 走原 query`);
     return false;
   }
 
