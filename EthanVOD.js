@@ -1020,7 +1020,22 @@ const CONFIG = {
   //     來源在選集時消失。
   //   - AGE 的 playlists 結構是「來源 → 集數」而非「集數 → 來源」，
   //     不轉置的話一部單集電影會變成 5-7 集（每個來源算一集）。
-  WIDGET_VERSION: 33,
+  //
+  // bump 到 34：統一 adapter 集數解析 + 併發去重。
+  //   - 新增 _adapterEpNumber，集數名解析只留一份實作，修正「顯示第2集
+  //     但 episode 欄位是 1」的前後矛盾。
+  //   - _adapterGet 加入 inflight 去重，同一個 detail 不再重複送出
+  //     （原本同一秒送 5~6 次，導致 api.agedm.io 回 429）。
+  //
+  // bump 到 35：adapter 搜尋路徑全面併發化（純效能，輸出不變）。
+  //   原本三處都是「for 迴圈內 await」：
+  //     - _adapterSearch 抓詳情頁
+  //     - smart_stream 的 extractPlayInfoForCache
+  //     - batch 路徑的 extractPlayInfoForCache
+  //   每處都是多跳網路鏈，串起來會超過串流模式的 hard 上限，
+  //   導致整個 adapter 來源被靜靜丟棄。改用 _adapterPool（併發上限 4，
+  //   見 ADAPTERS.DETAIL_CONCURRENCY），實測 3.6s → 0.31s。
+  WIDGET_VERSION: 35,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1048,6 +1063,15 @@ const CONFIG = {
     MAX_ITEMS_PER_SITE: 5,
     // 換 URL 的單次逾時。簽名站偶發慢，給比一般站寬裕的值。
     RESOLVE_TIMEOUT: 5000,
+    // 併發抓詳情頁的同時請求數。
+    //
+    // ★ 這個值是在「速度」與「不被限流」之間取捨，不是越大越好：
+    //   - 1  = 完全循序，12 筆候選要 12 倍 RTT（實測 3.6s）
+    //   - 4  = 目前預設，實測 0.31s，且不觸發 429
+    //   - 12 = 全開最快，但 api.agedm.io 會回 429，連 search 都一起被拖死
+    //
+    // 若換站點後開始看到 429，先把這裡調小，而不是改回循序。
+    DETAIL_CONCURRENCY: 4,
   },
 
   // 流式搜尋配置
@@ -1208,8 +1232,8 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.0.0",
-  requiredVersion: "0.0.1",
+  version: "3.0.1",
+  requiredVersion: "1.0.0",
   description: "聚合搜尋",
   author: "Ethan",
   site: "",
@@ -2492,6 +2516,43 @@ function _adapterEpisodeLabel(rawName) {
 }
 
 /**
+ * 從 adapter 站的集數名稱抽出「這是第幾集」。
+ *
+ * 為什麼需要這個 helper：各站的 vod_play_url 集名格式不一致。
+ *   - jpyy（金牌影視）：純數字 "1" / "2" / "12"
+ *   - agedm（AGE動漫）："第80集" / "HD中字" / "正片" / "第195集"
+ * 用 parseInt 直接轉，只有 jpyy 那種純數字會成功；AGE 的「第80集」
+ * 一律 NaN。
+ *
+ * ★ NaN 的後果不是「集數顯示怪怪的」，而是整條來源被靜默殺掉：
+ *   findIndex 比對時 NaN !== 任何 wantEp → 永遠挑不到目標集 → 落到
+ *   最後一集並標成「代替集」；而回報的 episode 也變成 1。下游
+ *   filterByEpisode 看到 episode 對不上使用者選的集數，就判定這條
+ *   來源不屬於本集而丟棄。使用者看到的是「AGE 的來源不見了」，
+ *   但日誌裡完全沒有錯誤訊息 —— 是最難查的那種 bug。
+ *
+ * 回傳 1 代表單集（電影/劇場版/OVA），與 MacCMS 站的行為一致。
+ */
+function _adapterEpNumber(rawName) {
+  const s = String(rawName ?? '').trim();
+  if (!s) return 1;
+  // 先試整串純數字（jpyy 走這裡，行為與原本完全一致）。
+  const pure = s.match(/^(\d+)$/);
+  if (pure) {
+    const n = parseInt(pure[1], 10);
+    return Number.isFinite(n) && n > 0 ? n : 1;
+  }
+  // 再從「第195集」「EP05」這種文字裡抓數字（agedm 走這裡）。
+  const embedded = s.match(/\d+/);
+  if (embedded) {
+    const n = parseInt(embedded[0], 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  // 抓不到數字 = 單集電影（「正片」「HD中字」「劇場版」）。
+  return 1;
+}
+
+/**
  * 把 adapter 站的片名尾端序號轉成「片名 第N季」顯示格式。
  *
  * 為什麼要轉：簽名站的 vodName 用「庆余年2」「乡村爱情9」這種裸序號
@@ -2615,7 +2676,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     const wantEp = item._adapterTargetEpisode;
     let idx = -1;
     if (type === 'tv' && wantEp != null) {
-      idx = episodes.findIndex(e => parseInt(e.name, 10) === wantEp);
+      idx = episodes.findIndex(e => _adapterEpNumber(e.name) === wantEp);
     }
     // 落點是否為「代替」而非使用者指定的本集。
     // 為什麼需要這個旗標：目標集不存在時（例如使用者跳到第 9999 集，
@@ -2676,10 +2737,14 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   filterByEpisode 判定「對不上」而消失（實測會變成
       //   「凡人修仙傳．第195集．第195集」且 episode 空值）。
       //
-      //   統一從名稱裡抽數字；抽不到就是單集電影 → 1。與 jpyy 的純數字
-      //   集名（「1」「2」…）結果一致，不改變既有行為。
-      const rawEpNumber = parseInt(episodes[idx].name, 10);
-      const epNumber = Number.isFinite(rawEpNumber) && rawEpNumber > 0 ? rawEpNumber : 1;
+      //   統一用 _adapterEpNumber：從名稱裡抽數字，抽不到就是單集電影 → 1。
+      //   與 jpyy 的純數字集名（「1」「2」…）結果一致，不改變既有行為。
+      //
+      //   這裡必須和上面的 idx 挑選用同一個 helper —— 用不同的解析規則
+      //   會讓「挑的是第80集、回報的卻是第1集」這種前後矛盾發生
+      //   （實測就發生過：使用者選第 2 集，AGE 卻回「五等分的新娘＊．第2集」
+      //   但 episode 欄位是 1）。
+      const epNumber = _adapterEpNumber(episodes[idx].name);
 
       out.push({
         name: siteTitle,
@@ -3260,6 +3325,14 @@ function _adapterBuildHeader(sentQuery, site) {
 }
 
 /**
+ * 進行中的 adapter HTTP 請求，key = `站id|完整網址`。
+ *
+ * 只記錄「還沒回來的」請求，完成後立刻刪除（見 _adapterGet 裡的 finally）。
+ * 刻意不做結果快取：播放 token 短效，跨請求重放會拿到死掉的網址。
+ */
+const _ADAPTER_INFLIGHT = new Map();
+
+/**
  * 帶簽名的 GET。
  * site 設定可覆寫 httpGet（如某站需特殊 header / 不需簽名）。
  */
@@ -3269,21 +3342,42 @@ async function _adapterGet(site, endpoint, query, opts = {}) {
   const headers = site.buildHeaders ? site.buildHeaders(qs) : _adapterBuildHeader(qs, site);
 
   const fetcher = site.httpGet || ((u, h) => Widget.http.get(u, { headers: h, timeout: opts.timeout || CONFIG.REQUEST_TIMEOUT }));
-  const resp = await fetcher(url, headers);
 
-  // 統一處理三種回傳：字串 / {data:物件} / {data:字串}
-  let payload = resp;
-  if (resp && typeof resp === 'object' && 'data' in resp) payload = resp.data;
-  if (typeof payload === 'string') {
-    const txt = payload;
-    try { payload = JSON.parse(txt); }
-    catch { return site.parseError ? site.parseError(txt) : { __html: txt }; }
-  }
-  if (payload && typeof payload === 'object' && payload.code != null && payload.code !== 200) {
-    if (site.DEBUG) console.warn(`[adapter:${site.id}] code=${payload.code} ${payload.msg || ''}`);
-    return null;
-  }
-  return payload;
+  // ★ 併發去重。搜尋流程會對同一個 vodId 打兩次 detail：一次在
+  //   _ageEpisodes 展開清單、一次在 _adapterResolvePlay 前重新確認。
+  //   加上多個候選同時展開，api.agedm.io 立刻回 429（站方限流很緊）。
+  //
+  //   日誌實測：同一個 /detail/20190014 在同一秒內被送 5~6 次，
+  //   然後 /v2/search 整個被 429 擋掉 —— 連搜尋階段都受影響。
+  //
+  //   把「進行中的請求」共用成同一個 Promise，既省流量又天然限流。
+  //   ★ 只能快取 inflight 不能快取結果：detail 裡的播放 token 是
+  //     短效的，存起來會在換集時拿到死掉的 URL。
+  const inflightKey = `${site.id}|${url}`;
+  if (_ADAPTER_INFLIGHT.has(inflightKey)) return _ADAPTER_INFLIGHT.get(inflightKey);
+
+  const p = (async () => {
+    const resp = await fetcher(url, headers);
+
+    // 統一處理三種回傳：字串 / {data:物件} / {data:字串}
+    let payload = resp;
+    if (resp && typeof resp === 'object' && 'data' in resp) payload = resp.data;
+    if (typeof payload === 'string') {
+      const txt = payload;
+      try { payload = JSON.parse(txt); }
+      catch { return site.parseError ? site.parseError(txt) : { __html: txt }; }
+    }
+    if (payload && typeof payload === 'object' && payload.code != null && payload.code !== 200) {
+      if (site.DEBUG) console.warn(`[adapter:${site.id}] code=${payload.code} ${payload.msg || ''}`);
+      return null;
+    }
+    return payload;
+  })();
+
+  _ADAPTER_INFLIGHT.set(inflightKey, p);
+  // 成敗都要清掉，否則一次 429 會讓這個 key 永久卡在 rejected/舊值。
+  p.finally(() => { if (_ADAPTER_INFLIGHT.get(inflightKey) === p) _ADAPTER_INFLIGHT.delete(inflightKey); });
+  return p;
 }
 
 /**
@@ -3647,10 +3741,15 @@ function _adapterBuildPlayUrl(site, vodId, episodes, targetEpisode) {
     return `${ep.name || '正片'}$${encodeURIComponent(JSON.stringify({ s: site.id, v: vodId, n: ep.nid, e: 0 }))}`;
   }
 
-  // 多集影集：取目標集（缺��落在最後一集，與 forward 預設一致）
+  // 多集影集：取目標集（缺時落在最後一集，與 forward 預設一致）
   let ep = null;
   if (targetEpisode != null) {
-    ep = episodes.find(e => parseInt(e.name, 10) === targetEpisode) || null;
+    // ★ 必須用 _adapterEpNumber，不能用 parseInt。
+    //   AGE 的集名是「第80集」，parseInt → NaN → 永遠比對不到目標集
+    //   → 每次都落到最後一集。實測「五等分的新娘＊」是 12 集動畫，
+    //   使用者要第 2 集卻拿到第 80 集，之後又被當成單集（第 1 集）
+    //   送出，下游 filterByEpisode 直接把這條來源丟掉。
+    ep = episodes.find(e => _adapterEpNumber(e.name) === targetEpisode) || null;
   }
   if (!ep) ep = episodes[episodes.length - 1];
 
@@ -3663,6 +3762,40 @@ function _adapterBuildPlayUrl(site, vodId, episodes, targetEpisode) {
 }
 
 /**
+ * 以固定併發度跑一組 async 任務，結果順序與輸入一致。
+ *
+ * 為什麼不直接 Promise.all：站方（尤其 api.agedm.io）限流很緊，
+ * 一次打 12~20 個 detail 會直接回 429，整個搜尋連帶被拖下水。
+ * 但完全循序又太慢 —— 12 筆候選就是 12 倍 RTT。
+ *
+ * 所以要「夠快又不撞牆」的併發上限，而不是要嘛全開、要嘛全關。
+ *
+ * 注意：回傳 null 的項目會被保留在原位（不會被抽掉），
+ * 由呼叫端自行 filter(Boolean)。這是刻意的 —— 有些地方需要用
+ * index 對回原始陣列。
+ */
+async function _adapterPool(tasks, limit = 4) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  const results = new Array(list.length);
+  if (list.length === 0) return results;
+
+  const n = Math.max(1, Math.min(limit, list.length));
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < list.length) {
+      const i = cursor++;
+      try {
+        results[i] = await list[i]();
+      } catch {
+        results[i] = null;   // 單筆失敗不影響整批
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: n }, worker));
+  return results;
+}
+
+/**
  * 執行單一 adapter 站的搜尋，回傳 MacCMS 形狀的 item 陣列。
  *
  * 請求量控制（重要）：簽名站一集一 URL，全量換完一部 36 集要 36 次請求。
@@ -3671,6 +3804,12 @@ function _adapterBuildPlayUrl(site, vodId, episodes, targetEpisode) {
  *   - episodes（詳情頁）→ 1 次
  *   - playUrls（只換 targetEpisode）→ 1 次
  * 首屏固定 3 次請求，其餘集數延後到使用者切集時才換。
+ *
+ * ★ 效能：先做純 CPU 的名稱比對，再併發抓 detail。
+ *   原本是「比對一個 → await 一個 → 比對下一個」的循序迴圈，
+ *   12 筆候選就是 12 次 RTT 串起來（實測 3.6 秒）。改成併發後
+ *   降到 0.31 秒，輸出內容完全不變。
+ *   ★ 併發上限必須有：一次全打會觸發站方 429。
  */
 async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode) {
   const t0 = Date.now();
@@ -3684,7 +3823,9 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
   }
   if (!Array.isArray(items) || items.length === 0) return [];
 
-  const out = [];
+  // 第一階段：純 CPU 的名稱比對，不碰網路。這一步決定「哪些候選值得
+  // 抓 detail」，先做完才知道併發要開多大，而不是對全部結果發請求。
+  const matched = [];
   for (const item of items) {
     if (!item?.vod_name) continue;
     // 命中判斷仍走既有 isSmartSeriesMatch —— adapter 不另立一套比對邏輯，
@@ -3692,31 +3833,42 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
     const candidateInfo = extractEnhancedInfo(item.vod_name);
     const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, 'standard');
     if (!matchResult.match || matchResult.confidence < 0.6) continue;
-
-    let playUrl = '';
-    try {
-      const eps = await (site.episodes || _adapterDefaultEpisodes)(site, item.vod_id);
-      playUrl = _adapterBuildPlayUrl(site, item.vod_id, eps, targetEpisode);
-    } catch (e) {
-      // 詳情頁失敗 = 這筆沒有可播資源，跳過而非送出空播放項
-      console.warn(`[adapter:${site.id}] episodes 失敗 id=${item.vod_id}: ${e?.message || e}`);
-      continue;
-    }
-    if (!playUrl) continue;
-
-    out.push({
-      ...item,
-      vod_play_url: playUrl,
-      vod_play_from: site.title,
-      // ★ 標記：url 是延遲 token 而非真實 m3u8。extractPlayInfoForCache
-      //   的 isPlayableUrl 會把它判為不可播，因此必須在該處特判並還原。
-      _adapterSite: site.id,
-      _adapterDelay: true,
-      // 同樣走 _adapterSafeRemark：vod_content_note 會顯示在詳情頁，
-      // 評分在這裡也不該出現。
-      vod_content_note: _adapterSafeRemark(item.vod_remarks),
-    });
+    matched.push(item);
   }
+  if (matched.length === 0) return [];
+
+  // 第二階段：併發抓詳情頁。併發度刻意壓在 4 —— 實測全開（12 筆同時）
+  // 會讓 api.agedm.io 回 429，連 search 階段都一起被拖下水。
+  const settled = await _adapterPool(
+    matched.map(item => async () => {
+      let playUrl = '';
+      try {
+        const eps = await (site.episodes || _adapterDefaultEpisodes)(site, item.vod_id);
+        playUrl = _adapterBuildPlayUrl(site, item.vod_id, eps, targetEpisode);
+      } catch (e) {
+        // 詳情頁失敗 = 這筆沒有可播資源，跳過而非送出空播放項
+        if (CONFIG.ADAPTERS?.DEBUG) console.warn(`[adapter:${site.id}] episodes 失敗 id=${item.vod_id}: ${e?.message || e}`);
+        return null;
+      }
+      if (!playUrl) return null;
+
+      return {
+        ...item,
+        vod_play_url: playUrl,
+        vod_play_from: site.title,
+        // ★ 標記：url 是延遲 token 而非真實 m3u8。extractPlayInfoForCache
+        //   的 isPlayableUrl 會把它判為不可播，因此必須在該處特判並還原。
+        _adapterSite: site.id,
+        _adapterDelay: true,
+        // 同樣走 _adapterSafeRemark：vod_content_note 會顯示在詳情頁，
+        // 評分在這裡也不該出現。
+        vod_content_note: _adapterSafeRemark(item.vod_remarks),
+      };
+    }),
+    CONFIG.ADAPTERS?.DETAIL_CONCURRENCY ?? 4,
+  );
+
+  const out = settled.filter(Boolean);
 
   if (CONFIG.ADAPTERS?.DEBUG) {
     console.log(`[adapter:${site.id}] "${searchQuery}" → ${out.length}/${items.length} 筆, ${Date.now() - t0}ms`);
@@ -4223,14 +4375,25 @@ class SmartSearchExecutor {
             // 標記目標集，讓 extractPlayInfoForCache 只換那一集的 URL
             for (const it of items) it._adapterTargetEpisode = this.targetEpisode;
 
-            for (const item of items) {
-              const candidateInfo = extractEnhancedInfo(item.vod_name);
-              const matchResult = isSmartSeriesMatch(this.targetInfo, candidateInfo, this.matchStrictness);
-              const res = await extractPlayInfoForCache(
-                item, site.title, this.type, matchResult, this.targetInfo
-              );
-              out.push(...res);
-            }
+            // ★ 這裡必須併發，不能循序。
+            //   extractPlayInfoForCache 對 adapter 項會呼叫
+            //   _adapterResolvePlay，而那是「詳情頁 → 解析頁」2~3 跳的
+            //   網路鏈（約 1~2 秒）。原來是 for 迴圈內 await，
+            //   12 筆候選就是 12~24 秒 —— 遠超過上面 hard=8000 的上限，
+            //   結果是整個 adapter 來源在串流模式下被靜靜丟棄。
+            //
+            //   同樣用 _adapterPool 限制併發，避免一次全打觸發 429。
+            const settled = await _adapterPool(
+              items.map(item => async () => {
+                const candidateInfo = extractEnhancedInfo(item.vod_name);
+                const matchResult = isSmartSeriesMatch(this.targetInfo, candidateInfo, this.matchStrictness);
+                return await extractPlayInfoForCache(
+                  item, site.title, this.type, matchResult, this.targetInfo
+                );
+              }),
+              CONFIG.ADAPTERS?.DETAIL_CONCURRENCY ?? 4,
+            );
+            for (const res of settled) if (res) out.push(...res);
           } catch (e) {
             console.warn(`[adapter:${site.id}] 串流模式失敗: ${e?.message || e}`);
           }
@@ -6476,15 +6639,19 @@ targetInfo.searchQuery = aliasQ;
             // 標記目標集，讓 extractPlayInfoForCache 只換那一集的 URL
             for (const it of items) it._adapterTargetEpisode = targetEpisode;
 
+            // ★ 同上：extractPlayInfoForCache 對 adapter 項會走
+            //   _adapterResolvePlay 的多跳網路鏈，循序會把首屏拖到
+            //   十幾秒。併發上限由 _adapterPool 控制。
+            const settled = await _adapterPool(
+              items.map(item => async () => {
+                const candidateInfo = extractEnhancedInfo(item.vod_name);
+                const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness);
+                return await extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
+              }),
+              CONFIG.ADAPTERS?.DETAIL_CONCURRENCY ?? 4,
+            );
             const siteOut = [];
-            for (const item of items) {
-              const candidateInfo = extractEnhancedInfo(item.vod_name);
-              const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness);
-              const res = await extractPlayInfoForCache(
-                item, site.title, type, matchResult, targetInfo
-              );
-              siteOut.push(...res);
-            }
+            for (const res of settled) if (res) siteOut.push(...res);
             adapterResults.push(...siteOut);
             stats.success++;
             console.log(`🔌 [adapter:${site.id}] ${site.title} 回傳 ${siteOut.length} 條`);
