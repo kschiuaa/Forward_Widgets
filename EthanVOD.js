@@ -374,18 +374,30 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
     };
     waitDeadline();
   });
-  // cacheWatchP：microtask tick（cache 寫入或 deadline 到期）
+  // cacheWatchP：microtask tick（cache 寫入含 CN 或 deadline 到期）
   //
-  // v2.8.14 簡化：cache 內現在只會有 CN 別名（v2.8.14 移除 HK/TW/SG），
-  // 不需要「有中文」條件了——cache 有別名就 fire。
+  // v2.8.15：早寫入階段 cache 內只有 hit 內欄位（無 CN），cacheWatchP
+  // 看到要**等 CN 別名**（IIFE 覆蓋 cache 後）才 fire。否則 race
+  // 拿到早寫入的 2 個無 CN 別名 → tryExpand 拿空 → 0 筆。
   const cacheWatchP = new Promise((resolve) => {
     const deadline = startTs + maxWaitMs;
     const tick = () => {
       const c = _tmdbAliasCache.get(cacheKey);
       if (c?.aliases && c.aliases.length > 0) {
-        console.log(`[TMDB-diag] cacheWatchP: cache hit after ${Date.now() - startTs}ms (n=${c.aliases.length})`);
-        resolve({ kind: 'cache', aliases: c.aliases });
-        return;
+        // 要求至少 1 個別名含中文字且是簡體（CN 別名）
+        // v2.8.15：簡化條件 — CN 別名本身就是簡體，所以「含中文字 + 簡體化後等於原值」
+        // 表示該別名是簡體中文（CN），可作 bestAlias 候選
+        const hasCnAlias = c.aliases.some(a => {
+          const t = String(a || '').trim();
+          if (!/[一-鿿]/.test(t)) return false;  // 不含中文
+          return convertChinese(t, false) === t;  // 簡體化後 == 原值（已是簡體）
+        });
+        if (hasCnAlias) {
+          console.log(`[TMDB-diag] cacheWatchP: cache hit (含 CN 簡體) after ${Date.now() - startTs}ms (n=${c.aliases.length})`);
+          resolve({ kind: 'cache', aliases: c.aliases });
+          return;
+        }
+        // 沒 CN 簡體 — 早寫入階段還沒覆蓋；繼續等
       }
       if (Date.now() >= deadline) {
         console.log(`[TMDB-diag] cacheWatchP: deadline hit after ${Date.now() - startTs}ms`);
@@ -484,92 +496,109 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   pushAlias(hit.title);
   pushAlias(hit.original_title);
 
-  // v2.8.14 簡化：只取 CN 別名，inline await 整個流程。
+  // v2.8.15 修法：早寫入 + fire-and-forget IIFE + inflightP 等 IIFE 寫完 cache
   //
-  // v2.8.11 早寫入 + IIFE fire-and-forget 設計有 bug：inflightP resolve
-  // 早於 IIFE 完成 → inflightDoneP 看到 cache 還是早寫入的 2 個無 CN 別名
-  // → race 拿空 → tryExpand 0 筆。改成「inline await」後：
-  //   - 不早寫入：search 拿到 hit 不立即寫 cache，等 alt_titles 一起寫
-  //   - inline await：inflightP 真的 resolve 在 cache 完整覆蓋後
-  //   - inflightDoneP 看到完整 CN 別名 → race 命中
-  //   - 性能：caller 用 inflightP 共享，第一個 caller 8s 串行，後續 race 命中
+  // v2.8.14 inline await 整個流程 30s+：search 就要 20s，alt_titles 雖然 2ms
+  // 但 inline await 串行等 20s 後才進 alt_titles → 寫 cache → inflightP
+  // resolve。Caller 30s 拿不到別名。
+  //
+  // v2.8.15 改回 fire-and-forget 但保證 inflightP resolve 在 IIFE 寫完 cache 後：
+  //   1. search 拿到 hit 立即早寫入 cache（hit 內欄位，無 CN）
+  //   2. 啟動 IIFE：拿 alt_titles → 篩 CN → 覆蓋 cache → storage
+  //   3. inflightP = IIFE 的 promise。inflightP resolve 必在 cache 覆蓋後
+  //   4. inflightDoneP 等 inflightP resolve 拿 cache.aliases → 一定有 CN
   //
   // 為什麼只取 CN：VOD 站都是簡體中文，HK/TW/SG 繁體別名站方字典不認。
   // ALT_TITLE_REGIONS 改為 ['CN'] 後，cache 內就只會有 CN 別名，tryExpand
   // 拿第一個非空 CN 別名就對。
+
+  // 早寫入：search 拿到 hit 立即寫入 cache（至少 2 個，baseName
+  // + hit.name + original_name）。這讓 race 2~3s 內 caller 至少能拿到
+  // 早期別名（沒 CN 但有 baseName 繁簡變體），alt_titles background 跑
+  // 完再覆蓋。
+  console.log(`[TMDB-diag] 早寫入 cache，n=${aliases.length}: ${JSON.stringify(aliases)}`);
+  _tmdbAliasCache.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
+  _tmdbAliasRecent.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
+  _enforceTmdbAliasCacheLimit();
+  _storeTmdbAliasCache(cacheKey, [...aliases]).catch(() => {});
+
   const altUrl = `https://api.themoviedb.org/3/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}/` +
     `alternative_titles?api_key=${encodeURIComponent(apiKey)}`;
 
-  let finalAliases;
-  try {
-    const t0 = Date.now();
-    const resp2 = await Widget.http.get(altUrl, {
-      timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
-      headers: { 'Accept': 'application/json' }
-    });
-    console.log(`[TMDB-diag] alt resp after ${Date.now() - t0}ms: typeof=${typeof resp2}`);
-    const altData = _unwrapHttpResponse(resp2);
-    const titles = Array.isArray(altData?.titles) ? altData.titles
-                  : Array.isArray(altData?.results) ? altData.results
-                  : [];
-    console.log(`[TMDB-diag] alt titles count=${titles.length}`);
+  // IIFE：fire-and-forget 拿 alt_titles，覆蓋 cache。inflightP resolve
+  // 必在 cache 覆蓋後，inflightDoneP 拿到的 cache.aliases 一定有 CN。
+  const inflightP = (async () => {
+    try {
+      const t0 = Date.now();
+      const resp2 = await Widget.http.get(altUrl, {
+        timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+        headers: { 'Accept': 'application/json' }
+      });
+      console.log(`[TMDB-diag] alt resp after ${Date.now() - t0}ms: typeof=${typeof resp2}`);
+      const altData = _unwrapHttpResponse(resp2);
+      const titles = Array.isArray(altData?.titles) ? altData.titles
+                    : Array.isArray(altData?.results) ? altData.results
+                    : [];
+      console.log(`[TMDB-diag] alt titles count=${titles.length}`);
 
-    // 篩選 CN 別名（v2.8.14 簡化：只取 CN）。CN 別名本身就是簡體中文，
-    // tryExpand 內的 convertChinese 簡體化判斷會放行，VOD 站字典能認。
-    const regions = CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN'];
-    const regionSet = new Set(regions);
-    const cnTitles = [];
-    for (const t of titles) {
-      if (!t?.title) continue;
-      const title = String(t.title).trim();
-      if (!title) continue;
-      const region = String(t.iso_3166_1 || '').toUpperCase();
-      if (!regionSet.has(region)) continue;
-      cnTitles.push(title);
+      // 篩選 CN 別名（v2.8.14 簡化：只取 CN）。CN 別名本身就是簡體中文，
+      // tryExpand 內的 convertChinese 簡體化判斷會放行，VOD 站字典能認。
+      const regions = CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN'];
+      const regionSet = new Set(regions);
+      const cnTitles = [];
+      for (const t of titles) {
+        if (!t?.title) continue;
+        const title = String(t.title).trim();
+        if (!title) continue;
+        const region = String(t.iso_3166_1 || '').toUpperCase();
+        if (!regionSet.has(region)) continue;
+        cnTitles.push(title);
+      }
+      console.log(`[TMDB-diag] CN titles count=${cnTitles.length}: ${JSON.stringify(cnTitles)}`);
+
+      // 合併：CN 別名放最前面，hit 內欄位放後面
+      const finalAliases = [];
+      const seenLocal = new Set();
+      for (const title of cnTitles) {
+        const tn = normalizeForMatching(title);
+        if (seenLocal.has(tn)) continue;
+        seenLocal.add(tn);
+        finalAliases.push(title);
+      }
+      for (const a of aliases) {
+        const tn = normalizeForMatching(a);
+        if (seenLocal.has(tn)) continue;
+        seenLocal.add(tn);
+        finalAliases.push(a);
+      }
+
+      if (finalAliases.length === 0) {
+        console.log(`[TMDB-diag] alt_titles 回但無 CN 別名（已早寫入 ${aliases.length} 個）`);
+        return;
+      }
+
+      // 覆蓋內存 + storage
+      console.log(`[TMDB-diag] IIFE 覆蓋 cache，finalAliases=${JSON.stringify(finalAliases)}`);
+      try {
+        _tmdbAliasCache.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
+        _tmdbAliasRecent.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
+      } catch (e) {
+        console.log(`[TMDB-diag] 寫 cache 失敗: ${e?.message || e}`);
+      }
+      const cachedAfterSet = _tmdbAliasCache.get(cacheKey);
+      console.log(`[TMDB-diag] IIFE 寫入後 cache 確認：${JSON.stringify(cachedAfterSet?.aliases || [])} (n=${cachedAfterSet?.aliases?.length})`);
+      _enforceTmdbAliasCacheLimit();
+      try {
+        await _storeTmdbAliasCache(cacheKey, finalAliases);
+      } catch (_) {}
+
+      console.log(`[TMDB-diag] ✓ "${baseName}" → ${finalAliases.length} 別名:`, finalAliases);
+    } catch (e) {
+      console.log(`[TMDB-diag] IIFE EXCEPTION: ${e?.message || e}`);
     }
-    console.log(`[TMDB-diag] CN titles count=${cnTitles.length}: ${JSON.stringify(cnTitles)}`);
+  })();
 
-    // 合併：CN 別名放最前面，hit 內欄位放後面
-    finalAliases = [];
-    const seenLocal = new Set();
-    for (const title of cnTitles) {
-      const tn = normalizeForMatching(title);
-      if (seenLocal.has(tn)) continue;
-      seenLocal.add(tn);
-      finalAliases.push(title);
-    }
-    for (const a of aliases) {
-      const tn = normalizeForMatching(a);
-      if (seenLocal.has(tn)) continue;
-      seenLocal.add(tn);
-      finalAliases.push(a);
-    }
-  } catch (e) {
-    console.log(`[TMDB-diag] alt_titles EXCEPTION: ${e?.message || e}`);
-    finalAliases = aliases;  // 退路：保留 hit 內欄位
-  }
-
-  if (!finalAliases || finalAliases.length === 0) {
-    console.log(`[TMDB-diag] hit 內無可用的 name/title 欄位`);
-    return;
-  }
-
-  // 寫入內存 + storage
-  console.log(`[TMDB-diag] 寫入 cache，finalAliases=${JSON.stringify(finalAliases)}`);
-  try {
-    _tmdbAliasCache.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
-    _tmdbAliasRecent.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
-  } catch (e) {
-    console.log(`[TMDB-diag] 寫 cache 失敗: ${e?.message || e}`);
-  }
-  const cachedAfterSet = _tmdbAliasCache.get(cacheKey);
-  console.log(`[TMDB-diag] cache 確認：${JSON.stringify(cachedAfterSet?.aliases || [])} (n=${cachedAfterSet?.aliases?.length})`);
-  _enforceTmdbAliasCacheLimit();
-  try {
-    await _storeTmdbAliasCache(cacheKey, finalAliases);
-  } catch (_) {}
-
-  console.log(`[TMDB-diag] ✓ "${baseName}" → ${finalAliases.length} 別名:`, finalAliases);
+  return inflightP;
 }
 
 /**
@@ -922,7 +951,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.14",
+  version: "2.8.15",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4174,11 +4203,12 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   const baseName = String(targetInfo.baseName || '').trim();
   if (!baseName || baseName.length < 2) return false;
 
-  // 同步等 TMDB 別名（最多 10s）。失敗 / timeout → 回 []（走 fallback）。
+  // 同步等 TMDB 別名（最多 6s）。失敗 / timeout → 回 []（走 fallback）。
   //
-  // v2.8.14 簡化：inline await 後 inflightP resolve 在 cache 覆蓋後，
-  // 但 search + alt_titles 串行可達 8s，race 10s 確保能拿到。
-  const aliases = await getTMDBAliasesBlocking(baseName, type, 10000);
+  // v2.8.15：早寫入 + IIFE fire-and-forget 模式。cacheWatchP 條件放寬為
+  // 「cache 內有 CN 簡體別名」才 fire，所以 race 6s 內 caller 拿到
+  // 早寫入或 IIFE 覆蓋後的別名（含 CN）。
+  const aliases = await getTMDBAliasesBlocking(baseName, type, 6000);
   if (!Array.isArray(aliases) || aliases.length === 0) return false;
 
   // v2.8.14 簡化：aliases 內現在只有 CN 簡體別名 + hit 內原名。
