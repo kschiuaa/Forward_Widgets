@@ -359,14 +359,23 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     // v25 patch 3：Forward 的 Widget.http.get 回傳值有三種可能：
     //   (1) 已自動 parse 的 object    → { results: [...] }
     //   (2) string body               → 要 safeJsonParse
-    //   (3) Forward 包裝 { data, code, headers } → data 可能是 string 或 object
+    //   (3) Forward 包裝 { headers, statusCode, data } → data 是 payload (string 或 object)
     // 沒做 unwrap 時 results 會 undefined 然後被當成「無搜尋結果」靜默退出。
     //
     // 診斷 log（v25 patch 4，永遠印，不只在 VERBOSE 下）— 確認 Forward
     // response 真實結構，方便往後 debug。
-    console.log(`[TMDB-diag] search resp: typeof=${typeof resp}, isNull=${resp == null}, keys=${resp && typeof resp === 'object' && !Array.isArray(resp) ? Object.keys(resp).slice(0, 8).join(',') : 'n/a'}, hasData=${resp && 'data' in resp}, hasCode=${resp && 'code' in resp}, codeType=${resp && typeof resp.code}`);
+    if (resp && typeof resp === 'object' && !Array.isArray(resp) && 'data' in resp) {
+      const d = resp.data;
+      const dType = typeof d;
+      const dIsString = dType === 'string';
+      const dKeys = (d && typeof d === 'object' && !Array.isArray(d)) ? Object.keys(d).slice(0, 8).join(',') : 'n/a';
+      const dPreview = dIsString ? d.slice(0, 80) : (d ? JSON.stringify(d).slice(0, 80) : 'null');
+      console.log(`[TMDB-diag] wrap: statusCode=${resp.statusCode}, dType=${dType}, dIsString=${dIsString}, dKeys=${dKeys}, dPreview=${dPreview}`);
+    } else {
+      console.log(`[TMDB-diag] no wrap: typeof=${typeof resp}, keys=${resp && typeof resp === 'object' ? Object.keys(resp).slice(0, 5).join(',') : 'n/a'}`);
+    }
     searchData = _unwrapHttpResponse(resp);
-    console.log(`[TMDB-diag] search unwrapped: type=${typeof searchData}, results.len=${searchData?.results?.length}`);
+    console.log(`[TMDB-diag] search unwrapped: type=${typeof searchData}, results.len=${searchData?.results?.length}, topKeys=${searchData && typeof searchData === 'object' ? Object.keys(searchData).slice(0, 5).join(',') : 'n/a'}`);
   } catch (e) {
     console.log(`[TMDB-diag] search EXCEPTION: ${e?.message || e}`);
     return;
@@ -463,21 +472,40 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
  */
 function _unwrapHttpResponse(resp) {
   if (!resp) return null;
-  // 情況 3: Forward wrap { data, code, headers, ... }
-  // 判斷依據: data 是欄位 + code 是數字(200)。
-  // raw TMDB response 沒有 .code 欄位。
+  // Forward 真實 wrap (從 user log 抓出): { headers, statusCode, data }
+  // 注意：是 statusCode 不是 code!
+  // 判斷是否為 wrap:「data 欄位 + statusCode 數字」(或兼容舊版的 code)。
   if (typeof resp === 'object' && !Array.isArray(resp)
-      && 'data' in resp && typeof resp.code === 'number') {
-    const d = resp.data;
-    if (typeof d === 'string') return safeJsonParse(d);
-    if (typeof d === 'object' && d) return d;
-    return null;
+      && 'data' in resp) {
+    // 兼容 v25 patch 3 的舊 wrap 假設 ({ data, code })
+    // 與實際觀察到的 ({ data, statusCode, headers })
+    const hasWrap = typeof resp.statusCode === 'number'
+                 || typeof resp.code === 'number';
+    if (hasWrap) {
+      const d = resp.data;
+      if (typeof d === 'string') return safeJsonParse(d);
+      if (typeof d === 'object' && d) {
+        // 雙層 wrap 偵測: data 內還是 { headers, statusCode, data } 結構
+        // （理論上不該發生，但保險起見 unwrap 一次）
+        if (d && typeof d === 'object' && !Array.isArray(d)
+            && 'data' in d
+            && (typeof d.statusCode === 'number' || typeof d.code === 'number')) {
+          const d2 = d.data;
+          if (typeof d2 === 'string') return safeJsonParse(d2);
+          if (typeof d2 === 'object' && d2) return d2;
+        }
+        return d;
+      }
+      return null;
+    }
+    // data 欄位存在但沒有 statusCode / code 也不像 wrap → 退回 raw object 嘗試
+    return resp;
   }
-  // 情況 1: 已經是 raw TMDB JSON object
+  // 已經是 raw TMDB JSON object
   if (typeof resp === 'object' && !Array.isArray(resp)) {
     return resp;
   }
-  // 情況 2: string body
+  // string body
   if (typeof resp === 'string') return safeJsonParse(resp);
   return null;
 }
@@ -777,7 +805,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.2",
+  version: "2.8.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
