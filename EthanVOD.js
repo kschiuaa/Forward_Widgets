@@ -969,7 +969,44 @@ const CONFIG = {
   // 邏輯。extractPlayInfoForCache 改為 async（新增 adapter 分支會 await
   // 換 URL），舊 cache 內的結果格式雖仍可讀，但 adapter 的延遲 token
   // 不可跨版本重用，故一併清掉。
-  WIDGET_VERSION: 27,
+  // bump 到 28：修正「切換集數後結果沒變」的三個根因。
+  // (1) performBatchSearch 的 cacheKey 漏了 episode —— 串流模式本來就有
+  //     _e${targetEpisode}，只有 batch 漏了。adapter 的結果是綁定集數的
+  //     （回傳的是「當下那一集」換來的 m3u8），所以 ep=1 的結果被 ep=5
+  //     讀回去，使用者切集後看到第 1 集。MacCMS 站不會中招，因為它們一次
+  //     回傳全部集數的連結。
+  // (2) adapter 只接在 performBatchSearch，串流模式（SmartSearchExecutor）
+  //     完全沒去問它 —— 選「智慧流式」時金牌影視整個不存在。而且即使接上，
+  //     也必須在 search() 尾端 await：MacCMS 站組常常在幾百 ms 內就達到
+  //     SUFFICIENT_SITE_COUNT 而提前返回，那時 adapter 還在飛。
+  // (3) 目標集不存在時（如跳到第 9999 集而站方只有 46 集），fallback 到
+  //     最後一集後照實回報 episode=46，會被後段 filterByEpisode 以
+  //     「46 !== 9999」殺掉整條資源。現在標記 _adapterFallbackEp 並回報
+  //     目標集數，真實集數留在 _epActualEp。
+  // bump 到 29：修正 adapter 站的顯示格式。
+  // (1) 不顯示評分。原來 _adapterDefaultSearch 把豆瓣分塞進 vod_remarks，
+  //     而 vod_remarks 在 MacCMS 慣例裡是「狀態標記」的位置，會直接被
+  //     拼在片名後面 —— 實測輸出「慶餘年1．3．7.9」，7.9 排在集數旁邊
+  //     極像另一個集號。改用站方本來就有的 vodRemarks（"(36全)"），
+  //     並在顯示層加 _adapterSafeRemark 二次過濾。
+  // (2) 集數補「第x集」。簽名站的 episodeList 只給純數字（"3"），
+  //     與 MacCMS 站的「第03集」並排顯示時突兀且難以辨識。
+  // (3) 順手收斂 movie：電影不該顯示「第01集」，也不該帶更新集數。
+  // bump 到 30：季別也補上「第N季」(_adapterSeasonLabel)。
+  // 簽名站的 vodName 用「庆余年2」「乡村爱情9」這種裸序號表示續集，
+  // 跟 MacCMS 站的「人民的名义第二季」並排不統一，且容易被誤讀成片名。
+  // 三道閘門避免誤傷：站方已寫季別字樣就不動；序號交給 extractSequelNumber
+  // 判定（因此「寻秦记2018」的年份、「1917」這種數字片名都不會被當季別）；
+  // 序號為 1 代表原作也不加。只影響 description，比對邏輯仍吃原始 vod_name。
+  // bump 到 31：版本標記「[2019年 - 國語]」改為獨立成行。
+  // 原本接在描述後面同一行（中間一個半形空白），方括號與片名的中點
+  // 混在同一段，掃過一整列時難以一眼分辨哪個是片名、哪個是版本註記。
+  // 順帶修掉兩個相關缺陷：
+  //   - adapter 資源沒帶 _year / _area，導致金牌影視是唯一沒有版本
+  //     標記的來源（同樣搜慶餘年，其他站都帶著）。
+  //   - areaLabel 對未正規化的地區字串直接原樣輸出，簽名站的简体
+  //     「中国大陆」會變成全站唯一的簡體字串；改走 toDisplayText。
+  WIDGET_VERSION: 31,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1143,7 +1180,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.9.7",
+  version: "2.9.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2372,6 +2409,123 @@ function filterByEpisode(results, targetEpisode) {
   });
 }
 
+/**
+ * 把 adapter 站的集數名轉成「第x集」顯示格式。
+ *
+ * 為什麼要轉：簽名站的 episodeList 只給純數字（實測「1」「2」…「36」），
+ * 而 MacCMS 站的 vod_play_url 片段本身就是「第03集」。兩種來源並排在
+ * 詳情頁時，只有一半顯示「第x集」、另一半光禿禿一個數字，非常突兀
+ * （使用者回報的就是「慶餘年1．3」而不是「慶餘年1．第03集」）。
+ *
+ * 規則：
+ *   - 純數字（"3" / "03"）→ 第03集（補零到兩位，與 MacCMS 站一致）
+ *   - 已含「集」「期」→ 原樣（站方已給好格式，例如「正片」「第1話」）
+ *   - 其他文字（"正片"、"預告"）→ 原樣，不硬套「第x集」
+ */
+function _adapterEpisodeLabel(rawName) {
+  const s = String(rawName ?? '').trim();
+  if (!s) return '';
+  // 站方已給好格式，不要二次包裝
+  if (/[集期話]/.test(s)) return toDisplayText(s);
+  const m = s.match(/^(\d+)$/);
+  if (m) {
+    const n = String(parseInt(m[1], 10)).padStart(2, '0');
+    return `第${n}集`;
+  }
+  return toDisplayText(s);
+}
+
+/**
+ * 把 adapter 站的片名尾端序號轉成「片名 第N季」顯示格式。
+ *
+ * 為什麼要轉：簽名站的 vodName 用「庆余年2」「乡村爱情9」這種裸序號
+ * 表示續集，跟 MacCMS 站的「人民的名义第二季」並排時不統一，
+ * 而且單看「庆余年2」很容易被誤讀成片名本身就叫「庆余年2」。
+ *
+ * ★ 三道閘門，缺一道就會出錯（實測掃過 70 筆站方結果）：
+ *
+ *   1. 片名已有季別字樣 → 原樣返回，不動。
+ *      「黑镜 第五季 Black Mirror Season 5」「三孩来了第三季」
+ *      「人民的名义第二季」都走這裡。station 自己已經寫清楚了，
+ *      再加「第5季」會變成「...Season 第5季」。
+ *
+ *   2. 尾端數字必須「站得住」才轉。extractSequelNumber 已經做過
+ *      同一套判斷（排除年份、要求前方是文字），這裡直接沿用它的
+ *      結果，不自己重寫一套數字解析 —— 兩套規則遲早會打架。
+ *      seq 為 null 代表那個數字不是續集序號（例如「寻秦记2018」
+ *      的 2018 是年份、「1917」整個就是片名），一律不轉。
+ *
+ *   3. 續集序號為 1 不轉。站在「庆余年1」代表的就是第一部本身
+ *      （沒有前作），寫成「庆余年 第1季」反而像還有第0季。
+ *      這與 isSmartSeriesMatch 把 sequel 1 視為原作是同一個判斷。
+ *
+ * 回傳的是「顯示用」字串，只影響 description；比對邏輯一律
+ * 繼續吃原始 vod_name，見 extractPlayInfoForCache 的 displayName。
+ */
+function _adapterSeasonLabel(rawName) {
+  const s = String(rawName ?? '').trim();
+  if (!s) return '';
+
+  // 閘門 1：站方已給季別字樣 → 原樣
+  if (/[季部]|[Ss]eason\s*\d|\bS\d\b/.test(s)) return toDisplayText(s);
+
+  // 閘門 2 + 3：沿用 extractSequelNumber 的判斷，不重寫數字規則
+  const seq = extractSequelNumber(s);
+  if (!seq || seq <= 1) return toDisplayText(s);
+
+  // 把「片名 + 序號 + 後綴」拆開，把序號那一段換成「第N季」。
+  //
+  // 關鍵：序號不一定在尾端。「小时代2：青木時代」的 2 在中間，若照著
+  // 「尾端序號」的直覺把 2 當成後綴的一部分切掉，就會變成
+  // 「小时代：青木時代 第2季」—— 片名裡的數字憑空消失（實測確認）。
+  // 這裡改成「非貪婪抓第一段數字 + 保留其餘原文」，只在確認抓到的
+  // 數字就是 extractSequelNumber 判定的序號時才置換，否則整段原樣返回。
+  //
+  // 判定依舊來自 extractSequelNumber：它已經排除了年份（>=100）、
+  // 要求數字前方是文字，所以「寻秦记2018」不會命中這裡。
+  const m = s.match(/^(\D*?)(\d+)(\D*)$/);
+  if (!m) return toDisplayText(s);
+  const [, head, digits, rest] = m;
+  if (parseInt(digits, 10) !== seq) return toDisplayText(s);
+
+  const seasonText = `第${seq}季`;
+  // 後綴存在（「：青木時代」）時季別插在後綴之前，否則讀起來像片名被拆開：
+  //   「小时代：青木時代 第2季」✗  →  「小时代 第2季：青木時代」✓
+  const converted = rest.trim()
+    ? `${head.trim()} ${seasonText}${rest}`
+    : `${head.trim()} ${seasonText}`;
+  return toDisplayText(converted);
+}
+
+/**
+ * adapter 站的狀態標記過濾：拿掉評分，保留真正的狀態文字。
+ *
+ * _adapterDefaultSearch 已把 vod_remarks 換成站方的 vodRemarks（更新集數），
+ * 這裡是第二道防線 —— 萬一站方改版又把分數塞進來，顯示層仍不會漏出。
+ *
+ * 判定順序：
+ *   1. 純數字 / 評分樣式（"7.9"、"8.0分"）→ 評分，丟掉。
+ *   2. 只含集數進度的括號或「更新至N集」→ 丟。因為旁邊已經有
+ *      「第03集」，再補一個「(46全)」是同一件事講兩次，
+ *      反而把片名擠擠的（實測輸出是「慶餘年1．第36集．(46全)」）。
+ *      這裡的進度對「能不能播」沒有任何判斷用途 ——
+ *      那是 _adapterResolvePlay 換 URL 時的事。
+ *   3. 其他（"HD"、"蓝光"、"國語"）→ 照常顯示。
+ */
+function _adapterSafeRemark(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+  // 純數字（含小數）或評分樣式 → 評分，丟
+  if (/^\d+(\.\d+)?$/.test(s)) return '';
+  if (/^\d+(\.\d+)?\s*(分|评分|評分)?$/.test(s)) return '';
+  if (/\d+\.\d+\s*分/.test(s)) return '';
+  // 只由集數／集數進度構成的括號："(36全)"、"（36集）"、"[36]"
+  if (/^[(（\[【]\s*\d+\s*(全|集|期|話)?\s*[)）\]】]$/.test(s)) return '';
+  // 「更新至36集」「更新到36集」—— 已由 epLabel 表達
+  if (/^更新(至|到)\s*\d+\s*[集期話]?$/.test(s)) return '';
+  return toDisplayText(s);
+}
+
 async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
   const { vod_name, vod_play_url, vod_play_from, vod_remarks = '' } = item;
   if (!vod_name || !vod_play_url) return [];
@@ -2395,10 +2549,30 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     });
     if (episodes.length === 0) return [];
 
-    // 使用者要播的那一集（沒指定就取最後一集，與 MacCMS movie 分支一致）
+    // 使用者要播的那一集（挑不到時的落點規則見下）
     const wantEp = item._adapterTargetEpisode;
-    let idx = wantEp != null ? episodes.findIndex(e => parseInt(e.name, 10) === wantEp) : -1;
-    if (idx < 0) idx = episodes.length - 1;
+    let idx = -1;
+    if (type === 'tv' && wantEp != null) {
+      idx = episodes.findIndex(e => parseInt(e.name, 10) === wantEp);
+    }
+    // 落點是否為「代替」而非使用者指定的本集。
+    // 為什麼需要這個旗標：目標集不存在時（例如使用者跳到第 9999 集，
+    // 而站方只有 46 集），我們會 fallback 到最後一集。此時若照實回報
+    // episode=46，performBatchSearch 後段的 filterByEpisode 會因為
+    // 「46 !== 9999」把整條資源殺掉 —— 使用者看到的是「這個來源消失了」，
+    // 而不是「這集不存在，給你看最新一集」。後者才是合理的降級。
+    let isFallbackEp = false;
+    if (idx < 0) {
+      isFallbackEp = (type === 'tv' && wantEp != null);
+      // 落到最後一集的理由：forward 在未指定集數時，UI 預設停在最新一集。
+      // 對多集影集而言這才符合使用者預期（MacCMS movie 分支取第一個 m3u8
+      // 是因為電影只有一集，那個「第一」其實也是「唯一」）。
+      //
+      // 例外：type === 'movie' 且站方拆成多集（實測金牌影視會把正片 +
+      // 花絮併在同一 vodId），此時必須取第一集 —— 電影沒有「最新一集」
+      // 的概念，取最後一集會直接播到花絮。
+      idx = type === 'movie' ? 0 : episodes.length - 1;
+    }
 
     const resolved = await _adapterResolvePlay(episodes[idx].token);
     if (!resolved || resolved.length === 0) return [];
@@ -2419,10 +2593,21 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   猜測 —— 「高清」在不同站可能指 720 也可能指 1080，數字才是權威。
       const resName = r.resolutionName || '';
       const resInfo = extractResolutionInfo(vod_name, `${resName} ${r.resolution || 0}p`);
-      const displayName = toDisplayText(vod_name);
-      const epLabel = toDisplayText(episodes[idx].name);
-      const remark = toDisplayText(vod_remarks);
-      const tail = [epLabel, remark].filter(Boolean).join('．');
+      // displayName 是「顯示用」：片名 + 季別。原始 vod_name 仍用在
+      // extractResolutionInfo / extractSequelNumber 等比對邏輯上，
+      // 只有這裡的 description 與 wrap 的 name 拿轉換後的字串。
+      const displayName = _adapterSeasonLabel(vod_name);
+      const epLabel = _adapterEpisodeLabel(episodes[idx].name);
+      // ★ 評分已在上游 (_adapterDefaultSearch) 排除，這裡只留「非評分」的
+      //   狀態標記。純數字／帶星號的短字串一律視為評分丟掉 ——
+      //   站方哪天改版塞別的數字進 vodRemarks 時，不該讓評分再冒出來。
+      //   語意正確的標記（"更新至36集"、"HD"）則照常顯示。
+      //
+      //   movie 不顯示集數與更新進度：電影沒有「第x集」的概念，
+      //   「慶餘年．第01集」讀起來像漏了什麼（使用者會以為壞掉）。
+      const showEpisode = type !== 'movie';
+      const remark = showEpisode ? _adapterSafeRemark(vod_remarks) : '';
+      const tail = showEpisode ? [epLabel, remark].filter(Boolean).join('．') : '';
       const epNumber = parseInt(episodes[idx].name, 10);
 
       out.push({
@@ -2445,7 +2630,13 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         //   當前集，只給 _ep 的話過濾後會是空陣列（cleanResourceForOutput
         //   會把 _ep 提升為 episode，但那是輸出階段；此處 resources 直接
         //   進 cache/stream，仍需自帶）。理由見 cleanResourceForOutput 註解。
-        episode: Number.isFinite(epNumber) ? epNumber : null,
+        //
+        // ★ fallback 時回報「使用者要求的集數」而非實際取到的那一集：
+        //   這是為了通過後段的 filterByEpisode（label === targetEpisode）。
+        //   真實集數仍保留在 _epActualEp，log 與除錯看得到實際值。
+        episode: isFallbackEp && Number.isFinite(wantEp)
+          ? wantEp
+          : (Number.isFinite(epNumber) ? epNumber : null),
 
         // 保留 adapter 身分，供去重與 log 判斷
         _adapterSite: item._adapterSite,
@@ -2456,7 +2647,20 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         _hasEpInfo: episodes.length > 1,
         _rawName: vod_name,
         _seasonFromItem: extractSequelNumber(vod_name),
+        // ★ 補上年份／地區，否則 cleanResourceForOutput 組不出
+        //   「[2019年 - 中國大陸]」版本標記 —— 金牌影視就會是唯一
+        //   沒有版本資訊的來源（同樣搜慶餘年，其他站都帶著）。
+        //
+        //   來源是 item.vod_year / item.vod_area，即 _adapterDefaultSearch
+        //   從站方 vodPubdate / vodArea 映射過來的欄位（站方有的都有）。
+        //   之前漏了這兩個 key，adapter 的每一筆都拿不到版本標記，
+        //   使用者要自己開詳情頁比對是哪一年的版本。
+        _year: item.vod_year || null,
+        _area: item.vod_area || null,
         _ep: Number.isFinite(epNumber) ? epNumber : null,
+        // 實際取到的集數（fallback 時與 episode 不同），僅供 log／除錯
+        _epActualEp: Number.isFinite(epNumber) ? epNumber : null,
+        _adapterFallbackEp: isFallbackEp,
         _areaMismatch: false,
         _areaMatch: false,
       });
@@ -3023,7 +3227,16 @@ async function _adapterDefaultSearch(site, keyword) {
     vod_pic: it.vodPic,
     vod_year: String(it.vodPubdate || '').slice(0, 4) || '',
     vod_area: it.vodArea || '',
-    vod_remarks: it.vodDoubanScore ? String(it.vodDoubanScore) : (it.vodVersion || ''),
+    // ★ 不把豆瓣分放進 vod_remarks。
+    //
+    //   MacCMS 慣例中 vod_remarks 是「狀態標記」（"HD"、"更新至第12集"），
+    //   顯示時直接接在片名後面當副標。簽名站回傳的是 vodDoubanScore=7.9，
+    //   塞進去會變成「慶餘年1．第03集．7.9」—— 評分被排版成集數的同級，
+    //   使用者得自己猜那是什麼，而 REX 也沒有評分欄位可放。
+    //
+    //   改用站方本來就有的狀態欄位 vodRemarks（實測 "(36全)"、"更新至36集"），
+    //   語意與 MacCMS 一致：顯示的是更新進度，不是分數。
+    vod_remarks: it.vodRemarks || (it.vodVersion || ''),
   }));
 }
 
@@ -3206,7 +3419,9 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
       //   的 isPlayableUrl 會把它判為不可播，因此必須在該處特判並還原。
       _adapterSite: site.id,
       _adapterDelay: true,
-      vod_content_note: item.vod_remarks || '',
+      // 同樣走 _adapterSafeRemark：vod_content_note 會顯示在詳情頁，
+      // 評分在這裡也不該出現。
+      vod_content_note: _adapterSafeRemark(item.vod_remarks),
     });
   }
 
@@ -3432,7 +3647,18 @@ const AREA_LABELS = {
 
 function areaLabel(area) {
   if (!area) return null;
-  return AREA_LABELS[area] || area;
+  const key = String(area).trim();
+  // 正規化過的地區代碼（jp / cn / hk …）才查表
+  if (AREA_LABELS[key]) return AREA_LABELS[key];
+  // 其餘是站方原字串。
+  //
+  // ★ 必須過 toDisplayText：簽名站回傳的 vod_area 是简体
+  //   （實測「中国大陆」），不轉會讓版本標記變成
+  //   「[2019年 - 中国大陆]」—— 全站唯一一個簡體字串混在繁體列表裡。
+  //   MacCMS 站回傳本來就是繁體，toDisplayText 對繁體是恆等轉換，
+  //   不會影響既有輸出。
+  const converted = toDisplayText(key);
+  return converted || key;
 }
 
 function normalizeArea(value) {
@@ -3635,12 +3861,15 @@ class SiteManager {
 
 // ==================== 智能搜索执行模块 ====================
 class SmartSearchExecutor {
-  constructor(siteManager, targetInfo, type, matchStrictness, targetEpisode = null) {
+  constructor(siteManager, targetInfo, type, matchStrictness, targetEpisode = null, adapterSites = []) {
     this.siteManager = siteManager;
     this.targetInfo = targetInfo;
     this.type = type;
     this.matchStrictness = matchStrictness;
     this.targetEpisode = targetEpisode;
+    // 簽名型 adapter 站（金牌影視等）。空陣列 = 本次不跑 adapter。
+    // 由 performSmartSearch 依 _adapterIsEnabled 決定要不要傳進來。
+    this.adapterSites = adapterSites || [];
     
     this.allResults = [];
     this.seenUrls = new Set();
@@ -3670,6 +3899,73 @@ class SmartSearchExecutor {
 
     const siteGroups = this.groupSitesByPriority(sites);
     let allResults = [];
+
+    // ===== 簽名型 adapter 站（串流模式；與 MacCMS 並行）=====
+    //
+    // 為什麼要在這裡也接：performBatchSearch 早就接了 adapter，但串流模式
+    // 是走本執行器。若只在 batch 接，使用者選「串流」時金牌影視會整個不見
+    // —— 這正是「change ep 沒反應」最容易被誤判成「adapter 壞掉」的情況：
+    // 串流模式根本沒去問它。
+    //
+    // 走與 MacCMS 完全相同的下游：item 已被 _adapterSearch 偽裝成
+    // MacCMS 欄位，dedup / 年份季別過濾 / m3u8 wrap 全部共用。
+    //
+    // 刻意不塞進 siteGroups：adapter 一筆結果要 2 次請求（詳情頁 + 換 URL），
+    // 併進站組會佔滿連線拖慢 MacCMS 站。獨立一條 task 自己控制節奏，
+    // 失敗靜默回傳 []。
+    if (this.adapterSites && this.adapterSites.length > 0) {
+      const runAdapters = (async () => {
+        const out = [];
+        for (const site of this.adapterSites) {
+          try {
+            const items = await _adapterSearch(
+              site,
+              this.targetInfo.searchQuery || this.targetInfo.baseName,
+              this.targetInfo,
+              this.type,
+              this.targetEpisode
+            );
+            if (!items || items.length === 0) continue;
+
+            // 標記目標集，讓 extractPlayInfoForCache 只換那一集的 URL
+            for (const it of items) it._adapterTargetEpisode = this.targetEpisode;
+
+            for (const item of items) {
+              const candidateInfo = extractEnhancedInfo(item.vod_name);
+              const matchResult = isSmartSeriesMatch(this.targetInfo, candidateInfo, this.matchStrictness);
+              const res = await extractPlayInfoForCache(
+                item, site.title, this.type, matchResult, this.targetInfo
+              );
+              out.push(...res);
+            }
+          } catch (e) {
+            console.warn(`[adapter:${site.id}] 串流模式失敗: ${e?.message || e}`);
+          }
+        }
+        return out;
+      })();
+
+      // 與 MacCMS 站組併行跑，但不被 deadline 綁架：adapter 的延遲換 URL
+      // 已在 _adapterSearch 內部有硬性上限，錯過整批時限頂多是這條結果
+      // 晚點出現，不該拖住其餘站。
+      runAdapters.then(res => {
+        if (res && res.length > 0) {
+          for (const r of res) this.collected.push(r);
+          this.stats.successfulSites++;
+          if (onResultCallback) {
+            try { onResultCallback(this.smartDeduplicate(this.collected.slice())); } catch {}
+          }
+        }
+      }).catch(() => {});
+
+      // ★ 存成 this._adapterPromise，稍後在 search() 尾端 await。
+      //
+      //   不能用區域變數 fire-and-forget：MacCMS 站組常在幾百 ms 內就
+      //   達到 SUFFICIENT_SITE_COUNT 而提前返回，那時 adapter 還在飛，
+      //   使用者拿到的 allResults 就不含這個來源 —— 串流模式下看起來
+      //   就是「這個站不存在」，而不是「慢了一點」。
+      this._adapterPromise = runAdapters;
+    }
 
     // 整批搜尋的時限。慢站若被無限等待，complete 事件會晚到前端等待上限之後，
     // 使用者只會看到「暫無可用資源」——即使其他站早已回傳結果。
@@ -3741,6 +4037,32 @@ class SmartSearchExecutor {
       }
       allResults.push(...groupResults);
 
+      allResults = this.smartDeduplicate(allResults);
+    }
+
+    // ★ adapter 必須在這裡 await，不能只 fire-and-forget。
+    //
+    //   MacCMS 站組是「夠了就收尾」（enough()），常常只跑了幾百 ms 就
+    //   達到 SUFFICIENT_SITE_COUNT 而提前返回 —— adapter 那條鏈這時還在
+    //   飛（詳情頁 + 換 URL 要 2 次請求）。若不 await，使用者看到的
+    //   `allResults` 根本不含金牌影視，串流模式下這來源就是不存在。
+    //
+    //   而且要在 enough() 判定「之後」才併入：enough() 是看 MacCMS 站
+    //   數，adapter 算進去會讓它提早收尾，反而害 MacCMS 站少查幾個。
+    let adapterResults = [];
+    if (this._adapterPromise) {
+      // 給 adapter 一個硬上限：它內部已有 per-request timeout，但整條鏈
+      // （搜尋 → 詳情頁 → 換 URL）是串行的三跳，超時就整個放棄這輪，
+      // 寧可這輪少一個來源，也不要讓串流模式失去「快」的特性。
+      const hard = 8000;
+      adapterResults = await Promise.race([
+        this._adapterPromise,
+        new Promise(r => setTimeout(() => r([]), hard)),
+      ]).catch(() => []);
+    }
+
+    if (adapterResults.length > 0) {
+      allResults.push(...adapterResults);
       allResults = this.smartDeduplicate(allResults);
     }
 
@@ -4209,6 +4531,13 @@ function cleanResourceForOutput(resource) {
   //   2. extractVersionMarker(_rawName)（從站方檔名裡抓年份）
   //      ——「仁医2012」這類就算 _year 為 null 也能抓到
   //   3. 都拿不到就跳過，描述不被灌水
+  //
+  // ★ 版本標記換行擺放（原本是接在描述後面同一行，中間一個半形空白）。
+  //
+  //   「慶餘年第一季．第03集 [2019年 - 國語]」讀起來像片名的一部分 ——
+  //   方括號與中點混在同一段，掃過一整列時很難一眼分辨哪個是片名、
+  //   哪個是年份地區。加上方括號本來就是「註記」的視覺語意，
+  //   獨立成一行後與第一行的正片資訊分層更清楚。
   const itemYear = resource._year || extractVersionMarker(resource._rawName) || null;
   const itemArea = resource._area || null;
   if (itemYear || itemArea) {
@@ -4217,8 +4546,10 @@ function cleanResourceForOutput(resource) {
     const label = areaLabel(itemArea);
     if (label) parts.push(label);
     const versionTag = `[${parts.join(' - ')}]`;
+    // includes 檢查是為了冪等：同一筆資源可能被 clean 兩次
+    // （cache 命中路徑 + 輸出路徑），重複換行會多出一個空行。
     if (versionTag && !clean.description.includes(versionTag)) {
-      clean.description = `${clean.description} ${versionTag}`;
+      clean.description = `${clean.description}\n${versionTag}`;
     }
   }
 
@@ -5614,7 +5945,12 @@ targetInfo.searchQuery = aliasQ;
   // 結果不影響搜尋行為，等於每個站先被多打一次請求再打正式的搜尋請求，
   // 慢的站還要等滿 1500ms 超時。串流的價值就是快，實測因此多花掉數秒，
   // 這裡直接移除。
-  const executor = new SmartSearchExecutor(siteManager, targetInfo, type, matchStrictness, targetEpisode);
+  // adapter 站在串流模式下也要參與，否則選「串流」時金牌影視整個不見。
+  // 傳空陣列 = 本次不跑（未啟用或沒設定站點）。
+  const smartAdapterSites = _adapterIsEnabled(params)
+    ? _adapterActiveSites(params)
+    : [];
+  const executor = new SmartSearchExecutor(siteManager, targetInfo, type, matchStrictness, targetEpisode, smartAdapterSites);
   
   const allResults = await executor.search(onStreamResult);
   
@@ -5717,7 +6053,17 @@ targetInfo.searchQuery = aliasQ;
   // 與串流模式同樣帶上續集序號，理由見 loadResource 的 cacheKey 說明。
   const batchSequel = extractSequelNumber(targetInfo.rawName);
   const batchVersion = targetInfo.year ?? extractVersionMarker(targetInfo.rawName) ?? 'x';
-  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}`;
+  // ★ 必須帶上 episode，與串流模式（line ~4727 的 _e${targetEpisode}）一致。
+  //
+  //   為什麼：adapter 站（金牌影視等）是「延遲換 URL」—— 回傳的資源帶的是
+  //   呼叫當下 targetEpisode 換來的 m3u8。cache key 若不含 episode，ep=1
+  //   換出的結果會被 ep=5 直接讀回 —— 使用者切集後看到第 1 集的影片。
+  //
+  //   這在 MacCMS 站不會發生（它們一次回傳全部集數的連結，cache 內容與
+  //   episode 無關），但 adapter 的結果綁定了集數，兩者不能共用 key 規則。
+  //   加上 _e 之後，adapter 的快取命中率會下降，但正確性優先 —— 錯一集
+  //   比慢一次嚴重得多。
+  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}_e${targetEpisode || 'all'}`;
   let allResults = [];
 
   try {
