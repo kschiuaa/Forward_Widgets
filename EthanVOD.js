@@ -133,6 +133,9 @@ function _tmdbAliasKey(baseName, type) {
 const _tmdbAliasCache = new Map();
 // 防止同一片名 fire-and-forget 重複觸發 N 次。
 const _tmdbAliasInFlight = new Set();
+// 共享 Promise:多個 caller 等同一片名的 in-flight 結果。
+// 用 Promise 物件而不是 Set,這樣 call site 可以 await 而非 race setTimeout。
+const _tmdbInFlightPromise = new Map();  // key -> Promise<void>
 // 短期內重複查同一片名直接復用結果（即使 cache miss）。
 const _tmdbAliasRecent = new Map();  // key -> { aliases, ts }
 
@@ -279,43 +282,61 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
   }
 
   // 4. 同步等 TMDB，但嚴守 maxWaitMs。TMDB 不準時 → fallback
-  const deadline = Date.now() + Math.max(50, maxWaitMs);
-  if (!_tmdbAliasInFlight.has(cacheKey)) {
-    _tmdbAliasInFlight.add(cacheKey);
-    _fetchTMDBAliasesAsync(base, type, cacheKey)
-      .finally(() => _tmdbAliasInFlight.delete(cacheKey));
+  //
+  // 重要修正 (v25 patch 2)：
+  //   原本用 60ms 輪詢 _tmdbAliasCache 來偵測完成，但若 _fetchTMDBAliasesAsync
+  //   內部 await 失敗/timeout 完全不會寫進 cache，watchP 永遠輪空，最後只
+  //   能等滿 maxWaitMs 才退場 — 這對 call site 仍會等 1.5s，浪費時間且容易
+  //   讓 performBatchSearch 之類的後續路徑拿不到結果。
+  //
+  //   修法：把 in-flight 的 Promise 包進一個「共享變數」，所有 caller 共用同
+  //   一個 await。新的 fetch 由第一個 caller 啟動、Promise 物件存在 _tmdbInFlightPromise
+  //   上；後續 caller 直接 race 這個 Promise，省去重複 fetch 與重複 timeout 計時。
+  let inflightP = _tmdbInFlightPromise.get(cacheKey);
+  if (!inflightP) {
+    inflightP = (async () => {
+      try {
+        await _fetchTMDBAliasesAsync(base, type, cacheKey);
+      } catch (e) {
+        if (CONFIG.TMDB.VERBOSE) console.warn('[TMDB] fetch 失敗:', e?.message || e);
+      }
+    })();
+    _tmdbInFlightPromise.set(cacheKey, inflightP);
+    // 跑完後清掉 map，後續 cold caller 重新啟動（避免持有舊 Promise 浪費記憶）
+    inflightP.finally(() => {
+      if (_tmdbInFlightPromise.get(cacheKey) === inflightP) {
+        _tmdbInFlightPromise.delete(cacheKey);
+      }
+    });
   }
 
-  // 等待 in-flight 完成（已在跑）或資料出現在 cache（單獨 race）。
-  const inFlightHas = _tmdbAliasInFlight.has(cacheKey);
-  let timer;
+  // Race：cache 出現資料 vs in-flight 完成 vs 整體 timeout。
+  // 三者任一先發生就 return。
   const timeoutP = new Promise((resolve) => {
-    timer = setTimeout(() => resolve({ timedOut: true, aliases: [] }), maxWaitMs);
+    setTimeout(() => resolve({ kind: 'timeout', aliases: [] }), maxWaitMs);
   });
-  const watchP = new Promise((resolve) => {
-    const start = Date.now();
+  const cacheWatchP = new Promise((resolve) => {
+    const deadline = Date.now() + maxWaitMs;
     const tick = () => {
       const c = _tmdbAliasCache.get(cacheKey);
       if (c?.aliases) {
-        resolve({ timedOut: false, aliases: c.aliases });
+        resolve({ kind: 'cache', aliases: c.aliases });
         return;
       }
       if (Date.now() >= deadline) {
-        resolve({ timedOut: true, aliases: [] });
+        resolve({ kind: 'timeout', aliases: [] });
         return;
       }
-      setTimeout(tick, 60);
+      setTimeout(tick, 30);
     };
     tick();
   });
+  const inflightDoneP = inflightP.then(() => ({
+    kind: 'inflight',
+    aliases: (_tmdbAliasCache.get(cacheKey)?.aliases) || []
+  })).catch(() => ({ kind: 'inflight', aliases: [] }));
 
-  const result = await Promise.race([watchP, timeoutP]);
-  clearTimeout(timer);
-
-  if (result?.timedOut && CONFIG.TMDB.VERBOSE) {
-    console.log(`[TMDB] "${base}" 在 ${maxWaitMs}ms 內未回覆，fallback 到原 keyword`);
-  }
-
+  const result = await Promise.race([cacheWatchP, inflightDoneP, timeoutP]);
   return (result && result.aliases) || [];
 }
 
@@ -335,14 +356,19 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
       timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
       headers: { 'Accept': 'application/json' }
     });
-    searchData = typeof resp === 'string' ? safeJsonParse(resp) : resp;
+    // v25 patch 3：Forward 的 Widget.http.get 回傳值有三種可能：
+    //   (1) 已自動 parse 的 object    → { results: [...] }
+    //   (2) string body               → 要 safeJsonParse
+    //   (3) Forward 包裝 { data, code, headers } → data 可能是 string 或 object
+    // 沒做 unwrap 時 results 會 undefined 然後被當成「無搜尋結果」靜默退出。
+    searchData = _unwrapHttpResponse(resp);
   } catch (e) {
     if (CONFIG.TMDB.VERBOSE) console.warn('[TMDB] search 失敗:', e?.message || e);
     return;
   }
 
   if (!searchData?.results?.length) {
-    if (CONFIG.TMDB.VERBOSE) console.log(`[TMDB] "${baseName}" 無搜尋結果`);
+    if (CONFIG.TMDB.VERBOSE) console.log(`[TMDB] "${baseName}" 無搜尋結果 (searchData type=${typeof searchData}, has results=${!!searchData?.results})`);
     return;
   }
 
@@ -362,7 +388,7 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
       timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
       headers: { 'Accept': 'application/json' }
     });
-    altData = typeof resp2 === 'string' ? safeJsonParse(resp2) : resp2;
+    altData = _unwrapHttpResponse(resp2);
   } catch (e) {
     if (CONFIG.TMDB.VERBOSE) console.warn('[TMDB] alternative_titles 失敗:', e?.message || e);
     return;
@@ -406,6 +432,42 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   if (CONFIG.TMDB.VERBOSE) {
     console.log(`[TMDB] "${baseName}" → ${aliases.length} 別名:`, aliases);
   }
+}
+
+/**
+ * 統一處理 Widget.http.get 的三種回傳格式。
+ *
+ * Forward 對 http.get 的回傳：
+ *   - Content-Type: application/json → 自動 parse 成 object
+ *   - 其他 → 回 string
+ *   - 包裝 { data, code, headers }   → 要 unwrap
+ *
+ * 不處理時 `searchData.results` 會是 undefined,被當成「無搜尋結果」。
+ * 這是 v25 patch 3 之前 TMDB 完全沒生效的主因。
+ *
+ * 注意：判斷是否為 Forward wrap 的依據是「有 .code 數字 + .data 欄位」，
+ * 不能用 .results / .titles (TMDB alt_titles 端點 for TV 沒有 .titles 欄位，
+ * 只有 .results，用 .results 判斷會誤判 wrap 與 raw 兩種格式)。
+ */
+function _unwrapHttpResponse(resp) {
+  if (!resp) return null;
+  // 情況 3: Forward wrap { data, code, headers, ... }
+  // 判斷依據: data 是欄位 + code 是數字(200)。
+  // raw TMDB response 沒有 .code 欄位。
+  if (typeof resp === 'object' && !Array.isArray(resp)
+      && 'data' in resp && typeof resp.code === 'number') {
+    const d = resp.data;
+    if (typeof d === 'string') return safeJsonParse(d);
+    if (typeof d === 'object' && d) return d;
+    return null;
+  }
+  // 情況 1: 已經是 raw TMDB JSON object
+  if (typeof resp === 'object' && !Array.isArray(resp)) {
+    return resp;
+  }
+  // 情況 2: string body
+  if (typeof resp === 'string') return safeJsonParse(resp);
+  return null;
 }
 
 // 超過上限時淘汰最舊的（Map 保留插入順序）
@@ -703,7 +765,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.0",
+  version: "2.8.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -753,9 +815,9 @@ WidgetMetadata = {
       type: "enumeration",
       enumOptions: [
         { title: "自動", value: "auto" },
-        { title: "4K優先", value: "4k" },
-        { title: "1080P優先", value: "1080p" },
-        { title: "720P優先", value: "720p" }
+        { title: "4K", value: "4k" },
+        { title: "1080p", value: "1080p" },
+        { title: "720p", value: "720p" }
       ],
       value: "auto"
     },
