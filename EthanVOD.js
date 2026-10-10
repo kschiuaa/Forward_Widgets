@@ -165,7 +165,10 @@ const CONFIG = {
   // 整段 try/catch 把 throw 吃掉後靜默 return 裸 CDN，導致 wrap 從未跑。
   // 修法：HAS_URL 偵測 + 字串拼接 fallback。對「已 wrap 的 url」仍走
   // isAlreadyWrapped 冪等檢查；對裸 CDN 字串拼接後就是 Worker URL。
-  WIDGET_VERSION: 19,
+  // bump 到 20：新增 m3u8FilterTsMode UI 開關，給使用者切換 ts 走原站
+  // (hybrid) / 全代理 (proxy) / 全絕對 (absolute)。對應 Worker 端
+  // ?rewrite= query 參數；Worker 行程不用重啟即可切換。
+  WIDGET_VERSION: 21,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -266,6 +269,15 @@ const CONFIG = {
 
     // 啟動時自動驗證 admin token(失敗只在 console 警告,不擋啟動)
     AUTO_VERIFY_TOKEN: true,
+
+    // ts 影片段要由 Worker 代理,還是播放器直連原站 CDN。
+    // 'hybrid' (預設)  → m3u8 playlist 走 Worker(過濾),.ts 走原站(快)
+    // 'proxy'           → playlist 跟 .ts 全部走 Worker(慢但可控)
+    // 'absolute'        → 全部直連原站(不過濾、debug 用)
+    //
+    // 對應 Worker 端 ?rewrite= 參數(同名字)。Worker 端 URI_REWRITE_MODE
+    // 環境變數作為全域預設；widget 傳 query 可以單連線覆寫。
+    TS_MODE: 'hybrid',
   },
 };
 
@@ -274,7 +286,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.9",
+  version: "2.7.11",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -382,6 +394,30 @@ WidgetMetadata = {
         { title: "停用", value: "disabled" }
       ],
       value: "enabled"
+    },
+    {
+      // ts 走哪裡 —— 跟播放速度直接相關。
+      //
+      // 三個選項語意：
+      //   - 純去廣告(預設)  : m3u8 playlist 走 Worker 過濾; .ts 影片段走原站 CDN 直連
+      //                       廣告能過濾、流量不走本機、速度最快。多數情境推薦。
+      //   - 伺服器代理      : playlist 跟 .ts 全部走 Worker 代理
+      //                       流量過本機 → 較慢,但可在 Worker 內加日誌/統計/額外處理
+      //   - 全直連          : playlist 跟 .ts 都指回原站(Worker 只驗 m3u8 文本格式,不過濾、不代理)
+      //                       速度最快(沒有任何層過 Worker),但**完全不去廣告**
+      //                       僅適合 debug 或「確認 Worker 通不通」場景
+      //
+      // Worker 端 URI_REWRITE_MODE 環境變數保留作為全域預設；這個 query 參數
+      // 可以對單一 widget / 單一連線覆寫,不需重啟 Worker。
+      name: "m3u8FilterTsMode",
+      title: "ts 分片走哪 (速度/過濾 取捨)",
+      type: "enumeration",
+      enumOptions: [
+        { title: "純去廣告 (playlist 過濾 + ts 原站,推薦)", value: "hybrid" },
+        { title: "伺服器代理 (全部走 Worker,流量過本機)", value: "proxy" },
+        { title: "全直連 (不過濾,debug 用)", value: "absolute" }
+      ],
+      value: "hybrid"
     }
   ],
   modules: [
@@ -2752,6 +2788,18 @@ function wrapM3U8WithFilter(url, hint) {
   if (!base) return url;
   const ep = (CONFIG.M3U8_FILTER.ENDPOINT || '').replace(/^\/+/, '');
   const mode = CONFIG.M3U8_FILTER.MODE || 'filter';
+  // ts 走向：給 Worker 的 ?rewrite= 查詢。
+  //
+  // 為什麼要從 CONFIG.M3U8_FILTER.TS_MODE 讀：TS_MODE 已在 loadResource 內
+  // 三層 fallback 完畢（params > globalParams > 'hybrid' 預設值），
+  // wrap 函式不該再各自 fallback 一份邏輯,直接讀 CONFIG。
+  //
+  // 為什麼不是每個 wrap 都加 rewrite= query：Worker 端 ?rewrite= 沒帶時
+  // 會 fallback 到環境變數 URI_REWRITE_MODE。如果使用者環境變數設了
+  // 'proxy' 但 widget 預設 'hybrid',這裡就必須明確傳 'hybrid' 才能
+  // 覆寫 —— 沒帶 = Worker 用環境變數值 = 跟 widget UI 顯示的不一致。
+  // 永遠明確傳值,UI 跟實際行為才會綁定。
+  const tsMode = CONFIG.M3U8_FILTER.TS_MODE || 'hybrid';
 
   let finalUrl;
   if (HAS_URL) {
@@ -2761,6 +2809,7 @@ function wrapM3U8WithFilter(url, hint) {
     let u;
     try { u = new URL(base + '/' + ep); } catch (e) { return url; }
     u.searchParams.set('mode', mode);
+    u.searchParams.set('rewrite', tsMode);
     u.searchParams.set('url', inner);
     if (hint && typeof hint === 'object') {
       if (hint.site) u.searchParams.set('site', String(hint.site));
@@ -2776,6 +2825,7 @@ function wrapM3U8WithFilter(url, hint) {
     // fallback 正則也保證 base 符合 scheme://host 格式。
     const parts = [];
     parts.push('mode=' + encodeURIComponent(mode));
+    parts.push('rewrite=' + encodeURIComponent(tsMode));
     parts.push('url=' + encodeURIComponent(url));
     if (hint && typeof hint === 'object') {
       if (hint.site) parts.push('site=' + encodeURIComponent(String(hint.site)));
@@ -2787,7 +2837,7 @@ function wrapM3U8WithFilter(url, hint) {
 
   // 診斷：wrap 真的執行了才印。這是「播放有沒有走過濾」的第一手證據。
   try {
-    console.log(`🔗 wrap m3u8 (HAS_URL=${HAS_URL}) -> ${(finalUrl || '').slice(0, 120)}`);
+    console.log(`🔗 wrap m3u8 (HAS_URL=${HAS_URL}, mode=${mode}, rewrite=${tsMode}) -> ${(finalUrl || '').slice(0, 120)}`);
   } catch {}
   return finalUrl;
 }
@@ -2896,6 +2946,24 @@ async function loadResource(params, onStreamResult = null) {
     CONFIG.M3U8_FILTER.MODE = modeParam;
   }
 
+  // ts 走向：對應 Worker 端 ?rewrite= 參數。
+  //
+  // 優先級同 mode：params 顯式傳入 > globalParams 設定 > 模組預設 'hybrid'。
+  //
+  // 為什麼不像 mode 那樣嚴格驗證 enum：m3u8FilterTsMode 預設是 'hybrid'，
+  // 三選一都是合法值；如果未來 Worker 加新模式（例如 'segmented'），
+  // 寬鬆驗證可以讓 widget 跟 Worker 各自演進、不會因為 enum 沒對齊而
+  // 整個設定被丟掉。Worker 端同樣寬鬆驗證。
+  const tsModeParam = (typeof m3u8FilterTsMode === 'string' && m3u8FilterTsMode.trim())
+    ? m3u8FilterTsMode.trim()
+    : gpValue('m3u8FilterTsMode', 'hybrid');
+  // 寬鬆驗證：只接受 proxy / hybrid / absolute，其他退回 hybrid。
+  if (tsModeParam === 'proxy' || tsModeParam === 'hybrid' || tsModeParam === 'absolute') {
+    CONFIG.M3U8_FILTER.TS_MODE = tsModeParam;
+  } else {
+    CONFIG.M3U8_FILTER.TS_MODE = 'hybrid';
+  }
+
   // 診斷：把三層 fallback 的實際結果全部印出來。
   //
   // 為什麼需要：症狀是「改了設定但播放沒走過濾伺服器」，可能原因有四種
@@ -2909,11 +2977,13 @@ async function loadResource(params, onStreamResult = null) {
       workerUrl: CONFIG.M3U8_FILTER.WORKER_URL,
       mode: CONFIG.M3U8_FILTER.MODE,
       endpoint: CONFIG.M3U8_FILTER.ENDPOINT,
+      tsMode: CONFIG.M3U8_FILTER.TS_MODE,
       // params 層有沒有值（沒值 = 走 globalParams）
       fromParams: !!m3u8FilterWorkerUrl,
       // globalParams 層的原始值（'' 代表 Forward 沒存到設定）
       gpWorkerUrl: gpValue('m3u8FilterWorkerUrl', '(空)'),
       gpEnabled: gpValue('m3u8FilterEnabled', '(空)'),
+      gpTsMode: gpValue('m3u8FilterTsMode', '(空)'),
       gpCount: allGp.length,
       gpNames: allGp.map(p => p.name).join(','),
     }));
