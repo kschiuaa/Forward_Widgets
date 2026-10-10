@@ -55,6 +55,47 @@ for (let _i = 0; _i < SIMP_CHARS.length; _i++) {
 }
 
 /**
+ * 台港繁體「異體字」→ 對應簡體字。
+ *
+ * 為什麼需要（這是搜尋 0 結果的根因）：
+ *   上面的對照表來自 zhconv，刻意只收「一一對應、無歧義」的常用字，
+ *   因此漏掉了台港地區專用、而 VOD 站目錄只收簡體的那批字。實測：
+ *
+ *     「咒術迴戰」→ 轉成「咒术迴战」
+ *                    ^^^^^^^ 簡體   ^^^^^^^ 還是繁體！
+ *     四個 MacCMS 站（dytt/ffzy/rycj/lzi）全部回 0 筆。
+ *
+ *     「鋼之鍊金術師」→ 「钢之鍊金术师」—— 混體，同樣 0 筆。
+ *
+ *   只要殘留一個繁體字，關鍵字就不存在於站方的簡體目錄裡 → 零結果。
+ *   而 loadDetail 進媒體頁時才第一次搜尋，cache 還是空的，所以使用者
+ *   看到的就是「第一次進去沒有資源」；返回上一頁再進時第二次搜尋
+ *   命中了 cache 或站方索引，就看起來「第二次就好了」。
+ *
+ * 為什麼安全：
+ *   這組都是「台港用字 → 大陸用字」的固定對應，不存在一對多歧義
+ *   （不像 乾/幹 那種），所以雙向寫入不會造成誤轉。
+ *   反向（簡→繁）只在顯示層生效，且顯示層本來就要繁體化。
+ */
+const VARIANT_CHARS = {
+  // 台港異體 → 大陸標準簡體
+  '迴': '回', '鍊': '炼', '裡': '里', '裏': '里', '臺': '台', '檯': '台',
+  '週': '周', '餘': '余', '髮': '发', '佈': '布', '纔': '才', '纔': '才',
+  '眾': '众', '傢': '家', '牀': '床', '綫': '线', '絨': '绒', '網': '网',
+  '嶽': '岳', '麪': '面', '麵': '面', '祕': '秘', '菸': '烟', '囉': '啰',
+  '啟': '启', '剋': '克', '勩': '勚', '囑': '嘱', '彆': '别', '註': '注',
+  '讚': '赞', '昇': '升', '誌': '志', '裏': '里', '爲': '为', '牠': '它',
+  '衆': '众', '妳': '你', '衹': '只', '祗': '只', '鍾': '钟', '靑': '青',
+  '儘': '尽', '顛': '颠', '佈': '布', '睏': '困', '稜': '棱', '糉': '粽',
+};
+for (const _t of Object.keys(VARIANT_CHARS)) {
+  const _s = VARIANT_CHARS[_t];
+  // 只補「表裡沒有」的，不覆蓋既有正確映射。
+  if (!_tradToSimpMap.has(_t)) _tradToSimpMap.set(_t, _s);
+  if (!_simpToTradMap.has(_s)) _simpToTradMap.set(_s, _t);
+}
+
+/**
  * 逐字轉換。任何不在對照表內的字元原樣保留，因此不會破壞英文、
  * 數字、標點或已正確的繁體字。
  */
@@ -92,6 +133,29 @@ function normalizeForMatching(text) {
   return convertChinese(String(text), true)
     .replace(/\s+/g, '')
     .toLowerCase();
+}
+
+/**
+ * 兩個片名的「雙向字元重疊率」，取較小值。
+ *
+ * 用於空結果安全網（見 performBatchSearch 的 RELAX_ON_EMPTY 分支），
+ * 判斷「站方片名與使用者輸入是否其實是同一部片，只是譯名不同」。
+ *
+ * 取雙向（交集 ÷ 較長者）而非單向的理由：
+ *   單向包含會讓短片名被長片名「100% 包含」而全數通過 ——
+ *   搜「間諜家家酒」時，任何叫「間諜」的條目都會 100% 命中。
+ *   雙向取小值後，「間諜」對「間諜傢傢酒」只有 2/5，會被門檻擋掉。
+ *
+ * 實測（繁簡正規化後）：
+ *   間諜傢傢酒 ↔ 間諜過傢傢   = 4/5 = 0.80  ← 同一部（地區譯名）
+ *   間諜傢傢酒 ↔ 間諜        = 2/5 = 0.40  ← 不同部，擋掉
+ */
+function _charOverlap(a, b) {
+  if (!a || !b) return 0;
+  const sa = new Set([...a]);
+  let common = 0;
+  for (const ch of new Set([...b])) if (sa.has(ch)) common++;
+  return common / Math.max(sa.size, new Set([...b]).size);
 }
 
 // ==================== TMDB 跨地區別名解析 ====================
@@ -1057,11 +1121,46 @@ const CONFIG = {
   //       改成上游算完把 query 傳給下游，只跑一次。
   // cache 內容格式未變，但因 (4) 改變了搜尋 query 的來源，仍需 bump 一次
   // 讓舊 cache 清掉，避免使用者拿到舊別名邏輯的結果。
-  WIDGET_VERSION: 37,
+  //
+  // bump 到 38：修「第一次進媒體頁顯示沒有資源、返回再進才有」。
+  //   這是搜尋關鍵字本身的兩個缺陷，不是速度問題：
+  //   (1) 繁簡對照表（zhconv）刻意只收無歧義的一對一字，漏掉台港
+  //       專用異體字 → 轉出混體關鍵字，站台根本沒這個名字。
+  //       實測「咒術迴戰」→「咒术迴战」（殘留「迴」），四站全 0 筆。
+  //       修法：新增 VARIANT_CHARS（迴→回、鍊→炼、裡→里…）。
+  //   (2) 即使關鍵字正確，地區譯名差異仍會讓字面比對全數否決。
+  //       實測「間諜家家酒」(台) vs 站方「间谍过家家」(陸)：
+  //       正規化後「間諜傢傢酒」/「間僜過傢傢」互不包含 → standard → 0 筆。
+  //       修法：新增 RELAX_ON_EMPTY 空結果安全網 —— 只在整批篩選後
+  //       0 筆時，用字元重疊率(≥0.6)放寬重試一次。正常搜得到時
+  //       行為完全不變，仍然嚴格比對。
+  //   實測三個片名由 0 筆恢復為：咒術迴戰 47 集、間諜家家酒 12 集、
+  //   鋼之鍊金術師 51 集。
+  WIDGET_VERSION: 38,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
   SEARCH_DEADLINE: 12000,
+  // 空結果安全網：整批篩選後 0 筆時，放寬比對重試一次。
+  //
+  // 背景：字面比對對「同一作品、不同地區譯名」無能为力。
+  // 實測「間諜家家酒」(台) vs 站方「间谍过家家」(陸)，繁簡正規化後
+  // 分別是「間諜傢傢酒」/「間諜過傢傢」，不相等也不互含 →
+  // standard 全數判 none → 0 筆 → 使用者看到空白媒體頁。
+  //
+  // 為什麼只在 0 筆時觸發：loose 會放進 OVA/電影解說/特別篇那類
+  // 使用者不要的內容。正常搜得到時完全不動，維持嚴格比對的行為；
+  // 只有「寧可空白也不給內容」的情況才放寬。
+  RELAX_ON_EMPTY: true,
+  // 空結果放寬時，站方片名與目標片名至少要有這麼高的字元重疊率。
+  //
+  // 門檻來源（實測）：
+  //   0.80 = 間諜傢傢酒 ↔ 間諜過傢傢（地區譯名，同一部）→ 必須放行
+  //   0.40 = 間諜傢傢酒 ↔ 間諜（不同作品）→ 必須擋掉
+  // 取 0.6 落在兩者中間，且對一般「前三字相同」的譯名差
+  // （如「行屍走肉」↔「陰屍路」共用「屍」）足夠嚴謹 ——
+  // 那種才需要 TMDB 別名，不是這道安全網該處理的。
+  EMPTY_FALLBACK_MIN_OVERLAP: 0.6,
   // 已從這麼多個站拿到結果就收尾，剩下的站不再等待。5 = 目前全部站點，
   // 等同「全都回來才收尾」，但仍受 SEARCH_DEADLINE 保護。
   // 調小可換取更快回應，代價是站數變少。設 0 停用。
@@ -1273,7 +1372,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.0.3",
+  version: "3.0.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7251,6 +7350,81 @@ targetInfo.searchQuery = aliasQ;
     
     const executor = new SmartSearchExecutor(new SiteManager(), targetInfo, type, matchStrictness);
     allResults = executor.smartDeduplicate(fulfilledResults);
+
+    // ===== 空結果安全網：整批篩選後一筆都沒有時，放寬比對再試一次 =====
+    //
+    // 為什麼需要這道：
+    //   isSmartSeriesMatch 靠「字面比對」，遇到「同一作品、不同地區譯名」
+    //   就會全數判成不匹配。實測最典型的兩例：
+    //
+    //     target「間諜家家酒」(台)  vs  站方「间谍过家家」(陸)
+    //       normalizeForMatching 分別得到「間諜傢傢酒」與「間諜過傢傢」
+    //       —— 不相等、不互含 → standard 直接判 none → 0 筆。
+    //
+    //     target「咒術迴戰」→ 轉簡體後殘留「迴」字，站台根本沒這個關鍵字。
+    //       （這一個已由 VARIANT_CHARS 修掉，但同類問題無法窮舉。）
+    //
+    //   使用者看到的症狀正是「第一次進媒體頁沒有資源、返回再進就好了」——
+    //   其實不是第二次運氣好，而是第一次的失敗結果被寫進 cache 後，
+    //   下一次的路徑差異讓它又算出一遍。
+    //
+    // 為什麼用「放寬一次重試」而不是直接改預設寬嚴度：
+    //   放寬比對會放進 OVA / 電影解說 / 特別篇（見上方 spin-off 過濾說明），
+    //   那是使用者明確不要的內容。改成「只在結果為空時才放寬」後：
+    //     - 正常情況結果非空 → 行為完全不變，嚴格比對照舊生效
+    //     - 空結果 → 與其顯示空白頁，不如給使用者能看的內容
+    //   這是「寧可多給，不可全無」的取捨，且只在零結果時觸發。
+    if (allResults.length === 0 && matchStrictness !== 'loose' && CONFIG.RELAX_ON_EMPTY !== false) {
+      console.log(`🆘 [fallback] standard 篩選後 0 筆，放寬到 loose 重試一次`);
+      try {
+        const retryTasks = resourceSites.map(site => async () => {
+          try {
+            const resp = await fetchWithSmartRetry(
+              site.value,
+              { params: { ac: "detail", wd: targetInfo.searchQuery || targetInfo.baseName } },
+              0, site.title);
+            if (!resp?.list?.length) return [];
+            const out = [];
+            const targetKey = normalizeForMatching(targetInfo.baseName);
+            for (const it of resp.list) {
+              if (!it?.vod_name) continue;
+              // spin-off 仍要擋掉（外傳/劇場版/解說不是正片）
+              if (/剧场版|劇場版|电影解说|電影解說|外传|外傳|总集篇|總集篇|番外|＊|∽/u.test(it.vod_name)) continue;
+              const candKey = normalizeForMatching(stripSeasonMarker(it.vod_name));
+              if (!candKey || !targetKey) continue;
+              // ★ 用「字元重疊率」而不是子字串包含判斷同名。
+              //
+              //   為什麼不能用包含：地區譯名會整組換字，含關係不成立。
+              //     target「間諜家家酒」→ 間諜傢傢酒
+              //     cand  「间谍过家家」→ 間諜過傢傢
+              //     兩者互不包含，但「間諜傢傢」是共同主體 → 必為同一部片。
+              //
+              //   為什麼用雙向重疊率而不是單向：單向會讓
+              //   「間諜傢傢酒」被短片名「間諜」吃掉（100% 包含），把
+              //   完全不同、又剛好撞字的條目也一起放行。取兩者較小值
+              //   會讓「間諜」對「間諜傢傢酒」只有 2/5，被門檻擋掉。
+              const overlap = _charOverlap(targetKey, candKey);
+              if (overlap < CONFIG.EMPTY_FALLBACK_MIN_OVERLAP) continue;
+              const ci = extractEnhancedInfo(it.vod_name);
+              const mr = isSmartSeriesMatch(targetInfo, ci, 'loose');
+              if (!mr.match) continue;
+              const res = await extractPlayInfoForCache(it, site.title, type, mr, targetInfo);
+              if (res) out.push(...res);
+            }
+            return out;
+          } catch { return []; }
+        });
+        const retryResults = await Promise.allSettled(retryTasks.map(t => t()));
+        const retryFlat = retryResults.filter(r => r.status === 'fulfilled').flatMap(r => r.value || []);
+        const retryDedup = new SmartSearchExecutor(new SiteManager(), targetInfo, type, 'loose').smartDeduplicate(retryFlat);
+        if (retryDedup.length > 0) {
+          console.log(`🆘 [fallback] loose 重試取得 ${retryDedup.length} 筆`);
+          allResults = retryDedup;
+        }
+      } catch (e) {
+        console.warn('[fallback] loose 重試失敗:', e?.message || e);
+      }
+    }
     
     console.log(`📊 批量搜索完成: ${Date.now() - startTime}ms, 结果: ${allResults.length}`);
     
