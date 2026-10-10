@@ -849,7 +849,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.7",
+  version: "2.8.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3727,7 +3727,9 @@ async function loadResource(params, onStreamResult = null) {
   // try/catch 確保 TMDB 任何意外錯誤都不會中斷搜尋主流程。
   try {
     await tryExpandWithTMDBAliases(targetInfo, type);
+    console.log(`[TMDB-diag] tryExpand returned, _aliasSearchQuery="${targetInfo._aliasSearchQuery || '(空)'}", searchQuery="${targetInfo.searchQuery}"`);
   } catch (e) {
+    console.log(`[TMDB-diag] tryExpand THREW: ${e?.message || e}`);
     if (CONFIG.TMDB?.VERBOSE) console.warn('[TMDB] expand 失敗,繼續原 query:', e?.message || e);
   }
   if (targetInfo._aliasSearchQuery) {
@@ -4136,7 +4138,10 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   }
   if (!bestAlias) bestAlias = fallbackAlias;
 
-  if (!bestAlias) return false;
+  if (!bestAlias) {
+    console.log(`[TMDB-diag] tryExpand: 無 bestAlias（aliases=${aliases.length} 個，fallbackAlias=${fallbackAlias}），return false`);
+    return false;
+  }
 
   // 寫進 targetInfo 讓下游的 `this.targetInfo.searchQuery` 走它。
   // 注意保留原本 rawName 與 baseName：buildSearchQuery 用的 searchQuery
@@ -4145,6 +4150,7 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
     console.log(`[TMDB] baseName="${baseName}" → 採用別名 query="${bestAlias}"（候選 ${aliases.length} 個）`);
   }
   targetInfo._aliasSearchQuery = bestAlias;
+  console.log(`[TMDB-diag] tryExpand: bestAlias="${bestAlias}"，已設 _aliasSearchQuery`);
   return true;
 }
 
@@ -4568,7 +4574,9 @@ async function performSmartSearch(params, onStreamResult) {
   // try/catch 確保 TMDB 任何意外錯誤都不會中斷搜尋主流程。
   try {
     await tryExpandWithTMDBAliases(targetInfo, type);
+    console.log(`[TMDB-diag] tryExpand returned, _aliasSearchQuery="${targetInfo._aliasSearchQuery || '(空)'}", searchQuery="${targetInfo.searchQuery}"`);
   } catch (e) {
+    console.log(`[TMDB-diag] tryExpand THREW: ${e?.message || e}`);
     if (CONFIG.TMDB?.VERBOSE) console.warn('[TMDB] expand 失敗,繼續原 query:', e?.message || e);
   }
   if (targetInfo._aliasSearchQuery) {
@@ -4658,7 +4666,9 @@ async function performBatchSearch(params) {
   // try/catch 確保 TMDB 任何意外錯誤都不會中斷搜尋主流程。
   try {
     await tryExpandWithTMDBAliases(targetInfo, type);
+    console.log(`[TMDB-diag] tryExpand returned, _aliasSearchQuery="${targetInfo._aliasSearchQuery || '(空)'}", searchQuery="${targetInfo.searchQuery}"`);
   } catch (e) {
+    console.log(`[TMDB-diag] tryExpand THREW: ${e?.message || e}`);
     if (CONFIG.TMDB?.VERBOSE) console.warn('[TMDB] expand 失敗,繼續原 query:', e?.message || e);
   }
   if (targetInfo._aliasSearchQuery) {
