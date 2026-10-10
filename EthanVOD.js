@@ -374,28 +374,18 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
     };
     waitDeadline();
   });
-  // cacheWatchP：30ms 輪詢改 microtask tick（cache 寫入或 deadline 到期）
+  // cacheWatchP：microtask tick（cache 寫入或 deadline 到期）
   //
-  // v2.8.11 修法：cache hit 條件放寬為「**至少 1 個別名含中文字**」。
-  // 為什麼：早返回機制下，_fetchTMDBAliasesAsync 在 search 拿到 hit 時
-  // 會先寫入早期別名（baseName + hit.name + original_name — 通常含
-  // 中英文，CN 簡體還沒拿到）。如果 cacheWatchP 看到這 2~3 個就 fire，
-  // caller 拿到的別名「無 CN 簡體」→ tryExpand 拿空 → VOD 站 0 筆。
-  // 加上「有中文」條件後，cacheWatchP 會**等** alt_titles 寫入的完整
-  // 別名（含 CN「行尸走肉」）才 fire，tryExpand 才能挑到 CN 別名。
+  // v2.8.14 簡化：cache 內現在只會有 CN 別名（v2.8.14 移除 HK/TW/SG），
+  // 不需要「有中文」條件了——cache 有別名就 fire。
   const cacheWatchP = new Promise((resolve) => {
     const deadline = startTs + maxWaitMs;
     const tick = () => {
       const c = _tmdbAliasCache.get(cacheKey);
       if (c?.aliases && c.aliases.length > 0) {
-        // v2.8.11：要求至少 1 個別名含中文字才算 cache hit
-        const hasCnAlias = c.aliases.some(a => /[一-鿿]/.test(String(a || '')));
-        if (hasCnAlias) {
-          console.log(`[TMDB-diag] cacheWatchP: cache hit (含中文) after ${Date.now() - startTs}ms (n=${c.aliases.length})`);
-          resolve({ kind: 'cache', aliases: c.aliases });
-          return;
-        }
-        // 沒中文 — 早返回階段還沒拿到 CN；繼續等
+        console.log(`[TMDB-diag] cacheWatchP: cache hit after ${Date.now() - startTs}ms (n=${c.aliases.length})`);
+        resolve({ kind: 'cache', aliases: c.aliases });
+        return;
       }
       if (Date.now() >= deadline) {
         console.log(`[TMDB-diag] cacheWatchP: deadline hit after ${Date.now() - startTs}ms`);
@@ -406,24 +396,12 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
     };
     tick();
   });
-  const inflightDoneP = inflightP.then(async () => {
-    // v2.8.11：inflightP resolve 不代表 cache 已被 CN 覆蓋。_fetchTMDBAliasesAsync
-    // 是 fire-and-forget，IIFE 完成才覆蓋 cache。inflightDoneP 不能直接
-    // 拿 cache 結果 return — 必須等「cache 內有 CN 別名」或 deadline。
-    const deadline = startTs + maxWaitMs;
-    while (Date.now() < deadline) {
-      const a = (_tmdbAliasCache.get(cacheKey)?.aliases) || [];
-      const hasCnAlias = a.some(x => /[一-鿿]/.test(String(x || '')));
-      if (hasCnAlias) {
-        console.log(`[TMDB-diag] inflightDoneP: inflight done + CN ready after ${Date.now() - startTs}ms, cache.aliases=${a.length}`);
-        return { kind: 'inflight', aliases: a };
-      }
-      // 沒 CN — 等下一個 microtask
-      await Promise.resolve();
-    }
+  // v2.8.14 簡化：inline await 後 inflightP resolve 保證 cache 已覆蓋。
+  // 直接讀 cache.aliases 即可。
+  const inflightDoneP = inflightP.then(() => {
     const a = (_tmdbAliasCache.get(cacheKey)?.aliases) || [];
-    console.log(`[TMDB-diag] inflightDoneP: deadline 但無 CN after ${Date.now() - startTs}ms, cache.aliases=${a.length}`);
-    return { kind: 'inflight', aliases: a };  // 沒 CN 也 return（fallback 走原 query）
+    console.log(`[TMDB-diag] inflightDoneP: inflight done after ${Date.now() - startTs}ms, cache.aliases=${a.length}`);
+    return { kind: 'inflight', aliases: a };
   }).catch((e) => {
     console.log(`[TMDB-diag] inflightDoneP: rejected after ${Date.now() - startTs}ms: ${e?.message || e}`);
     return { kind: 'inflight', aliases: [] };
@@ -506,129 +484,92 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   pushAlias(hit.title);
   pushAlias(hit.original_title);
 
-  // v2.8.11 早寫入 cache：search 拿到 hit 立即寫入（至少 2 個，baseName
-  // + hit.name + original_name）。這讓 race 4s 內 caller 至少能拿到
-  // 早期別名（沒 CN 但有 baseName 繁簡變體），alt_titles background 跑
-  // 完再覆蓋。
+  // v2.8.14 簡化：只取 CN 別名，inline await 整個流程。
   //
-  // 為什麼這段重要：log 顯示 TMDB search + alt_titles 兩條 request 串行
-  // 8005ms 才完成。原本 race 4s → timeout → tryExpand 拿空 → 0 筆。
-  // 早寫入 + race 4s → cacheWatchP ~1500ms 看到早期 2 別名 → race
-  // 命中 → tryExpand 拿到別名（雖然沒 CN，至少「陰屍路」轉「阴尸路」
-  // 對 VOD 站可能仍 0 筆，但 batch 第一次結果出來了）。
-  if (aliases.length >= 1) {
-    _tmdbAliasCache.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
-    _tmdbAliasRecent.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
-    _enforceTmdbAliasCacheLimit();
-    _storeTmdbAliasCache(cacheKey, [...aliases]).catch(() => {});
-    console.log(`[TMDB-diag] ✓ 早寫入 cache（hit 內欄位，n=${aliases.length}），alt_titles 仍在背景 fetch`);
-  }
-
-  // 第二步：拿 alternative_titles（多地區別名：CN/HK/TW/SG）
-  // 這是 v2.8.5 加回來的。v2.8.11 改成 fire-and-forget：IIFE 跑完
-  // 直接覆蓋 cache 與 storage（CN 別名優先），caller 不 await。
+  // v2.8.11 早寫入 + IIFE fire-and-forget 設計有 bug：inflightP resolve
+  // 早於 IIFE 完成 → inflightDoneP 看到 cache 還是早寫入的 2 個無 CN 別名
+  // → race 拿空 → tryExpand 0 筆。改成「inline await」後：
+  //   - 不早寫入：search 拿到 hit 不立即寫 cache，等 alt_titles 一起寫
+  //   - inline await：inflightP 真的 resolve 在 cache 完整覆蓋後
+  //   - inflightDoneP 看到完整 CN 別名 → race 命中
+  //   - 性能：caller 用 inflightP 共享，第一個 caller 8s 串行，後續 race 命中
   //
-  // 重要：覆蓋 cache 時**完整保留**早期別名（baseName + hit 內 name），
-  // 把 CN/TW/HK/SG 別名 push 到前面（CN 排第一），這樣 tryExpand 拿到
-  // 的 aliases 陣列第一個非空且非原名的中文別名就是「行尸走肉」。
+  // 為什麼只取 CN：VOD 站都是簡體中文，HK/TW/SG 繁體別名站方字典不認。
+  // ALT_TITLE_REGIONS 改為 ['CN'] 後，cache 內就只會有 CN 別名，tryExpand
+  // 拿第一個非空 CN 別名就對。
   const altUrl = `https://api.themoviedb.org/3/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}/` +
     `alternative_titles?api_key=${encodeURIComponent(apiKey)}`;
 
-  (async () => {
-    let finalAliases;
-    try {
-      const t0 = Date.now();
-      const resp2 = await Widget.http.get(altUrl, {
-        timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
-        headers: { 'Accept': 'application/json' }
-      });
-      console.log(`[TMDB-diag] alt resp after ${Date.now() - t0}ms: typeof=${typeof resp2}`);
-      const altData = _unwrapHttpResponse(resp2);
-      const titles = Array.isArray(altData?.titles) ? altData.titles
-                    : Array.isArray(altData?.results) ? altData.results
-                    : [];
-      console.log(`[TMDB-diag] alt titles count=${titles.length}`);
+  let finalAliases;
+  try {
+    const t0 = Date.now();
+    const resp2 = await Widget.http.get(altUrl, {
+      timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+      headers: { 'Accept': 'application/json' }
+    });
+    console.log(`[TMDB-diag] alt resp after ${Date.now() - t0}ms: typeof=${typeof resp2}`);
+    const altData = _unwrapHttpResponse(resp2);
+    const titles = Array.isArray(altData?.titles) ? altData.titles
+                  : Array.isArray(altData?.results) ? altData.results
+                  : [];
+    console.log(`[TMDB-diag] alt titles count=${titles.length}`);
 
-      // 第三步：篩選我們關心的地區（CN/TW/HK/SG），並**優先放 CN 別名**。
-      //
-      // 為什麼要把 CN 排第一：tryExpandWithTMDBAliases 內的挑選邏輯是
-      // 「拿第一個簡體化後 ≠ baseSimp 的別名」。如果 CN 別名排後面，
-      // 前面可能卡到一個英文別名（"The Walking Dead"）就被挑走，導致
-      // 沒走到 CN「行尸走肉」→ VOD 站 0 筆結果。
-      //
-      // TMDB 的 /alternative_titles response 順序不固定，必須在這裡
-      // 明確分桶。
-      const regions = CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN', 'TW', 'HK', 'SG'];
-      const regionSet = new Set(regions);
-      const byRegion = new Map();
-      for (const t of titles) {
-        if (!t?.title) continue;
-        const title = String(t.title).trim();
-        if (!title) continue;
-        const region = String(t.iso_3166_1 || '').toUpperCase();
-        if (!regionSet.has(region)) continue;
-        if (!byRegion.has(region)) byRegion.set(region, []);
-        byRegion.get(region).push(title);
-      }
-      // 把 CN/TW/HK/SG 別名合併到 aliases 前面（CN 排第一）
-      //
-      // v2.8.12 修法：原本用 unshift 結果 CN 排最後（SG→HK→TW→CN
-      // 反序），tryExpand 拿「行屍」(HK 繁體) 當 bestAlias 而非
-      // 「行尸走肉」(CN 簡體) → VOD 站 0 結果。
-      // 改用 push + 反向遍歷 regions（CN 先進、SG 最後進），CN 排最前。
-      const merged = [...aliases];
-      const seenLocal = new Set(merged.map(a => normalizeForMatching(a)));
-      for (let i = regions.length - 1; i >= 0; i--) {
-        const r = regions[i];
-        const list = byRegion.get(r);
-        if (!list) continue;
-        for (const title of list) {
-          const tn = normalizeForMatching(title);
-          if (seenLocal.has(tn)) continue;
-          seenLocal.add(tn);
-          merged.unshift(title);  // i 反向遍歷 + unshift = 順序為 CN,TW,HK,SG
-        }
-      }
-      finalAliases = merged;
-    } catch (e) {
-      console.log(`[TMDB-diag] alt_titles EXCEPTION: ${e?.message || e}`);
-      finalAliases = aliases;  // 退路：保留早期別名
+    // 篩選 CN 別名（v2.8.14 簡化：只取 CN）。CN 別名本身就是簡體中文，
+    // tryExpand 內的 convertChinese 簡體化判斷會放行，VOD 站字典能認。
+    const regions = CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN'];
+    const regionSet = new Set(regions);
+    const cnTitles = [];
+    for (const t of titles) {
+      if (!t?.title) continue;
+      const title = String(t.title).trim();
+      if (!title) continue;
+      const region = String(t.iso_3166_1 || '').toUpperCase();
+      if (!regionSet.has(region)) continue;
+      cnTitles.push(title);
     }
+    console.log(`[TMDB-diag] CN titles count=${cnTitles.length}: ${JSON.stringify(cnTitles)}`);
 
-    if (!finalAliases || finalAliases.length === 0) {
-      console.log(`[TMDB-diag] hit 內無可用的 name/title 欄位`);
-      return;
+    // 合併：CN 別名放最前面，hit 內欄位放後面
+    finalAliases = [];
+    const seenLocal = new Set();
+    for (const title of cnTitles) {
+      const tn = normalizeForMatching(title);
+      if (seenLocal.has(tn)) continue;
+      seenLocal.add(tn);
+      finalAliases.push(title);
     }
+    for (const a of aliases) {
+      const tn = normalizeForMatching(a);
+      if (seenLocal.has(tn)) continue;
+      seenLocal.add(tn);
+      finalAliases.push(a);
+    }
+  } catch (e) {
+    console.log(`[TMDB-diag] alt_titles EXCEPTION: ${e?.message || e}`);
+    finalAliases = aliases;  // 退路：保留 hit 內欄位
+  }
 
-    // 覆蓋內存 + storage（IIFE 完成才執行）
+  if (!finalAliases || finalAliases.length === 0) {
+    console.log(`[TMDB-diag] hit 內無可用的 name/title 欄位`);
+    return;
+  }
+
+  // 寫入內存 + storage
+  console.log(`[TMDB-diag] 寫入 cache，finalAliases=${JSON.stringify(finalAliases)}`);
+  try {
     _tmdbAliasCache.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
     _tmdbAliasRecent.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
-    _enforceTmdbAliasCacheLimit();
-    try {
-      await _storeTmdbAliasCache(cacheKey, finalAliases);
-    } catch (_) {}
+  } catch (e) {
+    console.log(`[TMDB-diag] 寫 cache 失敗: ${e?.message || e}`);
+  }
+  const cachedAfterSet = _tmdbAliasCache.get(cacheKey);
+  console.log(`[TMDB-diag] cache 確認：${JSON.stringify(cachedAfterSet?.aliases || [])} (n=${cachedAfterSet?.aliases?.length})`);
+  _enforceTmdbAliasCacheLimit();
+  try {
+    await _storeTmdbAliasCache(cacheKey, finalAliases);
+  } catch (_) {}
 
-    console.log(`[TMDB-diag] ✓ "${baseName}" → ${finalAliases.length} 別名（背景完成）:`, finalAliases);
-  })();
-
-  // v2.8.11 修法：_fetchTMDBAliasesAsync 必須 await IIFE 完才 return，
-  // 否則 inflightP resolve 早於 IIFE 完成（cache 還是早期 2 別名），
-  // race 拿到空 CN → tryExpand 拿空 → 0 筆。
-  //
-  // 但 race 的 cacheWatchP / inflightDoneP 已經會等到 IIFE 完成才 fire
-  // cache hit（因為 cache 內有 CN 才算 hit）——所以 inflightP 早 resolve
-  // 不影響 cacheWatchP。
-  //
-  // 保留：caller 不 await _fetchTMDBAliasesAsync 本身（用 inflight 共享），
-  // 但 _fetchTMDBAliasesAsync 內部必須讓 IIFE 跑完才 return，讓 storage
-  // 也被覆蓋。
-  //
-  // 實作：把 IIFE 提升為 _fetchTMDBAliasesAsync 主體的 await
-  console.log(`[TMDB-diag] inflight kickoff 完成（早寫入 n=${aliases.length}，alt_titles background 跑）`);
-  // 注意：這裡是 async function，return undefined。IIFE 已啟動（fire-and-forget），
-  // 真正的 cache 覆蓋由 IIFE 完成。但 inflightP（用 _fetchTMDBAliasesAsync() 共享）
-  // resolve 為 undefined 時 cacheWatchP 仍在 microtask tick 內觀察 cache，
-  // 會在 IIFE 覆蓋 cache 後才 fire cache hit。
+  console.log(`[TMDB-diag] ✓ "${baseName}" → ${finalAliases.length} 別名:`, finalAliases);
 }
 
 /**
@@ -962,7 +903,7 @@ const CONFIG = {
     // 同時拿 CN + HK + TW。地區設定跟 alternative_titles 的 iso_3166_1 對應。
     SEARCH_LANGUAGE: 'zh-TW',
     ALT_TITLE_LANGS: ['zh-CN', 'zh-TW', 'zh-HK', 'en'],
-    ALT_TITLE_REGIONS: ['CN', 'TW', 'HK', 'SG'],
+    ALT_TITLE_REGIONS: ['CN'],
     // 別名 cache TTL（秒）。片名別名極少改，7 天綽綽有餘。
     CACHE_TTL: 7 * 24 * 3600,
     // 別名快取最多保留幾部作品的 alias。超過時按 LRU 刪除最舊的，避免
@@ -981,7 +922,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.8.13",
+  version: "2.8.14",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4233,35 +4174,22 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   const baseName = String(targetInfo.baseName || '').trim();
   if (!baseName || baseName.length < 2) return false;
 
-  // 同步等 TMDB 別名（最多 6.0s）。失敗 / timeout → 回 []（走 fallback）。
+  // 同步等 TMDB 別名（最多 10s）。失敗 / timeout → 回 []（走 fallback）。
   //
-  // v2.8.11 修法：v2.8.10 設 4s 還是不夠（log 顯示串行 8s）。拉到 6s
-  // 覆蓋大部分 case（4 別名 6s 內到）。早寫入 cache 策略保留，
-  // race 2~3s 內 caller 至少能拿到早期 2 別名。
-  const aliases = await getTMDBAliasesBlocking(baseName, type, 6000);
+  // v2.8.14 簡化：inline await 後 inflightP resolve 在 cache 覆蓋後，
+  // 但 search + alt_titles 串行可達 8s，race 10s 確保能拿到。
+  const aliases = await getTMDBAliasesBlocking(baseName, type, 10000);
   if (!Array.isArray(aliases) || aliases.length === 0) return false;
 
-  // 站方幾乎都是簡體中文，因此優先挑「**簡體中文**且跟 baseName 簡體
-  // 版不同」的別名。
-  //
-  // v2.8.12 修法：原本「含中文字 + ≠ baseSimp」條件對繁體中文別名
-  // 也會放行（「行屍」HK 簡體化後「行尸」≠「阴尸路」），被當 bestAlias
-  // → VOD 站字典認不出繁體「行屍」→ 0 筆。
-  // 改成「**別名本身已是簡體中文**」（aSimp === aTrim — 簡體化後等於原值
-  // 表示本來就簡體）+ ≠ baseSimp + 含中文字。CN 別名如「行尸走肉」
-  // 會被優先挑走；HK/TW 繁體別名（aSimp !== aTrim）會被略過。
+  // v2.8.14 簡化：aliases 內現在只有 CN 簡體別名 + hit 內原名。
+  // 不需要「aSimp === aTrim」複雜判斷，簡體化後跟 baseSimp 不同就挑。
   //
   // 三條過濾條件（任一 fail 就跳過這個 alias）：
   //   1. 跟 baseName 原文同名（去重）
   //   2. 跟 baseName 的簡體版同名（CN 繁體混標時會撞到，視為無新資訊）
   //   3. **不含任何中文字**（VOD 站中文字典認不出英文片名）
-  //   4. **不是簡體中文**（v2.8.12 新增：避免繁體被誤挑）
   //
-  // 第一條成立的別名直接挑走（break）。aliases 陣列內 CN 排第一，
-  // 所以對中文劇幾乎一定挑到「行尸走肉」這類 CN 別名。
-  //
-  // 退路：如果全部 alias 都不含中文（罕見），fallback 拿第一個非空
-  // 非原名的 alias 湊合。
+  // 第一條成立的別名直接挑走（break）。aliases 陣列內 CN 別名排第一。
   const baseSimp = convertChinese(baseName, false);
   const hasChinese = (s) => /[一-鿿]/.test(s);
   let bestAlias = null;
@@ -4277,8 +4205,6 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
     if (!fallbackAlias) fallbackAlias = aTrim;
     // 必須含中文字 — VOD 站用中文字典
     if (!hasChinese(aTrim)) continue;
-    // v2.8.12 新增：必須是簡體中文（aSimp === aTrim 表示別名本來就簡體）
-    if (aSimp !== aTrim) continue;
     bestAlias = aTrim;
     break;
   }
