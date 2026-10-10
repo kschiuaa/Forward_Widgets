@@ -151,7 +151,7 @@ const CONFIG = {
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
   // 使用者看到的會是錯的。
-  // bump 到 17：wrap 邏輯變更（冪等化 + movie 分支補 wrap + Worker URL
+  // bump 到 17：wrap 邏輯變更（冪等化 + movie 分支補 wrap + 過濾廣告伺服器 URL
   // 三層 fallback），舊 cache 裡存的是未包裝或二次包裝的 URL，必須清掉。
   // bump 到 18：即使 v17 已引入 syncWidgetVersion 完整清 cache，實機仍
   // 觀察到 cache 內存著裸 CDN 的歷史 URL（推測是早期版本繞過 wrap 直接
@@ -164,10 +164,13 @@ const CONFIG = {
   // ReferenceError: Can't find variable: URL，因為沙箱沒有 URL 全域物件。
   // 整段 try/catch 把 throw 吃掉後靜默 return 裸 CDN，導致 wrap 從未跑。
   // 修法：HAS_URL 偵測 + 字串拼接 fallback。對「已 wrap 的 url」仍走
-  // isAlreadyWrapped 冪等檢查；對裸 CDN 字串拼接後就是 Worker URL。
+  // isAlreadyWrapped 冪等檢查；對裸 CDN 字串拼接後就是過濾廣告伺服器 URL。
   // bump 到 20：新增 m3u8FilterTsMode UI 開關，給使用者切換 ts 走原站
-  // (hybrid) / 全代理 (proxy) / 全絕對 (absolute)。對應 Worker 端
-  // ?rewrite= query 參數；Worker 行程不用重啟即可切換。
+  // (hybrid) / 全代理 (proxy) / 全絕對 (absolute)。對應過濾廣告伺服器端
+  // ?rewrite= query 參數；伺服器行程不用重啟即可切換。
+  // bump 到 23：移除 cachePatterns / getCached() / invalidate() 死代碼,
+  // 移除 CONFIG.AUTO_LOAD_PATTERNS / AUTO_VERIFY_TOKEN(從未被讀取)。
+  // UI 將「Worker」改稱「過濾廣告伺服器」(內部變數/全域參數名保留相容)。
   WIDGET_VERSION: 23,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
@@ -243,33 +246,34 @@ const CONFIG = {
     AREA_MATCH_BONUS: 40,
   },
 
-  // m3u8 廣告過濾 Worker
-  // 所有 m3u8 輸出 URL 會被 wrap 成 Worker URL,Player 拉到清流。
+  // m3u8 過濾廣告伺服器設定
+  // 所有 m3u8 輸出 URL 會被 wrap 走過濾廣告伺服器,Player 拉到清流。
   // ENABLED = false 可一鍵關閉,所有 URL 恢復原始 CDN 直連。
   M3U8_FILTER: {
     ENABLED: true,
+    // 過濾廣告伺服器完整 URL(含 https,不含結尾斜線)
     WORKER_URL: 'https://m3u8-adfliter.kschiuaa.com',
-    // 為了 cache 命中穩定,base path 寫死。endpoint 內部模式見 Worker 端。
+    // 為了 cache 命中穩定,base path 寫死。endpoint 內部模式見過濾廣告伺服器端。
     ENDPOINT: '/filter',
     // 透傳 / 過濾 切換:debug 用。預設 'filter'。
-    // 'passthrough' = 走 Worker 但不過濾,只驗 Worker 通不通。
+    // 'passthrough' = 走過濾廣告伺服器但不過濾,只驗伺服器通不通。
     MODE: 'filter',
-    // admin 認證(對應 Worker 的 ADMIN_USER / ADMIN_PASS 環境變數)。
+    // admin 認證(對應過濾廣告伺服器的 ADMIN_USER / ADMIN_PASS 環境變數)。
     // 留空 = 不啟用 admin 功能,只能讀 patterns(GET /patterns)。
     // 填了之後啟動時會自動登入拿 session cookie,console 印對接狀態
     // 程式內可呼叫 m3u8FilterAdmin.xxx() 操作(增/刪/reload/reset)。
     //
-    // 注意:Worker 用 cookie session(帳密 → admin_session),不是 Bearer token。
+    // 注意:過濾廣告伺服器用 cookie session(帳密 → admin_session),不是 Bearer token。
     // 設定填這兩欄後 widget 會自動 POST /admin/login 拿 cookie。
     ADMIN_USER: '',
     ADMIN_PASS: '',
 
-    // ts 影片段要由 Worker 代理,還是播放器直連原站 CDN。
-    // 'hybrid' (預設)  → m3u8 playlist 走 Worker(過濾),.ts 走原站(快)
-    // 'proxy'           → playlist 跟 .ts 全部走 Worker(慢但可控)
+    // ts 影片段要由過濾廣告伺服器代理,還是播放器直連原站 CDN。
+    // 'hybrid' (預設)  → m3u8 playlist 走過濾廣告伺服器(過濾),.ts 走原站(快)
+    // 'proxy'           → playlist 跟 .ts 全部走過濾廣告伺服器(慢但可控)
     // 'absolute'        → 全部直連原站(不過濾、debug 用)
     //
-    // 對應 Worker 端 ?rewrite= 參數(同名字)。Worker 端 URI_REWRITE_MODE
+    // 對應過濾廣告伺服器端 ?rewrite= 參數(同名字)。伺服器端 URI_REWRITE_MODE
     // 環境變數作為全域預設；widget 傳 query 可以單連線覆寫。
     TS_MODE: 'hybrid',
   },
@@ -280,7 +284,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.7.13",
+  version: "2.7.15",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -308,10 +312,10 @@ WidgetMetadata = {
       type: "enumeration",
       enumOptions: [
         { title: "智慧流式", value: "smart_stream" },
-        { title: "批次搜尋", value: "batch" },
+        { title: "批次搜尋 ", value: "batch" },
         { title: "自動選擇", value: "auto" }
       ],
-      value: "smart_stream"
+      value: "batch"
     },
     {
       name: "matchStrictness",
@@ -358,20 +362,21 @@ WidgetMetadata = {
     },
     {
       name: "m3u8FilterWorkerUrl",
-      title: "Worker URL",
+      title: "過濾廣告伺服器 URL",
       type: "input",
+      description: "完整 URL(含 https://,結尾不要斜線)。預設值就是官方伺服器,直接用即可。",
       value: "https://m3u8-adfliter.kschiuaa.com"
     },
     {
       name: "m3u8FilterAdminUser",
-      title: "Worker 管理帳號 (選填)",
+      title: "過濾廣告伺服器 管理帳號 (選填)",
       type: "input",
       description: "填入後可從 console 呼叫 m3u8FilterAdmin.*() 動態管理 patterns。留空 = 唯讀模式。需要同時填寫管理密碼。",
       value: ""
     },
     {
       name: "m3u8FilterAdminPass",
-      title: "Worker 管理密碼 (選填)",
+      title: "過濾廣告伺服器 管理密碼 (選填)",
       type: "input",
       description: "管理帳號的密碼。Widget 啟動時會自動登入取得 session cookie。",
       value: ""
@@ -390,22 +395,22 @@ WidgetMetadata = {
       // ts 走哪裡 —— 跟播放速度直接相關。
       //
       // 三個選項語意：
-      //   - 純去廣告(預設)  : m3u8 playlist 走 Worker 過濾; .ts 影片段走原站 CDN 直連
+      //   - 純去廣告(預設)  : m3u8 playlist 走過濾廣告伺服器過濾; .ts 影片段走原站 CDN 直連
       //                       廣告能過濾、流量不走本機、速度最快。多數情境推薦。
-      //   - 伺服器代理      : playlist 跟 .ts 全部走 Worker 代理
-      //                       流量過本機 → 較慢,但可在 Worker 內加日誌/統計/額外處理
-      //   - 全直連          : playlist 跟 .ts 都指回原站(Worker 只驗 m3u8 文本格式,不過濾、不代理)
-      //                       速度最快(沒有任何層過 Worker),但**完全不去廣告**
-      //                       僅適合 debug 或「確認 Worker 通不通」場景
+      //   - 伺服器代理      : playlist 跟 .ts 全部走過濾廣告伺服器代理
+      //                       流量過本機 → 較慢,但可在伺服器內加日誌/統計/額外處理
+      //   - 全直連          : playlist 跟 .ts 都指回原站(伺服器只驗 m3u8 文本格式,不過濾、不代理)
+      //                       速度最快(沒有任何層過伺服器),但**完全不去廣告**
+      //                       僅適合 debug 或「確認過濾廣告伺服器通不通」場景
       //
-      // Worker 端 URI_REWRITE_MODE 環境變數保留作為全域預設；這個 query 參數
-      // 可以對單一 widget / 單一連線覆寫,不需重啟 Worker。
+      // 過濾廣告伺服器端 URI_REWRITE_MODE 環境變數保留作為全域預設；這個 query 參數
+      // 可以對單一 widget / 單一連線覆寫,不需重啟伺服器。
       name: "m3u8FilterTsMode",
       title: "ts 分片走哪 (速度/過濾 取捨)",
       type: "enumeration",
       enumOptions: [
         { title: "純去廣告 (playlist 過濾 + ts 原站,推薦)", value: "hybrid" },
-        { title: "伺服器代理 (全部走 Worker,流量過本機)", value: "proxy" },
+        { title: "伺服器代理 (全部走過濾廣告伺服器,流量過本機)", value: "proxy" },
         { title: "全直連 (不過濾,debug 用)", value: "absolute" }
       ],
       value: "hybrid"
@@ -453,7 +458,7 @@ WidgetMetadata = {
 // 「無副檔名就放行」會讓站方自帶播放器頁（/share/xxx）混進結果，Forward 播不了，
 // 使用者點了只會看到轉圈後失敗。寧可少給可選項，也不要給必定失敗的選項。
 const PLAYABLE_EXT = /\.(m3u8|mp4|flv|mkv|avi|mov|ts)(?:$|[?#])/i;
-// 已 wrap 過的 Worker URL 形如
+// 已 wrap 過的過濾廣告伺服器 URL 形如
 //   http://host:8787/filter?mode=filter&url=https%3A%2F%2F...%2Findex.m3u8
 // 內層 m3u8 是 percent-encoded，後面接的是字面量「url=」而非 ?#，
 // 所以 PLAYABLE_EXT 不會匹配。若不補這條規則，排序階段會把已包裝的
@@ -2672,8 +2677,8 @@ function cleanResourceForOutput(resource) {
     }
   }
 
-  // m3u8 過濾 wrap。customHeaders 保留在物件上(REX 客戶端會用),Worker 端
-  // 收到 m3u8 子請求時自動從 Referer 解析或回退到 customHeaders(Worker 端邏輯,
+  // m3u8 過濾 wrap。customHeaders 保留在物件上(REX 客戶端會用),過濾廣告伺服器端
+  // 收到 m3u8 子請求時自動從 Referer 解析或回退到 customHeaders(伺服器端邏輯,
   // 見 m3u8-ad-filter-worker.js)。
   if (isM3U8Url(clean.url)) {
     clean.url = wrapM3U8WithFilter(clean.url);
@@ -2706,16 +2711,16 @@ function cleanResourceForOutput(resource) {
   return clean;
 }
 
-// 把 m3u8 URL 包成 Worker URL。Player 拉到 m3u8 後,所有 .ts 子請求都會
-// 經 Worker 代理,由 Worker 端的 m3u8-ad-filter-worker.js 依 CONFIG.M3U8_FILTER
+// 把 m3u8 URL 包成過濾廣告伺服器 URL。Player 拉到 m3u8 後,所有 .ts 子請求都會
+// 經過濾廣告伺服器代理,由伺服器端的 m3u8-ad-filter-worker.js 依 CONFIG.M3U8_FILTER
 // 設定的 pattern 去除廣告 segment。
 //
 // 守護設計：
 //  - ENABLED 為 false → 透傳
 //  - 非 m3u8 (mp4/flv/...) → 透傳
-//  - WORKER_URL 沒配 → 透傳(避免被 wrap 成相對路徑把播放搞壞)
+//  - 過濾廣告伺服器 URL 沒配 → 透傳(避免被 wrap 成相對路徑把播放搞壞)
 //  - URL 解析失敗 → 透傳(避免 IllegalArgumentException)
-//  - 已經是 Worker URL → 原樣返回(冪等)
+//  - 已經是過濾廣告伺服器 URL → 原樣返回(冪等)
 //
 // 冪等是必要的：搜尋結果會被寫進 cache(CACHE_TTL 30 分鐘),cache 命中時
 // 物件裡的 url 已經是 wrap 過的。若不判重,每次命中都會再包一層：
@@ -2779,16 +2784,16 @@ function wrapM3U8WithFilter(url, hint) {
   if (!base) return url;
   const ep = (CONFIG.M3U8_FILTER.ENDPOINT || '').replace(/^\/+/, '');
   const mode = CONFIG.M3U8_FILTER.MODE || 'filter';
-  // ts 走向：給 Worker 的 ?rewrite= 查詢。
+  // ts 走向：給過濾廣告伺服器的 ?rewrite= 查詢。
   //
   // 為什麼要從 CONFIG.M3U8_FILTER.TS_MODE 讀：TS_MODE 已在 loadResource 內
   // 三層 fallback 完畢（params > globalParams > 'hybrid' 預設值），
   // wrap 函式不該再各自 fallback 一份邏輯,直接讀 CONFIG。
   //
-  // 為什麼不是每個 wrap 都加 rewrite= query：Worker 端 ?rewrite= 沒帶時
+  // 為什麼不是每個 wrap 都加 rewrite= query：過濾廣告伺服器端 ?rewrite= 沒帶時
   // 會 fallback 到環境變數 URI_REWRITE_MODE。如果使用者環境變數設了
   // 'proxy' 但 widget 預設 'hybrid',這裡就必須明確傳 'hybrid' 才能
-  // 覆寫 —— 沒帶 = Worker 用環境變數值 = 跟 widget UI 顯示的不一致。
+  // 覆寫 —— 沒帶 = 伺服器用環境變數值 = 跟 widget UI 顯示的不一致。
   // 永遠明確傳值,UI 跟實際行為才會綁定。
   const tsMode = CONFIG.M3U8_FILTER.TS_MODE || 'hybrid';
 
@@ -2862,7 +2867,7 @@ async function loadResource(params, onStreamResult = null) {
     VodData,
     matchStrictness = 'standard',
     preferResolution = 'auto',
-    searchMode = 'smart_stream',
+    searchMode = 'batch',
     m3u8FilterEnabled = 'enabled',
     m3u8FilterWorkerUrl,
     m3u8FilterMode = 'filter',
@@ -2955,14 +2960,14 @@ async function loadResource(params, onStreamResult = null) {
   if (userParam) CONFIG.M3U8_FILTER.ADMIN_USER = userParam;
   if (passParam) CONFIG.M3U8_FILTER.ADMIN_PASS = passParam;
 
-  // ts 走向：對應 Worker 端 ?rewrite= 參數。
+  // ts 走向：對應過濾廣告伺服器端 ?rewrite= 參數。
   //
   // 優先級同 mode：params 顯式傳入 > globalParams 設定 > 模組預設 'hybrid'。
   //
   // 為什麼不像 mode 那樣嚴格驗證 enum：m3u8FilterTsMode 預設是 'hybrid'，
-  // 三選一都是合法值；如果未來 Worker 加新模式（例如 'segmented'），
-  // 寬鬆驗證可以讓 widget 跟 Worker 各自演進、不會因為 enum 沒對齊而
-  // 整個設定被丟掉。Worker 端同樣寬鬆驗證。
+  // 三選一都是合法值；如果未來伺服器加新模式（例如 'segmented'），
+  // 寬鬆驗證可以讓 widget 跟伺服器各自演進、不會因為 enum 沒對齊而
+  // 整個設定被丟掉。伺服器端同樣寬鬆驗證。
   const tsModeParam = (typeof m3u8FilterTsMode === 'string' && m3u8FilterTsMode.trim())
     ? m3u8FilterTsMode.trim()
     : gpValue('m3u8FilterTsMode', 'hybrid');
@@ -3185,6 +3190,7 @@ async function loadResource(params, onStreamResult = null) {
     console.log('🎯 使用智能流式搜索模式');
     finalResults = await performSmartSearch(params, onStreamResult);
   } else {
+    // 'batch' 為預設,涵蓋未來任何未知值(寬鬆驗證一致)
     console.log('🔍 使用批量搜索模式');
     finalResults = await performBatchSearch(params);
   }
@@ -3887,9 +3893,9 @@ async function performBatchSearch(params) {
       console.log(`✅ 批量模式缓存命中: ${cached.length}个结果`);
       // 兜底 wrap：cache 內 url 在歷史版本曾以裸 CDN 寫入（syncWidgetVersion
       // 沒清乾淨、或 batch 路徑在某版繞過 wrap 直接 set），即使 v17 之後的
-      // wrap 邏輯是冪等的，也不會把已存的裸 url 變成 Worker URL —— 因為
+      // wrap 邏輯是冪等的，也不會把已存的裸 url 變成過濾廣告伺服器 URL —— 因為
       // wrapM3U8WithFilter 從未被呼叫。必須在這裡主動呼叫一次才能讓歷史
-      // cache 自動恢復為 Worker URL。
+      // cache 自動恢復為過濾廣告伺服器 URL。
       //
       // 冪等保證：對已 wrap 的 url，wrapM3U8WithFilter 內的 isAlreadyWrapped
       // 會直接 return，不會二次包裝；只對裸 CDN 才會真正 wrap 並印 log。
@@ -3905,7 +3911,7 @@ async function performBatchSearch(params) {
       }
       if (rewrapped > 0) {
         console.log(`🩹 batch cache 兜底 wrap: ${rewrapped}/${cached.length} 條裸 CDN 已修復`);
-        // 順手把修好的 cache 寫回 storage，下次命中直接是 Worker URL。
+        // 順手把修好的 cache 寫回 storage，下次命中直接是過濾廣告伺服器 URL。
         try { Widget.storage?.set?.(cacheKey, JSON.stringify(cached), CONFIG.CACHE_TTL); } catch {}
       }
       allResults = cached;
@@ -4417,7 +4423,7 @@ async function loadDetail(link) {
         episode,
         id,
         link,
-        searchMode: 'smart_stream',
+        searchMode: 'batch',
         matchStrictness: 'standard',
         preferResolution: 'auto',
         multiSource: (WidgetMetadata.globalParams.find(p => p.name === 'multiSource') || {}).value || 'enabled',
@@ -4584,7 +4590,7 @@ async function loadSubtitle(params) {
 // ==================== m3u8 Filter Admin ====================
 //
 // 提供一組 helper,讓 widget 載入後可以在 console / 其他 module 直接管理
-// Worker 上的 patterns。認證走帳密 → session cookie(對應 Worker 的
+// 過濾廣告伺服器上的 patterns。認證走帳密 → session cookie(對應伺服器的
 // ADMIN_USER / ADMIN_PASS + /admin/login)。
 //
 // 用法:
@@ -4609,10 +4615,10 @@ const m3u8FilterAdmin = (() => {
   const pass = cfg.ADMIN_PASS || '';
 
   // 啟動時自動行為:有帳密 → 登入 + 抓 patterns 印給 console 看
-  // (純診斷用途,結果不存 cache,過濾邏輯在 Worker 端獨立運作)
+  // (純診斷用途,結果不存 cache,過濾邏輯在過濾廣告伺服器端獨立運作)
   const autoBootstrap = true;
 
-  // 記住 session cookie,跨 request 帶過去(Worker 用 admin_session cookie)
+  // 記住 session cookie,跨 request 帶過去(過濾廣告伺服器用 admin_session cookie)
   let sessionCookie = '';
 
   /** 帶 Content-Type + session cookie 的 headers */
@@ -4688,9 +4694,9 @@ const m3u8FilterAdmin = (() => {
       return r;
     },
 
-    /** 登出(只清本地 cookie,Worker 那邊要等到 cookie 過期 / 改密碼才失效) */
+    /** 登出(只清本地 cookie,過濾廣告伺服器那邊要等到 cookie 過期 / 改密碼才失效) */
     async logout() {
-      // Worker 端 logout endpoint(可選)
+      // 過濾廣告伺服器端 logout endpoint(可選)
       if (sessionCookie) {
         await httpJson('POST', '/admin/logout').catch(() => {});
       }
@@ -4761,7 +4767,7 @@ const m3u8FilterAdmin = (() => {
       if (v.ok && v.json && v.json.admin_enabled) {
         console.log('[m3u8FilterAdmin] 登入 + 驗證 OK:', v.json);
       } else {
-        console.warn('[m3u8FilterAdmin] Worker 沒啟用 admin(ADMIN_USER / ADMIN_PASS env 沒設?)');
+        console.warn('[m3u8FilterAdmin] 過濾廣告伺服器沒啟用 admin(ADMIN_USER / ADMIN_PASS env 沒設?)');
       }
       return v;
     },
