@@ -1010,7 +1010,17 @@ const CONFIG = {
   // 金牌影視 / jpyy 這類站的 m3u8 是自己簽發的延遲 token，串流本身沒有
   // 廣告片頭，讓它們繞過濾廣告伺服器純粹白繞（多一次往返、拉長啟動時間）。
   // 預設 'skip'；與全站總開關 m3u8FilterEnabled 分層，可獨立控制。
-  WIDGET_VERSION: 32,
+  // bump 到 33：新增第二個簽名型來源「AGE動漫」(agedm)。
+  // 動畫專站，內容與金牌影視不重疊（AGE 查不到真人劇、金牌查不到動畫番），
+  // 所以 adapterSiteLimit 預設從 1 調到 2。
+  //
+  // 順帶修掉兩個只有 AGE 才會踩到的框架缺陷：
+  //   - parseInt(episodes[idx].name) 假設集數名是純數字，但 AGE 是
+  //     「第195集」「HD中字」「正片」→ NaN，episode 變空值會讓這條
+  //     來源在選集時消失。
+  //   - AGE 的 playlists 結構是「來源 → 集數」而非「集數 → 來源」，
+  //     不轉置的話一部單集電影會變成 5-7 集（每個來源算一集）。
+  WIDGET_VERSION: 33,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1198,7 +1208,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.9.9",
+  version: "3.0.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1410,8 +1420,12 @@ WidgetMetadata = {
       name: "adapterSiteLimit",
       title: "簽名型站 同時查詢站數",
       type: "input",
-      description: "最多同時查詢幾個簽名型站。預設 1（只查金牌影視）。新增站點後可調高，每加 1 站首屏多約 3 次請求。",
-      value: "1"
+      // 預設 2：目前有兩個站（金牌影視 = 綜合內容、AGE動漫 = 動畫）。
+      // 兩者內容不重疊 —— AGE 只有動畫，動漫番這類查詢金牌影視多半零命中，
+      // 反過來劇集 AGE 也是零命中。一起開的實際效益高於其 6 次請求的成本。
+      // 想省流量可以調回 1（此時只查第一個站 = 金牌影視）。
+      description: "最多同時查詢幾個簽名型站。預設 2（金牌影視 + AGE動漫）。每加 1 站首屏多約 3 次請求。",
+      value: "2"
     },
     {
       // adapter 詳細日誌。除錯用（站方改版時需要看簽名是否過關）。
@@ -2565,6 +2579,12 @@ function _adapterSafeRemark(raw) {
   if (/^[(（\[【]\s*\d+\s*(全|集|期|話)?\s*[)）\]】]$/.test(s)) return '';
   // 「更新至36集」「更新到36集」—— 已由 epLabel 表達
   if (/^更新(至|到)\s*\d+\s*[集期話]?$/.test(s)) return '';
+  // 「第195集」「195话」這類「只有集數」的狀態標記 —— 與 epLabel 重複。
+  //
+  // AGE 的 vod_remarks（站方 uptodate 欄位）在長篇動畫上就是「第195集」，
+  // 不過濾的話描述會變成「凡人修仙傳．第195集．第195集」—— 同一句
+  // 話印兩次。跟上面的「更新至N集」是同一個道理。
+  if (/^第?\s*\d+\s*[集期話]$/.test(s)) return '';
   return toDisplayText(s);
 }
 
@@ -2650,7 +2670,16 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       const showEpisode = type !== 'movie';
       const remark = showEpisode ? _adapterSafeRemark(vod_remarks) : '';
       const tail = showEpisode ? [epLabel, remark].filter(Boolean).join('．') : '';
-      const epNumber = parseInt(episodes[idx].name, 10);
+      // ★ 集數不能直接 parseInt(episodes[idx].name)：AGE 的集數名是
+      //   「第195集」「HD中字」「正片」，都不是純數字 → NaN。
+      //   NaN 會讓 episode 欄位變 null，使用者選第195集時這條來源被
+      //   filterByEpisode 判定「對不上」而消失（實測會變成
+      //   「凡人修仙傳．第195集．第195集」且 episode 空值）。
+      //
+      //   統一從名稱裡抽數字；抽不到就是單集電影 → 1。與 jpyy 的純數字
+      //   集名（「1」「2」…）結果一致，不改變既有行為。
+      const rawEpNumber = parseInt(episodes[idx].name, 10);
+      const epNumber = Number.isFinite(rawEpNumber) && rawEpNumber > 0 ? rawEpNumber : 1;
 
       out.push({
         name: siteTitle,
@@ -3315,6 +3344,202 @@ async function _adapterDefaultPlayUrls(site, vodId, nid) {
   return j?.data?.list || [];
 }
 
+// ================= AGE 動漫（協定不同，獨立實作） =================
+//
+// 與 jpyy 的差異（為什麼不能沿用預設三件套）：
+//   1. 不簽名 → buildHeaders 覆寫（見 ADAPTER_SITES）
+//   2. 搜尋回應在 data.videos、詳情在 data.video.playlists，形狀完全不同
+//   3. 播放連結要「先開解析頁 → 正則抓 Vurl → 再取 m3u8」三段跳
+//
+// ★ 40050 不是錯誤，是「查無此片」。
+//   實測 /v2/search?query=庆余年 → {"code":40050,"message":"参数错误！"}，
+//   但 query=鬼灭 就正常。AGE 是純動畫站，沒有真人劇，所以國劇片名
+//   一律查不到。_adapterGet 對非 200 code 回 null，正好把這些靜靜丟掉，
+//   不需要額外處理 —— 但這也代表搜尋真人劇時 AGE 貢獻為零，是預期行為。
+
+/** AGE 搜尋：/v2/search?query=&page= */
+async function _ageSearch(site, keyword) {
+  const j = await _adapterGet(site, '/search', { query: keyword, page: 1 });
+  const list = j?.data?.videos || [];
+  return list.map(it => ({
+    vod_id: String(it.id),
+    vod_name: it.name,
+    vod_pic: it.cover || '',
+    // premiere 是 "2026-10-04"，取年份。AGE 是動畫站沒有「地區」概念，
+    // 留空讓下游 area 過濾不會誤判。
+    vod_year: String(it.premiere || '').slice(0, 4) || '',
+    vod_area: '',
+    // uptodate 是站方既有的狀態欄位（"第02集"、"全集"、"PV"），
+    // 語意與 MacCMS 的 vod_remarks 一致，交給 _adapterSafeRemark 處理。
+    // 注意站方沒有評分欄位，不會有「豆瓣分被當成狀態標記」的問題。
+    vod_remarks: it.uptodate || '',
+  }));
+}
+
+/**
+ * AGE 集數：從 detail 的 playlists 取。
+ *
+ * 回傳 [{ name, nid }]，nid = 「來源分組|token」（站方給的是 base64
+ * token 不是 id；合組是因為同一集在不同源下要配不同 VIP 前綴）。
+ *
+ * ★ 關鍵：AGE 的資料結構是「來源 → 集數清單」，不是「集數 → 來源」。
+ *   所以必須轉置，否則一部單集電影會變成「6 個來源 = 6 集」，
+ *   使用者會看到一部電影有 6 集，切集其實是換播放源。
+ *
+ *   轉置方式：以第一個（依站方 UI 順序的）來源為基準集數序列，
+ *   其餘來源的同名集併進同一集的 sources 清單。
+ *
+ * 只收 m3u8 系列：playlists 裡還有 xigua / qiyi 等非 m3u8 來源，
+ * 那是站方網頁版播放器專用，拿到的不是可播的串流網址。
+ */
+async function _ageEpisodes(site, vodId) {
+  // 傳 {} 而非省略：_adapterGet 會直接 Object.keys(query)，給 null 會炸。
+  // 詳情頁是路徑式（/detail/{id}），沒有 query 參數。
+  const j = await _adapterGet(site, `/detail/${vodId}`, {});
+  const root = j?.data || j;
+  const playlists = root?.video?.playlists || {};
+  if (!playlists || typeof playlists !== 'object') return [];
+
+  // 站方 VIP 清單是逗號分隔字串。
+  const vipList = String(root.player_vip || '').split(',').map(s => s.trim());
+  const labels = root.player_label_arr || {};
+
+  // 依 label_arr（站方 UI 的顯示順序）取 m3u8 來源，站方把熱門源排前面。
+  const order = Object.keys(labels).filter(k => playlists[k] && k.includes('m3u8'));
+
+  // 先展開成 [{epName, group, token}] 的扁平清單
+  const flat = [];
+  for (const groupKey of order) {
+    const eps = playlists[groupKey];
+    if (!Array.isArray(eps)) continue;
+    for (const pair of eps) {
+      if (!Array.isArray(pair) || pair.length < 2) continue;
+      const [name, token] = pair;
+      if (!token) continue;
+      flat.push({
+        epName: String(name || ''),
+        group: groupKey,
+        groupLabel: labels[groupKey] || groupKey,
+        isVip: vipList.includes(groupKey),
+        token: String(token),
+      });
+    }
+  }
+  if (!flat.length) return [];
+
+  // ★ 轉置必須「依集數」而不是「依集數名稱」分組。
+  //
+  //   站方每個來源的集數名不完全一致：同一部電影，ffm3u8 叫
+  //   「HD中字」而 wjm3u8 叫「HD」、hnm3u8 叫「抢先版」（實測
+  //   「剧场版 鬼灭之刃」三個來源各叫不同名字）。若用名稱當 key，
+  //   一部單集電影會變成 5 集（「HD中字」「HD国语」「HD」「TC」
+  //   「抢先版」），使用者看到一部電影有 5 集卻切不到不同內容。
+  //
+  //   真正的集數要從名稱裡抽數字（「第01集」→ 1）。抽不到數字的
+  //   （電影的「HD中字」「正片」）視為第 0 集，也就是「單集電影」，
+  //   與站方 type/uptodate 一致。
+  const byEpNo = new Map();
+  for (const f of flat) {
+    // 「第01集」/「第1话」/「01」都能抓到數字；抓不到就是無編號的單集。
+    const numM = f.epName.match(/(\d+)/);
+    const epNo = numM ? parseInt(numM[1], 10) : 0;
+    if (!byEpNo.has(epNo)) byEpNo.set(epNo, []);
+    byEpNo.get(epNo).push(f);
+  }
+
+  // 依集數排序：第 0 集（單集電影）排最前，其餘照數字遞增。
+  const epNos = [...byEpNo.keys()].sort((a, b) => a - b);
+
+  const out = [];
+  for (const epNo of epNos) {
+    const sources = byEpNo.get(epNo);
+    // 集數名統一用「第N集」格式，讓下游 episodeLabelOf / 使用者顯示
+    // 一致。單集電影沿用「正片」較自然（與 MacCMS 站一致）。
+    const epName = epNo > 0 ? `第${epNo}集` : (sources[0].epName || '正片');
+    out.push({
+      name: epName,
+      // 主來源（sources[0]）的 token 就是這一集的播放依據，其餘來源
+      // 保留在 nid 的後備清單裡 —— 換 URL 時若主來源解析失敗可自動
+      // 換下一個來源，不必讓使用者看到空白來源。
+      nid: JSON.stringify(sources.map(s => ({
+        g: s.group, v: s.isVip ? 1 : 0, t: s.token,
+      }))),
+      sources,
+    });
+  }
+  return out;
+}
+
+/**
+ * AGE 播放連結：解析頁 → Vurl → m3u8。
+ *
+ * AGE 的播放連結是三段式，比 jpyy 多兩跳：
+ *   1. playlists 給的是 base64 token（age_xxxx），不是網址
+ *   2. 組出「解析頁網址」去 GET，拿回一頁 HTML
+ *   3. 從 HTML 裡的 `Vurl = '...'` 抓到真正的 m3u8
+ *
+ * ★ 第 2 步的解析服務在 jx.wuzhoupai.com，站方不是自己架的。
+ *   VIP 清單內的源要用 player_jx.vip 前綴、其餘用 player_jx.zj。
+ *   實測用錯前綴會拿到沒有 Vurl 的頁面（靜默失敗，不是報錯），
+ *   所以這個判斷不能省。
+ *
+ * ★ 會依序試所有來源直到成功 —— 解析服務是第三方（wuzhoupai），
+ *   某個 token 過期或該源掛掉是很常見的。回傳一筆能播的總比
+ *   讓使用者看到空白來源好（框架會把這筆來源丟掉，整部作品少一路）。
+ *
+ * 回傳 [{ url, resolution, resolutionName }] 以符合框架契約。
+ * AGE 不提供多清晰度資訊，一律標最高畫質（站方單一 m3u8）。
+ */
+async function _agePlayUrls(site, vodId, nid) {
+  // nid 是 _ageEpisodes 存的 sources JSON（見該函式）
+  let sources;
+  try {
+    sources = JSON.parse(String(nid || ''));
+  } catch (e) {
+    return [];
+  }
+  if (!Array.isArray(sources) || !sources.length) return [];
+
+  // 再取一次 detail：player_jx / player_vip 只在 detail 回應裡，
+  // 沒存起來的話這裡就沒有前綴可用。延遲換取的設計本來就是
+  // 「用到才換」，多這一次請求是必要的。
+  const j = await _adapterGet(site, `/detail/${vodId}`, {});
+  const root = j?.data || j;
+  const jx = root?.player_jx || {};
+  if (!jx.vip && !jx.zj) return [];
+
+  // 依序試各來源，第一個解析成功的就是它。
+  for (const s of sources) {
+    const token = s && s.t;
+    if (!token) continue;
+    // isVip 已在 _ageEpisodes 算好並存進 nid，不必重新比對 player_vip ——
+    // 站方改了 VIP 清單也不該讓已建好的 token 突然走錯前綴。
+    const prefix = s.v ? jx.vip : jx.zj;
+    if (!prefix) continue;
+
+    let html;
+    try {
+      const resp = await Widget.http.get(prefix + token, {
+        headers: { 'User-Agent': site.ua, 'Referer': 'https://m.agedm.io/' },
+        timeout: CONFIG.REQUEST_TIMEOUT,
+      });
+      html = resp;
+      if (resp && typeof resp === 'object' && 'data' in resp) html = resp.data;
+    } catch (e) {
+      continue;   // 換下一個來源，不要讓整條來源消失
+    }
+    if (typeof html !== 'string' || !html) continue;
+
+    // 站方在頁面裡用單引號包住 Vurl。正則寬鬆一點：站方改引號樣式時
+    // 寧可寬鬆也不要整個功能壞掉（抓不到就續試下一個來源）。
+    const m = html.match(/Vurl\s*=\s*['"]([^'"]+)['"]/);
+    if (!m || !m[1].trim()) continue;
+
+    return [{ url: m[1].trim(), resolution: 1080, resolutionName: 'AGE' }];
+  }
+  return [];
+}
+
 // ---------- 簽名型站點清單 ----------
 //
 // 新增同協定站：複製一個物件、改 id/base/signKey 即可，零程式碼改動。
@@ -3332,6 +3557,29 @@ const ADAPTER_SITES = [
     // 這類站回傳的資料比 MacCMS 站豐富（豆瓣評分、地區、多清晰度），
     // 給予排序加成。
     isMain: true,
+  },
+  {
+    id: 'agedm',
+    title: 'AGE動漫',
+    base: 'https://api.agedm.io/v2',
+    // 動畫站。片名是簡體中文原名、沒有豆瓣分與多清晰度，排序加成
+    // 意義不大，不設 isMain。
+    //
+    // ★ 協定與 jpyy 完全不同：不簽名、純 GET、要帶 Referer/Origin。
+    //   覆寫 buildHeaders 就能跳過簽名流程（_adapterGet 有
+    //   site.buildHeaders 優先的分支）—— 非簽名站不需要改框架任何一行。
+    ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    buildHeaders() {
+      return {
+        'User-Agent': this.ua,
+        // 站方會檢查來源。實測補上這兩行 detail / 解析頁才穩定回 200。
+        'Referer': 'https://m.agedm.io/',
+        'Origin': 'https://m.agedm.io',
+      };
+    },
+    search: _ageSearch,
+    episodes: _ageEpisodes,
+    playUrls: _agePlayUrls,
   },
 ];
 
