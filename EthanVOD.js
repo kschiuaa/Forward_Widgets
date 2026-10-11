@@ -1391,7 +1391,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.1.4",
+  version: "3.1.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2806,7 +2806,12 @@ function _adapterSeasonLabel(rawName) {
   // ★ 先剝掉片名尾端的「(語言)」括弧：「轻功(粤语)」「轻功（国语）」
   //   → 拆成「轻功」，語言由頂層 language 欄位承擔（見 stripLanguageParen 註解）。
   //   抽不到語言的片名（無括弧或括弧內非語言）保持原樣，不破壞既有資料。
-  const stripped = stripLanguageParen(s);
+  //
+  //   stripHint 用「這條字串自己抽到的語言」：讓階段二精準刪「對應的語言
+  //   變體」，避免誤刪「中字」之類的字幕標記。
+  //   此時還沒進 cleanResourceForOutput，**自己抽一次**（代價小，邏輯一致）。
+  const selfLang = extractLanguageTag(s);
+  const stripped = stripLanguageParen(s, selfLang);
   if (stripped === s) {
     // 沒拆到語言 → 走原本邏輯
     return _adapterSeasonLabelInner(s);
@@ -4770,6 +4775,10 @@ function extractLanguageTag(name) {
 // displayName 內仍帶著「轻功(粤语)」字樣，視覺上與頂層 language 重複。
 // 抽出讓 displayName 只留「轻功」，頂層 language 承擔「這部是粵語版」。
 //
+// 第二個參數 stripHint：若已知「抽到的是哪個語言」，就只剝**這個語言**
+// 對應的字眼（含繁簡變體）。不傳或傳 null 時用 LANGUAGE_TAGS 內**所有**
+// 字眼去 try —— 但這個模式有反例風險（見階段二註解），預設不建議。
+//
 // 規則：
 //   1. 只處理「明確抽出語言時」才拆 —— 抽不到（null）就保持原文不動。
 //      「进击的巨人(双语)」在 extractLanguageTag 內沒規則命中，回 null，
@@ -4777,23 +4786,65 @@ function extractLanguageTag(name) {
 //   2. 只拆**最末段**的括弧：避免誤刪中間的版本描述。
 //   3. 拆完若剩下空字串，退回原片名（不讓顯示變成空白）。
 //   4. 拆完若剩下字串完全等於原片名（未命中），原樣返回（冪等）。
-function stripLanguageParen(rawName) {
+function stripLanguageParen(rawName, stripHint = null) {
   const s = String(rawName ?? '').trim();
   if (!s) return s;
-  // 先確認抽得到語言（抽不到就什麼都不做）
+  // 先確認抽得到語言（抽不到就什麼也不做）
   if (!extractLanguageTag(s)) return s;
 
-  // 抓**所有**括弧段（不限最末段）：
+  // ── 階段一：剝所有「(語言) / （語言）」括弧段 ──
+  //   抓**所有**括弧段（不限最末段）：
   //   「进击的巨人 (国语) 第四季」中間的 (國語) 也要剝，
   //   不然跟頂層 language 仍重複顯示。
-  // 用 iterate 從右往左替換每個 [（(...)）] 段，剝到沒有為止。
+  //   用 iterate 從右往左替換每個 [（(...)）] 段，剝到沒有為止。
   let out = s;
-  // 一輪只能剝一個括弧段（正則不支援巢狀），多次跑直到穩定
   let prev;
   do {
     prev = out;
     out = out.replace(/\s*[（(][^()（）]*[)）]\s*/, ' ').replace(/\s+/g, ' ').trim();
   } while (out !== prev);
+
+  // ── 階段二：剝「無括弧的語言字眼」尾綴（itemLang 已知的情況）──
+  //   場景：部分站把語言字眼直接黏在片名尾端，沒括號。
+  //     「九五至尊粤语」→ 樂子 MacCMS 站方原標題就這樣
+  //     「庆余年2 国语」  → 某些站方直接空格接
+  //   只刪「**抽到的 itemLang 本身**」對應的字眼（含繁簡變體），
+  //   **不貪心刪 LANGUAGE_TAGS 內其他字眼**。
+  //
+  //   反例：「破地獄 國語中字」站方語意是「國語配音 + 中文字幕」，
+  //   extractLanguageTag 命中「國語」。此時只該刪「國語」，
+  //   不該把「中字」（中文字幕標記）也一起剝掉。
+  //   若用「所有 LANGUAGE_TAGS 字眼去 try」，會把「中字」誤刪成
+  //   「破地獄 國語」—— 反而把字幕標記殘留進去。
+  //
+  //   規則：
+  //     1. 只刪「最末段」是「itemLang 對應字眼」的情況。
+  //     2. 前面可有可無空白或「．·・」分隔符。
+  //     3. 刪完用 trim 清掉殘留的句點 / 空白。
+  //     4. 沒命中（itemLang 不在字尾）就原樣返回，不報錯。
+  if (stripHint) {
+    // 從 LANGUAGE_TAGS 內撈出 label===stripHint 那條，用它的 label 與
+    // 繁簡變體構成「這個語言的所有可能字眼列表」。
+    const tag = LANGUAGE_TAGS.find(t => t.label === stripHint);
+    const variants = new Set();
+    if (tag) {
+      variants.add(tag.label);
+      const simp = tag.label
+        .replace(/國/g, '国').replace(/粵/g, '粤').replace(/語/g, '语');
+      variants.add(simp);
+    }
+    // 保險起見也把 stripHint 自己加進去
+    variants.add(stripHint);
+    // 由長到短（避免「粵語」被「語」先吃掉）
+    const sorted = [...variants].sort((a, b) => b.length - a.length);
+    for (const lang of sorted) {
+      const tailRe = new RegExp(`[\\s．·・]?${lang.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`);
+      if (tailRe.test(out)) {
+        out = out.replace(tailRe, '').replace(/[．·・\s]+$/, '').trim();
+        break;
+      }
+    }
+  }
 
   if (!out) return s;            // 拆完空字串 → 退回原文
   if (out === s) return s;       // 沒拆到（應該不會發生，但保險）
@@ -5823,6 +5874,27 @@ function cleanResourceForOutput(resource) {
   const langFromName = extractLanguageTag(resource._rawName);
   const langFromDesc = langFromName ? null : extractLanguageTag(resource.description);
   const itemLang = langFromName || langFromDesc;
+
+  // ★ 從 _rawName 剝掉語言字眼（防止「九五至尊粤语」這種「語言黏在
+  // 站方原標題」的字眼洩漏到 title / description 顯示）。
+  //
+  //   為什麼抽完語言後還要剝：頂層 language 欄位已承擔「這部是粵語版」，
+  //   如果不剝，title 與 description 兩處都會再顯示「粵語」一次，
+  //   使用者看起來「同樣資訊出現三次」（title / description / language）。
+  //   cleanResourceForOutput 內這裡剝完，title 與 description 後續
+  //   都拿到剝後的 _rawName —— 一次處理，兩處生效。
+  //
+  //   stripHint=langFromName：把「抽到的語言」傳進去，stripLanguageParen
+  //   只剝**這個語言**對應的字眼（含繁簡變體）。不傳或 null 時會用
+  //   LANGUAGE_TAGS 全部字眼去 try，但這個模式有反例（見函式註解），
+  //   這裡有 itemLang 已知就走精準路徑。
+  if (langFromName) {
+    resource._rawName = stripLanguageParen(resource._rawName, langFromName);
+  } else if (langFromDesc && resource._rawName) {
+    // description 抽到語言但 _rawName 沒抽到：剝時仍以 _rawName 為準
+    // （這條路徑通常 _rawName 沒語言字眼可剝，呼叫會是 no-op，但保險）
+    resource._rawName = stripLanguageParen(resource._rawName, langFromDesc);
+  }
 
   // ★★★ 統一清單設計 (v1) — 頂層獨立欄位
   //
