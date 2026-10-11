@@ -1391,7 +1391,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.0.9",
+  version: "3.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2402,6 +2402,24 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     };
   }
 
+  // ★ 站方分類衝突：jpyy 對劇場版存 typeId1=1（電影），TV 動漫存 typeId1=4。
+  //   進來時 type='tv'（找 S1 動漫）但候選 _siteTypeName='movie'（劇場版）
+  //   → spin-off，擋掉。jpyy 劇場版的 rawName 往往就是「五等分的新娘」，
+  //   沒「劇場版」字眼，上述 rawName 守門員抓不到，必須靠這層補。
+  //
+  //   反向（type='movie' 但 _siteTypeName='tv'）也擋：使用者明確要電影，
+  //   不要 TV 動漫。
+  if (targetInfo.type && candidateInfo._siteTypeName &&
+      targetInfo.type !== candidateInfo._siteTypeName &&
+      candidateInfo._siteTypeName !== 'other') {
+    return {
+      match: false, type: 'spin_off', score: 0,
+      similarity: 0, seasonMatch: false,
+      targetSub: '', candidateSub: `siteType=${candidateInfo._siteTypeName}`,
+      confidence: 0
+    };
+  }
+
   // 「的」「之」是中文常用虛詞，Forward / 站方 / 使用者輸入時常有省略：
   //   target「五等分新娘」vs candidate「五等分的新娘」其實是同一片。
   // 比對前去掉這些虛詞，否則相似度會被 1 個虛詞拉低，導致「實際同片」誤判失敗。
@@ -2948,7 +2966,26 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   「慶餘年．第01集」讀起來像漏了什麼（使用者會以為壞掉）。
       const showEpisode = type !== 'movie';
       const remark = showEpisode ? _adapterSafeRemark(vod_remarks) : '';
-      const tail = showEpisode ? [epLabel, remark].filter(Boolean).join('．') : '';
+      let tail = showEpisode ? [epLabel, remark].filter(Boolean).join('．') : '';
+      // ★ 過濾「畫質字眼」當集名。
+      //
+      // 場景：jpyy 對單集電影（劇場版）把 episode.name 設成「高清」「蓝光」、
+      // vod_remarks 也設成「高清」「HD」之類。這些都不是集名，是畫質標記
+      // —— REX 客戶端把它顯示成「五等分的新娘．高清．藍光」時，使用者
+      // 會誤以為這是兩集，實際上整季/整部就這一個。
+      //
+      // 規則：當 epLabel（或 remark）整段就是畫質字眼時，從 tail 拿掉。
+      // 保留「更新至 N 集」「完結」等有意義的標記。
+      // 條件用整段比對：這些字眼不混在其它內容裡，混在其他內容代表是
+      // 編劇備註，例如「1080P HDR 字幕版」就保留。
+      //
+      // ★ 只在「單集電影」（episodes.length === 1）時觸發 —— 多集劇的
+      // 集名是「1」「2」「第1集」這類集數，不會誤判。
+      const QUALITY_ONLY = /^(高清|蓝光|藍光|超清|標清|标清|HD|SD|1080P?|720P?|4K|HDR|TS|TC|CAM|BluRay|Blu-ray|WEB-?DL)$/i;
+      if (episodes.length === 1 && tail) {
+        const parts = tail.split('．').filter(p => p && !QUALITY_ONLY.test(p.trim()));
+        tail = parts.join('．');
+      }
       // ★ 集數不能直接 parseInt(episodes[idx].name)：AGE 的集數名是
       //   「第195集」「HD中字」「正片」，都不是純數字 → NaN。
       //   NaN 會讓 episode 欄位變 null，使用者選第195集時這條來源被
@@ -4070,6 +4107,34 @@ const ADAPTER_SITES = [
     // 這類站回傳的資料比 MacCMS 站豐富（豆瓣評分、地區、多清晰度），
     // 給予排序加成。
     isMain: true,
+    // ★ 自訂 toMacItem：把 jpyy 的 typeId1 帶進 _siteTypeId 私有欄。
+    //
+    // 為什麼：jpyy 對「劇場版」「電影版」會存成 typeId1=1（電影），
+    // 對 TV 動漫存成 typeId1=4（劇集）。使用者從 REX 進來帶 type='tv'
+    // 時，我們的任務是找「TV 動漫」。若同標題下同時有劇場版(typeId1=1)
+    // 跟 TV 動漫(typeId1=4)，劇場版是 spin-off 必須擋掉。
+    //
+    // 預設 _adapterDefaultSearch 只取 5 個欄位，typeId1 被丟掉 →
+    // 下游 isSmartSeriesMatch 看不到 → 劇場版會被當成 S1 命中 exact 100。
+    // 補上 _siteTypeId 後，extractPlayInfoForCache 進去就能辨別。
+    //
+    // ★ 必帶的 MacCMS 欄位（否則 extractPlayInfoForCache / isSmartSeriesMatch
+    //   / 去重 / 排序全部走空值）：
+    //   - vod_id、vod_name、vod_pic、vod_year、vod_area、vod_remarks。
+    // ★ 私有欄 _siteTypeId / _siteTypeName：
+    //   下游 extractPlayInfoForCache 內可讀到（item._siteTypeId），
+    //   進 isSmartSeriesMatch 前預篩時判 typeId1===1 但 type==='tv' → 擋。
+    toMacItem: (it) => ({
+      vod_id: String(it.vodId),
+      vod_name: it.vodName,
+      vod_pic: it.vodPic,
+      vod_year: String(it.vodPubdate || '').slice(0, 4) || '',
+      vod_area: it.vodArea || '',
+      // ★ vod_remarks 一律不帶 vodDoubanScore（見 _adapterDefaultSearch 註解）。
+      vod_remarks: it.vodRemarks || (it.vodVersion || ''),
+      _siteTypeId: it.typeId1,
+      _siteTypeName: it.typeId1 === 1 ? 'movie' : (it.typeId1 === 4 ? 'tv' : 'other'),
+    }),
   },
   {
     id: 'agedm',
@@ -6990,6 +7055,16 @@ async function performSmartSearch(params, onStreamResult) {
     targetInfo._expectedSequel = targetSeason;
   }
   targetInfo.seasonNumber = targetSeason;
+  // ★ 把使用者指定的 type 帶進 targetInfo，給下游 isSmartSeriesMatch 用。
+  //
+  // 為什麼：jpyy 對「劇場版」存成 typeId1=1（電影），跟 S1 TV 動漫的
+  // typeId1=4 不同。當使用者 type='tv' 但 candidate 的 _siteTypeName='movie'
+  // 時，劇場版是 spin-off 必須擋掉。沒有這個欄位，isSmartSeriesMatch 收
+  // 不到 type 訊息 → 誤判 exact 100。
+  // 條件：type 只在 'tv'/'movie'/'variety' 之一時帶入，避免無效值污染。
+  if (type === 'tv' || type === 'movie' || type === 'variety') {
+    targetInfo.type = type;
+  }
 
   // 詳細頁指定的版本同樣要帶進來。
   //
