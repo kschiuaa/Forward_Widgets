@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.2.1",
+  version: "3.2.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7849,55 +7849,127 @@ targetInfo.searchQuery = aliasQ;
   // 與串流模式同樣帶上續集序號，理由見 loadResource 的 cacheKey 說明。
   const batchSequel = extractSequelNumber(targetInfo.rawName);
   const batchVersion = targetInfo.year ?? extractVersionMarker(targetInfo.rawName) ?? 'x';
-  // ★ 必須帶上 episode，與串流模式（line ~4727 的 _e${targetEpisode}）一致。
+  // ★ Cache 拆分：MacCMS 全季共用，adapter 單集綁定。
   //
-  //   為什麼：adapter 站（金牌影視等）是「延遲換 URL」—— 回傳的資源帶的是
-  //   呼叫當下 targetEpisode 換來的 m3u8。cache key 若不含 episode，ep=1
-  //   換出的結果會被 ep=5 直接讀回 —— 使用者切集後看到第 1 集的影片。
+  //   舊設計：cache key 帶 _e${targetEpisode}，整批結果（含 MacCMS + adapter）
+  //   一起存。使用者從 E1 切到 E2 時，cache miss → 全站重搜（MacCMS 的
+  //   detail 也要重抓），但實際上 MacCMS 的結果跟集數無關，純粹是
+  //   cache key 設計錯誤導致的「假性 cache miss」。實測從 E1 切到 E2
+  //   需重抓 5+ 個 MacCMS 站的 detail ≈ 4-8s，使用者體感是「切集很慢、
+  //   還要重搜」。
   //
-  //   這在 MacCMS 站不會發生（它們一次回傳全部集數的連結，cache 內容與
-  //   episode 無關），但 adapter 的結果綁定了集數，兩者不能共用 key 規則。
-  //   加上 _e 之後，adapter 的快取命中率會下降，但正確性優先 —— 錯一集
-  //   比慢一次嚴重得多。
-  const cacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}_e${targetEpisode || 'all'}`;
+  //   新設計（兩把 key）：
+  //     • macCacheKey  → 不含 _e${ep}，整季 MacCMS 結果，跨集共享
+  //     • adCacheKey   → 含 _e${ep}，該集 adapter 結果（adapter 延遲換
+  //       URL 換出的是當集 m3u8，與集數綁定，不能跨集共用）
+  //
+  //   讀取：合併兩把 cache，run filterByEpisode 取出當集。
+  //   寫入：寫完搜尋後，allResults 按 _adapterSite 標籤分流到兩把 cache。
+  //
+  //   兼容：舊 key（vod_batch_..._e${ep} 含全部類型）保留讀取。命中時
+  //   legacy 結果會跟 mac / ad 結果合併（用 url 去重），讓使用者無感升級；
+  //   30 分鐘後舊 key 自然過期，不再佔用 storage。
+  const baseCacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}`;
+  const macCacheKey = baseCacheKey + '_mac';
+  const adCacheKey  = baseCacheKey + `_adapter_e${targetEpisode || 'all'}`;
+  // 舊格式 key（向後相容：v 之前的版本存進去的整批結果）
+  const legacyCacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}_e${targetEpisode || 'all'}`;
+
+  // ★ 標記「cache 哪邊命中」：搜尋區段會用來決定要不要跑 MacCMS 補抓。
+  let _macCacheHit = false;
+  let _adapterCacheHit = false;
+
+  // 對每條 cache 結果跑兜底 wrap：歷史版本可能以裸 CDN 寫入（syncWidgetVersion
+  // 沒清乾淨、或 batch 路徑在某些版本繞過 wrap 直接 set），wrap 邏輯是冪等的，
+  // 已 wrap 的 url 會被 isAlreadyWrapped 擋下，這裡只對裸 CDN 真正 wrap。
+  const _rewrap = (arr) => {
+    let n = 0;
+    for (const r of arr) {
+      if (!r || !r.url || typeof r.url !== 'string') continue;
+      const before = r.url;
+      const after = wrapM3U8WithFilter(r.url, { adapter: !!r._adapterSite });
+      if (after !== before) { r.url = after; n++; }
+    }
+    return n;
+  };
+  const _persistIfRewrapped = (key, arr, rewrapped) => {
+    if (rewrapped <= 0) return;
+    console.log(`🩹 cache 兜底 wrap: ${rewrapped}/${arr.length} 條裸 CDN 已修復（key=${key.slice(0, 60)}...）`);
+    try { Widget.storage?.set?.(key, JSON.stringify(arr), CONFIG.CACHE_TTL); } catch {}
+  };
+
   let allResults = [];
 
+  // ★ 讀 cache：合併 mac + adapter。
+  //
+  //   為什麼 mac 與 adapter 都要讀：cache miss 任一邊都要重抓那邊；
+  //   兩邊都 hit 就是完整結果，直接跳過搜尋。
   try {
-    const cached = parseCacheValue(await Widget.storage?.get?.(cacheKey));
-    if (cached.length > 0) {
-      console.log(`✅ 批量模式缓存命中: ${cached.length}个结果`);
-      // 兜底 wrap：cache 內 url 在歷史版本曾以裸 CDN 寫入（syncWidgetVersion
-      // 沒清乾淨、或 batch 路徑在某版繞過 wrap 直接 set），即使 v17 之後的
-      // wrap 邏輯是冪等的，也不會把已存的裸 url 變成過濾廣告伺服器 URL —— 因為
-      // wrapM3U8WithFilter 從未被呼叫。必須在這裡主動呼叫一次才能讓歷史
-      // cache 自動恢復為過濾廣告伺服器 URL。
-      //
-      // 冪等保證：對已 wrap 的 url，wrapM3U8WithFilter 內的 isAlreadyWrapped
-      // 會直接 return，不會二次包裝；只對裸 CDN 才會真正 wrap 並印 log。
-      let rewrapped = 0;
-      for (const r of cached) {
-        if (!r || !r.url || typeof r.url !== 'string') continue;
-        const before = r.url;
-        // 同 smart cache 路徑：帶上 adapter 標記，讓跳過設定在 batch cache
-        // 生效（否則這裡會把 adapter 的 url 又包回去，設定形同失效）。
-        const after = wrapM3U8WithFilter(r.url, { adapter: !!r._adapterSite });
-        if (after !== before) {
-          r.url = after;
-          rewrapped++;
-        }
+    const [macRaw, adRaw, legacyRaw] = await Promise.all([
+      Widget.storage?.get?.(macCacheKey),
+      Widget.storage?.get?.(adCacheKey),
+      Widget.storage?.get?.(legacyCacheKey),
+    ]);
+    const macCached = parseCacheValue(macRaw);
+    const adCached  = parseCacheValue(adRaw);
+    const legacyCached = parseCacheValue(legacyRaw);
+
+    if (macCached.length > 0 || adCached.length > 0 || legacyCached.length > 0) {
+      // 兜底 wrap
+      const w1 = _rewrap(macCached);
+      const w2 = _rewrap(adCached);
+      const w3 = _rewrap(legacyCached);
+      _persistIfRewrapped(macCacheKey, macCached, w1);
+      _persistIfRewrapped(adCacheKey,  adCached,  w2);
+      _persistIfRewrapped(legacyCacheKey, legacyCached, w3);
+
+      // 合併：舊格式的 legacy 也要納入（其內含 MacCMS + adapter 兩種，
+      // 由 _adapterSite 自動分流）
+      const fromLegacy = legacyCached.filter(r => {
+        const isInMac = macCached.some(m => m.url === r.url);
+        const isInAd  = adCached.some(a => a.url === r.url);
+        return !isInMac && !isInAd;
+      });
+      const merged = [...macCached, ...adCached, ...fromLegacy];
+      if (merged.length > 0) {
+        console.log(`💾 batch cache 命中: mac=${macCached.length} adapter=${adCached.length} legacy=${fromLegacy.length}（合併 ${merged.length}）`);
+        allResults = merged;
+        // ★ 記住「哪邊 cache 命中」：決定要不要重抓補上 miss 的部分。
+        //
+        //   修正前：合併後 non-empty 就直接跳過搜尋 → adapter miss 時
+        //     永遠不會被補抓，使用者切到該集只看到 MacCMS 站，
+        //     看不到金牌影視等 adapter 站。
+        //   修正後：若 adCached 為空（即 adapter 站該集 cache miss），
+        //     設 _adapterNeedsRefetch=true，後續搜尋區段仍會跑
+        //     （因為 allResults 是 cache 填的，後面 if 會依 _macCacheHit
+        //     決定要不要跑 MacCMS 補抓，只跑 adapter 補抓即可）。
+        _macCacheHit = macCached.length > 0;
+        _adapterCacheHit = adCached.length > 0;
       }
-      if (rewrapped > 0) {
-        console.log(`🩹 batch cache 兜底 wrap: ${rewrapped}/${cached.length} 條裸 CDN 已修復`);
-        // 順手把修好的 cache 寫回 storage，下次命中直接是過濾廣告伺服器 URL。
-        try { Widget.storage?.set?.(cacheKey, JSON.stringify(cached), CONFIG.CACHE_TTL); } catch {}
-      }
-      allResults = cached;
     }
   } catch (e) {
-    console.warn('读取缓存失败');
+    console.warn('读取缓存失败:', e.message);
   }
 
-  if (allResults.length === 0) {
+  // ★ 從 legacy 命中但 mac/ad 都 miss 的場景：把 legacy 結果視為
+  //   「MacCMS 部分命中」（legacy 內含 MacCMS 全季）。等同 _macCacheHit。
+  if (allResults.length > 0 && !_macCacheHit && !_adapterCacheHit) {
+    _macCacheHit = true;
+  }
+
+  // ★ 進入搜尋區段的條件：完全 cache miss 或部分 cache miss。
+  //
+  //   修正前：只看 allResults.length（被 cache 填滿就不搜）→ adapter miss 時
+  //     永遠不會被補抓，使用者切到該集只看到 MacCMS 站。
+  //   修正後：allResults 為空（完全 miss），或 adapter 該集 cache miss
+  //     但 MacCMS 命中（部分 miss），都會進入搜尋區段；搜尋區段內部
+  //     依 _macCacheHit 決定要不要跑 MacCMS 任務（避免重抓已命中的
+  //     MacCMS 站，省下 5 站 detail 重抓時間）。
+  const _needRefetch = (
+    allResults.length === 0
+    || (!_adapterCacheHit && _adapterIsEnabled(params))
+  );
+  if (_needRefetch) {
     const stats = { total: resourceSites.length, success: 0, failed: 0 };
     const requestTasks = [];
 
@@ -8016,7 +8088,15 @@ targetInfo.searchQuery = aliasQ;
     // 請求存活（避免站方目錄更新帶來的 stale 問題），純函式內存。
     const macResponseCache = new Map();   // site.value -> response.list
 
-    const macTasks = resourceSites.map(site => async () => {
+    // ★ MacCMS 站已 cache 命中時，跳過整批 MacCMS detail 重抓。
+    //
+    //   修正前：每次進入搜尋區段都會建 macTasks 跑 Promise.allSettled，
+    //     即使 MacCMS cache 已經有完整結果也照抓一遍。E1 切到 E2 時
+    //     5 個 MacCMS 站的 detail 都重抓，耗時 4-8s。
+    //   修正後：_macCacheHit=true 時 macTasks 為空，requestTasks 只含
+    //     adapter 補抓；進 if 之後 allResults 已含 MacCMS cache，合併
+    //     新的 adapter 結果後寫回。E1 切 E2 從 4-8s 降到 ~200ms。
+    const macTasks = _macCacheHit ? [] : resourceSites.map(site => async () => {
       try {
         const retries = site.isMain ? CONFIG.RETRY_ATTEMPTS : 1;
         const response = await fetchWithSmartRetry(
@@ -8279,13 +8359,26 @@ targetInfo.searchQuery = aliasQ;
     requestTasks.push(...macTasks);
 
     const results = await Promise.allSettled(requestTasks.map(task => task()));
-    
+
     const fulfilledResults = results
       .filter(r => r.status === 'fulfilled')
       .flatMap(r => r.value);
-    
+
     const executor = new SmartSearchExecutor(new SiteManager(), targetInfo, type, matchStrictness);
-    allResults = executor.smartDeduplicate(fulfilledResults);
+    // ★ 部分 cache 命中時，搜出來的新結果要與 cache 合併而非覆蓋。
+    //
+    //   修正前：smartDeduplicate 直接 assign 給 allResults，覆蓋掉
+    //     cache 內的 MacCMS 結果。
+    //   修正後：cache 已有結果（_macCacheHit）時，與新結果合併去重。
+    const newSearched = executor.smartDeduplicate(fulfilledResults);
+    if (allResults.length > 0) {
+      // 合併：cache 內的 MacCMS + 新搜的 adapter（或部分 MacCMS）
+      const existingUrls = new Set(allResults.map(r => r.url).filter(Boolean));
+      const additions = newSearched.filter(r => !r.url || !existingUrls.has(r.url));
+      allResults = [...allResults, ...additions];
+    } else {
+      allResults = newSearched;
+    }
 
     // ===== 空結果安全網：整批篩選後一筆都沒有時，放寬比對再試一次 =====
     //
@@ -8397,10 +8490,56 @@ targetInfo.searchQuery = aliasQ;
     }
     
     console.log(`📊 批量搜索完成: ${Date.now() - startTime}ms, 结果: ${allResults.length}`);
-    
+
+    // ★ 分流寫 cache：MacCMS 全季共用，adapter 綁定到該集。
+    //
+    //   為什麼必須分流：舊版寫入時把 MacCMS + adapter 混在同一個 key
+    //   （vod_batch_..._e${ep}），使用者從 E1 切 E2 時 cache miss 會
+    //   觸發整批重抓，5 個 MacCMS 站 detail 重抓 ≈ 4-8s。分流後
+    //   MacCMS 部分跨集共享，E1 → E2 切集時只需重抓 adapter（單站
+    //   單集 ≈ 200-400ms）。
+    //
+    //   寫入策略：
+    //     • MacCMS 結果（無 _adapterSite）→ 寫 macCacheKey（覆蓋式；
+    //       為避免「這次只抓到部分集時丟失舊的全季」，把「這次新抓的」
+    //       與「舊 macCacheKey 內的」按 url 去重合併後再寫）。
+    //     • Adapter 結果（有 _adapterSite）→ 寫 adCacheKey
+    //       （adapter 是單集綁定，直接覆蓋即可，不會丟資料）。
     if (allResults.length > 0) {
       try {
-        Widget.storage?.set?.(cacheKey, JSON.stringify(allResults), CONFIG.CACHE_TTL);
+        const macResults = allResults.filter(r => !r._adapterSite);
+        const adResults  = allResults.filter(r => !!r._adapterSite);
+
+        // MacCMS：合併舊 cache（避免這次只抓到部分集時丟失舊的全季）。
+        // 為什麼不直接覆蓋：使用者可能從 E5 開始搜（macResults 只有 E5 集），
+        // 這時若覆蓋，舊 cache 內的 E1~E4 集會被清空，E1 切回時
+        // 還要重抓那 4 集。改成「新增 + 保留舊」後，cache 是「漸進式
+        // 累積」，缺哪集就補哪集。
+        if (macResults.length > 0) {
+          (async () => {
+            let toWrite = macResults;
+            try {
+              const oldMac = parseCacheValue(await Widget.storage?.get?.(macCacheKey));
+              if (oldMac.length > 0) {
+                const newUrls = new Set(macResults.map(r => r.url).filter(Boolean));
+                const retained = oldMac.filter(r => r.url && !newUrls.has(r.url));
+                toWrite = [...macResults, ...retained];
+                console.log(`💾 MacCMS cache 寫入: 新增 ${macResults.length} + 保留舊 ${retained.length} = ${toWrite.length} 條`);
+              } else {
+                console.log(`💾 MacCMS cache 首次寫入: ${macResults.length} 條`);
+              }
+            } catch (e) { /* 合併失敗時直接寫 macResults */ }
+            try { Widget.storage?.set?.(macCacheKey, JSON.stringify(toWrite), CONFIG.CACHE_TTL); } catch {}
+          })();
+        }
+
+        // Adapter：直接覆蓋（adapter 結果綁定 targetEpisode，不能跨集共用）
+        if (adResults.length > 0) {
+          try {
+            Widget.storage?.set?.(adCacheKey, JSON.stringify(adResults), CONFIG.CACHE_TTL);
+            console.log(`💾 adapter cache 寫入: ${adResults.length} 條（key=..._adapter_e${targetEpisode || 'all'}）`);
+          } catch (e) {}
+        }
       } catch (e) {}
     }
   }
