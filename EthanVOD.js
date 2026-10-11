@@ -1391,7 +1391,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.1.1",
+  version: "3.1.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3009,9 +3009,22 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   但 episode 欄位是 1）。
       const epNumber = _adapterEpNumber(episodes[idx].name);
 
+      // ★ 把 AGE 多源（非凡/无尽/计算云/...）帶進 description。
+      //
+      // 為什麼：_agePlayUrls 從一個 episode 回傳多個 URL（多 CDN），
+      // 對應多個不同站方 source。若不在 description 標明，使用者
+      // 看到「凡人修仙傳．第80集」出現 4 次但完全看不出差別，會以為
+      // 重複 —— 切到 source 下拉才發現是「非凡」「无尽」不同 CDN。
+      //
+      // 條件：只在「真有多 source」時帶（_groupLabel 有值且非空）。
+      // 單 source（_agePlayUrls 只回 1 個）時不重複出現。
+      const sourceTag = r?._groupLabel ? `[${r._groupLabel}]` : '';
+
       out.push({
         name: siteTitle,
-        description: tail ? `${displayName}．${tail}` : displayName,
+        description: tail
+          ? (sourceTag ? `${displayName}．${tail}．${sourceTag}` : `${displayName}．${tail}`)
+          : (sourceTag ? `${displayName}．${sourceTag}` : displayName),
         url: wrapM3U8WithFilter(url.trim(), {
           site: siteTitle, name: displayName, episode: epLabel,
           // 標記這是簽名型 adapter 站的資源，讓 wrap 能依 ADAPTER_MODE 決定
@@ -3995,8 +4008,12 @@ async function _ageEpisodes(site, vodId) {
       // 主來源（sources[0]）的 token 就是這一集的播放依據，其餘來源
       // 保留在 nid 的後備清單裡 —— 換 URL 時若主來源解析失敗可自動
       // 換下一個來源，不必讓使用者看到空白來源。
+      //
+      // ★ gl = groupLabel，站方 UI 上對人類可讀的 CDN 名（「非凡」「无尽」
+      //   「计算云」），跟 g（ffm3u8/wjm3u8/lzm3u8）對應。多源切換時 REX
+      //   給使用者看到「非凡」比「ffm3u8」直觀。
       nid: JSON.stringify(sources.map(s => ({
-        g: s.group, v: s.isVip ? 1 : 0, t: s.token,
+        g: s.group, gl: s.groupLabel, v: s.isVip ? 1 : 0, t: s.token,
       }))),
       sources,
     });
@@ -4057,19 +4074,25 @@ async function _agePlayUrls(site, vodId, nid) {
   //   改成「併發發出去、依原順序取第一個成功」：延遲上限從 sum 降成
   //   max，並且維持「優先用站方排在前面的源」這個行為
   //   （Promise.all + 依序掃描，結果與循序版本完全相同）。
+  // 與原 ordered 不同：這裡帶上 group / groupLabel 供 probe 帶回 source 標籤，
+  // 否則多源切換時 REX 看不到「非凡」「无尽」這類 CDN 區分。
+  // ★ 從 _ageEpisodes 存的 sources JSON 抽（順序 = player_label_arr 站方排的順序）。
+  //   對每個 (prefix, token) 對應到 s.g 跟 s.gl。
+  const sourceLabels = (() => {
+    try { return JSON.parse(String(nid || '')) || []; } catch (e) { return []; }
+  })();
   const ordered = [];
-  for (const s of sources) {
+  for (let i = 0; i < sourceLabels.length; i++) {
+    const s = sourceLabels[i];
     const token = s && s.t;
     if (!token) continue;
-    // isVip 已在 _ageEpisodes 算好並存進 nid，不必重新比對 player_vip ——
-    // 站方改了 VIP 清單也不該讓已建好的 token 突然走錯前綴。
     const prefix = s.v ? jx.vip : jx.zj;
     if (!prefix) continue;
-    ordered.push({ prefix, token });
+    ordered.push({ prefix, token, group: s.g, groupLabel: s.gl || s.g });
   }
   if (ordered.length === 0) return [];
 
-  const probe = async ({ prefix, token }) => {
+  const probe = async ({ prefix, token, group, groupLabel }) => {
     try {
       const resp = await Widget.http.get(prefix + token, {
         headers: { 'User-Agent': site.ua, 'Referer': 'https://m.agedm.io/' },
@@ -4082,14 +4105,53 @@ async function _agePlayUrls(site, vodId, nid) {
       // 寧可寬鬆也不要整個功能壞掉（抓不到就續試下一個來源）。
       const m = html.match(/Vurl\s*=\s*['"]([^'"]+)['"]/);
       if (!m || !m[1].trim()) return null;
-      return { url: m[1].trim(), resolution: 1080, resolutionName: 'AGE' };
+      const vurl = m[1].trim();
+
+      // ★ Vurl 當下可達性檢查。
+      //
+      // 為什麼：解析服務（wuzhoupai）回「Vurl=...」只代表站方有解析出
+      // 結果，不代表該 URL 當下能播。實測 Vurl 短時間過期 / CDN 端 502
+      // 都會發生（vip.ffzy-plays.com、64.32.20.246 都遇過）—— 不驗證
+      // 的話把壞 URL 給 REX，使用者點下去 502 看到一片黑，沒有任何
+      // fallback 機制。
+      //
+      // HEAD 探測超時 2s（一般 m3u8 主機 200ms 內回應）：2s 沒回當不可達，
+      // 跳下一個 source。
+      //
+      // ★ 不驗證的慘痛後果：站方詳情 API 永遠能解析出 Vurl（站方 CDN
+      //   有問題時仍塞 HTML 給你），光看 probe 認為「成功」就把 URL
+      //   給 REX。REX 播放時實際打 Vurl 失敗 → 整個 AGE 來源全廢。
+      try {
+        const head = await Widget.http.get(vurl, {
+          method: 'HEAD',
+          timeout: 2000,
+          headers: { 'User-Agent': site.ua, 'Referer': 'https://m.agedm.io/' },
+        });
+        const status = head?.statusCode || head?.status;
+        if (status && status >= 400) return null;  // 404/502 → 換下一個
+      } catch (e) {
+        // HEAD 失敗：m3u8 主機無回應 / SSL 錯誤 / 連線逾時 → 換下一個
+        return null;
+      }
+
+      return { url: vurl, resolution: 1080, resolutionName: 'AGE', _group: group, _groupLabel: groupLabel };
     } catch (e) {
       return null;   // 這個源壞了，改用下一個
     }
   };
 
-  // 併發發出所有探測，但「結果」依 ordered 順序取第一個成功 ——
-  // 與循序版本輸出完全相同，只是把所有 RTT 疊在一起。
+  // 併發發出所有探測，依站方順序取第一個 Vurl 可達的結果。
+  //
+  // 為什麼要 HEAD 探 Vurl：
+  //   解析服務 (jx.wuzhoupai.com) 拿到的是站方預先解析的 CDN URL，
+  //   站方 CDN 隨時可能 502（實測 vip.ffzy-plays.com、64.32.20.246 都遇過）。
+  //   不驗證的話把壞 URL 給 REX，使用者點下去整段播不了。
+  //
+  // 為什麼只回 1 條（不像 jpyy 多源那樣回多條）：
+  //   age 的「多源」是「同一集的多個 CDN 鏡像」（非凡/无尽/计算云/...），
+  //   不是「同一集的不同語言/畫質版本」。每集建 4 條同名同集 source
+  //   對使用者體驗很差（80 集動漫會變 320 條「同一集」）。
+  //   改成「保證給的 URL 當下能 200」就夠了。
   const probed = await _adapterPool(
     ordered.map(o => async () => await probe(o)),
     ordered.length,
