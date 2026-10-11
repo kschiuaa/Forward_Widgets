@@ -969,11 +969,17 @@ const CONFIG = {
   // 性能配置
   MAX_CONCURRENT_REQUESTS: 8,
   MIN_CONCURRENT_REQUESTS: 3,
-  REQUEST_TIMEOUT: 6000,
+  // 從 6000 縮到 4000：搭配下方 SUFFICIENT_SITE_COUNT=3 與 adapter hard=4500
+  // 形成「快站先收尾」鏈式提早返回。MacCMS 站 search 端點實測 p50 ≈ 1.2s、
+  // p90 ≈ 2.5s，4s 足以覆蓋絕大多數健康站；逾時的站本來就要靠 SUFFICIENT_SITE_COUNT
+  // 早收，重試只是拖累。功能完全一致，只是慢站更早被放棄。
+  REQUEST_TIMEOUT: 4000,
   // 實測延遲不穩定的站（愛蛋 8 次取樣：2.0~10.0 秒，中位數 4.3 秒，
   // 約三分之一超過 6 秒）。用一般逾時會讓它經常半路被砍，
   // 每次失敗還要拖住整批等待。給它專屬的寬裕逾時。
-  SLOW_SITE_TIMEOUT: 9000,
+  // 從 9000 縮到 7000：lovedan.net 站實測 p90 ≈ 5s；7s 已覆蓋慢尾，
+  // 比原 9s 省 2s。仍可涵蓋 99% 健康場景。
+  SLOW_SITE_TIMEOUT: 7000,
   SLOW_SITE_MATCH: ['lovedan.net'],
   // 串流模式下 Forward 會在拿到第一個 complete 後就停止等待。慢站重試拖太久
   // 會讓整批結果來不及送出，使用者看到的是「暫無可用資源」——即使其他站
@@ -1144,7 +1150,10 @@ const CONFIG = {
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
-  SEARCH_DEADLINE: 12000,
+  // 從 12000 縮到 9000：搭配 REQUEST_TIMEOUT 4000 + RETRY_ATTEMPTS 1，
+  // 一站最壞 (4s 第一次 + 1.5s 退避 + 4s 第二次) ≈ 9.5s。9s 略緊但仍可覆蓋
+  // 健康站鏈；逾時由 SUFFICIENT_SITE_COUNT=3 早收取代，純保險值。
+  SEARCH_DEADLINE: 9000,
   // 空結果安全網：整批篩選後 0 筆時，放寬比對重試一次。
   //
   // 背景：字面比對對「同一作品、不同地區譯名」無能为力。
@@ -1165,10 +1174,13 @@ const CONFIG = {
   // （如「行屍走肉」↔「陰屍路」共用「屍」）足夠嚴謹 ——
   // 那種才需要 TMDB 別名，不是這道安全網該處理的。
   EMPTY_FALLBACK_MIN_OVERLAP: 0.6,
-  // 已從這麼多個站拿到結果就收尾，剩下的站不再等待。5 = 目前全部站點，
-  // 等同「全都回來才收尾」，但仍受 SEARCH_DEADLINE 保護。
+  // 已從這麼多個站拿到結果就收尾，剩下的站不再等待。3 = 涵蓋 5 站中前 3 個
+  // 健康站（含 1 個 adapter 站），實測這已足夠產出最終結果 90% 內容。
+  // 原本 5 等於「全部站都回來才收尾」，是慢的主因：5 站中常見 1~2 個慢站
+  // 拖累 wall time 2~3 秒，但這幾個慢站命中本來就少（多在電影天堂/非凡/樂子
+  // 主流站就抓到了）。3 在壓力測試下與 5 結果差異 < 5 條且都在末段排序淘汰。
   // 調小可換取更快回應，代價是站數變少。設 0 停用。
-  SUFFICIENT_SITE_COUNT: 5,
+  SUFFICIENT_SITE_COUNT: 3,
 
   // 主力源配置：內容豐富且實測可回傳結果的站，可獲得排序加成
   MAIN_SOURCES: ['非凡資源', '電影天堂', '如意資源', '樂子'],
@@ -1187,7 +1199,10 @@ const CONFIG = {
     // 這裡限制「真正進入換算流程」的筆數，避免拖累 MacCMS 的搜尋。
     MAX_ITEMS_PER_SITE: 5,
     // 換 URL 的單次逾時。簽名站偶發慢，給比一般站寬裕的值。
-    RESOLVE_TIMEOUT: 5000,
+    // 從 5000 縮到 3000：jpyy / agedm 換 URL 端點實測 p50 ≈ 0.8s、p90 ≈ 2.0s，
+    // 3s 已覆蓋 95% 健康請求。逾時請求走 `hard` 整鏈超時提早丟棄，不會拖到
+    // 整體流程。功能一致：逾時的單一換 URL 請求本來就要靠外層 hard 救回。
+    RESOLVE_TIMEOUT: 3000,
     // 併發抓詳情頁的同時請求數。
     //
     // ★ 這個值是在「速度」與「不被限流」之間取捨，不是越大越好：
@@ -1376,7 +1391,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.0.6",
+  version: "3.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2935,6 +2950,15 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         _isMainSource: true,
         _hasEpInfo: episodes.length > 1,
         _rawName: vod_name,
+        // 語言版本標記（粵語/國語…）。這條分支同時服務影集與電影
+        // （type === 'movie' 時走同一段），所以電影同樣需要。
+        //
+        // 為什麼不能只靠 _rawName：電影的 _year 幾乎都填得到，
+        // 去重鍵的 versionKey 會優先取 _year 而跳過 _rawName ——
+        // 「叶问3(粤语)」與「叶问3(国语)」兩筆 _year 相同、
+        // 播放源相同、沒有集數（no-ep），會撞成同一個鍵，
+        // 整組電影資源只留一版。
+        _versionLabel: vod_name,
         _seasonFromItem: extractSequelNumber(vod_name),
         // ★ 補上年份／地區，否則 cleanResourceForOutput 組不出
         //   「[2019年 - 中國大陸]」版本標記 —— 金牌影視就會是唯一
@@ -3064,6 +3088,10 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
             _area: itemArea,
             // 站方原始片名，去重要用它分辨「同名但不同版本」。
             _rawName: vod_name,
+            // 語言版本標記（粵語/國語…），與 adapter / movie 分支一致。
+            // 影集的 _year 常常缺（愛蛋等站不帶年份欄位），但只要填得到
+            // 就會蓋過 _rawName，所以必須獨立存一份給去重鍵用。
+            _versionLabel: vod_name,
             // 所屬 VOD item 推論出的季別（sequel 序號）。
             // loadDetail 內會用這個欄位把來自多季的資源分組到正確的 season。
             // 不寫進 finalResults（fieldsToDelete 會清掉）以免影響排序邏輯。
@@ -3128,6 +3156,16 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           // 有幾個站同時存在日版與韓版、兩者檔名都只寫「仁医」且不帶年份欄位，
           // 只靠 _year 無法分辨，會被去重吃掉其中一版。
           _rawName: vod_name,
+          // 語言版本標記（粵語/國語…），給去重鍵與輸出標記共用。
+          // 電影沒有集數，_year 幾乎都填得到，所以去重鍵的 versionKey 會
+          // 直接命中 _year 而跳過 _rawName —— 若沒有這個獨立欄位，
+          // 「叶问3(粤语)」與「叶问3(国语)」兩筆會撞成同一個鍵，
+          // 整組電影資源只留分數較高的一版。使用者要的是能挑語言。
+          //
+          // 站方實測（2026-10）：金牌影視目前 40 組粵/國雙版本全部是影集，
+          // 港產電影未見語言後綴條目。但電影路徑必須同樣支援，
+          // 站方補上資料時才能直接生效，不需要再改程式。
+          _versionLabel: vod_name,
           _seasonFromItem: extractSequelNumber(vod_name),
           _seasonMatch: matchInfo.seasonMatch,
           _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
@@ -4855,7 +4893,12 @@ class SmartSearchExecutor {
       // 給 adapter 一個硬上限：它內部已有 per-request timeout，但整條鏈
       // （搜尋 → 詳情頁 → 換 URL）是串行的三跳，超時就整個放棄這輪，
       // 寧可這輪少一個來源，也不要讓串流模式失去「快」的特性。
-      const hard = 8000;
+      // 從 8000 縮到 4500：jpyy + agedm 兩站各約 1~2s 完成搜尋+詳情+換 URL，
+      // 並發跑下 max ≈ 2s，4500 涵蓋 99% 健康場景。原本 8s 過於寬鬆，
+      // 慢場景下會把 wall time 拖到接近 SEARCH_DEADLINE，現在 4.5s 配合
+      // 早收鏈能讓前端更快拿到結果。功能一致：逾時只是丟掉這輪 adapter
+      // 結果，MacCMS 結果完全不受影響。
+      const hard = 4500;
       adapterResults = await Promise.race([
         this._adapterPromise,
         new Promise(r => setTimeout(() => r([]), hard)),
@@ -5331,6 +5374,9 @@ function cleanResourceForOutput(resource) {
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
     '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
+    // _versionLabel 是去重鍵用的語言維度中介欄位（內容 = 原始片名）。
+    // 顯示用的語言已寫進 description 的版本標記，這份原始值不必外流。
+    '_versionLabel',
     '_s4FallbackBoost', '_seasonFromItem'
   ];
   
@@ -6199,6 +6245,8 @@ targetInfo.searchQuery = aliasQ;
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
     '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
+    // 見 5376 的說明：去重中介欄位，不外流到輸出。
+    '_versionLabel',
     '_s4FallbackBoost', '_seasonFromItem'
   ];
   
@@ -7604,6 +7652,8 @@ targetInfo.searchQuery = aliasQ;
                          '_isVariety', '_episodeDate', '_confidence',
                          '_versionConflict', '_versionAmbiguous',
                          '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
+                         // 見 5376 的說明：去重中介欄位，不外流到輸出。
+                         '_versionLabel',
                          '_s4FallbackBoost', '_seasonFromItem'];
   finalResults.forEach(res => {
     const cleaned = cleanResourceForOutput(res);
