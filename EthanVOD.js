@@ -1150,7 +1150,13 @@ const CONFIG = {
 //   電影的語言在 episodeList 條目名（"粤语"/"国语"）而非片名，
 //   修版前只換第一條來源，國語版整組被丟掉（使用者實際回報）。
 //   同時去重鍵新增清晰度維度，否則同一語言的 1080P/720P/480P 互相吃掉。
-WIDGET_VERSION: 40,
+//   bump 到 41：adapter 站帶 _adapterTypeId1。
+//   forward 那邊對同名系列（葉問 / 葉問 2）一律當電影搜，但 jpyy 可能有
+//   typeId1=1（電影）也可能有 typeId1=2（50 集影集），若照 forward 傳入
+//   的 type 走，50 集影集會被當電影「多來源」一次打 50 次換 URL 請求
+//   （站方 429，使用者看到 50 個獨立來源）。把 typeId1 帶到 item 上下
+//   游決策，避免被 forward 那邊的模糊分類帶偏。
+WIDGET_VERSION: 41,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1395,7 +1401,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.1.0",
+  version: "3.1.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2822,6 +2828,38 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
   const { vod_name, vod_play_url, vod_play_from, vod_remarks = '' } = item;
   if (!vod_name || !vod_play_url) return [];
 
+  // ★ 決定「這筆 item 實際是電影還是影集」必須看 item 自己的 type_id，
+  //   不能用 forward 傳入的 type —— forward 那邊可能對同名系列（葉問、
+  //   葉問 2、葉問 3…）一律當電影搜，而 jpyy 同一個名稱底下
+  //   可能既有電影也有影集（typeId1=1 vs 2）。
+  //
+  //   對 adapter 站而言，episodeList 的形態是決定性的：
+  //     - 電影：多筆時每筆是「語言/畫質」（「粤语」「国语」「蓝光」…）
+  //     - 影集：多筆時每筆是「集數」（「1」「2」「3」… 或「第1集」…）
+  //
+  //   若用 forward 傳入的 type 走錯路徑：
+  //     - type=movie 對 typeId1=2 的 50 集影集 → movieMultiSource 觸發，
+  //       50 集全換 URL，站方直接 429，使用者看到的「葉問 1, 2, 3...」
+  //       變成 50 個獨立來源。
+  //     - type=tv 對 typeId1=1 的 1 集電影 → 取第一集是對的，沒事。
+  //     - type=tv 對 typeId1=1 但 episodeList 2 筆的電影（110860 那種）→
+  //       只取「第一集」即第一個語言，國語版被丟（這是本 bug 修正前
+  //       的場景）。
+  //
+  //   解法：依 _adapterTypeId1 直接覆蓋 forward 傳入的 type。
+  //   影集路徑（只取目標集）與電影路徑（展開所有來源）都按站方真實類型
+  //   走，forward 那邊的「同名當電影」就只會影響「找不到目標集」fallback
+  //   的語意，不再誤踩多來源分支。
+  const adapterTypeId1 = item._adapterTypeId1 != null ? String(item._adapterTypeId1) : '';
+  const isAdapterMovie = adapterTypeId1
+    ? adapterTypeId1 === '1' || adapterTypeId1 === '3'   // 3 = 綜藝
+    : (type === 'movie');
+  // 上面 isAdapterMovie 還需要傳給下游當 description / 「電影才不顯示
+  // 第N集」用的判斷。我用一個 const 讓語意清楚。
+  const realType = item._adapterDelay
+    ? (isAdapterMovie ? 'movie' : 'tv')
+    : type;
+
   // ===== 簽名型 adapter 站的獨立分支 =====
   //
   // 這些站的 vod_play_url 裡放的不是真實 m3u8，而是延遲 token
@@ -2844,7 +2882,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     // 使用者要播的那一集（挑不到時的落點規則見下）
     const wantEp = item._adapterTargetEpisode;
     let idx = -1;
-    if (type === 'tv' && wantEp != null) {
+    if (realType === 'tv' && wantEp != null) {
       idx = episodes.findIndex(e => _adapterEpNumber(e.name) === wantEp);
     }
     // 落點是否為「代替」而非使用者指定的本集。
@@ -2855,15 +2893,15 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     // 而不是「這集不存在，給你看最新一集」。後者才是合理的降級。
     let isFallbackEp = false;
     if (idx < 0) {
-      isFallbackEp = (type === 'tv' && wantEp != null);
+      isFallbackEp = (realType === 'tv' && wantEp != null);
       // 落到最後一集的理由：forward 在未指定集數時，UI 預設停在最新一集。
       // 對多集影集而言這才符合使用者預期（MacCMS movie 分支取第一個 m3u8
       // 是因為電影只有一集，那個「第一」其實也是「唯一」）。
       //
-      // 例外：type === 'movie' 且站方拆成多集（實測金牌影視會把正片 +
+      // 例外：realType === 'movie' 且站方拆成多集（實測金牌影視會把正片 +
       // 花絮併在同一 vodId），此時必須取第一集 —— 電影沒有「最新一集」
       // 的概念，取最後一集會直接播到花絮。
-      idx = type === 'movie' ? 0 : episodes.length - 1;
+      idx = realType === 'movie' ? 0 : episodes.length - 1;
     }
 
     // ★ 電影的「多條」不是集數，是並列的播放來源，且必須全部保留。
@@ -2885,7 +2923,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     //
     // 影集維持原行為（只換目標那一集），理由見上：36 集全換太貴，
     // 而且延遲換取本來就是為了避免一次性預取。
-    const movieMultiSource = type === 'movie' && episodes.length > 1;
+    const movieMultiSource = realType === 'movie' && episodes.length > 1;
     const idxList = movieMultiSource ? episodes.map((_, i) => i) : [idx];
 
     // 併發換 URL：各來源彼此獨立不依賴，並發上限沿用 _adapterPool 的節制
@@ -2951,7 +2989,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //
       //   movie 不顯示集數與更新進度：電影沒有「第x集」的概念，
       //   「慶餘年．第01集」讀起來像漏了什麼（使用者會以為壞掉）。
-      const showEpisode = type !== 'movie';
+      const showEpisode = realType !== 'movie';
       const remark = showEpisode ? _adapterSafeRemark(vod_remarks) : '';
       // ★ 電影的描述必須帶上來源標記（語言）。
       //
@@ -3772,6 +3810,24 @@ async function _adapterDefaultSearch(site, keyword) {
     vod_pic: it.vodPic,
     vod_year: String(it.vodPubdate || '').slice(0, 4) || '',
     vod_area: it.vodArea || '',
+    // ★ 必須帶 typeId1 —— 否則 forward 那邊對同名系列（如「葉問 2」既
+    //   是電影也是影集）會統一傳 type=movie，而 jpyy 的電影 episodeList
+    //   通常只有 1 筆（單一清晰度「蓝光」），影集則可能有 50+ 筆。
+    //   extractPlayInfoForCache 收到 item 時，若依 forward 傳入的 type
+    //   決定走 movie 還是 tv 路徑，會把 50 集的影集當成「電影多來源」
+    //   全部換 URL（50 次請求），這是純粹的浪費且會被站方 429。
+    //
+    //   正確的判斷必須看「這筆 item 自己本來的 type」：
+    //     typeId1 = 1 → 電影（多筆 episodeList = 多語言 / 多版）
+    //     typeId1 = 2 → 影集（多筆 episodeList = 集數）
+    //
+    //   對「多筆但實際是影集」的情況，jpyy 那 50 條 episodeList 名稱是
+    //   純數字（「1」「2」…），而電影的條目名幾乎是語言/畫質文字
+    //   （「粤语」「国语」「蓝光」），heuristic 上可以這樣分：
+    //   但靠名稱不穩，這裡直接帶原始 typeId1 下去，extractPlayInfoForCache
+    //   看到 _adapterTypeId1=2 就走影集路徑（只取目標集 1 次請求）。
+    type_id: String(it.typeId1 ?? ''),
+    type_name: it.typeName || '',
     // ★ 不把豆瓣分放進 vod_remarks。
     //
     //   MacCMS 慣例中 vod_remarks 是「狀態標記」（"HD"、"更新至第12集"），
@@ -4265,6 +4321,13 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
         //   的 isPlayableUrl 會把它判為不可播，因此必須在該處特判並還原。
         _adapterSite: site.id,
         _adapterDelay: true,
+        // ★ 把搜尋結果的 typeId1 帶到下游。forward 那邊對同名系列
+        //   （葉問 / 葉問 2）一律當電影搜，但 jpyy 可能有電影版（typeId1=1）
+        //   也有影集版（typeId1=2，50 集那種）。extractPlayInfoForCache
+        //   必須看 item 自己的 type，不能被 forward 傳入的 type 帶偏走
+        //   「電影多來源 = 全部換 URL」分支，否則 50 集會被一次打 50 次
+        //   換 URL 請求，站方 429。
+        _adapterTypeId1: item.type_id || item._adapterTypeId1 || '',
         // 同樣走 _adapterSafeRemark：vod_content_note 會顯示在詳情頁，
         // 評分在這裡也不該出現。
         vod_content_note: _adapterSafeRemark(item.vod_remarks),
