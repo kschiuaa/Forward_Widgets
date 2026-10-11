@@ -1146,17 +1146,7 @@ const CONFIG = {
   //   去重鍵新增語言維度 + 版本標記顯示語言，舊 cache 裡缺這個維度，
   //   會讓已合併掉的語言版本永遠補不回來（只會繼續維持合併狀態）。
   //   必須清掉重搜，否則使用者看不到粵語/國語兩版。
-//   bump 到 40：電影的多來源結構。
-//   電影的語言在 episodeList 條目名（"粤语"/"国语"）而非片名，
-//   修版前只換第一條來源，國語版整組被丟掉（使用者實際回報）。
-//   同時去重鍵新增清晰度維度，否則同一語言的 1080P/720P/480P 互相吃掉。
-//   bump 到 41：adapter 站帶 _adapterTypeId1。
-//   forward 那邊對同名系列（葉問 / 葉問 2）一律當電影搜，但 jpyy 可能有
-//   typeId1=1（電影）也可能有 typeId1=2（50 集影集），若照 forward 傳入
-//   的 type 走，50 集影集會被當電影「多來源」一次打 50 次換 URL 請求
-//   （站方 429，使用者看到 50 個獨立來源）。把 typeId1 帶到 item 上下
-//   游決策，避免被 forward 那邊的模糊分類帶偏。
-WIDGET_VERSION: 41,
+  WIDGET_VERSION: 39,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1401,7 +1391,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.1.1",
+  version: "3.0.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2828,38 +2818,6 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
   const { vod_name, vod_play_url, vod_play_from, vod_remarks = '' } = item;
   if (!vod_name || !vod_play_url) return [];
 
-  // ★ 決定「這筆 item 實際是電影還是影集」必須看 item 自己的 type_id，
-  //   不能用 forward 傳入的 type —— forward 那邊可能對同名系列（葉問、
-  //   葉問 2、葉問 3…）一律當電影搜，而 jpyy 同一個名稱底下
-  //   可能既有電影也有影集（typeId1=1 vs 2）。
-  //
-  //   對 adapter 站而言，episodeList 的形態是決定性的：
-  //     - 電影：多筆時每筆是「語言/畫質」（「粤语」「国语」「蓝光」…）
-  //     - 影集：多筆時每筆是「集數」（「1」「2」「3」… 或「第1集」…）
-  //
-  //   若用 forward 傳入的 type 走錯路徑：
-  //     - type=movie 對 typeId1=2 的 50 集影集 → movieMultiSource 觸發，
-  //       50 集全換 URL，站方直接 429，使用者看到的「葉問 1, 2, 3...」
-  //       變成 50 個獨立來源。
-  //     - type=tv 對 typeId1=1 的 1 集電影 → 取第一集是對的，沒事。
-  //     - type=tv 對 typeId1=1 但 episodeList 2 筆的電影（110860 那種）→
-  //       只取「第一集」即第一個語言，國語版被丟（這是本 bug 修正前
-  //       的場景）。
-  //
-  //   解法：依 _adapterTypeId1 直接覆蓋 forward 傳入的 type。
-  //   影集路徑（只取目標集）與電影路徑（展開所有來源）都按站方真實類型
-  //   走，forward 那邊的「同名當電影」就只會影響「找不到目標集」fallback
-  //   的語意，不再誤踩多來源分支。
-  const adapterTypeId1 = item._adapterTypeId1 != null ? String(item._adapterTypeId1) : '';
-  const isAdapterMovie = adapterTypeId1
-    ? adapterTypeId1 === '1' || adapterTypeId1 === '3'   // 3 = 綜藝
-    : (type === 'movie');
-  // 上面 isAdapterMovie 還需要傳給下游當 description / 「電影才不顯示
-  // 第N集」用的判斷。我用一個 const 讓語意清楚。
-  const realType = item._adapterDelay
-    ? (isAdapterMovie ? 'movie' : 'tv')
-    : type;
-
   // ===== 簽名型 adapter 站的獨立分支 =====
   //
   // 這些站的 vod_play_url 裡放的不是真實 m3u8，而是延遲 token
@@ -2882,7 +2840,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     // 使用者要播的那一集（挑不到時的落點規則見下）
     const wantEp = item._adapterTargetEpisode;
     let idx = -1;
-    if (realType === 'tv' && wantEp != null) {
+    if (type === 'tv' && wantEp != null) {
       idx = episodes.findIndex(e => _adapterEpNumber(e.name) === wantEp);
     }
     // 落點是否為「代替」而非使用者指定的本集。
@@ -2893,76 +2851,22 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     // 而不是「這集不存在，給你看最新一集」。後者才是合理的降級。
     let isFallbackEp = false;
     if (idx < 0) {
-      isFallbackEp = (realType === 'tv' && wantEp != null);
+      isFallbackEp = (type === 'tv' && wantEp != null);
       // 落到最後一集的理由：forward 在未指定集數時，UI 預設停在最新一集。
       // 對多集影集而言這才符合使用者預期（MacCMS movie 分支取第一個 m3u8
       // 是因為電影只有一集，那個「第一」其實也是「唯一」）。
       //
-      // 例外：realType === 'movie' 且站方拆成多集（實測金牌影視會把正片 +
+      // 例外：type === 'movie' 且站方拆成多集（實測金牌影視會把正片 +
       // 花絮併在同一 vodId），此時必須取第一集 —— 電影沒有「最新一集」
       // 的概念，取最後一集會直接播到花絮。
-      idx = realType === 'movie' ? 0 : episodes.length - 1;
+      idx = type === 'movie' ? 0 : episodes.length - 1;
     }
 
-    // ★ 電影的「多條」不是集數，是並列的播放來源，且必須全部保留。
-    //
-    // 實測金牌影視 id=110860「大话西游之大圣娶亲」（typeId1=1 電影）：
-    //   episodeList = [ {name:"粤语", nid:1304906}, {name:"国语", nid:1304905} ]
-    //
-    // 語言是「同一個 vodId 下的多個 episodeList 條目」，不是兩筆不同 vodId
-    // （那種結構是影集在用的。先前只修了那一種，所以電影這裡一直漏著）。
-    //
-    // 原本 idx=0 只挑了第一條（粵語），換完 URL 就結束 —— 國語版整組被丟掉。
-    // 使用者看到的來源列表是「1080P / 720P / 480P」三筆粵語清晰度，
-    // 完全沒有國語可選，與站方詳情頁的「粤语 / 国语」兩個按鈕不符
-    // （這是使用者實際回報的現象）。
-    //
-    // 修法：電影時對「每一條」都換 URL，各自成為一個來源群組。
-    //   條目名（粤语/国语/蓝光/高清…）→ 作為語言/來源標記帶到輸出
-    //   每條換回的清晰度（1080P/720P/480P）→ 該來源下的多個畫質
-    //
-    // 影集維持原行為（只換目標那一集），理由見上：36 集全換太貴，
-    // 而且延遲換取本來就是為了避免一次性預取。
-    const movieMultiSource = realType === 'movie' && episodes.length > 1;
-    const idxList = movieMultiSource ? episodes.map((_, i) => i) : [idx];
-
-    // 併發換 URL：各來源彼此獨立不依賴，並發上限沿用 _adapterPool 的節制
-    // （站方限流緊，全開會回 429）。影集路徑維持單一請求。
-    const groups = movieMultiSource
-      ? await _adapterPool(
-          idxList.map(i => async () => {
-            try {
-              const r = await _adapterResolvePlay(episodes[i].token);
-              return (r && r.length) ? r : null;
-            } catch (e) {
-              if (CONFIG.ADAPTERS?.DEBUG) {
-                console.warn(`[adapter:${site.id}] movie 來源 ${episodes[i].name} 解析失敗`);
-              }
-              return null;
-            }
-          }),
-          Math.min(idxList.length, 3),
-        )
-      : [await _adapterResolvePlay(episodes[idx].token).catch(() => null)];
-
-    // 濾掉失敗的群組，但保留原本的來源順序（站方把首選來源排前面）
-    const liveGroups = [];
-    for (let g = 0; g < groups.length; g++) {
-      const list = groups[g];
-      if (!list || !list.length) continue;
-      liveGroups.push({ list, srcIdx: idxList[g], srcName: episodes[idxList[g]]?.name || '' });
-    }
-    if (!liveGroups.length) return [];
+    const resolved = await _adapterResolvePlay(episodes[idx].token);
+    if (!resolved || resolved.length === 0) return [];
 
     const out = [];
-    for (const grp of liveGroups) {
-      const curIdx = grp.srcIdx;
-      // ★ 條目名同時是「來源標記」。電影時它幾乎都是語言（粤语/国语），
-      //   但也可能是清晰度（蓝光/高清/标清）或正片+花絮的區分，
-      //   所以一律當成來源名帶出去，不假設它一定是語言。
-      const srcLabel = grp.srcName;
-      const srcLang = extractLanguageTag(srcLabel);
-      for (const r of grp.list) {
+    for (const r of resolved) {
       const url = r?.url;
       if (!url || !isPlayableUrl(url)) continue;
       // 簽名站回傳的是 resolutionName（蓝光/高清/标清）+ resolution（數字）。
@@ -2981,7 +2885,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       // extractResolutionInfo / extractSequelNumber 等比對邏輯上，
       // 只有這裡的 description 與 wrap 的 name 拿轉換後的字串。
       const displayName = _adapterSeasonLabel(vod_name);
-      const epLabel = _adapterEpisodeLabel(episodes[curIdx].name);
+      const epLabel = _adapterEpisodeLabel(episodes[idx].name);
       // ★ 評分已在上游 (_adapterDefaultSearch) 排除，這裡只留「非評分」的
       //   狀態標記。純數字／帶星號的短字串一律視為評分丟掉 ——
       //   站方哪天改版塞別的數字進 vodRemarks 時，不該讓評分再冒出來。
@@ -2989,24 +2893,9 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //
       //   movie 不顯示集數與更新進度：電影沒有「第x集」的概念，
       //   「慶餘年．第01集」讀起來像漏了什麼（使用者會以為壞掉）。
-      const showEpisode = realType !== 'movie';
+      const showEpisode = type !== 'movie';
       const remark = showEpisode ? _adapterSafeRemark(vod_remarks) : '';
-      // ★ 電影的描述必須帶上來源標記（語言）。
-      //
-      //   修版前電影的描述是裸片名（「大話西遊之大聖娶親」），
-      //   粵語與國語的 3 筆清晰度看起來一模一樣，使用者既分不出是哪個語言，
-      //   也不知道站方明明有兩個語言可選。
-      //
-      //   改成「片名．來源」形式：与大話西遊（粵語）／大話西遊（國語）。
-      //   只在「有語言標記且不只一個來源」時加 —— 單來源的電影維持裸片名，
-      //   避免多出無意義的「．藍光」（清晰度已經有 resolution 欄位了）。
-      const needSrcLabel = movieMultiSource && episodes.length > 1 && srcLabel;
-      const descTail = needSrcLabel
-        ? (srcLang ? `${toDisplayText(srcLabel)}` : `${toDisplayText(srcLabel)}`)
-        : '';
-      const tail = showEpisode
-        ? [epLabel, remark].filter(Boolean).join('．')
-        : descTail;
+      const tail = showEpisode ? [epLabel, remark].filter(Boolean).join('．') : '';
       // ★ 集數不能直接 parseInt(episodes[idx].name)：AGE 的集數名是
       //   「第195集」「HD中字」「正片」，都不是純數字 → NaN。
       //   NaN 會讓 episode 欄位變 null，使用者選第195集時這條來源被
@@ -3020,7 +2909,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   會讓「挑的是第80集、回報的卻是第1集」這種前後矛盾發生
       //   （實測就發生過：使用者選第 2 集，AGE 卻回「五等分的新娘＊．第2集」
       //   但 episode 欄位是 1）。
-      const epNumber = _adapterEpNumber(episodes[curIdx].name);
+      const epNumber = _adapterEpNumber(episodes[idx].name);
 
       out.push({
         name: siteTitle,
@@ -3061,25 +2950,6 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         _isMainSource: true,
         _hasEpInfo: episodes.length > 1,
         _rawName: vod_name,
-        // 語言版本標記（粵語/國語…）。這條分支同時服務影集與電影
-        // （type === 'movie' 時走同一段），所以電影同樣需要。
-        //
-        // 為什麼不能只靠 _rawName：電影的 _year 幾乎都填得到，
-        // 去重鍵的 versionKey 會優先取 _year 而跳過 _rawName ——
-        // 「叶问3(粤语)」與「叶问3(国语)」兩筆 _year 相同、
-        // 播放源相同、沒有集數（no-ep），會撞成同一個鍵，
-        // 整組電影資源只留一版。
-        //
-        // ★ 電影要優先用「來源條目名」而不是片名。
-        //
-        //   電影的語言存在於 episodeList 條目名（「粤语」「国语」），
-        //   片名是乾淨的「大話西游之大圣娶亲」，裡面沒有語言。
-        //   （那是影集的結構 —— 片名自帶「轻功(粤语)」後綴。）
-        //   所以這裡拼成「片名+來源名」，讓 extractLanguageTag 能抽到，
-        //   去重鍵與輸出標記都正確分開粵語/國語兩組清晰度。
-        _versionLabel: (needSrcLabel && srcLang)
-          ? `${vod_name} ${srcLabel}`
-          : vod_name,
         _seasonFromItem: extractSequelNumber(vod_name),
         // ★ 補上年份／地區，否則 cleanResourceForOutput 組不出
         //   「[2019年 - 中國大陸]」版本標記 —— 金牌影視就會是唯一
@@ -3098,8 +2968,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         _areaMismatch: false,
         _areaMatch: false,
       });
-      } // for (const r of grp.list)
-    } // for (const grp of liveGroups)
+    }
     return out;
   }
 
@@ -3210,10 +3079,6 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
             _area: itemArea,
             // 站方原始片名，去重要用它分辨「同名但不同版本」。
             _rawName: vod_name,
-            // 語言版本標記（粵語/國語…），與 adapter / movie 分支一致。
-            // 影集的 _year 常常缺（愛蛋等站不帶年份欄位），但只要填得到
-            // 就會蓋過 _rawName，所以必須獨立存一份給去重鍵用。
-            _versionLabel: vod_name,
             // 所屬 VOD item 推論出的季別（sequel 序號）。
             // loadDetail 內會用這個欄位把來自多季的資源分組到正確的 season。
             // 不寫進 finalResults（fieldsToDelete 會清掉）以免影響排序邏輯。
@@ -3278,16 +3143,6 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           // 有幾個站同時存在日版與韓版、兩者檔名都只寫「仁医」且不帶年份欄位，
           // 只靠 _year 無法分辨，會被去重吃掉其中一版。
           _rawName: vod_name,
-          // 語言版本標記（粵語/國語…），給去重鍵與輸出標記共用。
-          // 電影沒有集數，_year 幾乎都填得到，所以去重鍵的 versionKey 會
-          // 直接命中 _year 而跳過 _rawName —— 若沒有這個獨立欄位，
-          // 「叶问3(粤语)」與「叶问3(国语)」兩筆會撞成同一個鍵，
-          // 整組電影資源只留分數較高的一版。使用者要的是能挑語言。
-          //
-          // 站方實測（2026-10）：金牌影視目前 40 組粵/國雙版本全部是影集，
-          // 港產電影未見語言後綴條目。但電影路徑必須同樣支援，
-          // 站方補上資料時才能直接生效，不需要再改程式。
-          _versionLabel: vod_name,
           _seasonFromItem: extractSequelNumber(vod_name),
           _seasonMatch: matchInfo.seasonMatch,
           _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
@@ -3810,24 +3665,6 @@ async function _adapterDefaultSearch(site, keyword) {
     vod_pic: it.vodPic,
     vod_year: String(it.vodPubdate || '').slice(0, 4) || '',
     vod_area: it.vodArea || '',
-    // ★ 必須帶 typeId1 —— 否則 forward 那邊對同名系列（如「葉問 2」既
-    //   是電影也是影集）會統一傳 type=movie，而 jpyy 的電影 episodeList
-    //   通常只有 1 筆（單一清晰度「蓝光」），影集則可能有 50+ 筆。
-    //   extractPlayInfoForCache 收到 item 時，若依 forward 傳入的 type
-    //   決定走 movie 還是 tv 路徑，會把 50 集的影集當成「電影多來源」
-    //   全部換 URL（50 次請求），這是純粹的浪費且會被站方 429。
-    //
-    //   正確的判斷必須看「這筆 item 自己本來的 type」：
-    //     typeId1 = 1 → 電影（多筆 episodeList = 多語言 / 多版）
-    //     typeId1 = 2 → 影集（多筆 episodeList = 集數）
-    //
-    //   對「多筆但實際是影集」的情況，jpyy 那 50 條 episodeList 名稱是
-    //   純數字（「1」「2」…），而電影的條目名幾乎是語言/畫質文字
-    //   （「粤语」「国语」「蓝光」），heuristic 上可以這樣分：
-    //   但靠名稱不穩，這裡直接帶原始 typeId1 下去，extractPlayInfoForCache
-    //   看到 _adapterTypeId1=2 就走影集路徑（只取目標集 1 次請求）。
-    type_id: String(it.typeId1 ?? ''),
-    type_name: it.typeName || '',
     // ★ 不把豆瓣分放進 vod_remarks。
     //
     //   MacCMS 慣例中 vod_remarks 是「狀態標記」（"HD"、"更新至第12集"），
@@ -4321,13 +4158,6 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
         //   的 isPlayableUrl 會把它判為不可播，因此必須在該處特判並還原。
         _adapterSite: site.id,
         _adapterDelay: true,
-        // ★ 把搜尋結果的 typeId1 帶到下游。forward 那邊對同名系列
-        //   （葉問 / 葉問 2）一律當電影搜，但 jpyy 可能有電影版（typeId1=1）
-        //   也有影集版（typeId1=2，50 集那種）。extractPlayInfoForCache
-        //   必須看 item 自己的 type，不能被 forward 傳入的 type 帶偏走
-        //   「電影多來源 = 全部換 URL」分支，否則 50 集會被一次打 50 次
-        //   換 URL 請求，站方 429。
-        _adapterTypeId1: item.type_id || item._adapterTypeId1 || '',
         // 同樣走 _adapterSafeRemark：vod_content_note 會顯示在詳情頁，
         // 評分在這裡也不該出現。
         vod_content_note: _adapterSafeRemark(item.vod_remarks),
@@ -5404,27 +5234,11 @@ class SmartSearchExecutor {
     //   抽不到語言標記時回 'x'，維持既有行為 —— 沒有語言維度的站
     //   （幾乎所有 MacCMS 站）不會因為多了一個鍵而被拆開。
     const versionKey = resource._year || resource._rawName || 'x';
-    const langKey = extractLanguageTag(resource._versionLabel || resource._rawName) || 'x';
-    // ★ 清晰度必須是獨立維度，否則同一語言下的多個畫質會互相吃掉。
-    //
-    //   實測金牌影影视 id=110860「大话西游之大圣娶亲」：每個語言來源
-    //   換 URL 後回傳 3 檔清晰度（1080P / 720P / 480P）。這 3 筆的
-    //   語言、站名、集數、播放源全都相同，只有 resolution 不同 ——
-    //   沒有這一段維度時，smartDeduplicate 只會留下其中一檔，
-    //   使用者連「要不要選 480P」都不能選。
-    //
-    //   這與「語言版本」是不同層級的維度：語言決定「看哪個版本」，
-    //   清晰度決定「這個版本的畫質」，兩者都可獨立挑選。
-    //
-    //   抽不到清晰度時回 'x'，MacCMS 站的既有行為完全不變
-    //   （那些站的清晰度寫在 description 的方括號裡，已由
-    //   playSourceKeyOf 處理）。
-    const resKey = resource.resolution || 'x';
+    const langKey = extractLanguageTag(resource._rawName || resource._versionLabel) || 'x';
     return [
       resource.name,
       versionKey,
       langKey,
-      resKey,
       episodeKeyOf(resource),
       playSourceKeyOf(resource)
     ].join('|');
@@ -5537,9 +5351,6 @@ function cleanResourceForOutput(resource) {
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
     '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
-    // _versionLabel 是去重鍵用的語言維度中介欄位（內容 = 原始片名）。
-    // 顯示用的語言已寫進 description 的版本標記，這份原始值不必外流。
-    '_versionLabel',
     '_s4FallbackBoost', '_seasonFromItem'
   ];
   
@@ -6408,8 +6219,6 @@ targetInfo.searchQuery = aliasQ;
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
     '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
-    // 見 5376 的說明：去重中介欄位，不外流到輸出。
-    '_versionLabel',
     '_s4FallbackBoost', '_seasonFromItem'
   ];
   
@@ -7815,8 +7624,6 @@ targetInfo.searchQuery = aliasQ;
                          '_isVariety', '_episodeDate', '_confidence',
                          '_versionConflict', '_versionAmbiguous',
                          '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
-                         // 見 5376 的說明：去重中介欄位，不外流到輸出。
-                         '_versionLabel',
                          '_s4FallbackBoost', '_seasonFromItem'];
   finalResults.forEach(res => {
     const cleaned = cleanResourceForOutput(res);
