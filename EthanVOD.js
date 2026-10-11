@@ -1391,7 +1391,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.1.2",
+  version: "3.1.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1936,10 +1936,17 @@ function extractSequelNumber(name) {
   }
 
   // 羅馬數字（II / III / IV）：不論在結尾還是副標題中都算。
-  const roman = s.match(/(?:\s|：|:)([IVX]{1,4})\b/);
+  //
+  // ★ 補抓「中文結尾接純羅馬數字」：「庆余年II」「大江大河II」等站方
+  //   罕見寫法。先前的 (?:\s|：|:) 前綴要求空白或冒號，中文接著羅馬
+  //   數字會被漏掉（實測「庆余年II」→ null，被當成 sequel=1 處理）。
+  //
+  //   修正則：把前綴從「空白/冒號」放寬到「非數字字元」，並要求
+  //   「後方為字串結尾或非字母數字」，避免「IMAX」這種英文單字被誤判。
+  const roman = s.match(/(^|[^\dIVX])([IVX]{2,4})(?=[^IVX]|$)/);
   if (roman) {
     const map = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
-    const v = map[roman[1].toUpperCase()];
+    const v = map[roman[2].toUpperCase()];
     if (v) return v;
   }
 
@@ -2796,8 +2803,83 @@ function _adapterSeasonLabel(rawName) {
   const s = String(rawName ?? '').trim();
   if (!s) return '';
 
-  // 閘門 1：站方已給季別字樣 → 原樣
-  if (/[季部]|[Ss]eason\s*\d|\bS\d\b/.test(s)) return toDisplayText(s);
+  // ★ 先剝掉片名尾端的「(語言)」括弧：「轻功(粤语)」「轻功（国语）」
+  //   → 拆成「轻功」，語言由頂層 language 欄位承擔（見 stripLanguageParen 註解）。
+  //   抽不到語言的片名（無括弧或括弧內非語言）保持原樣，不破壞既有資料。
+  const stripped = stripLanguageParen(s);
+  if (stripped === s) {
+    // 沒拆到語言 → 走原本邏輯
+    return _adapterSeasonLabelInner(s);
+  }
+  // 拆到 → 對剝後字串走季別邏輯；尾端語言括弧不會再被誤判為「季」
+  return _adapterSeasonLabelInner(stripped);
+}
+
+function _adapterSeasonLabelInner(s) {
+
+  // ★ 閘門 1 改寫：站方把季別字眼直接寫進片名（「庆余年第二季」、
+  // 「庆余年S2」、「庆余年 第2季」、「庆余年完结篇」）時，把這段字眼
+  // 抽出改成「第N季」後綴形式，避免顯示重複：
+  //   「庆余年第二季」       → 「庆余年 第2季」
+  //   「庆余年S2」           → 「庆余年 第2季」
+  //   「庆余年 第2季」       → 「庆余年 第2季」  （不變，已是統一格式）
+  //   「半泽直树完结篇」     → 「半泽直树 第2季 完結篇」
+  //   「寻秦记2018」        → 「寻秦记2018」   （不改，年份當序號會誤判）
+  //
+  // 改前：看到 [季部] / Season / S\d 一律原樣返回 → displayName 內
+  //   「第二季」與頂層 season: 2 重複顯示，視覺上是同一件事說兩次。
+  // 改後：抽出後統一為「第N季」格式（與從序號推出的寫法一致）。
+  //
+  // ★ 為什麼不放進 stripSeasonMarker：stripSeasonMarker 從片名刪掉
+  //   季別字眼，extractSequelNumber 依賴「刪除前的 rawName」抓序號
+  //   與「刪除後的字串」做後續規則；放在這裡（_adapterSeasonLabel）
+  //   是「顯示前最後一次重新組裝」，對擷取邏輯無副作用。
+  if (/[季部]|[Ss]eason\s*\d|\bS\d\b|完结篇|完結篇|\b[IVX]{2,4}\b/.test(s)) {
+    // 走 extractSequelNumber 判斷實際是 S 幾，避免被站方
+    // 「第2部」「第三季」這類文字描述誤導。
+    const seqFromName = extractSequelNumber(s);
+    if (seqFromName && seqFromName > 1) {
+      // 從 rawName 抽出的「第N季」字串與原始片名合併：
+      //   head    = 季別字眼前綴（可能含分隔符）
+      //   seasonText = 第N季
+      //   rest    = 季別字眼後所有內容（保留 [國語]、HD 等後綴）
+      //
+      // 先抓序號在 rawName 哪個位置：用「季」「部」「完结篇」之類的
+      // 關鍵字當 anchor，找它前面所有非關鍵字字元當 head。
+      // ★ 注意順序：先抓「完结篇/完結篇」(在 extractSequelNumber 已
+      //   抓為 sequel=2)，再抓「第X季」「X季」「S2」「Season 2」「第X部」。
+      const patterns = [
+        /完结篇|完結篇/,                                  // 完結篇（已先回傳 2）
+        /第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季/,  // 第2季 / 第二季
+        /\b[Ss]\d+\b/,                                   // S2
+        /[Ss]eason\s*\d+/,                              // Season 2
+        /[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季/,  // 2季 / 第二季
+        /第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*部/,  // 第2部 / 第二部
+        /[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*部/,    // 2部
+        /\b[IVX]{2,4}\b(?![a-zA-Z])/,                    // 純羅馬數字 II/III/IV（不接英文字）
+      ];
+      for (const p of patterns) {
+        const m = s.match(p);
+        if (m) {
+          const head = s.slice(0, m.index).trim();
+          const rest = s.slice(m.index + m[0].length).trim();
+          const seasonText = `第${seqFromName}季`;
+          // ★「完結篇」這類語意詞要保留
+          //   「半泽直树完结篇」→ 「半泽直树 第2季 完結篇」
+          //   m[0] = "完结篇" → 把它放回 rest 開頭
+          let restWithSemantic = rest;
+          if (/完结篇|完結篇/.test(m[0])) {
+            restWithSemantic = m[0] + (rest ? ' ' + rest : '');
+          }
+          const display = restWithSemantic
+            ? `${head} ${seasonText} ${restWithSemantic}`.replace(/\s+/g, ' ').trim()
+            : `${head} ${seasonText}`.replace(/\s+/g, ' ').trim();
+          return toDisplayText(display);
+        }
+      }
+    }
+    return toDisplayText(s);
+  }
 
   // 閘門 2 + 3：沿用 extractSequelNumber 的判斷，不重寫數字規則
   const seq = extractSequelNumber(s);
@@ -3072,6 +3154,10 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         //   使用者要自己開詳情頁比對是哪一年的版本。
         _year: item.vod_year || null,
         _area: item.vod_area || null,
+        // ★ 提升 AGE 多源 group 標籤到頂層（給 cleanResourceForOutput 用）。
+        // 沒有這行 cleanResourceForOutput 永遠讀不到 _groupLabel，
+        // 描述內的 [红牛]、[非凡] 等等就會一直留著。
+        _groupLabel: r?._groupLabel || null,
         _ep: Number.isFinite(epNumber) ? epNumber : null,
         // 實際取到的集數（fallback 時與 episode 不同），僅供 log／除錯
         _epActualEp: Number.isFinite(epNumber) ? epNumber : null,
@@ -3198,7 +3284,10 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           const dateMatch = epName.match(/(\d{4}年\d{1,2}月\d{1,2}日|\d{4}\.\d{1,2}\.\d{1,2}|\d{4}\d{2}\d{2})/);
 
           // 資源站回傳簡體，統一轉繁體後再顯示
-          const displayName = toDisplayText(vod_name);
+          // ★ 走 _adapterSeasonLabel 而非 toDisplayText：站方把季別寫進
+          //   片名（「庆余年第二季」「进击的巨人 最终季」）時，自動
+          //   抽出統一成「第N季」格式，與頂層 season 欄位不重複。
+          const displayName = _adapterSeasonLabel(vod_name);
           const displayEp = toDisplayText(epName);
           const displayRemarks = toDisplayText(vod_remarks);
 
@@ -3275,12 +3364,26 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     } else if (type === 'movie' && !isTV) {
       const firstM3U8 = playSource.split('#').find(v => isM3U8Url(v.split('$')[1]));
       if (firstM3U8) {
-        const [quality, url] = firstM3U8.split('$');
+        // ★ 過濾「預告片 / 預告 / 花絮 / 片段」之類非正片
+        //
+        // 背景：站方常把「破·地獄[預告片]」「沙丘2[預告片]」等非正片
+        // 也歸進電影搜尋結果（v_type='movie'）。這對使用者是噪音——
+        // 點下去是 30 秒預告，正片得另找。extractSequelNumber 對
+        // 「預告」字眼已回 null，排序會掉到後段；但**不會被排除**，
+        // 所以 REX 端仍會把它列為一條候選，使用者看得到。
+        //
+        // 規則：vod_name 內含常見「非正片」字眼 → 跳過，不進 results。
+        // 注意：這裡的 vod_name 是從站方解析出的原始片名（_rawName），
+        // 站方在標題上常會用方括號 [預告片] 標明 —— 整段抓出來比對。
+        const isNonMainRelease = /[\[【（(]\s*(预告片|預告片|预告|預告|花絮|片段|彩蛋|片花|幕后|幕後|特辑|特輯|先行|先导|先導|幕后花絮|幕後花絮)[\]】）)]/i.test(vod_name)
+            || /\b(预告|預告|花絮|片段|彩蛋|片花|幕后|幕後|特辑|特輯|先行|先导|先導)\b/i.test(vod_name);
+        if (!isNonMainRelease) {
+          const [quality, url] = firstM3U8.split('$');
         const qualityText = quality.toLowerCase().includes('tc') ? '搶先版' : '正片';
 
         const resolutionInfo = extractResolutionInfo(vod_name, quality);
 
-        const displayName = toDisplayText(vod_name);
+        const displayName = _adapterSeasonLabel(vod_name);
         // Movie 描述：正片（默認）不附標記；搶先版/TC/其他非正片
         // 標籤以「．」中點附在片名後。
         const isMainRelease = qualityText === '正片';
@@ -3329,8 +3432,9 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           _areaMismatch: areaMismatch,
           _areaMatch: areaMatch
         };
-        
+
         results.push(resource);
+        }
       }
     }
   });
@@ -4659,6 +4763,43 @@ function extractLanguageTag(name) {
   return null;
 }
 
+// 把片名尾端的「(語言) / （語言）」括弧段抽出。
+//
+// 為什麼要做：站方常用「轻功(粤语)」「轻功（国语）」這類寫法標語言版本，
+// 我們已經把語言抽到頂層 language 欄位（cleanResourceForOutput 內），但
+// displayName 內仍帶著「轻功(粤语)」字樣，視覺上與頂層 language 重複。
+// 抽出讓 displayName 只留「轻功」，頂層 language 承擔「這部是粵語版」。
+//
+// 規則：
+//   1. 只處理「明確抽出語言時」才拆 —— 抽不到（null）就保持原文不動。
+//      「进击的巨人(双语)」在 extractLanguageTag 內沒規則命中，回 null，
+//      拆也不會拆 —— 保留片名原樣。
+//   2. 只拆**最末段**的括弧：避免誤刪中間的版本描述。
+//   3. 拆完若剩下空字串，退回原片名（不讓顯示變成空白）。
+//   4. 拆完若剩下字串完全等於原片名（未命中），原樣返回（冪等）。
+function stripLanguageParen(rawName) {
+  const s = String(rawName ?? '').trim();
+  if (!s) return s;
+  // 先確認抽得到語言（抽不到就什麼都不做）
+  if (!extractLanguageTag(s)) return s;
+
+  // 抓**所有**括弧段（不限最末段）：
+  //   「进击的巨人 (国语) 第四季」中間的 (國語) 也要剝，
+  //   不然跟頂層 language 仍重複顯示。
+  // 用 iterate 從右往左替換每個 [（(...)）] 段，剝到沒有為止。
+  let out = s;
+  // 一輪只能剝一個括弧段（正則不支援巢狀），多次跑直到穩定
+  let prev;
+  do {
+    prev = out;
+    out = out.replace(/\s*[（(][^()（）]*[)）]\s*/, ' ').replace(/\s+/g, ' ').trim();
+  } while (out !== prev);
+
+  if (!out) return s;            // 拆完空字串 → 退回原文
+  if (out === s) return s;       // 沒拆到（應該不會發生，但保險）
+  return out;
+}
+
 // 目標片名自帶年份時（「仁醫2012」），候選年份不同即為另一版本。
 function isConflictingVersion(targetInfo, candidateName) {
   const targetYear = extractVersionMarker(targetInfo.rawName) || targetInfo.year;
@@ -4692,7 +4833,12 @@ const AREA_ALIASES = {
 // AREA_ALIASES 的值（jp / kr / cn）是給比對用的代碼，直接顯示出來只會讓
 // 使用者看到無意義的「jp」。顯示層需要轉成中文。
 const AREA_LABELS = {
-  jp: '日本', cn: '國語', hk: '粵語', tw: '台灣', kr: '韓國',
+  // ★★ 修正：cn / hk 原本寫成 '國語' / '粵語'，但這兩個是**語言**
+  //   不是地區別。實測樂子站「慶餘年2」會把 `vod_area=國語` 經
+  //   normalizeArea 變成 'cn'，再被 areaLabel 翻回 '國語'，
+  //   結果頂層 area 是「國語」—— 使用者看了會誤以為這是地區。
+  //   修法：cn 對「中國大陸」、hk 對「中國香港」，是地區的話。
+  jp: '日本', cn: '中國大陸', hk: '中國香港', tw: '台灣', kr: '韓國',
   us: '美國', uk: '英國', fr: '法國', th: '泰國', in: '印度'
 };
 
@@ -5630,7 +5776,39 @@ function cleanResourceForOutput(resource) {
   //   哪個是年份地區。加上方括號本來就是「註記」的視覺語意，
   //   獨立成一行後與第一行的正片資訊分層更清楚。
   const itemYear = resource._year || extractVersionMarker(resource._rawName) || null;
-  const itemArea = resource._area || null;
+  let itemArea = resource._area || null;
+  // ★ 站方欄位錯用：樂子站（或部分 MacCMS 站）會把語言字眼（「國語」
+  //   「粵語」「普通話」之類）寫進 vod_area 欄位。隨機抽樣實測：
+  //   「慶餘年2」樂子站回 area=國語 → 頂層 area 變成「國語」，
+  //   使用者看到「a=國語」會誤以為是地區分類。語言不該當地區。
+  //
+  //   修法：cleanResourceForOutput 內若 _area 是「語言類字眼」，
+  //   把 _area 視為語言候選（清空 area 提升進 language），不要污染 area。
+  //
+  //   偵測：站方 _area 文字若**完全等於** LANGUAGE_TAGS 內任一 label
+  //   或能 match 任一 LANGUAGE_TAGS regex → 視為語言。
+  //
+  //   注意：itemLang 已從 _rawName 抽過一次，這裡只補「站方 _area
+  //   端有線索但 _rawName 沒線索」的情況。已有 itemLang 時不再覆蓋
+  //   （抽自 _rawName 的語言通常比站方欄位更權威——後者容易錯位）。
+  if (itemArea) {
+    const aStr = String(itemArea).trim();
+    const isLangLike = LANGUAGE_TAGS.some(t => t.re.test(aStr)) ||
+                       /^國語$|^粵語$|^普通話$|^國粵雙語$|^英[語語]$|^日[語語]$|^韓[語語]$/.test(aStr);
+    if (isLangLike) {
+      // 用 area 字眼補進 language 候選（若 _rawName 已抽到就不覆蓋）
+      const fromArea = extractLanguageTag(aStr);
+      if (fromArea) {
+        // itemLang 在下一行從 _rawName 抽，這裡是「萬一 _rawName 抽不到」的後備
+        // 用變數名 itemAreaBackup 標明語意。
+        if (!resource._rawName || !extractLanguageTag(resource._rawName)) {
+          resource._versionLabel = resource._versionLabel || aStr;
+        }
+      }
+      // 不論有沒有後備語言，都把 _area 視為無效地區別（不污染頂層 area）
+      itemArea = null;
+    }
+  }
   // ★ 語言版本也進版本標記。片名「轻功(粤语)」與「轻功(国语)」在描述上
   //   幾乎一樣（同年、同地區、同播放源），去重鍵分開之後兩筆都會留著，
   //   但沒有標記時使用者在來源列表裡根本分不出哪一筆是哪個語言 ——
@@ -5638,6 +5816,54 @@ function cleanResourceForOutput(resource) {
   //
   //   語言抽不到時不加，維持原本「[2019年 - 國語]」的輸出不變。
   const itemLang = extractLanguageTag(resource._rawName || resource._versionLabel);
+
+  // ★★★ 統一清單設計 (v1) — 頂層獨立欄位
+  //
+  // 為什麼要在這裡拆：REX 客戶端的詳細頁播放列表（與「來源切換器」不同），
+  // 目前只能用 description 拼字串做事，沒法把「年份／地區／語言」當獨立
+  // meta 顯示。把這三個欄位拉到頂層，client 端就能按以下統一排版渲染：
+  //
+  //   ┌────────────────────────────────────────────────┐
+  //   │ 庆余年2  第2季·第01集                          │  ← title（人類可讀）
+  //   │ 金牌影視 · 4K超清 · 2024 · 中國大陸 · 粵語     │  ← meta 一行
+  //   └────────────────────────────────────────────────┘
+  //
+  // 規則：只在「抽得到」時才寫欄位，不灌空字串 / null，避免客戶端要判斷
+  // 「這個欄位有意義還是空的」。REX 直接讀 truthy 即可顯示。
+  if (itemYear) clean.year = Number(itemYear) || itemYear;
+  const areaText = areaLabel(itemArea);
+  if (areaText) clean.area = areaText;
+  if (itemLang) clean.language = itemLang;
+
+  // 「主來源加成」是排序資訊。客戶端也想知道（粗體／外框／鎖定第一格），
+  // 直接給它一個布林欄位，比讓它重算 isMain 簡單。
+  if (resource._isMainSource) clean.isMainSource = true;
+
+  // AGE 多源：站方 group 標籤（「非凡」「无尽」等 CDN 群組）值得獨立欄位，
+  // 否則 client 端只能從 description 拼字串剝（容易拿錯）。
+  if (resource._groupLabel) {
+    clean.group = resource._groupLabel;
+    // 同時清掉 description 內的 [group] 段（[红牛]、[非凡] 等）
+    //   改前："進擊的巨人．第1集．[红牛]"
+    //   改後："進擊的巨人．第1集"
+    // 拼接順序是 displayName + tail + sourceTag，所以通常在最後一段；
+    // 用正則保險匹配：「．[xxx]」或「 [xxx]」或「末尾 [xxx]」。
+    clean.description = clean.description
+      .replace(new RegExp(`[．.]\\s*\\[${resource._groupLabel}\\]\\s*$`), '')
+      .replace(new RegExp(`\\s*\\[${resource._groupLabel}\\]\\s*$`), '')
+      .trim();
+  }
+
+  // ★ 改寫 description：移除先前以 [年 - 地 - 語] 拼接的版本段。
+  //
+  //   原因：這段資訊已抽出到頂層欄位（year / area / language），
+  //   description 留著會變成「同樣資訊出現兩次」——一次在頂層、一次在拼字串。
+  //   REX 端要重畫清單時只需要讀頂層欄位，description 留乾淨的「標題 + 集數」。
+  //   範例：
+  //     改前："慶餘年 第2季．第01集\n[2024年 - 中國大陸 - 粵語]"
+  //     改後："慶餘年 第2季．第01集"
+  //
+  //   冪等：包含檢查確保重複 clean 不會把版本段切到壞掉。
   if (itemYear || itemArea || itemLang) {
     const parts = [];
     if (itemYear) parts.push(`${itemYear}年`);
@@ -5645,10 +5871,15 @@ function cleanResourceForOutput(resource) {
     if (label) parts.push(label);
     if (itemLang) parts.push(itemLang);
     const versionTag = `[${parts.join(' - ')}]`;
-    // includes 檢查是為了冪等：同一筆資源可能被 clean 兩次
-    // （cache 命中路徑 + 輸出路徑），重複換行會多出一個空行。
-    if (versionTag && !clean.description.includes(versionTag)) {
-      clean.description = `${clean.description}\n${versionTag}`;
+    if (versionTag) {
+      // 同時清掉「以句點相接在同一行」與「換行獨立」兩種排法（歷史版本混用）。
+      const inlineTag = ` ${versionTag}`;
+      clean.description = clean.description
+        .replace(versionTag, '')
+        .replace(inlineTag, '')
+        .replace(/\s*\n\s*/, '\n')   // 摺疊多餘的換行
+        .replace(/\n+$/, '')         // 去掉尾端空行
+        .trim();
     }
   }
 
