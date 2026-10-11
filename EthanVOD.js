@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.2.2",
+  version: "3.2.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -5698,7 +5698,7 @@ class SmartSearchExecutor {
         newResults.push(resource);
         
         if (onResultCallback) {
-          const cleanResource = cleanResourceForOutput(resource);
+          const cleanResource = cleanResourceForOutput(resource, this.type);
           onResultCallback([cleanResource], {
             type: 'immediate_result',
             site: site.title,
@@ -5867,7 +5867,7 @@ class SmartSearchExecutor {
 }
 
 // ==================== 主函数模块 ====================
-function cleanResourceForOutput(resource) {
+function cleanResourceForOutput(resource, type = 'tv') {
   const clean = { ...resource };
 
   // 把 _ep / _seasonFromItem 提升為頂層 episode / season。
@@ -5885,6 +5885,22 @@ function cleanResourceForOutput(resource) {
   }
   if (resource._seasonFromItem != null && clean.season == null) {
     clean.season = resource._seasonFromItem;
+  }
+
+  // ★ S1 預設補 season。
+  //
+  // 場景：搜「白粉飛」這種 S1 影集時，站方檔名（白粉飛、白粉飞）不含
+  // 「第N季」字眼 → extractSequelNumber 回 null → _seasonFromItem=null
+  // → clean.season=null。沒 season 頂層欄位時，後續 S/E tag 拼接會
+  // 整個跳過，使用者只看到「金牌影視」沒「S1E1」。
+  //
+  // 規則：type=tv 且「沒有 season 但有 episode」時，預設補 season=1。
+  // 為什麼不在 type=movie 時補：電影沒「季」概念（只有 S1 一個
+  // 預設值），下面 S/E tag 那段會另外處理（只拼 S1 不拼 E）。
+  // 為什麼要有 episode 才補：完全沒 episode 的資源不是影集場景，
+  // 不要硬塞 S1 上去（可能是綜藝或電影的特殊資源）。
+  if (type === 'tv' && clean.season == null && Number.isFinite(clean.episode) && clean.episode > 0) {
+    clean.season = 1;
   }
 
   // ★ 把季別寫進 description 第一行（使用者選 C 的修正）。
@@ -6069,24 +6085,55 @@ function cleanResourceForOutput(resource) {
   // ★ 把「S{N}E{M}」加到 source name（使用者要求）。
   //
   // 範例：
-  //   改前: name = "金牌影視"
-  //   改後: name = "金牌影視 S2E10"
+  //   tv 改前: name = "金牌影視"
+  //   tv 改後: name = "金牌影視 S1E1"      (S1, E1)
+  //   tv 改後: name = "金牌影視 S2E10"     (S2, E10)
+  //   movie:  name = "非凡 S1"              (電影不拼 E)
   //
   // 規則：
-  //   - 只在「season 與 episode 都有」時才加，避免「只集沒季」或
-  //     「只季沒集」時拼出半殘標籤（會誤導使用者）。
-  //   - 冪等：name 末尾已含「S{N}E{M}」或「E{M}」任一寫法時不重複加。
-  //   - 拼在 name 末尾，與 name 之間用半形空格分隔（與下方的
-  //     _groupLabel 拼接風格一致）。
-  if (Number.isFinite(clean.season) && clean.season > 0
-      && Number.isFinite(clean.episode) && clean.episode > 0
-      && clean.name) {
-    const seTag = `S${clean.season}E${clean.episode}`;
+  //   - tv 模式：season 與 episode 都有 → `S{N}E{M}`；只有 season → `S{N}`
+  //     ；都沒有 → 不拼。
+  //   - movie 模式：永遠只拼 `S1`（電影沒「集」概念，但保留 S1 標籤讓
+  //     與 tv 一致；不拼 E 避免誤導使用者以為電影有多集）。
+  //   - 冪等：name 末尾已含相同 tag 時不重複加。
+  //   - 拼在 name 末尾，與 name 之間用半形空格分隔。
+  if (clean.name) {
     const nameStr = String(clean.name);
-    const alreadyHasSE = new RegExp(`S\\s*${clean.season}\\s*E\\s*${clean.episode}\\b`, 'i').test(nameStr)
-      || new RegExp(`E\\s*${clean.episode}\\b`, 'i').test(nameStr);
-    if (!alreadyHasSE) {
-      clean.name = `${nameStr} ${seTag}`;
+    let tag = null;
+    if (type === 'movie') {
+      // 電影：固定 S1，不拼 E。
+      tag = 'S1';
+    } else if (Number.isFinite(clean.season) && clean.season > 0
+        && Number.isFinite(clean.episode) && clean.episode > 0) {
+      tag = `S${clean.season}E${clean.episode}`;
+    } else if (Number.isFinite(clean.season) && clean.season > 0) {
+      tag = `S${clean.season}`;
+    }
+    if (tag) {
+      // 冪等檢查：name 末尾若已含「相同 tag」就跳過拼接。
+      //
+      // 三種 tag 各自的命中規則：
+      //   • S{N}E{M} → 找 \bS{N}\s*E{M}\b（明確匹配「季+集」）
+      //   • S{N}     → 找 \bS{N}\b(?!E\d)，避開被誤判為「S{N}E{...}」
+      //     的一部分（regex 的 lookahead 確保後面不接數字集數）。
+      //   • S1（電影）→ 找 \bS1\b(?!E)，同上邏輯。已含「S1E...」不視為
+      //     含「S1」（避免 S1E5 被當作 S1 電影的冪等匹配）。
+      let alreadyHas = false;
+      if (/^S\d+E\d+$/.test(tag)) {
+        // S{N}E{M} 形式
+        const m = tag.match(/^S(\d+)E(\d+)$/);
+        alreadyHas = new RegExp(`\\bS\\s*${m[1]}\\s*E\\s*${m[2]}\\b`, 'i').test(nameStr);
+      } else if (tag === 'S1') {
+        // 電影 S1：S1E? 視為已含（更嚴格）
+        alreadyHas = /\bS\s*1\s*E\b/i.test(nameStr) || /\bS\s*1\b(?!E\d)/i.test(nameStr);
+      } else {
+        // 純 S{N}
+        const sNum = tag.slice(1);
+        alreadyHas = new RegExp(`\\bS\\s*${sNum}\\b(?!E\\d)`, 'i').test(nameStr);
+      }
+      if (!alreadyHas) {
+        clean.name = `${nameStr} ${tag}`;
+      }
     }
   }
 
@@ -7004,7 +7051,7 @@ targetInfo.searchQuery = aliasQ;
     // 之前只在 onStreamResult 推播路徑呼叫 cleanResourceForOutput，
     // 寫 cache 的 finalResults 走自己的清理邏輯，導致 cache 命中時沒有標籤。
     // 改用同一個 helper 統一處理。
-    const cleaned = cleanResourceForOutput(res);
+    const cleaned = cleanResourceForOutput(res, type);
 
     // cleanResourceForOutput 用 { ...resource } 淺拷貝回傳新物件，
     // 這裡把原 res 的欄位換成 cleaned，後面寫 cache 與最終 return 都看得到。
@@ -8637,7 +8684,7 @@ targetInfo.searchQuery = aliasQ;
                          '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
                          '_s4FallbackBoost', '_seasonFromItem'];
   finalResults.forEach(res => {
-    const cleaned = cleanResourceForOutput(res);
+    const cleaned = cleanResourceForOutput(res, type);
     Object.keys(res).forEach(k => delete res[k]);
     Object.assign(res, cleaned);
   });
