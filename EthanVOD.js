@@ -1391,7 +1391,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.1.3",
+  version: "3.1.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -5815,7 +5815,14 @@ function cleanResourceForOutput(resource) {
   //   只會看到兩列看起來一模一樣的項目。標記必須跟著版本走。
   //
   //   語言抽不到時不加，維持原本「[2019年 - 國語]」的輸出不變。
-  const itemLang = extractLanguageTag(resource._rawName || resource._versionLabel);
+  // ★ 語言抽取：除了 _rawName 也要看 description 內的字眼。
+  // 場景：樂子站 MacCMS 來源把「國語中字」這類字眼**塞進 description
+  // 而不是片名**（站方 _rawName=「破·地狱」、description=「破·地獄．國語中字」）。
+  // 只餵 _rawName 會漏。兩路互補：_rawName 抽得到就優先，抽不到
+  // 退回 description。
+  const langFromName = extractLanguageTag(resource._rawName);
+  const langFromDesc = langFromName ? null : extractLanguageTag(resource.description);
+  const itemLang = langFromName || langFromDesc;
 
   // ★★★ 統一清單設計 (v1) — 頂層獨立欄位
   //
@@ -5863,23 +5870,53 @@ function cleanResourceForOutput(resource) {
   //     改前："慶餘年 第2季．第01集\n[2024年 - 中國大陸 - 粵語]"
   //     改後："慶餘年 第2季．第01集"
   //
-  //   冪等：包含檢查確保重複 clean 不會把版本段切到壞掉。
-  if (itemYear || itemArea || itemLang) {
+  // 冪等：包含檢查確保重複 clean 不會把版本段切到壞掉。
+  // 把 [年 - 地 - 語] 整段從 description 拿掉（之前已抽到頂層欄位）。
+  // 注意：itemYear / itemArea / itemLang 任一存在就要清（即使整段拼不出來）。
+  const versionTag = (() => {
+    if (!itemYear && !itemArea && !itemLang) return null;
     const parts = [];
     if (itemYear) parts.push(`${itemYear}年`);
     const label = areaLabel(itemArea);
     if (label) parts.push(label);
     if (itemLang) parts.push(itemLang);
-    const versionTag = `[${parts.join(' - ')}]`;
-    if (versionTag) {
-      // 同時清掉「以句點相接在同一行」與「換行獨立」兩種排法（歷史版本混用）。
-      const inlineTag = ` ${versionTag}`;
+    return `[${parts.join(' - ')}]`;
+  })();
+  if (versionTag) {
+    // 同時清掉「以句點相接在同一行」與「換行獨立」兩種排法（歷史版本混用）。
+    const inlineTag = ` ${versionTag}`;
+    clean.description = clean.description
+      .replace(versionTag, '')
+      .replace(inlineTag, '')
+      .replace(/\s*\n\s*/, '\n')   // 摺疊多餘的換行
+      .replace(/\n+$/, '')         // 去掉尾端空行
+      .trim();
+  }
+
+  // ★★★ 語言下行（人類可讀版）
+  //
+  // 把 language 視覺上拼到 description 第二行。REX 端詳細頁的
+  // 「播放列表」目前主要看 description —— 把語言擺在片名／集數下方
+  // 獨立一行，搭配 🌐︎ emoji 圖示，比塞在標題後面清楚。
+  //
+  // 規則：
+  //   1. 只在「有語言」時拼下行 —— 抽不到就維持單行（不拼 🌐︎ 原聲/不明），
+  //      因為沒語言字眼就代表「不知道」，拼個假資料比留空還糟。
+  //   2. 冪等：若 description 已有同樣的 🌐︎ 行就不重複拼（重複 clean 安全）。
+  //   3. 第一行保持片名/季/集原樣，下行只放語言。
+  //
+  // 範例：
+  //   改前："輕功．第01集"
+  //   改後："輕功．第01集\n🌐︎ 國語"
+  //
+  // 頂層 clean.language 仍保留（給 REX 客戶端機器讀用，與 description
+  // 視覺行**同時存在不衝突**——一個是顯示字串、一個是結構欄位）。
+  if (itemLang) {
+    const langLine = `🌐︎ ${itemLang}`;
+    if (!clean.description.includes(langLine)) {
       clean.description = clean.description
-        .replace(versionTag, '')
-        .replace(inlineTag, '')
-        .replace(/\s*\n\s*/, '\n')   // 摺疊多餘的換行
-        .replace(/\n+$/, '')         // 去掉尾端空行
-        .trim();
+        ? `${clean.description}\n${langLine}`
+        : langLine;
     }
   }
 
