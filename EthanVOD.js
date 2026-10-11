@@ -1146,7 +1146,13 @@ const CONFIG = {
   //   去重鍵新增語言維度 + 版本標記顯示語言，舊 cache 裡缺這個維度，
   //   會讓已合併掉的語言版本永遠補不回來（只會繼續維持合併狀態）。
   //   必須清掉重搜，否則使用者看不到粵語/國語兩版。
-  WIDGET_VERSION: 39,
+//   bump 到 41：站方年份不可信時改用 vodId 聚合。
+//   實測金牌影視把 1995 年的「大话西游之大圣娶亲」標成 2014-10-24
+//   （條目上線日期不是首映年份，差 19 年）。該站設 yearTrusted: false 後，
+//   去重鍵改用站方 vodId、年份不再顯示、搜指定年份時也不再殺掉結果。
+//   其他站（MacCMS / AGE）的年份是真首映年份，行為完全不變 ——
+//   愛蛋站「仁医」日韓版之分正是靠年份分開的。
+WIDGET_VERSION: 41,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1391,7 +1397,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.1.0",
+  version: "3.1.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2862,11 +2868,65 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       idx = type === 'movie' ? 0 : episodes.length - 1;
     }
 
-    const resolved = await _adapterResolvePlay(episodes[idx].token);
-    if (!resolved || resolved.length === 0) return [];
+    // ★ 電影的「多條」不是集數，是並列的播放來源，且必須全部保留。
+    //
+    // 實測金牌影視 id=110860「大话西游之大圣娶亲」（typeId1=1 電影）：
+    //   episodeList = [ {name:"粤语", nid:1304906}, {name:"国语", nid:1304905} ]
+    //
+    // 語言是「同一個 vodId 下的多個 episodeList 條目」，不是兩筆不同 vodId
+    // （那種結構是影集在用的。先前只修了那一種，所以電影這裡一直漏著）。
+    //
+    // 原本 idx=0 只挑了第一條（粵語），換完 URL 就結束 —— 國語版整組被丟掉。
+    // 使用者看到的來源列表是「1080P / 720P / 480P」三筆粵語清晰度，
+    // 完全沒有國語可選，與站方詳情頁的「粤语 / 国语」兩個按鈕不符
+    // （這是使用者實際回報的現象）。
+    //
+    // 修法：電影時對「每一條」都換 URL，各自成為一個來源群組。
+    //   條目名（粤语/国语/蓝光/高清…）→ 作為語言/來源標記帶到輸出
+    //   每條換回的清晰度（1080P/720P/480P）→ 該來源下的多個畫質
+    //
+    // 影集維持原行為（只換目標那一集），理由見上：36 集全換太貴，
+    // 而且延遲換取本來就是為了避免一次性預取。
+    const movieMultiSource = type === 'movie' && episodes.length > 1;
+    const idxList = movieMultiSource ? episodes.map((_, i) => i) : [idx];
+
+    // 併發換 URL：各來源彼此獨立不依賴，並發上限沿用 _adapterPool 的節制
+    // （站方限流緊，全開會回 429）。影集路徑維持單一請求。
+    const groups = movieMultiSource
+      ? await _adapterPool(
+          idxList.map(i => async () => {
+            try {
+              const r = await _adapterResolvePlay(episodes[i].token);
+              return (r && r.length) ? r : null;
+            } catch (e) {
+              if (CONFIG.ADAPTERS?.DEBUG) {
+                console.warn(`[adapter:${site.id}] movie 來源 ${episodes[i].name} 解析失敗`);
+              }
+              return null;
+            }
+          }),
+          Math.min(idxList.length, 3),
+        )
+      : [await _adapterResolvePlay(episodes[idx].token).catch(() => null)];
+
+    // 濾掉失敗的群組，但保留原本的來源順序（站方把首選來源排前面）
+    const liveGroups = [];
+    for (let g = 0; g < groups.length; g++) {
+      const list = groups[g];
+      if (!list || !list.length) continue;
+      liveGroups.push({ list, srcIdx: idxList[g], srcName: episodes[idxList[g]]?.name || '' });
+    }
+    if (!liveGroups.length) return [];
 
     const out = [];
-    for (const r of resolved) {
+    for (const grp of liveGroups) {
+      const curIdx = grp.srcIdx;
+      // ★ 條目名同時是「來源標記」。電影時它幾乎都是語言（粤语/国语），
+      //   但也可能是清晰度（蓝光/高清/标清）或正片+花絮的區分，
+      //   所以一律當成來源名帶出去，不假設它一定是語言。
+      const srcLabel = grp.srcName;
+      const srcLang = extractLanguageTag(srcLabel);
+      for (const r of grp.list) {
       const url = r?.url;
       if (!url || !isPlayableUrl(url)) continue;
       // 簽名站回傳的是 resolutionName（蓝光/高清/标清）+ resolution（數字）。
@@ -2885,7 +2945,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       // extractResolutionInfo / extractSequelNumber 等比對邏輯上，
       // 只有這裡的 description 與 wrap 的 name 拿轉換後的字串。
       const displayName = _adapterSeasonLabel(vod_name);
-      const epLabel = _adapterEpisodeLabel(episodes[idx].name);
+      const epLabel = _adapterEpisodeLabel(episodes[curIdx].name);
       // ★ 評分已在上游 (_adapterDefaultSearch) 排除，這裡只留「非評分」的
       //   狀態標記。純數字／帶星號的短字串一律視為評分丟掉 ——
       //   站方哪天改版塞別的數字進 vodRemarks 時，不該讓評分再冒出來。
@@ -2895,7 +2955,22 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   「慶餘年．第01集」讀起來像漏了什麼（使用者會以為壞掉）。
       const showEpisode = type !== 'movie';
       const remark = showEpisode ? _adapterSafeRemark(vod_remarks) : '';
-      const tail = showEpisode ? [epLabel, remark].filter(Boolean).join('．') : '';
+      // ★ 電影的描述必須帶上來源標記（語言）。
+      //
+      //   修版前電影的描述是裸片名（「大話西遊之大聖娶親」），
+      //   粵語與國語的 3 筆清晰度看起來一模一樣，使用者既分不出是哪個語言，
+      //   也不知道站方明明有兩個語言可選。
+      //
+      //   改成「片名．來源」形式：与大話西遊（粵語）／大話西遊（國語）。
+      //   只在「有語言標記且不只一個來源」時加 —— 單來源的電影維持裸片名，
+      //   避免多出無意義的「．藍光」（清晰度已經有 resolution 欄位了）。
+      const needSrcLabel = movieMultiSource && episodes.length > 1 && srcLabel;
+      const descTail = needSrcLabel
+        ? (srcLang ? `${toDisplayText(srcLabel)}` : `${toDisplayText(srcLabel)}`)
+        : '';
+      const tail = showEpisode
+        ? [epLabel, remark].filter(Boolean).join('．')
+        : descTail;
       // ★ 集數不能直接 parseInt(episodes[idx].name)：AGE 的集數名是
       //   「第195集」「HD中字」「正片」，都不是純數字 → NaN。
       //   NaN 會讓 episode 欄位變 null，使用者選第195集時這條來源被
@@ -2909,7 +2984,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   會讓「挑的是第80集、回報的卻是第1集」這種前後矛盾發生
       //   （實測就發生過：使用者選第 2 集，AGE 卻回「五等分的新娘＊．第2集」
       //   但 episode 欄位是 1）。
-      const epNumber = _adapterEpNumber(episodes[idx].name);
+      const epNumber = _adapterEpNumber(episodes[curIdx].name);
 
       out.push({
         name: siteTitle,
@@ -2958,7 +3033,17 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         // 「叶问3(粤语)」與「叶问3(国语)」兩筆 _year 相同、
         // 播放源相同、沒有集數（no-ep），會撞成同一個鍵，
         // 整組電影資源只留一版。
-        _versionLabel: vod_name,
+        //
+        // ★ 電影要優先用「來源條目名」而不是片名。
+        //
+        //   電影的語言存在於 episodeList 條目名（「粤语」「国语」），
+        //   片名是乾淨的「大話西游之大圣娶亲」，裡面沒有語言。
+        //   （那是影集的結構 —— 片名自帶「轻功(粤语)」後綴。）
+        //   所以這裡拼成「片名+來源名」，讓 extractLanguageTag 能抽到，
+        //   去重鍵與輸出標記都正確分開粵語/國語兩組清晰度。
+        _versionLabel: (needSrcLabel && srcLang)
+          ? `${vod_name} ${srcLabel}`
+          : vod_name,
         _seasonFromItem: extractSequelNumber(vod_name),
         // ★ 補上年份／地區，否則 cleanResourceForOutput 組不出
         //   「[2019年 - 中國大陸]」版本標記 —— 金牌影視就會是唯一
@@ -2970,6 +3055,18 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         //   使用者要自己開詳情頁比對是哪一年的版本。
         _year: item.vod_year || null,
         _area: item.vod_area || null,
+        // ★ 版本維度：年份不可信的站改用站方 vodId。
+        //
+        //   jpyy 的 vodPubdate 是上線日期不是首映年份（1995 年的電影標成
+        //   2014，差 19 年），拿它當去重鍵的 versionKey 等於用錯的依據
+        //   在分版本。站方 vodId 才是「同一個條目」最可靠的識別。
+        //   欄位在 generateContentKey 讀取（見 _adapterVersionKeyOf）。
+        _versionKeyOverride: item._versionKeyOverride || null,
+        // 年份是否可信。這是「站方層級」的屬性，必須從 item 帶到 resource，
+        // 否則下游（cleanResourceForOutput 決定要不要顯示年份、
+        // matchesTargetVersion 決定要不要放行）看不到它，會各自用
+        // 「有 _year 就當可信」的預設 —— jpyy 的錯年份又會全部顯示出來。
+        _adapterYearTrusted: item._adapterYearTrusted,
         _ep: Number.isFinite(epNumber) ? epNumber : null,
         // 實際取到的集數（fallback 時與 episode 不同），僅供 log／除錯
         _epActualEp: Number.isFinite(epNumber) ? epNumber : null,
@@ -2977,7 +3074,8 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         _areaMismatch: false,
         _areaMatch: false,
       });
-    }
+      } // for (const r of grp.list)
+    } // for (const grp of liveGroups)
     return out;
   }
 
@@ -3972,6 +4070,13 @@ const ADAPTER_SITES = [
     // 這類站回傳的資料比 MacCMS 站豐富（豆瓣評分、地區、多清晰度），
     // 給予排序加成。
     isMain: true,
+    // ★ 站方 vodPubdate 是「條目上線日期」而非首映年份，經典老片會整個錯掉：
+    //   大話西游之大圣娶亲（首映 1995）→ vodPubdate = 2014-10-24（差 +19 年）
+    //   轻功（首映 2022）             → vodPubdate = 2022-12-05（✅ 巧合正確）
+    // 新片準、老片錯，不能拿來當版本判斷依據。設 false 後，去重鍵改用
+    // 站方 vodId（站方自己認定的條目身分）作為版本維度 —— 理由見
+    // _adapterYearTrustworthy / _adapterVersionKeyOf。
+    yearTrusted: false,
   },
   {
     id: 'agedm',
@@ -4181,6 +4286,22 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
         //   的 isPlayableUrl 會把它判為不可播，因此必須在該處特判並還原。
         _adapterSite: site.id,
         _adapterDelay: true,
+        // 站方條目識別碼。帶著它下游才能在年份不可靠時改用它做版本維度
+        // （理由見 _adapterYearTrustworthy 與 generateContentKey）。
+        //
+        // 站方 vodId 是「同一筆站方條目」的識別，比站方年份權威得多：
+        // 實測金牌影視把 1995 年的「大話西游之大圣娶亲」(id=110860) 標成
+        // vodPubdate=2014-10-24（重映日期，差 19 年），但 vodId 忠實對應
+        // 「那一部粵語老片」這件事是沒有歧義的。
+        _adapterVodId: String(item.vod_id ?? ''),
+        // 站方年份是否可信。見 _adapterYearTrustworthy。
+        _adapterYearTrusted: _adapterYearTrustworthy(site),
+        // ★ 版本維度預先算好帶著走（年份不可信的站改用 vodId）。
+        //   這裡算而不是在下游算，是因為下游拿得到 _year / _adapterVodId
+        //   但拿不到 site 物件 —— 而「這個站相不信任年份」是站方設定，
+        //   不是單一資源的屬性。預先算好可避免下游另外維護一份站方清單，
+        //   也讓未來新增的站只要填 yearTrusted 就自動適用。
+        _versionKeyOverride: _adapterVersionKeyOf(site, item),
         // 同樣走 _adapterSafeRemark：vod_content_note 會顯示在詳情頁，
         // 評分在這裡也不該出現。
         vod_content_note: _adapterSafeRemark(item.vod_remarks),
@@ -4195,6 +4316,62 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
     console.log(`[adapter:${site.id}] "${searchQuery}" → ${out.length}/${items.length} 筆, ${Date.now() - t0}ms`);
   }
   return out;
+}
+
+/**
+ * 這個 adapter 站的年份欄位能不能拿來當「版本判斷」依據？
+ *
+ * ★ 為什麼需要這個判斷（實測金牌影視 jpyy）：
+ *
+ *   jpyy 的 vodPubdate 不是首映年份，而是**該條目在站方 library 的上線日期**。
+ *   對新片幾乎等於首映年份（實測「轻功」2022-12-05 首映 2022 ✅），
+ *   但對經典老片會整個錯掉：
+ *
+ *     大話西游之大圣娶亲（首映 1995）  →  vodPubdate = 2014-10-24  （差 +19 年）
+ *
+ *   差 19 年不是小數點後面的誤差，是完全不同的作品年代。若拿它當去重鍵的
+ *   versionKey，同一部粵語老片在站方若同時存在多個 library 條目（例如
+ *   不同上線批次），會因為年份被寫成不同值而被當成「不同版本」各留一筆，
+ *   使用者看到同一場戲重複出現多個來源。
+ *
+ * ★ 為什麼不是「全部站都不信任年份」：
+ *
+ *   其他站（MacCMS 站、AGE）的 vod_year 是真的首映年份，是可信的。
+ *   全域廢棄年份會讓日版「仁医」與韓版「仁医2012」這種同名不同年份的
+ *   真實版本差異消失 —— 那個 case 是年份欄位**救回來的**（見
+ *   generateContentKey 的註解）。所以這裡做成 per-site 旗標：
+ *   只有標記為不可信的站才改用 vodId。
+ *
+ * 判斷方式：站方設定明確宣告 yearTrusted: false。
+ * 預設 true（信任），避免新增站因為沒填這個欄位而誤損。
+ */
+function _adapterYearTrustworthy(site) {
+  return site?.yearTrusted !== false;
+}
+
+/**
+ * 這個 adapter 站的版本維度應該用什麼？
+ *
+ * 回傳一個「該站可信的版本識別字串」：
+ *   - 年份可信的站 → 回年份（維持既有行為，MacCMS 站的版本差異靠它分辨）
+ *   - 年份不可信的站 → 回站方 vodId（站方自己認定的條目身分，最可靠）
+ *
+ * 之所以不放棄整個版本維度：同名不同作品（日版仁医 / 韓版仁医2012）
+ * 在站方是不同條目，只是片名看起來一樣。維度不能拿掉，只能換成
+ * 站方認定的身分。
+ */
+function _adapterVersionKeyOf(site, item) {
+  if (_adapterYearTrustworthy(site)) {
+    return item?.vod_year || item?.vod_name || 'x';
+  }
+  // 年份不可信 → 用站方條目識別碼。同一筆條目 = 同一個版本，沒有歧義。
+  //
+  // ★ 要讀 vod_id 而不是 _adapterVodId：這個函式在 item 還沒被加工成
+  //   資源之前就被呼叫，那個時點欄位名是站方原始的 vod_id
+  //   （_adapterVodId 是後來才掛上去的另一個欄位，用它會永遠拿不到，
+  //   靜默退回 vod_name，等於整個修正失效卻沒有任何報錯 —— 這種
+  //   「拿不到就退回舊值」的寫法最危險，因為看起來有生效）。
+  return item?.vod_id || item?.vod_name || 'x';
 }
 
 /**
@@ -5142,8 +5319,20 @@ class SmartSearchExecutor {
   // 判斷依據是站方的 vod_year，不是片名：實測搜「仁医」時檔名多為光溜溜的
   // 「仁医」，年份只存在於 vod_year 欄位，拿片名比會誤殺。
   // 候選沒有年份就放行 —— 無法判斷不等於是錯的版本。
+  //
+  // ★ 年份不可信的站必須直接放行，不能拿它去比對目標年份。
+  //
+  //   實測金牌影視：搜「大話西遊 1995」時，唯一正確的那部（首映 1995）
+  //   站方 vod_year 標 2014 → 比對 1995 !== 2014 → 這筆被殺掉，
+  //   使用者拿到的是一堆錯的版本或空結果。
+  //
+  //   這種站上「無法判斷」的比例很高（經典片幾乎都錯），比對失敗時的
+  //   預設必須是「放行」而不是「殺掉」—— 殺掉是使用者看不到資源，
+  //   放行只是可能看到一個年份不對的版本，而年份對內容可播性毫無影響。
+  //   這也與上面「候選沒有年份就放行」的既有哲學一致。
   matchesTargetVersion(resource) {
     if (!this.targetInfo.year) return true;
+    if (resource._adapterYearTrusted === false) return true;
     const candYear = resource._year;
     if (!candYear) return true;
     return String(candYear) === String(this.targetInfo.year);
@@ -5236,6 +5425,20 @@ class SmartSearchExecutor {
    * 使用者點第3集時整集的來源都已被去重吃掉。
    */
   generateContentKey(resource) {
+    // ★ _versionKeyOverride 優先：站方宣告年份不可信時，這裡換成站方 vodId。
+    //
+    //   實測金牌影視 jpyy：大話西游之大圣娶亲首映 1995，站方 vodPubdate 卻是
+    //   2014-10-24（條目上線日期，差 19 年）。用它當版本維度等於用錯的依據
+    //   在分版本 —— 同一場戲若因站方多個 library 條目而有不同上線日期，
+    //   會被拆成多個「不同版本」各留一筆。
+    //
+    //   為什麼不是「全部站都不信任年份」：其他站（MacCMS、AGE）的 vod_year
+    //   是真首映年份，日版「仁医」vs 韓版「仁医2012」那種同名不同年份的真實
+    //   版本差異正是靠年份分開的（見下面 versionKey 的註解）。全站廢棄年份
+    //   會把那個 case 弄壞。所以是 per-site 旗標，只影響宣告不可信的站。
+    //
+    //   見 _adapterYearTrustworthy / _adapterVersionKeyOf。
+    const versionKey = resource._versionKeyOverride || resource._year || resource._rawName || 'x';
     // 版本維度優先用年份，但年份抽不到時必須退回站方原始片名，
     // 不能一律當成同一個。
     //
@@ -5256,12 +5459,27 @@ class SmartSearchExecutor {
     //
     //   抽不到語言標記時回 'x'，維持既有行為 —— 沒有語言維度的站
     //   （幾乎所有 MacCMS 站）不會因為多了一個鍵而被拆開。
-    const versionKey = resource._year || resource._rawName || 'x';
-    const langKey = extractLanguageTag(resource._rawName || resource._versionLabel) || 'x';
+    const langKey = extractLanguageTag(resource._versionLabel || resource._rawName) || 'x';
+    // ★ 清晰度必須是獨立維度，否則同一語言下的多個畫質會互相吃掉。
+    //
+    //   實測金牌影影视 id=110860「大话西游之大圣娶亲」：每個語言來源
+    //   換 URL 後回傳 3 檔清晰度（1080P / 720P / 480P）。這 3 筆的
+    //   語言、站名、集數、播放源全都相同，只有 resolution 不同 ——
+    //   沒有這一段維度時，smartDeduplicate 只會留下其中一檔，
+    //   使用者連「要不要選 480P」都不能選。
+    //
+    //   這與「語言版本」是不同層級的維度：語言決定「看哪個版本」，
+    //   清晰度決定「這個版本的畫質」，兩者都可獨立挑選。
+    //
+    //   抽不到清晰度時回 'x'，MacCMS 站的既有行為完全不變
+    //   （那些站的清晰度寫在 description 的方括號裡，已由
+    //   playSourceKeyOf 處理）。
+    const resKey = resource.resolution || 'x';
     return [
       resource.name,
       versionKey,
       langKey,
+      resKey,
       episodeKeyOf(resource),
       playSourceKeyOf(resource)
     ].join('|');
@@ -5377,6 +5595,9 @@ function cleanResourceForOutput(resource) {
     // _versionLabel 是去重鍵用的語言維度中介欄位（內容 = 原始片名）。
     // 顯示用的語言已寫進 description 的版本標記，這份原始值不必外流。
     '_versionLabel',
+    // 同上，去重鍵用的中介欄位（站方 vodId 或年份，依站方可信度而定）。
+    // 內容已反映在 description 的版本標記上，不外流。
+    '_versionKeyOverride', '_adapterVodId', '_adapterYearTrusted',
     '_s4FallbackBoost', '_seasonFromItem'
   ];
   
@@ -5408,9 +5629,21 @@ function cleanResourceForOutput(resource) {
   //
   //   語言抽不到時不加，維持原本「[2019年 - 國語]」的輸出不變。
   const itemLang = extractLanguageTag(resource._rawName || resource._versionLabel);
-  if (itemYear || itemArea || itemLang) {
+  //
+  // ★ 年份不可信的站不顯示年份（實測金牌影視）。
+  //
+  //   jpyy 的 vodPubdate 是條目上線日期：1995 年的「大話西游之大圣娶亲」
+  //   標成 2014-10-24。顯示成「[2014年 - 中國香港]」不只是不精確 ——
+  //   它是錯的，而且會讓使用者以為有部 2014 年的片子而放棄這筆。
+  //   一個不可信的欄位還不如不顯示：沒有年份，使用者看到的是
+  //   「[中國香港 - 粵語]」，仍然知道地區與語言，只是不會被年份誤導。
+  //
+  //   地區與語言不受影響 —— 它們在站方是準確的（vodArea 與
+  //   episodeList 條目名都不是上線時間相關的欄位）。
+  const showYear = resource._adapterYearTrusted !== false;
+  if ((showYear && itemYear) || itemArea || itemLang) {
     const parts = [];
-    if (itemYear) parts.push(`${itemYear}年`);
+    if (showYear && itemYear) parts.push(`${itemYear}年`);
     const label = areaLabel(itemArea);
     if (label) parts.push(label);
     if (itemLang) parts.push(itemLang);
@@ -6247,6 +6480,8 @@ targetInfo.searchQuery = aliasQ;
     '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
     // 見 5376 的說明：去重中介欄位，不外流到輸出。
     '_versionLabel',
+    // 同上，去重鍵用的版本維度中介欄位（站方 vodId 或年份）。
+    '_versionKeyOverride', '_adapterVodId', '_adapterYearTrusted',
     '_s4FallbackBoost', '_seasonFromItem'
   ];
   
@@ -7654,6 +7889,8 @@ targetInfo.searchQuery = aliasQ;
                          '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
                          // 見 5376 的說明：去重中介欄位，不外流到輸出。
                          '_versionLabel',
+                         // 同上，去重鍵用的版本維度中介欄位。
+                         '_versionKeyOverride', '_adapterVodId', '_adapterYearTrusted',
                          '_s4FallbackBoost', '_seasonFromItem'];
   finalResults.forEach(res => {
     const cleaned = cleanResourceForOutput(res);
