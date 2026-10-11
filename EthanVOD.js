@@ -1187,17 +1187,12 @@ const CONFIG = {
 
   // ===== MacCMS 站並發配置 =====
   //
-  // Phase A 提速：原本 performBatchSearch 對「每站 response.list 內
-  // 的候選 item」是「比對一個 → await 一個 → 比對下一個」循序迴圈，
-  // N 筆候選 = N 倍 RTT。改成「站內並發」後 = max(RTT)。
-  //
-  // 觀察點：實測 8 站 × 站內 4 並發 = 32 HTTP 在飛，未觸發 CDN 429。
-  // 若日後出現限流，把 DETAIL_CONCURRENCY 往下調。
+  // DETAIL_CONCURRENCY 控制每站內部抓詳情頁的同時請求數。
+  //   1 = 完全循序（baseline，0 風險）
+  //   4 = 站內併發（n=20 實測 median 769 vs baseline 735 → -4%，無統計顯著差，
+  //     且分位數長尾變長，return 1 維持 baseline）
   MAC: {
-    // 單一站內併發抓 detail 的上限。
-    //   1  = 完全循序（舊行為）
-    //   4  = 預設，8 站 × 4 = 32 並發，實測未觸發 429
-    DETAIL_CONCURRENCY: 4,
+    DETAIL_CONCURRENCY: 1,
   },
 
   // ===== 簽名型站 adapter =====
@@ -1238,13 +1233,11 @@ const CONFIG = {
     SITE_CONCURRENCY: 2,
     // detail 端點的短 TTL 快取（毫秒）。
     //
-    // ★ 這是最大的單項提速：搜尋流程會對同一個 vodId 打兩次
-    //   /detail（一次取播放清單、一次取 vip 前綴），因為前一次早已
-    //   回來、_ADAPTER_INFLIGHT 共用不到，所以第二次必定重新下載。
-    //   實測這一項單獨就佔 1.3 秒。
+    // 用途：搜尋流程會對同一個 vodId 打兩次 /detail（一次取播放清單、
+    // 一次取 vip 前綴），用這個 TTL 重放第二次的結果，省 RTT。
     //
-    //   只給「非短效憑證」的 detail 用：這裡重放的 player_jx 前綴是
-    //   站方固定設定；播放 token 不走這個快取（見 _ADAPTER_GET 說明）。
+    // 只給「非短效憑證」的 detail 用：這裡重放的 player_jx 前綴是
+    // 站方固定設定；播放 token 不走這個快取（見 _ADAPTER_GET 說明）。
     DETAIL_CACHE_TTL: 30000,
   },
 
@@ -1406,7 +1399,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.2.3",
+  version: "3.2.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4510,10 +4503,11 @@ async function _adapterPool(tasks, limit = 4) {
 /**
  * （保留）全域 HTTP 並發信號燈。
  *
- * 現況說明：Phase A 提速 #1 採用「每站 _adapterPool(N) 站內併發」即可，
- * 沒有套用全域 semaphore。實測單站 detail 併發 4 × 8 站 = 32 個 HTTP 在
- * 飛時未觸發 429，加了 FIFO 跨站排隊反而在高 candidate 數下退化成
- * 「搶 slot → 等待」序列，總時間拉長。
+ * 現況：目前站內 detail 是循序（DETAIL_CONCURRENCY=1），不呼叫這個 helper。
+ * 保留它作為「若日後要改回站內併發時」的工具。實測單站 detail 併發 4 × 8 站
+ * = 32 個 HTTP 在飛時未觸發 429；加 FIFO 跨站排隊反而在高 candidate 數下
+ * 退化成「搶 slot → 等待」序列，總時間拉長（n=20 凡人修仙傳 median 769 vs
+ * 純 baseline 735，無改善）。
  *
  * 若日後 CDN 真的開始 429 限流，把 MAC.GLOBAL_CONCURRENCY 解開 + 這幾個
  * helper 重新接回 batch 流程即可。
@@ -5528,36 +5522,19 @@ class SmartSearchExecutor {
             continue;
           }
           matchedItems.push({ item, matchResult });
+
+          if (matchResult.confidence >= 0.9) {
+            const resources = await extractPlayInfoForCache(item, site.title, this.type, matchResult, this.targetInfo);
+            siteResults.push(...this.processImmediateResults(resources, site, onResultCallback));
+          }
         }
       }
 
-      // Phase B 提速 #3：原本是「比對一個 → await detail → 比對下一個」
-      // 循序迴圈，N 筆候選 = N 倍 RTT。改成兩階段：
-      //   1. 純 CPU 比對收齊高/低 confidence 候選（已在上方迴圈完成）
-      //   2. 兩段併發抓 detail（高 confidence 先推，給使用者早點看到）
-      //
-      // 為什麼分兩段：原始設計刻意把高 confidence（>=0.9）單獨抽一輪
-      // 處理，是為了「馬上推」給 forward app。併發後保留這個分層——
-      // 高 confidence 整批先跑（任一完成就立刻 push），低 confidence
-      // 在後面跑。pool 限流避免 429。
-      const highConf = matchedItems.filter(x => x.matchResult.confidence >= 0.9);
-      const lowConf = matchedItems.filter(x => x.matchResult.confidence < 0.9);
-      const detailPool = (items) => items.length === 0 ? Promise.resolve([])
-        : _adapterPool(
-            items.map(({ item, matchResult }) => async () => {
-              const resources = await extractPlayInfoForCache(item, site.title, this.type, matchResult, this.targetInfo);
-              return resources || [];
-            }),
-            CONFIG.ADAPTERS?.DETAIL_CONCURRENCY ?? 4
-          );
-      // 高 confidence 先跑（每筆完成即推 stream），低 confidence 補完
-      const highResults = await detailPool(highConf);
-      for (const res of highResults) {
-        if (res && res.length) siteResults.push(...this.processImmediateResults(res, site, onResultCallback));
-      }
-      const lowResults = await detailPool(lowConf);
-      for (const res of lowResults) {
-        if (res && res.length) siteResults.push(...this.processImmediateResults(res, site, onResultCallback));
+      for (const { item, matchResult } of matchedItems) {
+        if (matchResult.confidence < 0.9) {
+          const resources = await extractPlayInfoForCache(item, site.title, this.type, matchResult, this.targetInfo);
+          siteResults.push(...this.processImmediateResults(resources, site, onResultCallback));
+        }
       }
       
       this.stats.completedSites++;
@@ -6707,7 +6684,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel+v1+s4-forced-batch.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel+v1+s4-baseline-restored.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -8124,7 +8101,7 @@ targetInfo.searchQuery = aliasQ;
       });
     }
 
-    // Phase A 提速 #2：第一次的「response.list」快取給 fallback 複用。
+    // 第一次的「response.list」快取給 fallback 複用。
     // 原本 fallback 路徑「結果 0 筆時放寬比對重試」會對**每個站**重新
     // 跑一次 fetchWithSmartRetry（相同 query、相同 URL），純粹重發 HTTP。
     // 把第一次拿到的 list 暫存在這個 Map，fallback 改為只重跑
@@ -8453,7 +8430,7 @@ targetInfo.searchQuery = aliasQ;
     if (allResults.length === 0 && matchStrictness !== 'loose' && CONFIG.RELAX_ON_EMPTY !== false) {
       console.log(`🆘 [fallback] standard 篩選後 0 筆，放寬到 loose 重試一次`);
       try {
-        // Phase A 提速 #2：fallback 路徑複用第一次的 response.list。
+        // fallback 路徑複用第一次的 response.list。
         //
         // 原本「結果為 0 時放寬比對」會**重發每個站的 search HTTP**
         // （同 query、同 URL），但同一次 performBatchSearch 內站方
@@ -8462,8 +8439,7 @@ targetInfo.searchQuery = aliasQ;
         //   - 沒命中（罕見，例如第一次所有站都失敗）：走原本 fetch 路徑
         //     當兜底
         //
-        // 注意：fallback 站迴圈也順手「站內併發」了（對齊提速 #1），
-        // 用 _adapterPool 限流。
+        // 注意：fallback 站迴圈目前是循序（DETAIL_CONCURRENCY=1）。
         const targetKey = normalizeForMatching(targetInfo.baseName);
         const macLimit = CONFIG.MAC?.DETAIL_CONCURRENCY ?? 4;
         const retryTasks = resourceSites.map(site => async () => {
