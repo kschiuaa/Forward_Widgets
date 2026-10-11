@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.2.0",
+  version: "3.2.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -5887,6 +5887,54 @@ function cleanResourceForOutput(resource) {
     clean.season = resource._seasonFromItem;
   }
 
+  // ★ 把季別寫進 description 第一行（使用者選 C 的修正）。
+  //
+  // 場景：jpyy（金牌影視）回傳的 _rawName 含「白粉飞 第二季」，但站方對
+  // description 只用剝過季別的 displayName + 「第N集」組成（見 toMacItem
+  // 內 tail 組裝），送進 cleanResourceForOutput 的 description 是
+  // 「白粉飛．第10集」——完全沒季別字眼。客戶端（Forward App）從
+  // description 抓季別 regex 抓不到，fallback 到 title 推算時把
+  // 「白粉飞 第二季」推成 S1（誤判），使用者看到「搜 S2 但清單顯示 S1」。
+  //
+  // 解法：以頂層 clean.season 為單一真相，把「第N季」注入 description
+  // 第一行（在集數前），讓客戶端 regex 穩定命中。
+  //
+  // 規則：
+  //   - 只在 clean.season 是有效正整數且 > 1 時注入（S1 是預設，多寫「第1季」是重複顯示）。
+  //   - 用阿拉伯數字（客戶端 regex 對「第2季」最穩，「第二季」會誤抓）。
+  //   - 冪等：description 第一行已含「第N季/Season N/S N」任一寫法就跳過。
+  //   - 插在第一行「片名」與「集數」之間：「白粉飛．第10集」→「白粉飛 第2季．第10集」。
+  if (Number.isFinite(clean.season) && clean.season > 1 && clean.description) {
+    const seasonTag = `第${clean.season}季`;
+    const lines = String(clean.description).split('\n');
+    const firstLine = lines[0];
+    const alreadyHasSeason = /第\s*[0-9一二三四五六七八九十]+\s*季/.test(firstLine)
+      || /Season\s*[0-9]+/i.test(firstLine)
+      || /\bS\s*[0-9]+\b/i.test(firstLine);
+    if (!alreadyHasSeason) {
+      // 在第一個「.」「．」或「 」（夾「第N集/話/回」前）插入季別標籤。
+      // 範例：
+      //   "白粉飛．第10集"   → "白粉飛 第2季．第10集"
+      //   "進擊的巨人．第1集 [2024年 - 日本]" → "進擊的巨人 第2季．第1集 [2024年 - 日本]"
+      //   "白粉飛 第10集"   → "白粉飛 第2季 第10集"  (沒分隔點但在「第」前插)
+      //   "白粉飛"          → "第2季 白粉飛"           (完全沒集數，前置插入)
+      const sepMatch = firstLine.match(/[．.]\s*第|[ \t]+第/);
+      if (sepMatch && sepMatch.index > 0) {
+        const before = firstLine.slice(0, sepMatch.index).replace(/\s+$/, '');
+        // 保留原分隔符（． / . / 空白）做視覺一致
+        const afterRaw = firstLine.slice(sepMatch.index);
+        // 取出分隔符
+        const sepChar = (afterRaw.match(/^[．.\s]+/) || [' '])[0].replace(/\s+/, ' ');
+        const after = afterRaw.replace(/^[．.\s]+/, '').replace(/^\s+/, '');
+        lines[0] = `${before} ${seasonTag}${sepChar}${after}`;
+      } else {
+        // 沒分隔點（純片名、或只有「第N集」無前文）→ 前置插入
+        lines[0] = `${seasonTag} ${firstLine}`;
+      }
+      clean.description = lines.join('\n');
+    }
+  }
+
   const fieldsToDelete = [
     '_finalScore', '_matchType', '_matchScore', '_seasonMatch',
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
@@ -6017,6 +6065,30 @@ function cleanResourceForOutput(resource) {
   const areaText = areaLabel(itemArea);
   if (areaText) clean.area = areaText;
   if (itemLang) clean.language = itemLang;
+
+  // ★ 把「S{N}E{M}」加到 source name（使用者要求）。
+  //
+  // 範例：
+  //   改前: name = "金牌影視"
+  //   改後: name = "金牌影視 S2E10"
+  //
+  // 規則：
+  //   - 只在「season 與 episode 都有」時才加，避免「只集沒季」或
+  //     「只季沒集」時拼出半殘標籤（會誤導使用者）。
+  //   - 冪等：name 末尾已含「S{N}E{M}」或「E{M}」任一寫法時不重複加。
+  //   - 拼在 name 末尾，與 name 之間用半形空格分隔（與下方的
+  //     _groupLabel 拼接風格一致）。
+  if (Number.isFinite(clean.season) && clean.season > 0
+      && Number.isFinite(clean.episode) && clean.episode > 0
+      && clean.name) {
+    const seTag = `S${clean.season}E${clean.episode}`;
+    const nameStr = String(clean.name);
+    const alreadyHasSE = new RegExp(`S\\s*${clean.season}\\s*E\\s*${clean.episode}\\b`, 'i').test(nameStr)
+      || new RegExp(`E\\s*${clean.episode}\\b`, 'i').test(nameStr);
+    if (!alreadyHasSE) {
+      clean.name = `${nameStr} ${seTag}`;
+    }
+  }
 
   // 「主來源加成」是排序資訊。客戶端也想知道（粗體／外框／鎖定第一格），
   // 直接給它一個布林欄位，比讓它重算 isMain 簡單。
