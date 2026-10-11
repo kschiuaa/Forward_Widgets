@@ -1391,7 +1391,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.1.0",
+  version: "3.1.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2103,16 +2103,19 @@ function extractResolutionInfo(vodName, epName) {
   return resolution;
 }
 
-function extractEnhancedInfo(seriesName) {
-  if (!seriesName) return { 
-    baseName: '', 
+function extractEnhancedInfo(seriesName, srcItem = null) {
+  if (!seriesName) return {
+    baseName: '',
     seasonNumber: 1,
     isVariety: false,
     varietyEpisode: null,
     varietyDate: null,
     year: null,
     region: 'other',
-    rawName: seriesName
+    rawName: seriesName,
+    // 站方分類訊號（jpyy 帶 _siteTypeName，MacCMS 站無此欄）。
+    // 預設 null，呼叫端沒傳 srcItem 時不打擾既有行為。
+    _siteTypeName: null,
   };
 
   const rawName = String(seriesName);
@@ -2216,7 +2219,12 @@ function extractEnhancedInfo(seriesName) {
     varietyDate,
     year,
     region,
-    rawName
+    rawName,
+    // ★ 站方分類訊號。jpyy 的 toMacItem 會帶 _siteTypeName
+    //   （'tv' / 'movie' / 'other'），下游 isSmartSeriesMatch 用它判
+    //   spin-off：target.type='tv' 但 candidate._siteTypeName='movie' →
+    //   擋掉劇場版。MacCMS 站沒帶這個欄位 → null 不觸發守門員。
+    _siteTypeName: srcItem?._siteTypeName || null,
   };
 }
 
@@ -2250,7 +2258,7 @@ function findYearMarkedSequels(list, targetInfo, matchStrictness = 'standard') {
   const groups = new Map();   // 片名主體 -> [{year, vodYear}]
   for (const item of list) {
     if (!item?.vod_name) continue;
-    const info = extractEnhancedInfo(item.vod_name);
+    const info = extractEnhancedInfo(item.vod_name, item);
     if (!isSmartSeriesMatch(targetInfo, info, matchStrictness).match) continue;
 
     const itemCore = normalizeTitleForMatch(
@@ -2326,7 +2334,7 @@ function findSubtitledSequels(list, targetInfo, targetSeason, matchStrictness = 
   const matched = [];
   for (const item of list) {
     if (!item?.vod_name) continue;
-    const info = extractEnhancedInfo(item.vod_name);
+    const info = extractEnhancedInfo(item.vod_name, item);
     const itemBase = normalizeTitleForMatch(info.baseName || '');
     // 雙向 prefix 匹配（target 可能比 candidate 短，或反之）。
     if (!targetBase.startsWith(itemBase) && !itemBase.startsWith(targetBase)) continue;
@@ -4314,7 +4322,7 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
     if (!item?.vod_name) continue;
     // 命中判斷仍走既有 isSmartSeriesMatch —— adapter 不另立一套比對邏輯，
     // 否則繁簡、地區、季別的處理會和 MacCMS 站不一致。
-    const candidateInfo = extractEnhancedInfo(item.vod_name);
+    const candidateInfo = extractEnhancedInfo(item.vod_name, item);
     const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, 'standard');
     if (!matchResult.match || matchResult.confidence < 0.6) continue;
     matched.push(item);
@@ -4924,7 +4932,7 @@ class SmartSearchExecutor {
             //   同樣用 _adapterPool 限制併發，避免一次全打觸發 429。
             const settled = await _adapterPool(
               items.map(item => async () => {
-                const candidateInfo = extractEnhancedInfo(item.vod_name);
+                const candidateInfo = extractEnhancedInfo(item.vod_name, item);
                 const matchResult = isSmartSeriesMatch(this.targetInfo, candidateInfo, this.matchStrictness);
                 return await extractPlayInfoForCache(
                   item, site.title, this.type, matchResult, this.targetInfo
@@ -5180,7 +5188,7 @@ class SmartSearchExecutor {
       for (const item of response.list) {
         if (!item.vod_name) continue;
 
-        const candidateInfo = extractEnhancedInfo(item.vod_name);
+        const candidateInfo = extractEnhancedInfo(item.vod_name, item);
         const matchResult = isSmartSeriesMatch(this.targetInfo, candidateInfo, this.matchStrictness);
 
         if (matchResult.match && matchResult.confidence >= 0.6) {
@@ -6086,8 +6094,13 @@ async function loadResource(params, onStreamResult = null) {
     onStreamResult && onStreamResult([], { type: 'error', message: '無可用資源站' });
     return [];
   }
-  
+
   const targetInfo = extractEnhancedInfo(seriesName);
+  // ★ 把 type 帶進 targetInfo（jpyy 劇場版守門員要用）。
+  // 條件：type 只在有效值之一時帶入，避免無效值污染。
+  if (type === 'tv' || type === 'movie' || type === 'variety') {
+    targetInfo.type = type;
+  }
   let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
   const targetEpisode = episode ? parseInt(episode) : null;
 
@@ -7179,6 +7192,10 @@ async function performBatchSearch(params) {
   }
 
   const targetInfo = extractEnhancedInfo(seriesName);
+  // ★ 把 type 帶進 targetInfo（jpyy 劇場版守門員要用）。
+  if (type === 'tv' || type === 'movie' || type === 'variety') {
+    targetInfo.type = type;
+  }
   let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
   const targetEpisode = episode ? parseInt(episode) : null;
   // 中文季別容錯
@@ -7381,7 +7398,7 @@ targetInfo.searchQuery = aliasQ;
             //   十幾秒。併發上限由 _adapterPool 控制。
             const settled = await _adapterPool(
               items.map(item => async () => {
-                const candidateInfo = extractEnhancedInfo(item.vod_name);
+                const candidateInfo = extractEnhancedInfo(item.vod_name, item);
                 const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness);
                 return await extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
               }),
@@ -7497,7 +7514,7 @@ targetInfo.searchQuery = aliasQ;
         for (const item of response.list) {
           if (!item.vod_name) continue;
 
-          const candidateInfo = extractEnhancedInfo(item.vod_name);
+          const candidateInfo = extractEnhancedInfo(item.vod_name, item);
           const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness);
 
           // 通用副標題型續集群啟發式（適用於進擊的巨人、鬼滅之刃等單 series）：
