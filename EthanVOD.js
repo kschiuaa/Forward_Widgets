@@ -1391,7 +1391,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.0.8",
+  version: "3.0.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2374,6 +2374,34 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   const targetName = normalizeTitleForMatch(targetInfo.baseName);
   const candidateName = normalizeTitleForMatch(candidateInfo.baseName);
 
+  // ★ 衍生作 / 劇場版 / 電影版 / OVA / 特別篇 必須在所有比對之前先擋。
+  //
+  // 為什麼這層要在最前面：stripSubtitle（見下方）會把「劇場版」「電影版」
+  // 這類詞當成「副標題」清掉，讓 candidateInfo.baseName 跟 S1 完全同字，
+  // similarity 直接 1.0 → 命中 exact → REX 預設展開這個劇場版，使用者
+  // 進詳細頁看到的是「2 小時 15 分鐘的劇場版」而不是真正的 S1 動漫 12 集。
+  //
+  // 實測：搜「五等分的新娘」時 jpyy 命中
+  //   id=116334 「五等分的新娘」(片長 2:15:38，別名「五等分の花嫁劇場版」)
+  //   id=128946 「五等分的新娘 第一季」(12 集動漫)
+  // 兩者 baseName 經 stripSubtitle 後都是「五等分的新娘」→ 排序時劇場版
+  // 排前面 → 詳細頁顯示 1 集（劇場版）而不是 12 集。
+  //
+  // 判定：比對「原始名」(rawName) 而非清理後的 baseName，且只看 candidate
+  // —— target 帶劇場版標記而 candidate 沒帶，屬於「明示要找劇場版」，
+  // 不該被擋。
+  const SPIN_OFF_MARK = /劇場版|剧场版|電影版|电影版|特別篇|特别篇|\bOVA\b|\bSP\b/;
+  const targetIsSpinOff = SPIN_OFF_MARK.test(targetInfo.rawName || '');
+  const candidateIsSpinOff = SPIN_OFF_MARK.test(candidateInfo.rawName || '');
+  if (!targetIsSpinOff && candidateIsSpinOff) {
+    return {
+      match: false, type: 'spin_off', score: 0,
+      similarity: 0, seasonMatch: false,
+      targetSub: '', candidateSub: 'spin_off',
+      confidence: 0
+    };
+  }
+
   // 「的」「之」是中文常用虛詞，Forward / 站方 / 使用者輸入時常有省略：
   //   target「五等分新娘」vs candidate「五等分的新娘」其實是同一片。
   // 比對前去掉這些虛詞，否則相似度會被 1 個虛詞拉低，導致「實際同片」誤判失敗。
@@ -2837,6 +2865,31 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     });
     if (episodes.length === 0) return [];
 
+    // ★ 集名列表「其實不是集數、是多源（語言/清晰度）」的判別。
+    //
+    // 為什麼要這層判別：jpyy 的 episodeList 在「單集電影」場景下，會用
+    // 一個 vodId 塞下該片的所有可選來源（常見：「高清」「蓝光」「粤语」
+    // 「国语」這種 2~3 筆）。原本會被當成多集輸出 → 「粤语$...#国语$...」
+    // → 詳細頁 UI 解讀成「第 1 集 = 粵語、第 2 集 = 國語」→ 國語被默默丟掉。
+    //
+    // 判別標準：所有集名都「不是集數」(無「第N集」、也非純數字)
+    // → 這些是同一集的多源 → 對每個源各建一條 resource (episode=1)，
+    //   description 帶源名讓 REX 顯示「[粵語]」「[國語]」版本標籤。
+    //
+    // ★ 多集劇絕不受影響：劇情站的 episodeList 是「1, 2, 3, ...」，
+    // 純數字可被 _adapterEpNumber 抽出集數 → 走原路徑。
+    const allAreSources = episodes.length > 1
+      && episodes.every(e => {
+        const s = String(e?.name || '').trim();
+        if (!s) return true;
+        if (/第\s*\d+\s*[集期話]/.test(s) || /\bEP\s*\d+/i.test(s)) return false;
+        if (/^\d+$/.test(s)) return false;
+        return true;
+      });
+    if (allAreSources) {
+      return await _buildAdapterMultiSourceResources(item, episodes, siteTitle, type, vod_name, vod_remarks);
+    }
+
     // 使用者要播的那一集（挑不到時的落點規則見下）
     const wantEp = item._adapterTargetEpisode;
     let idx = -1;
@@ -2968,6 +3021,74 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         _areaMismatch: false,
         _areaMatch: false,
       });
+    }
+    return out;
+  }
+
+  // === 多源單集 helper：見上方 allAreSources 分支的呼叫處 ===
+  //
+  // jpyy 在「單集電影」情境下，會把該片所有可選來源（語言/清晰度）
+  // 塞在同一個 episodeList。這時主迴圈只挑 idx=0 → 其餘源被默默丟掉。
+  // 這裡把所有源都解出來、每源建一條 resource（episode=1），讓
+  // smartDeduplicate 的「語言維度」把它們當成不同版本保留（先前修的
+  // extractLanguageTag + versionKey 邏輯）→ REX 詳細頁看到 1 集、
+  // 該集下面有多個 source 切換，每個 source 帶版本標籤
+  // （例如 `[1995年 - 粵語]`、`[1995年 - 國語]`）。
+  async function _buildAdapterMultiSourceResources(item, episodes, siteTitle, type, vod_name, vod_remarks) {
+    const out = [];
+    const displayName = _adapterSeasonLabel(vod_name);
+    for (const src of episodes) {
+      const resolved = await _adapterResolvePlay(src.token);
+      if (!resolved || resolved.length === 0) continue;
+      for (const r of resolved) {
+        const url = r?.url;
+        if (!url || !isPlayableUrl(url)) continue;
+        const resName = r.resolutionName || '';
+        const resInfo = extractResolutionInfo(vod_name, `${resName} ${r.resolution || 0}p`);
+        // 描述：片名 + 「．[語言/清晰度]」（與多集影集「．第N集」同一風格）
+        const sourceLabel = src.name ? `[${src.name}]` : '';
+        const tail = sourceLabel;
+        // 語言標籤用 extractLanguageTag 抽：粵/國/中字…，抽不到就空字串
+        // （讓 cleanResourceForOutput 仍能在版本標記裡標出[年-地]）。
+        const langLabel = extractLanguageTag(src.name) || '';
+        out.push({
+          name: siteTitle,
+          description: tail ? `${displayName}．${tail}` : displayName,
+          url: wrapM3U8WithFilter(url.trim(), {
+            site: siteTitle, name: displayName, episode: sourceLabel,
+            adapter: true,
+          }),
+          playerType: 'app',
+          customHeaders: { 'X-Forward-Skip-Redirect-Probe': '1' },
+          resolution: resInfo.label,
+          resolutionLevel: resInfo.level,
+          isHD: resInfo.isHD,
+          is4K: resInfo.is4K,
+          qualityTags: resInfo.tags,
+          qualityScore: resInfo.qualityScore,
+          isHttps: url.startsWith('https'),
+          // 全部視為第 1 集（單集電影）
+          episode: 1,
+          // 語言維度是去重鍵的一部分；把 src.name 餵進 _rawName 的副標記
+          // 讓 cleanResourceForOutput 內的 extractLanguageTag 抽得到。
+          _adapterSourceLabel: src.name,
+          _adapterSite: item._adapterSite,
+          _matchType: 'exact',
+          _matchScore: 1,
+          _confidence: 1,
+          _isMainSource: CONFIG.MAIN_SOURCES.includes(siteTitle),
+          _hasEpInfo: false,
+          _rawName: langLabel ? `${vod_name}（${langLabel}）` : vod_name,
+          _seasonFromItem: extractSequelNumber(vod_name),
+          _year: item.vod_year || null,
+          _area: item.vod_area || null,
+          _ep: 1,
+          _epActualEp: 1,
+          _adapterFallbackEp: false,
+          _areaMismatch: false,
+          _areaMatch: false,
+        });
+      }
     }
     return out;
   }
