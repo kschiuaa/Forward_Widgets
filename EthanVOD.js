@@ -1146,7 +1146,14 @@ const CONFIG = {
   //   去重鍵新增語言維度 + 版本標記顯示語言，舊 cache 裡缺這個維度，
   //   會讓已合併掉的語言版本永遠補不回來（只會繼續維持合併狀態）。
   //   必須清掉重搜，否則使用者看不到粵語/國語兩版。
-  WIDGET_VERSION: 39,
+  //   bump 到 40：adapterSiteLimit 從 input 改成 enumeration。
+  //   舊 input 欄位在 Forward 客戶端有「使用者輸入的值可能沒存進
+  //   WidgetMetadata.globalParams」的現象（解讀為空字串 → 退回預設 2），
+  //   導致設 1 仍然查到 AGE。改 enum 強制只能存 "1" / "2" 後，
+  //   問題從設定層消失，但舊 cache 內可能還存著「上一次設定為 2 時
+  //   抓到的 AGE 結果」—— 直接讀出來仍會看到 AGE。bump 版本強迫
+  //   syncWidgetVersion 清掉全部 cache，下次搜會依新設定只查金牌。
+  WIDGET_VERSION: 41,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1399,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.2.9",
+  version: "3.3.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4687,10 +4694,16 @@ function _adapterIsEnabled(params) {
  *
  * adapterSiteLimit 限制同時查詢幾站 —— 每站首屏固定 3 次請求，
  * 這個值直接決定額外請求量。新增站點後可調高。
+ *
+ * 嚴格驗證：只接受 "1" 或 "2"。其他值（舊版 input 欄位遺留的字串、
+ * 空字串、Forward 沒存進的 "0"、使用者亂打的 "5"）一律退回預設 2。
+ * 理由：把站點收斂到 1 雖然省請求但少了 AGE 的動畫內容，使用者主動
+ * 改成 1 是有意識的決定；退回 2 不會「少給東西」。反之若把 2 退回 1
+ * 是誤刪 AGE，使用者會看到動漫查不到。
  */
 function _adapterActiveSites(params) {
-  const limit = parseInt(_adapterGp('adapterSiteLimit', '1'), 10);
-  const n = Number.isFinite(limit) && limit > 0 ? limit : 1;
+  const raw = _adapterGp('adapterSiteLimit', '2');
+  const n = (raw === '1' || raw === '2') ? parseInt(raw, 10) : 2;
   const debug = _adapterGp('adapterDebug', 'disabled') === 'enabled';
   if (debug) CONFIG.ADAPTERS.DEBUG = true;
   return ADAPTER_SITES.slice(0, n);
