@@ -1399,7 +1399,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.2.5",
+  version: "3.2.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -5675,7 +5675,9 @@ class SmartSearchExecutor {
         newResults.push(resource);
         
         if (onResultCallback) {
-          const cleanResource = cleanResourceForOutput(resource, this.type);
+          const cleanResource = cleanResourceForOutput(resource, this.type, {
+            seasonNumber: this.targetInfo?.seasonNumber
+          });
           onResultCallback([cleanResource], {
             type: 'immediate_result',
             site: site.title,
@@ -5844,8 +5846,25 @@ class SmartSearchExecutor {
 }
 
 // ==================== 主函数模块 ====================
-function cleanResourceForOutput(resource, type = 'tv') {
+//
+// context 參數（v1）：把「playlist 級別已識別出的季別」傳進來。
+// 為什麼需要：cleanResourceForOutput 原本只從資源自己的 _rawName 抽季別，
+//   若 _rawName 沒寫「第N季/S2」字眼（例：白粉飛、仁医、庆余年），
+//   _seasonFromItem 會是 null，最後 fallback 寫死 season=1。
+//   但 playlist 級別（extractSequelNumber(targetInfo.rawName) +
+//   _expectedSequel）已經把整體季別算清楚了，可能是 2/3/4。
+//   沒把這個結果餵下來，clean 階段就會把整季資源一律標成 S1，
+//   切到 S2 載入時又被 line 8848 的 `r.season = s` 覆寫成 S2，
+//   結果是 S1E1 這個 tag 在 S2 載入時被錯拼到資源名後面。
+//
+// 用法：呼叫端從 targetInfo.seasonNumber（或 buildDetailLink 的 season 參數）
+//   拿 playlist 級別季別傳進 context.seasonNumber；type 仍依本資源的型別。
+function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   const clean = { ...resource };
+  // playlist 級別已識別的季別。null/0/負數一律視為無效。
+  const playlistSeason = Number.isFinite(context.seasonNumber) && context.seasonNumber > 0
+    ? context.seasonNumber
+    : null;
 
   // 把 _ep / _seasonFromItem 提升為頂層 episode / season。
   //
@@ -5864,20 +5883,26 @@ function cleanResourceForOutput(resource, type = 'tv') {
     clean.season = resource._seasonFromItem;
   }
 
-  // ★ S1 預設補 season。
+  // ★ 季別 fallback：優先用 playlist 級別識別結果，其次才用 S1。
   //
   // 場景：搜「白粉飛」這種 S1 影集時，站方檔名（白粉飛、白粉飞）不含
   // 「第N季」字眼 → extractSequelNumber 回 null → _seasonFromItem=null
   // → clean.season=null。沒 season 頂層欄位時，後續 S/E tag 拼接會
   // 整個跳過，使用者只看到「金牌影視」沒「S1E1」。
   //
-  // 規則：type=tv 且「沒有 season 但有 episode」時，預設補 season=1。
-  // 為什麼不在 type=movie 時補：電影沒「季」概念（只有 S1 一個
-  // 預設值），下面 S/E tag 那段會另外處理（只拼 S1 不拼 E）。
-  // 為什麼要有 episode 才補：完全沒 episode 的資源不是影集場景，
-  // 不要硬塞 S1 上去（可能是綜藝或電影的特殊資源）。
+  // 規則：
+  //   1. type=tv 且「沒有 season 但有 episode」時才補季別。
+  //      為什麼要有 episode 才補：完全沒 episode 的資源不是影集場景，
+  //      不要硬塞季別上去（可能是綜藝或電影的特殊資源）。
+  //   2. 補的值優先用 playlist 級別已識別的季別（context.seasonNumber）。
+  //      例：playlist 識別為 S3（targetInfo.seasonNumber=3），某條資源
+  //      站方檔名沒寫「第3季」→ fallback 用 3，不是寫死 1。
+  //   3. playlist 級別無效（null/0）才退回 S1 —— 這對應舊行為
+  //      （playlist 也沒識別出季別時預設 S1，例如真的就只是 S1 影集）。
+  //   4. type=movie 不補：電影沒「季」概念，S/E tag 那段會另外處理
+  //      （只拼 S1 不拼 E）。
   if (type === 'tv' && clean.season == null && Number.isFinite(clean.episode) && clean.episode > 0) {
-    clean.season = 1;
+    clean.season = playlistSeason ?? 1;
   }
 
   // ★ 把季別寫進 description 第一行（使用者選 C 的修正）。
@@ -6078,8 +6103,27 @@ function cleanResourceForOutput(resource, type = 'tv') {
     const nameStr = String(clean.name);
     let tag = null;
     if (type === 'movie') {
-      // 電影：固定 S1，不拼 E。
-      tag = 'S1';
+      // ★ 電影：用「資源自己的續集序號」決定 S 標籤，而不是寫死 S1。
+      //
+      // 改前：tag = 'S1'  → 全部電影無差別標 S1。
+      //   例外：「Back to the Future 3」「無間道2」「戰狼2」「叶問3」這些
+      //   續集電影使用者看「S1」會誤以為是第一部。續集序號 3 應該顯示 S3，
+      //   跟 tv 影集用 sequel 序號的邏輯對齊。
+      //
+      // 改後：tag = `S${extractSequelNumber(_rawName) ?? 1}`
+      //   - 「Back to the Future 3」 → S3
+      //   - 「無間道2」             → S2
+      //   - 「戰狼」 (沒序號)        → S1
+      //
+      // 為什麼不用 playlist 級別的 seasonNumber：loadResource 對 movie 不
+      // 帶 season 進來，且 extractSequelNumber(targetInfo.rawName) 對純
+      // 片名也常常抓不到序號（_rawName 才能抓到「Back to the Future 3」的 3）。
+      //
+      // 電影永遠只拼 S 標籤、不拼 E：電影沒「集」概念，與原邏輯一致。
+      const movieSequel = Number.isFinite(resource._seasonFromItem) && resource._seasonFromItem > 0
+        ? resource._seasonFromItem
+        : (extractSequelNumber(resource._rawName) ?? null);
+      tag = `S${Number.isFinite(movieSequel) && movieSequel > 0 ? movieSequel : 1}`;
     } else if (Number.isFinite(clean.season) && clean.season > 0
         && Number.isFinite(clean.episode) && clean.episode > 0) {
       tag = `S${clean.season}E${clean.episode}`;
@@ -6093,18 +6137,16 @@ function cleanResourceForOutput(resource, type = 'tv') {
       //   • S{N}E{M} → 找 \bS{N}\s*E{M}\b（明確匹配「季+集」）
       //   • S{N}     → 找 \bS{N}\b(?!E\d)，避開被誤判為「S{N}E{...}」
       //     的一部分（regex 的 lookahead 確保後面不接數字集數）。
-      //   • S1（電影）→ 找 \bS1\b(?!E)，同上邏輯。已含「S1E...」不視為
-      //     含「S1」（避免 S1E5 被當作 S1 電影的冪等匹配）。
+      //   電影的 S{N} 與 tv 的 S{N} 走同一條路徑：tag 形如 S\d+，冪等用
+      //   同一個 regex 判斷（不再有「S1 電影特例」，因為現在電影也可能是
+      //   S2/S3/...，例如「Back to the Future 3」→ S3）。
       let alreadyHas = false;
       if (/^S\d+E\d+$/.test(tag)) {
         // S{N}E{M} 形式
         const m = tag.match(/^S(\d+)E(\d+)$/);
         alreadyHas = new RegExp(`\\bS\\s*${m[1]}\\s*E\\s*${m[2]}\\b`, 'i').test(nameStr);
-      } else if (tag === 'S1') {
-        // 電影 S1：S1E? 視為已含（更嚴格）
-        alreadyHas = /\bS\s*1\s*E\b/i.test(nameStr) || /\bS\s*1\b(?!E\d)/i.test(nameStr);
       } else {
-        // 純 S{N}
+        // 純 S{N}（tv 單季 / 電影 任意 N）
         const sNum = tag.slice(1);
         alreadyHas = new RegExp(`\\bS\\s*${sNum}\\b(?!E\\d)`, 'i').test(nameStr);
       }
@@ -7028,7 +7070,9 @@ targetInfo.searchQuery = aliasQ;
     // 之前只在 onStreamResult 推播路徑呼叫 cleanResourceForOutput，
     // 寫 cache 的 finalResults 走自己的清理邏輯，導致 cache 命中時沒有標籤。
     // 改用同一個 helper 統一處理。
-    const cleaned = cleanResourceForOutput(res, type);
+    const cleaned = cleanResourceForOutput(res, type, {
+      seasonNumber: targetInfo?.seasonNumber
+    });
 
     // cleanResourceForOutput 用 { ...resource } 淺拷貝回傳新物件，
     // 這裡把原 res 的欄位換成 cleaned，後面寫 cache 與最終 return 都看得到。
@@ -8660,7 +8704,9 @@ targetInfo.searchQuery = aliasQ;
                          '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
                          '_s4FallbackBoost', '_seasonFromItem'];
   finalResults.forEach(res => {
-    const cleaned = cleanResourceForOutput(res, type);
+    const cleaned = cleanResourceForOutput(res, type, {
+      seasonNumber: targetInfo?.seasonNumber
+    });
     Object.keys(res).forEach(k => delete res[k]);
     Object.assign(res, cleaned);
   });
