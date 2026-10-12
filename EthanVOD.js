@@ -1399,7 +1399,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.2.6",
+  version: "3.2.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2807,7 +2807,20 @@ function _adapterEpNumber(rawName) {
  * 回傳的是「顯示用」字串，只影響 description；比對邏輯一律
  * 繼續吃原始 vod_name，見 extractPlayInfoForCache 的 displayName。
  */
-function _adapterSeasonLabel(rawName) {
+// ★ 對電影場景的處理：
+//   電影沒有「季」概念，_adapterSeasonLabel 對 movie 不應把序號轉成「第N季」。
+//   「Back to the Future 3」→ 原樣返回「Back to the Future 3」
+//                          （不是「Back to the Future 第3季」）
+//   續集序號的 S 標籤（S2/S3/...）由 cleanResourceForOutput 內的 source name
+//   tag 拼接負責，不在 description 內重複。
+//
+// 電影仍然做：
+//   - 剝掉站方原標題內的季別字眼（極少見，但站方偶爾會寫「[第2部]」等）
+//   - 剝掉語言括弧（「轻功(粤语)」→「轻功」，語言由頂層 language 承擔）
+// 不做：
+//   - 序號 → 「第N季」轉換（這是 tv 場景的行為）
+//   - 「完结篇/完結篇」→ sequel=2 推導（這也是 tv 專用語意）
+function _adapterSeasonLabel(rawName, type = 'tv') {
   const s0 = String(rawName ?? '').trim();
   if (!s0) return '';
 
@@ -2829,13 +2842,23 @@ function _adapterSeasonLabel(rawName) {
   const stripped = stripLanguageParen(s, selfLang);
   if (stripped === s) {
     // 沒拆到語言 → 走原本邏輯
-    return _adapterSeasonLabelInner(s);
+    return _adapterSeasonLabelInner(stripped, type);
   }
   // 拆到 → 對剝後字串走季別邏輯；尾端語言括弧不會再被誤判為「季」
-  return _adapterSeasonLabelInner(stripped);
+  return _adapterSeasonLabelInner(stripped, type);
 }
 
-function _adapterSeasonLabelInner(s) {
+function _adapterSeasonLabelInner(s, type = 'tv') {
+  // ★ 電影短路：跳過整個「第N季」轉換流程。
+  //
+  // 為什麼：電影沒「季」概念。「Back to the Future 3」是第 3 集電影，
+  // 不該被改寫成「Back to the Future 第3季」（讀起來像影集）。
+  // 電影的序號資訊已由 cleanResourceForOutput 的 source name tag
+  // 拼接「S3」承擔，description 維持原始片名最直覺。
+  //
+  // 仍要做的清理（語言括弧、站方季別字眼）已在上層 _adapterSeasonLabel
+  // 處理過，這裡直接返回剝後字串。
+  if (type === 'movie') return toDisplayText(s);
 
   // ★ 閘門 1 改寫：站方把季別字眼直接寫進片名（「庆余年第二季」、
   // 「庆余年S2」、「庆余年 第2季」、「庆余年完结篇」）時，把這段字眼
@@ -3071,7 +3094,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       // displayName 是「顯示用」：片名 + 季別。原始 vod_name 仍用在
       // extractResolutionInfo / extractSequelNumber 等比對邏輯上，
       // 只有這裡的 description 與 wrap 的 name 拿轉換後的字串。
-      const displayName = _adapterSeasonLabel(vod_name);
+      const displayName = _adapterSeasonLabel(vod_name, type);
       const epLabel = _adapterEpisodeLabel(episodes[idx].name);
       // ★ 評分已在上游 (_adapterDefaultSearch) 排除，這裡只留「非評分」的
       //   狀態標記。純數字／帶星號的短字串一律視為評分丟掉 ——
@@ -3206,7 +3229,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
   // （例如 `[1995年 - 粵語]`、`[1995年 - 國語]`）。
   async function _buildAdapterMultiSourceResources(item, episodes, siteTitle, type, vod_name, vod_remarks) {
     const out = [];
-    const displayName = _adapterSeasonLabel(vod_name);
+    const displayName = _adapterSeasonLabel(vod_name, type);
     for (const src of episodes) {
       const resolved = await _adapterResolvePlay(src.token);
       if (!resolved || resolved.length === 0) continue;
@@ -3334,7 +3357,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           // ★ 走 _adapterSeasonLabel 而非 toDisplayText：站方把季別寫進
           //   片名（「庆余年第二季」「进击的巨人 最终季」）時，自動
           //   抽出統一成「第N季」格式，與頂層 season 欄位不重複。
-          const displayName = _adapterSeasonLabel(vod_name);
+          const displayName = _adapterSeasonLabel(vod_name, type);
           const displayEp = toDisplayText(epName);
           const displayRemarks = toDisplayText(vod_remarks);
 
@@ -3430,7 +3453,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
 
         const resolutionInfo = extractResolutionInfo(vod_name, quality);
 
-        const displayName = _adapterSeasonLabel(vod_name);
+        const displayName = _adapterSeasonLabel(vod_name, type);
         // Movie 描述：正片（默認）不附標記；搶先版/TC/其他非正片
         // 標籤以「．」中點附在片名後。
         const isMainRelease = qualityText === '正片';
@@ -5922,7 +5945,7 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   //   - 用阿拉伯數字（客戶端 regex 對「第2季」最穩，「第二季」會誤抓）。
   //   - 冪等：description 第一行已含「第N季/Season N/S N」任一寫法就跳過。
   //   - 插在第一行「片名」與「集數」之間：「白粉飛．第10集」→「白粉飛 第2季．第10集」。
-  if (Number.isFinite(clean.season) && clean.season > 1 && clean.description) {
+  if (type === 'tv' && Number.isFinite(clean.season) && clean.season > 1 && clean.description) {
     const seasonTag = `第${clean.season}季`;
     const lines = String(clean.description).split('\n');
     const firstLine = lines[0];
