@@ -1153,7 +1153,7 @@ const CONFIG = {
   //   問題從設定層消失，但舊 cache 內可能還存著「上一次設定為 2 時
   //   抓到的 AGE 結果」—— 直接讀出來仍會看到 AGE。bump 版本強迫
   //   syncWidgetVersion 清掉全部 cache，下次搜會依新設定只查金牌。
-  WIDGET_VERSION: 45,
+  WIDGET_VERSION: 46,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.3.5",
+  version: "3.3.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6765,7 +6765,7 @@ async function loadResource(params, onStreamResult = null) {
   // 印出 widget 版本與 _expectedSequel，方便確認實機跑的是哪一版。
   // 若你重匯入後沒看到這行 log，表示 Forward App 還在用舊 snapshot。
   console.log(`📦 Widget version: ${WidgetMetadata.version} (期望 ${CONFIG.WIDGET_VERSION})`);
-  console.log(`🆔 FILTER_BUILD: filterBySequel+v1+s4-baseline-restored.${(new Date()).toISOString().slice(0,10)}`);
+  console.log(`🆔 FILTER_BUILD: filterBySequel+v2.adapter-sequel-guard.${(new Date()).toISOString().slice(0,10)}`);
 
   console.log(`🚀 启动智能搜索: ${seriesName}`);
   console.log(`⚙️ 模式: ${searchMode}, 严格度: ${matchStrictness}`);
@@ -8201,7 +8201,52 @@ targetInfo.searchQuery = aliasQ;
               if (items.length === 0) return [];
             }
 
-            // 標記目標集，讓 extractPlayInfoForCache 只換那一集的 URL
+            // ★ 續集序號過濾（adapter 專屬）。下游 filterBySequel 擋不住這裡，
+            //   必須在 adapter 層就收斂，原因有兩個獨立的缺陷：
+            //
+            //   缺陷 1：jpyy 不回年份。
+            //     `toMacItem` 的 vod_year 來自 `String(it.vodPubdate||'').slice(0,4)`；
+            //     站方vodPubdate 為空時 → vod_year='' → _year=null。
+            //     沒有年份 → filterBySequel 的 pooledYearMin=null
+            //              → 規則 3（「年份早於命中群」）整條不執行
+            //              → 只剩規則 1（檔名寫出序號）能擋。
+            //     實測：jpyy 回「疾速追殺」(無年份) + 「疾速追殺4」(無年份)
+            //           → 過濾 0 筆，第一部直接推給使用者。
+            //
+            //   缺陷 2：規則 1 只認「檔名裡明寫序號」，不認「序號不同」。
+            //     「疾速追殺3」對 season=4 應該擋（規則 X 處理這個），
+            //     但「疾速追殺」（原版，無序號）對 season=4 完全沒有
+            //     可判斷的線索 —— 它沒有任何欄位說自己「不是第四部」。
+            //
+            //   ★ 為什麼在這裡過濾是安全的（不會誤殺正確結果）：
+            //     條件是「站內有明確標為第 targetSeason 的條目」。jpyy 是
+            //     單站單片庫，「疾速追殺4」存在就代表第四部確實有片；
+            //     同一站同時回「疾速追殺」只能是搜尋模糊匹配把系列全部帶出來，
+            //     屬於站方資料污染而非使用者需求。使用者點第四部時要的是第四部。
+            //
+            //   ★ 為什麼 season=1 不過濾：
+            //     使用者搜「疾速追殺」第一部時，全部四部都是合法結果。
+            if (Number(targetInfo.seasonNumber) > 1 && type === 'movie') {
+              const tSeason = Number(targetInfo.seasonNumber);
+              const hitIdx = items.findIndex(it => extractSequelNumber(it.vod_name || '') === tSeason);
+              if (hitIdx >= 0) {
+                const kept = items.filter(it => {
+                  const sq = extractSequelNumber(it.vod_name || '');
+                  return sq === tSeason;   // 只留明確標為目標部的
+                });
+                if (kept.length !== items.length) {
+                  const droppedNames = items.filter(it => !kept.includes(it)).map(it => it.vod_name).join(', ');
+                  console.log(`🔌 [adapter:${site.id}] 第${tSeason}部續集過濾: ${items.length} -> ${kept.length}（濾掉: ${droppedNames}）`);
+                }
+                items.length = 0;
+                items.push(...kept);
+                if (items.length === 0) return [];
+              } else {
+                console.log(`🔌 [adapter:${site.id}] season=${tSeason} 站內無第${tSeason}部（${items.length} 筆候選），不過濾以免空清單`);
+              }
+            }
+
+            // 標記目標集，讓 extractPlayInfoForCache 只換那一集的URL
             for (const it of items) it._adapterTargetEpisode = targetEpisode;
 
             // ★ 同上：extractPlayInfoForCache 對 adapter 項會走
