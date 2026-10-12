@@ -1153,7 +1153,7 @@ const CONFIG = {
   //   問題從設定層消失，但舊 cache 內可能還存著「上一次設定為 2 時
   //   抓到的 AGE 結果」—— 直接讀出來仍會看到 AGE。bump 版本強迫
   //   syncWidgetVersion 清掉全部 cache，下次搜會依新設定只查金牌。
-  WIDGET_VERSION: 41,
+  WIDGET_VERSION: 42,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.3.1",
+  version: "3.3.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -5919,7 +5919,11 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   // 升級前 _ep / _seasonFromItem 已被 fieldsToDelete 清掉，client 端永遠
   // 看不到。升級後兩個欄位都保留且不污染其它排序邏輯（_finalScore 計算只看
   // resolution / isHD 等品質欄位）。
-  if (resource._ep != null && clean.episode == null) {
+  // ★ movie 不提升 _ep：電影沒有「集」概念，提升會把 episode=1 帶進
+  //   clean.episode，讓 movie 進錯 S{N}E{M} tag 分支 → 輸出「金牌影視 S4 S1」。
+  //   jpyy adapter movie 分支故意設 _ep=1 方便去重鍵計算，但這裡要把電影
+  //   的 episode 欄位排除在 tag 拼接之外。
+  if (type !== 'movie' && resource._ep != null && clean.episode == null) {
     clean.episode = resource._ep;
   }
   if (resource._seasonFromItem != null && clean.season == null) {
@@ -7028,6 +7032,51 @@ targetInfo.searchQuery = aliasQ;
 // description 解析，雖然「碰巧」能正確判斷（description 還含「第三季」字
 // 樣），但屬於無謂的二次處理、浪費效能、也容易因 log 顯示「_rawName=undefined」
 // 誤導除錯。stream / auto 模式仍需在此 filter（performSmartSearch 內部不跑）。
+
+  // ★ movie 續集過濾（串流路徑，與 batch 路徑同源邏輯）。
+  //   場景：使用者選 S4（如「疾速追殺4」），jpyy 回傳 3 條：
+  //     - 金牌影視 (2014) _rawName=疾速追杀        sequel=null
+  //     - 金牌影視 (2017) _rawName=疾速追杀        sequel=null
+  //     - 金牌影視 (2023) _rawName=疾速追杀4       sequel=4
+  //   目標清單只剩 S4 這一條。前兩條 _rawName 沒寫序號、但 _year 早於
+  //   命中群 9 年，明顯是不同續集。
+  //
+  //   為什麼不直接用 filterBySequel：它是給 tv 設計的，邏輯混了太多
+  //   對 movie 不該考慮的東西（sub-series marker drop、sao fallback 等）。
+  //   movie 場景更單純——兩條規則就夠：
+  //     1. sequel 明確標示為其他季 → drop
+  //     2. sequel=null 但 _year 比命中群 earliest 早 ≥1 年 → drop
+  if (type === 'movie' && Number.isFinite(targetInfo?.seasonNumber) && targetInfo.seasonNumber > 1) {
+    const targetSeason = targetInfo.seasonNumber;
+    const before = finalResults.length;
+
+    // 命中群：用來決定 pooledYearMin
+    const matched = finalResults.filter(res =>
+      extractSequelNumber(res._rawName || res.description || '') === targetSeason
+    );
+    const yearsOfMatched = matched
+      .map(res => Number(res._year) || Number(extractVersionMarker(res._rawName || '')) || null)
+      .filter(y => y && Number.isFinite(y));
+    const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
+
+    finalResults = finalResults.filter(res => {
+      const rawName = res._rawName || res.description || '';
+      const sequel = extractSequelNumber(rawName);
+      // 規則 1：sequel 明確標示為其他季 → drop
+      if (sequel !== null && sequel !== targetSeason) return false;
+      // 規則 2：sequel=null 但 _year 比命中群最早年還早 → drop
+      if (sequel === null && pooledYearMin !== null) {
+        const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+        if (candYear && candYear < pooledYearMin) return false;
+      }
+      return true;
+    });
+    const dropped = before - finalResults.length;
+    if (dropped > 0) {
+      console.log(`🎬 movie 第${targetSeason}續集過濾(stream): ${before} -> ${finalResults.length}（dropped ${dropped} 條不同續集，pooledYearMin=${pooledYearMin}）`);
+    }
+  }
+
   if (type === 'tv' && searchMode !== 'batch') {
     const r = filterBySequel(finalResults, targetInfo);
     let s4FallbackUsed = false;
@@ -8664,6 +8713,50 @@ targetInfo.searchQuery = aliasQ;
 
   // 版本過濾，理由與串流模式相同。
   finalResults = filterByTargetVersion(finalResults, targetInfo);
+
+  // ★ movie 續集過濾（與串流路徑同源邏輯）。
+  //   場景：使用者選 S4（如「疾速追殺4」），jpyy 回傳 3 條：
+  //     - 金牌影視 (2014) _rawName=疾速追杀        sequel=null
+  //     - 金牌影視 (2017) _rawName=疾速追杀        sequel=null
+  //     - 金牌影視 (2023) _rawName=疾速追杀4       sequel=4
+  //   目標清單只剩 S4 這一條。前兩條 _rawName 沒寫序號、但 _year 早於
+  //   命中群 9 年，明顯是不同續集。
+  //
+  //   為什麼不直接用 filterBySequel：它是給 tv 設計的，邏輯混了太多
+  //   對 movie 不該考慮的東西（sub-series marker drop、sao fallback 等）。
+  //   movie 場景更單純——兩條規則就夠：
+  //     1. sequel 明確標示為其他季 → drop
+  //     2. sequel=null 但 _year 比命中群 earliest 早 → drop
+  if (type === 'movie' && Number.isFinite(targetInfo?.seasonNumber) && targetInfo.seasonNumber > 1) {
+    const targetSeason = targetInfo.seasonNumber;
+    const before = finalResults.length;
+
+    // 命中群：用來決定 pooledYearMin
+    const matched = finalResults.filter(res =>
+      extractSequelNumber(res._rawName || res.description || '') === targetSeason
+    );
+    const yearsOfMatched = matched
+      .map(res => Number(res._year) || Number(extractVersionMarker(res._rawName || '')) || null)
+      .filter(y => y && Number.isFinite(y));
+    const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
+
+    finalResults = finalResults.filter(res => {
+      const rawName = res._rawName || res.description || '';
+      const sequel = extractSequelNumber(rawName);
+      // 規則 1：sequel 明確標示為其他季 → drop
+      if (sequel !== null && sequel !== targetSeason) return false;
+      // 規則 2：sequel=null 但 _year 比命中群最早年還早 → drop
+      if (sequel === null && pooledYearMin !== null) {
+        const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+        if (candYear && candYear < pooledYearMin) return false;
+      }
+      return true;
+    });
+    const dropped = before - finalResults.length;
+    if (dropped > 0) {
+      console.log(`🎬 movie 第${targetSeason}續集過濾(batch): ${before} -> ${finalResults.length}（dropped ${dropped} 條不同續集，pooledYearMin=${pooledYearMin}）`);
+    }
+  }
 
   // 第 2 季過濾：smart_stream 與 batch 兩個路徑都必須套用，
   // 否則批次搜「仁醫」+ season=2 會把第一季的「仁医」也一起推上來。
