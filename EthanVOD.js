@@ -1153,7 +1153,7 @@ const CONFIG = {
   //   問題從設定層消失，但舊 cache 內可能還存著「上一次設定為 2 時
   //   抓到的 AGE 結果」—— 直接讀出來仍會看到 AGE。bump 版本強迫
   //   syncWidgetVersion 清掉全部 cache，下次搜會依新設定只查金牌。
-  WIDGET_VERSION: 42,
+  WIDGET_VERSION: 45,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.3.3",
+  version: "3.3.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -5922,7 +5922,16 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   if (resource._ep != null && clean.episode == null) {
     clean.episode = resource._ep;
   }
-  if (resource._seasonFromItem != null && clean.season == null) {
+  // 頂層 season 欄位（tv 才有，movie 不帶）。
+  //
+  // 為什麼 movie 跳過提升：使用者決定「電影不要顯示 S 標籤」——
+  // S 標籤是為了讓多季影集使用者一眼分辨當前播放源屬於哪一季；
+  // 電影只有「單部」與「系列續集」兩種概念，續集序號（如戰狼2）站方
+  // 通常會在檔名就寫明，使用者從 description 就能辨識，不必再額外加
+  // S 標籤。頂層 season 欄位也是同樣理由：movie 不需要，給了反而會被
+  // REX 客戶端的「依 season 過濾」誤判（例如 season=4 的電影會被當成
+  // 「影集第 4 季」處理）。
+  if (type === 'tv' && resource._seasonFromItem != null && clean.season == null) {
     clean.season = resource._seasonFromItem;
   }
 
@@ -6138,36 +6147,25 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   // 規則：
   //   - tv 模式：season 與 episode 都有 → `S{N}E{M}`；只有 season → `S{N}`
   //     ；都沒有 → 不拼。
-  //   - movie 模式：永遠只拼 `S1`（電影沒「集」概念，但保留 S1 標籤讓
-  //     與 tv 一致；不拼 E 避免誤導使用者以為電影有多集）。
-  //   - 冪等：name 末尾已含相同 tag 時不重複加。
-  //   - 拼在 name 末尾，與 name 之間用半形空格分隔。
-  if (clean.name) {
+  //   - movie 模式：**完全不拼**（使用者決定，見下方長註解）。
+  //
+  // 冪等：name 末尾已含任何 S/E tag 時不重複加（見下方說明）。
+  // 拼在 name 末尾，與 name 之間用半形空格分隔。
+  //
+  // ★ 為什麼電影完全不拼 S 標籤（使用者決策）：
+  //   觀察 1：續集電影的序號站方本來就寫在檔名裡（「疾速追殺4」「战狼2」，
+  //           使用者從 description 就看得到，再加「S4」是重複資訊。
+  //   觀察 2：早期版本把 movie 一律標「S1」，續集改用序號後又變成「S4」，
+  //           同一份清單裡兩種標法不一致；更糟的是因為
+  //           cleanResourceForOutput 被重複呼叫而變成「S4 S1」，
+  //           使用者看到兩個互相矛盾的 season 標籤，比不顯示更困惑。
+  //   觀察 3：REX 客戶端有「依 result.season 過濾當前季」的行為，movie
+  //           帶 season 會被誤判為影集季別（season=4 的電影被當「第 4 季」）。
+  //   結論：movie 的 source name 只留站名（「金牌影視」），乾淨且不會出錯。
+  if (clean.name && type !== 'movie') {
     const nameStr = String(clean.name);
     let tag = null;
-    if (type === 'movie') {
-      // ★ 電影：用「資源自己的續集序號」決定 S 標籤，而不是寫死 S1。
-      //
-      // 改前：tag = 'S1'  → 全部電影無差別標 S1。
-      //   例外：「Back to the Future 3」「無間道2」「戰狼2」「叶問3」這些
-      //   續集電影使用者看「S1」會誤以為是第一部。續集序號 3 應該顯示 S3，
-      //   跟 tv 影集用 sequel 序號的邏輯對齊。
-      //
-      // 改後：tag = `S${extractSequelNumber(_rawName) ?? 1}`
-      //   - 「Back to the Future 3」 → S3
-      //   - 「無間道2」             → S2
-      //   - 「戰狼」 (沒序號)        → S1
-      //
-      // 為什麼不用 playlist 級別的 seasonNumber：loadResource 對 movie 不
-      // 帶 season 進來，且 extractSequelNumber(targetInfo.rawName) 對純
-      // 片名也常常抓不到序號（_rawName 才能抓到「Back to the Future 3」的 3）。
-      //
-      // 電影永遠只拼 S 標籤、不拼 E：電影沒「集」概念，與原邏輯一致。
-      const movieSequel = Number.isFinite(resource._seasonFromItem) && resource._seasonFromItem > 0
-        ? resource._seasonFromItem
-        : (extractSequelNumber(resource._rawName) ?? null);
-      tag = `S${Number.isFinite(movieSequel) && movieSequel > 0 ? movieSequel : 1}`;
-    } else if (Number.isFinite(clean.season) && clean.season > 0
+    if (Number.isFinite(clean.season) && clean.season > 0
         && Number.isFinite(clean.episode) && clean.episode > 0) {
       tag = `S${clean.season}E${clean.episode}`;
     } else if (Number.isFinite(clean.season) && clean.season > 0) {
@@ -7454,23 +7452,42 @@ function filterBySequel(results, targetInfo) {
 
   const before = results.length;
 
+  // ★ 欄位讀取 helper：私有欄位優先，頂層欄位作 fallback。
+  //
+  // 為什麼需要 fallback：cache 裡的物件已經過 cleanResourceForOutput，
+  // `_rawName` / `_year` 都在 fieldsToDelete 裡被刪掉，只剩頂層
+  // `description` / `year`。若只讀私有欄位，cache 命中路徑會拿到：
+  //   rawName = description  ✅（還好）
+  //   _year   = undefined   ❌ → yearsOfMatched = [] → pooledYearMin = null
+  //                              → 規則 3（年份早於命中群）整條不執行
+  //                              → cache 命中時第一部全部漏網
+  //
+  // 實測（疾速追殺 season=4，cache 命中）：kept=8 dropped=0，
+  // 四條 2014 的第一部沒被殺掉。
+  //
+  // 即時搜尋結果（未 clean）走私有欄位，cache 命中結果（已 clean）
+  // 走頂層欄位，兩條路徑行為一致。
+  const nameOf = (res) => res._rawName || res.description || '';
+  const yearOf = (res) => {
+    const y = Number(res._year) || Number(res.year)
+      || Number(extractVersionMarker(res._rawName || ''))
+      || Number(extractVersionMarker(res.description || ''))
+      || null;
+    return y && Number.isFinite(y) ? y : null;
+  };
+
   // 命中群：明確標為第 targetSeason 季的候選，用它們的年份決定 pooledYearMin。
-  const sequelMatched = results.filter(res => {
-    const rawName = res._rawName || res.description || '';
-    return extractSequelNumber(rawName) === targetSeason;
-  });
-  const yearsOfMatched = sequelMatched
-    .map(res => Number(res._year) || Number(extractVersionMarker(res._rawName || '')) || null)
-    .filter(y => y && Number.isFinite(y));
+  const sequelMatched = results.filter(res => extractSequelNumber(nameOf(res)) === targetSeason);
+  const yearsOfMatched = sequelMatched.map(yearOf).filter(Boolean);
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
   const unversionedBases = new Map();
   for (const res of results) {
-    const rawName = res._rawName || res.description || '';
+    const rawName = nameOf(res);
     if (extractSequelNumber(rawName) === targetSeason) continue;
-    const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+    const candYear = yearOf(res);
     if (candYear) continue;
     const base = (res._baseName || rawName.replace(/第[0-9一二三四五六七八九十百零〇]+[集話話回]/g, '').replace(/第[0-9]+季|Season\s*[0-9]+/gi, '')).trim();
     if (!base) continue;
@@ -7480,7 +7497,7 @@ function filterBySequel(results, targetInfo) {
   let kept = [];
   const dropped = [];
   for (const res of results) {
-    const rawName = res._rawName || res.description || '';
+    const rawName = nameOf(res);
     const sequel = extractSequelNumber(rawName);
 
     // 規則 0（最高優先）：sub-series marker 先 drop，**即使 sequel===targetSeason 也要 drop**。
@@ -7549,7 +7566,7 @@ function filterBySequel(results, targetInfo) {
 
     // 片名沒寫季、vod_year 比命中群最早年還要早 1 年以上 → 上一季嫌疑
     if (sequel === null && pooledYearMin !== null) {
-      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      const candYear = yearOf(res);
       // 為什麼用「candYear < pooledYearMin」而不是「candYear <= pooledYearMin - 1」：
       // 上一季的播出年通常正是 pooledYearMin - 1（S2 拍攝年的前一年）。
       // 把「candYear == pooledYearMin - 1」當 borderline 留著會讓 S1 整季漏網
@@ -7559,7 +7576,7 @@ function filterBySequel(results, targetInfo) {
       }
       // DEBUG: 印出通過/沒通過規則 3 的情況，幫忙定位漏網之魚
       if (candYear && candYear >= pooledYearMin && candYear < pooledYearMin + 1) {
-        console.log(`  [PASS-rule3 borderline] name="${res.name}" _year=${res._year} candYear=${candYear} pooledYearMin=${pooledYearMin}`);
+        console.log(`  [PASS-rule3 borderline] name="${res.name}" year=${yearOf(res)} candYear=${candYear} pooledYearMin=${pooledYearMin}`);
       }
     }
 
@@ -7577,7 +7594,7 @@ function filterBySequel(results, targetInfo) {
     // 風險：差 4 年可能誤殺正常跨季案例（如進擊的巨人 S4 2020 → Final S4 2023 差 3 年 OK），
     // 但比放進後續大堆雜亂條目好。
     if (sequel === null && pooledYearMin !== null) {
-      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      const candYear = yearOf(res);
       if (candYear && candYear > pooledYearMin + 3) {
         dropped.push(res); continue;
       }
@@ -7616,7 +7633,7 @@ function filterBySequel(results, targetInfo) {
     // 副標在冒號後，所以「進撃的巨人 第三季：瑪利亞之牆」之類的 S4 條目會誤殺。
     // 但實務極罕見，trade-off 可接受。
     if (/：|:|｜|\|/.test(rawName) && pooledYearMin !== null) {
-      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      const candYear = yearOf(res);
       if (candYear && candYear > pooledYearMin + 1) {
         dropped.push(res); continue;
       }
@@ -7643,7 +7660,7 @@ function filterBySequel(results, targetInfo) {
     // 為什麼不直接用「baseName 跨站一致性」：仁醫 case 樂子的「仁医」vod_year
     // 就是 2012（韓版），跨站看起來 baseName 一致但其實是韓版，啟發式反被誤導。
     if (sequel === null && pooledYearMin !== null) {
-      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      const candYear = yearOf(res);
       // 候選年份 = pooledYearMin + 1 → 同時代另一版本嫌疑
       if (candYear && candYear === pooledYearMin + 1) {
         dropped.push(res); continue;
@@ -7653,7 +7670,7 @@ function filterBySequel(results, targetInfo) {
     // 片名沒寫季也沒年份、且跨多站回傳同一 baseName → 上一季嫌疑
     // （只有 1 站回的可能是另一季沒寫季的合法結果，2 站以上才殺）
     if (sequel === null && pooledYearMin !== null) {
-      const candYear = Number(res._year) || Number(extractVersionMarker(rawName)) || null;
+      const candYear = yearOf(res);
       if (!candYear) {
         const base = (res._baseName || rawName.replace(/第[0-9一二三四五六七八九十百零〇]+[集話話回]/g, '').replace(/第[0-9]+季|Season\s*[0-9]+/gi, '')).trim();
         if (base && (unversionedBases.get(base) || 0) >= 2) {
@@ -7728,7 +7745,12 @@ function filterByTargetVersion(results, targetInfo) {
     const want = String(targetInfo.year);
     const before = results.length;
     const filtered = results.filter(res => {
-      const candYear = res._year ?? extractVersionMarker(res._rawName || '');
+      // ★ 與 filterBySequel 的 yearOf 同一理由：cache 內的物件已經過
+      // cleanResourceForOutput，_year / _rawName 都被刪了，只剩頂層
+      // year。只讀私有欄位會讓 cache 命中路徑的版本過濾完全失效。
+      const candYear = res._year ?? res.year
+        ?? extractVersionMarker(res._rawName || '')
+        ?? extractVersionMarker(res.description || '');
       return !candYear || String(candYear) === want;
     });
     if (before !== filtered.length) {
@@ -8629,57 +8651,25 @@ targetInfo.searchQuery = aliasQ;
     
     console.log(`📊 批量搜索完成: ${Date.now() - startTime}ms, 结果: ${allResults.length}`);
 
-    // ★ 分流寫 cache：MacCMS 全季共用，adapter 綁定到該集。
+    // ★★★ 分流寫 cache 移到 performBatchSearch 尾端 ★★★
     //
-    //   為什麼必須分流：舊版寫入時把 MacCMS + adapter 混在同一個 key
-    //   （vod_batch_..._e${ep}），使用者從 E1 切 E2 時 cache miss 會
-    //   觸發整批重抓，5 個 MacCMS 站 detail 重抓 ≈ 4-8s。分流後
-    //   MacCMS 部分跨集共享，E1 → E2 切集時只需重抓 adapter（單站
-    //   單集 ≈ 200-400ms）。
+    // 舊位置 bug（實測 log 佐證）：這段原本寫在「所有站搜完」之後、
+    // 「filterBySequel / filterByTargetVersion / cleanResourceForOutput」之前。
+    // 搜「疾速追殺」season=4 時：
+    //     📊 批量搜索完成: 2335ms, 结果: 11       ← 未過濾 11 筆
+    //     💾 adapter cache 寫入: 3 條             ← jpyy 的 2014/2017/2023 全寫進去
+    //     💾 MacCMS cache 首次寫入: 8 條          ← 含 4 條第一部
+    //     ✅ 搜索完成! 11 個結果                  ← 這次畫面對，但 cache 已髒
     //
-    //   寫入策略：
-    //     • MacCMS 結果（無 _adapterSite）→ 寫 macCacheKey（覆蓋式；
-    //       為避免「這次只抓到部分集時丟失舊的全季」，把「這次新抓的」
-    //       與「舊 macCacheKey 內的」按 url 去重合併後再寫）。
-    //     • Adapter 結果（有 _adapterSite）→ 寫 adCacheKey
-    //       （adapter 是單集綁定，直接覆蓋即可，不會丟資料）。
-    if (allResults.length > 0) {
-      try {
-        const macResults = allResults.filter(r => !r._adapterSite);
-        const adResults  = allResults.filter(r => !!r._adapterSite);
-
-        // MacCMS：合併舊 cache（避免這次只抓到部分集時丟失舊的全季）。
-        // 為什麼不直接覆蓋：使用者可能從 E5 開始搜（macResults 只有 E5 集），
-        // 這時若覆蓋，舊 cache 內的 E1~E4 集會被清空，E1 切回時
-        // 還要重抓那 4 集。改成「新增 + 保留舊」後，cache 是「漸進式
-        // 累積」，缺哪集就補哪集。
-        if (macResults.length > 0) {
-          (async () => {
-            let toWrite = macResults;
-            try {
-              const oldMac = parseCacheValue(await Widget.storage?.get?.(macCacheKey));
-              if (oldMac.length > 0) {
-                const newUrls = new Set(macResults.map(r => r.url).filter(Boolean));
-                const retained = oldMac.filter(r => r.url && !newUrls.has(r.url));
-                toWrite = [...macResults, ...retained];
-                console.log(`💾 MacCMS cache 寫入: 新增 ${macResults.length} + 保留舊 ${retained.length} = ${toWrite.length} 條`);
-              } else {
-                console.log(`💾 MacCMS cache 首次寫入: ${macResults.length} 條`);
-              }
-            } catch (e) { /* 合併失敗時直接寫 macResults */ }
-            try { Widget.storage?.set?.(macCacheKey, JSON.stringify(toWrite), CONFIG.CACHE_TTL); } catch {}
-          })();
-        }
-
-        // Adapter：直接覆蓋（adapter 結果綁定 targetEpisode，不能跨集共用）
-        if (adResults.length > 0) {
-          try {
-            Widget.storage?.set?.(adCacheKey, JSON.stringify(adResults), CONFIG.CACHE_TTL);
-            console.log(`💾 adapter cache 寫入: ${adResults.length} 條（key=..._adapter_e${targetEpisode || 'all'}）`);
-          } catch (e) {}
-        }
-      } catch (e) {}
-    }
+    // 後果：cache 命中時直接回放未過濾的舊結果 → 使用者又看到第一部混在
+    // 第四部清單裡，且因為 TTL 30 分鐘，反覆發生的週期很長。
+    //
+    // 實作：見 performBatchSearch 尾端 cleanResourceForOutput 之後的
+    // 「分流寫 cache（過濾後）」區塊。
+    //
+    // 分流策略本身維持不變（MacCMS 全季共用 / adapter 綁定到該集）：
+    //   • MacCMS（無 _adapterSite）→ macCacheKey，與舊內容按 url 去重合併
+    //   • Adapter（有 _adapterSite）→ adCacheKey，直接覆蓋
   }
 
   let finalResults = allResults;
@@ -8796,6 +8786,82 @@ targetInfo.searchQuery = aliasQ;
     Object.keys(res).forEach(k => delete res[k]);
     Object.assign(res, cleaned);
   });
+
+  // ★★★ 分流寫 cache（過濾 + clean 之後）★★★ ← 從搜尋尾端搬到這裡
+  //
+  // 為什麼必須在這裡寫（而不是搜完所有站就寫）：
+  //   cache 是「使用者下次會看到的東西」。如果在 filterByTargetVersion /
+  //   filterBySequel 之前寫入，cache 裡會存著已經被判定為無關的資源
+  //   （例如搜「疾速追殺」season=4 時的第一部 2014、第二部 2017）。
+  //   這次搜尋的畫面雖然是對的，但下次 cache 命中就直接回放髒資料 →
+  //   使用者看到「疾速追殺」(2014) 混在第四部清單裡，且會反覆發生
+  //   （TTL 30 分鐘內每次點進詳細頁都命中）。
+  //
+  // 實測佐證（修前 log）：
+  //   📊 批量搜索完成: 2335ms, 结果: 11
+  //   💾 adapter cache 寫入: 3 條      ← jpyy 的 2014/2017/2023 未過濾全入
+  //   💾 MacCMS cache 首次寫入: 8 條   ← 含 4 條第一部未過濾
+  //   ✅ 搜索完成! 11 個結果
+  //
+  // 分流策略維持原樣（見搜尋尾端被搬走的那段註解）：
+  //   • MacCMS（無 _adapterSite）→ macCacheKey，與舊內容按 url 去重合併
+  //     （跨集累積，避免從 E5 開始搜時把 E1~E4 洗掉）
+  //   • Adapter（有 _adapterSite）→ adCacheKey，直接覆蓋（綁定單集）
+  if (finalResults.length > 0 && CONFIG.CACHE_TTL > 0) {
+    try {
+      const macResults = finalResults.filter(r => !r._adapterSite);
+      const adResults  = finalResults.filter(r => !!r._adapterSite);
+
+      if (macResults.length > 0) {
+        (async () => {
+          let toWrite = macResults;
+          try {
+            const oldMac = parseCacheValue(await Widget.storage?.get?.(macCacheKey));
+            if (oldMac.length > 0) {
+              // ★ 舊資料也要過濾後才合併。
+              //
+              // 為什麼：舊的 merge 邏輯是「新增 + 保留舊」，目的是讓 cache 漸進式
+              // 累積（從 E5 開始搜時不洗掉 E1~E4）。但舊資料如果是「上個版本寫進去的
+              // 未過濾結果」，直接保留等於讓髒資料復活。
+              //
+              // 實測 bug（疾速追殺 season=4）：
+              //   過濾 6 -> 3（正確）
+              //   💾 MacCMS cache 寫入(過濾後): 新增 3 + 保留舊 3 = 6 條  ← 又變回 6 條！
+              //   下次 cache 命中：merged = 6 筆（髒）→ 過濾再殺一次，畫面對但
+              //   cache 永遠是髒的，任何一條「漏過濾的」路徑都會浮出來。
+              //
+              // 修法：把 oldMac 也丟進 filterBySequel，只保留與本次結果同一部/季的。
+              // 這同時保留了「漸進式累積」的原意（同一部/季的多站結果可以累積），
+              // 又不會讓「其他部/季」的髒資料混進來。
+              let oldToKeep = oldMac;
+              if (type === 'movie' || type === 'tv') {
+                const fr = filterBySequel(oldMac, targetInfo);
+                if (fr && Array.isArray(fr.kept)) oldToKeep = fr.kept;
+              }
+              const newUrls = new Set(macResults.map(r => r.url).filter(Boolean));
+              const retained = oldToKeep.filter(r => r.url && !newUrls.has(r.url));
+              toWrite = [...macResults, ...retained];
+              if (retained.length !== oldMac.length) {
+                console.log(`💾 MacCMS cache 寫入(過濾後): 新增 ${macResults.length} + 保留舊 ${retained.length}/${oldMac.length} = ${toWrite.length} 條（舊資料已再過濾）`);
+              } else {
+                console.log(`💾 MacCMS cache 寫入(過濾後): 新增 ${macResults.length} + 保留舊 ${retained.length} = ${toWrite.length} 條`);
+              }
+            } else {
+              console.log(`💾 MacCMS cache 首次寫入(過濾後): ${macResults.length} 條`);
+            }
+          } catch (e) { /* 合併失敗時直接寫 macResults */ }
+          try { Widget.storage?.set?.(macCacheKey, JSON.stringify(toWrite), CONFIG.CACHE_TTL); } catch {}
+        })();
+      }
+
+      if (adResults.length > 0) {
+        try {
+          Widget.storage?.set?.(adCacheKey, JSON.stringify(adResults), CONFIG.CACHE_TTL);
+          console.log(`💾 adapter cache 寫入(過濾後): ${adResults.length} 條（key=..._adapter_e${targetEpisode || 'all'}）`);
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
 
   return finalResults.slice(0, 100);
 }
