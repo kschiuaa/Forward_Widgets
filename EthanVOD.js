@@ -1399,7 +1399,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.2.7",
+  version: "3.2.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1985,23 +1985,27 @@ const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆�
     if (v) return v;
   }
 
-  // 阿拉伯數字：取第一個出現且不像年份的數字。
-  //
-  // 先把方括號內容（[hnm3u8] / [wjm3u8] 之類的宿主標籤）整段移除。
-  // 沒移除的話，方括號裡的 m3u8、f4、1080p 等數字會被當成續集序號，
-  // 實測「仁醫完結篇 - 第02集 - [ffm3u8]」會抓出 3（從 ffm3u8），
-  // 「仁医2 - 第01集 - [wjm3u8]」會抓出 8，整個比對規則全面錯亂。
-  const sNoBrackets = s.replace(/\[[^\]]*\]/g, '');
-  const digits = [...sNoBrackets.matchAll(/(\d+)/g)]
-    .map(m => ({ raw: m[1], at: m.index }))
-    .filter(d => {
-      const n = parseInt(d.raw, 10);
-      if (!(n > 0 && n < 100)) return false;      // 排除 0 與 100 以上（含年份）
-      // 序號前面是中文／英文文字才算續集；「红海行动2018」整個是年份。
-      const before = sNoBrackets.slice(0, d.at);
-      return /[^\d\s]$/.test(before) || before.length === 0;
-    });
-  if (digits.length) return parseInt(digits[0].raw, 10);
+      // 阿拉伯數字：取第一個出現且不像年份的數字。
+      //
+      // 先把方括號內容（[hnm3u8] / [wjm3u8] 之類的宿主標籤）整段移除。
+      // 沒移除的話，方括號裡的 m3u8、f4、1080p 等數字會被當成續集序號，
+      // 實測「仁醫完結篇 - 第02集 - [ffm3u8]」會抓出 3（從 ffm3u8），
+      // 「仁医2 - 第01集 - [wjm3u8]」會抓出 8，整個比對規則全面錯亂。
+      const sNoBrackets = s.replace(/\[[^\]]*\]/g, '');
+      const digits = [...sNoBrackets.matchAll(/(\d+)/g)]
+        .map(m => ({ raw: m[1], at: m.index }))
+        .filter(d => {
+          const n = parseInt(d.raw, 10);
+          if (!(n > 0 && n < 100)) return false;      // 排除 0 與 100 以上（含年份）
+          // 序號前面是中文／英文文字才算續集；「红海行动2018」整個是年份。
+          const before = sNoBrackets.slice(0, d.at);
+          // 舊條件：數字前方是「文字」或「字串開頭」才算。
+          // 問題：對「Back to the Future 3」（空白分隔），before = "Back to the Future "
+          // 結尾是空白，不匹配 [^\d\s]，所以 3 被錯誤排除。
+          // 新增第三條件：空白結尾也算有效（常見於英文片名以空白分隔數字）。
+          return /[^\d\s]$/.test(before) || before.length === 0 || /[\s]$/.test(before);
+        });
+      if (digits.length) return parseInt(digits[0].raw, 10);
 
   return null;
 }
