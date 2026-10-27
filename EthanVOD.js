@@ -1169,7 +1169,31 @@ const CONFIG = {
   //   兩者都屬「輸入解析」層修正，不改變任何輸出內容，cache 內容格式
   //   也不變 —— 但舊 cache 內的 S1 結果正是 bug 症狀，bump 版本讓
   //   syncWidgetVersion 清掉重搜。
-  WIDGET_VERSION: 48,
+  //
+  // bump 到 49：補上 loadResource 輸出的 link 欄位（真正的根因修法）。
+  //   前一版（48）修的是「參數解析」：REX 若帶了 season=2 就能拿對。
+  //   但 REX 切季時**不一定**帶 season 參數 —— 它帶的是「上一層
+  //   傳下來的 link」。而我們的 loadResource 輸出**完全沒有 link 欄位**
+  //   （Forward 契約 video.d.ts 的 VideoItemChild.link 是必填字串，
+  //   我們一直沒給），所以 REX 手上沒有可帶季別的載體 → 切季時
+  //   季別只能是「未指定」→ widget 端自然回第一季。
+  //
+  //   這一版讓 loadResource 的每筆結果都帶 link：
+  //     search:<片名>?season=<N>&episode=<M>&type=<tv|movie>
+  //   季別取自 clean.season（clean 階段提升後的頂層欄位，單一真相），
+  //   集數取自 clean.episode。cache 命中路徑（繞過 cleanResourceForOutput）
+  //   另外就地補 link，避免舊 cache 讀回來永遠缺欄位。
+  //
+  //   ★ 這也解釋了「有些劇可以切、有些不行」：
+  //     站方檔名帶季別（「仁醫 第2季 完結篇」）時，該筆結果的
+  //     _seasonFromItem 推得出季別，切季就正常；檔名沒季別
+  //     （「白粉飛」）的結果就掉回 S1 —— 同一個 bug 落在不同劇上
+  //     症狀看起來不一樣。
+  //
+  //   ★ 不影響既有功能：link 只被 REX/Forward 用來「開詳情頁」，
+  //     搜尋結果的顯示、排序、去重、季別過濾都不讀它。
+  //     Forward 端本來就要求 link 必填，補上是讓欄位符合契約。
+  WIDGET_VERSION: 49,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1422,7 +1446,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.4.2",
+  version: "3.4.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6372,6 +6396,59 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
         .trim();
     }
     clean.title = title || String(clean.name || '視頻資源');
+
+    // ★ link：Forward 契約的 VideoItemChild.link 是**必填**字串
+    //（@forward-widget/libs 的 video.d.ts: `link: string`，非 optional），
+    // 而我們的輸出原本完全沒有這個欄位。
+    //
+    // 為什麼這會讓 REX 切季失效（這是本次問題的真正根因）：
+    //
+    //   REX 從搜尋結果點進詳細頁時，需要用「該筆結果的 link」當作
+    //   loadDetail(link) 的入參。link 裡帶著 season / episode，
+    //   REX 才能在詳情頁裡知道「這是第幾季第幾集」，進而：
+    //     - 詳情頁的季別欄（MediaDetailsSeasonBar）能定位到正確的季
+    //     - 切換季別時帶著新季別重新載入資源
+    //
+    //   link 欄位缺失 → REX 拿不到季別 → 詳情頁只知道「這是第 1 季」
+    //   → 使用者切到 S2 時，REX 沒有任何季別資訊可帶，widget 端
+    //   自然只能回第一季的資源。這正是「切季不刷新」的直接原因。
+    //
+    //   這也解釋了「有些劇可以、有些不行」：能不能切，取決於該筆結果
+    //   當下是否帶得著 season 資訊。站方檔名帶季別（「仁醫 第2季 完結篇」）
+    //   的結果，其 _seasonFromItem 能推出季別，切季就正常；檔名沒季別
+    //   （「白粉飛」）的結果就掉回 S1。
+    //
+    // link 格式沿用 loadDetail 的 buildDetailLink：search:<標題>?season=N&episode=M
+    // 兩邊格式一致，REX 從搜尋結果帶進詳情頁、再從詳情頁帶回資源，
+    // 全程同一套 metadata 編碼，不會有格式落差。
+    //
+    // ★ 對既有功能的影響：Forward 端本來就要求 link 必填，補上只是
+    //   讓欄位符合契約，不改變 name / description / url / id 等既有欄位。
+    //   搜尋結果的顯示、排序、去重都不讀 link，故完全不影響。
+    if (!clean.link) {
+      const linkTitle = String(resource._rawName || clean.title || '').trim();
+      if (linkTitle) {
+        // ★ 季別要讀 clean.season，不是 resource.season。
+        // cleanResourceForOutput 會把季別提升到頂層 clean.season
+        // （來自 _seasonFromItem，或 context.seasonNumber，或 fallback S1），
+        // 而 resource.season 這個原始欄位多半是 undefined/null。
+        // 讀錯會讓 link 裡的 season 永遠缺漏 → REX 切季無效。
+        const linkSeason = Number.isFinite(clean.season) && clean.season > 0
+          ? clean.season
+          : (Number.isFinite(context.seasonNumber) && context.seasonNumber > 0
+              ? context.seasonNumber
+              : null);
+        const linkEpisode = Number.isFinite(clean.episode) ? clean.episode : null;
+        clean.link = buildDetailLink({
+          title: linkTitle,
+          season: linkSeason,
+          episode: linkEpisode,
+          // type 用本函式的 type 參數（呼叫端已帶入當前搜尋的類型），
+          // 不用 resource._type —— 該欄位不存在，會永遠退化成 'tv'。
+          type: type,
+        });
+      }
+    }
   }
 
   return clean;
@@ -6966,6 +7043,39 @@ targetInfo.searchQuery = aliasQ;
           cachedResults = [];
         } else {
           console.log(`💾 缓存命中: ${usable.length}个结果`);
+
+          // ★★ 補 link：快取命中路徑完全繞過 cleanResourceForOutput
+          //（下方直接 `return usable`），所以快取裡的物件是「寫入當下」
+          // 的舊格式。若當時還沒有 link 欄位，這裡讀回來的物件就永遠
+          // 沒有 link —— REX 從搜尋結果點進詳情頁時拿不到季別，
+          // 切季就退化成永遠停在第一季。
+          //
+          // 這正是「有些劇可以切、有些不行」的來源：
+          //   - 快取是「首次搜尋該季時」寫入的。首次搜尋若走的是
+          //     另一條路徑（或舊版 widget 寫的），link 就缺。
+          //   - 快取 TTL 30 分鐘，期內一直讀同一份 → 一直缺 link。
+          //
+          // 修法：快取命中時就地補 link。link 內容只取決於
+          // (標題, 季, 集)，與物件本身無關，補寫是冪等的。
+          // 已有 link 的不動（避免覆蓋更精確的 metadata）。
+          let linked = 0;
+          for (const r of usable) {
+            if (!r || r.link) continue;
+            const linkTitle = String(r.title || r._rawName || targetInfo.baseName || '').trim();
+            if (!linkTitle) continue;
+            r.link = buildDetailLink({
+              title: linkTitle,
+              // 季別優先用物件自己的 season（快取裡通常已帶），
+              // 沒有就用本次請求的目標季。
+              season: Number.isFinite(r.season) ? r.season : targetSeason,
+              episode: Number.isFinite(r.episode) ? r.episode : targetEpisode,
+              type,
+            });
+            linked++;
+          }
+          if (linked > 0) {
+            console.log(`🔗 快取補 link: ${linked}/${usable.length} 條`);
+          }
 
           // 兜底 wrap：對 cache 內每條物件的 url 主動呼叫 wrapM3U8WithFilter。
           // 與 batch 路徑同樣理由（見 performBatchSearch 內同段註解）。
