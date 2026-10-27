@@ -1193,7 +1193,22 @@ const CONFIG = {
   //   ★ 不影響既有功能：link 只被 REX/Forward 用來「開詳情頁」，
   //     搜尋結果的顯示、排序、去重、季別過濾都不讀它。
   //     Forward 端本來就要求 link 必填，補上是讓欄位符合契約。
-  WIDGET_VERSION: 49,
+  //
+  // bump 到 50：修掉 v49 引入的沙箱迴歸 + 補齊 link 的一致性。
+  //   (1) ★ v49 把 buildDetailLink 拉進 loadResource 的熱路徑，而它
+  //       內部用 URLSearchParams —— Forward 的 widget 沙箱
+  //       （iOS/Android JavaScriptCore）沒有那個全域，於是整個模組爆掉：
+  //         [error] 模組執行錯誤：Can't find variable: URLSearchParams
+  //       Node 測試環境有 URLSearchParams，所以本機全綠、真機才炸。
+  //       修法：buildDetailLink / parseDetailLink 都不再用 URLSearchParams，
+  //       改為手動組與解析 query string（參數值都是數字或 tv/movie，
+  //       encodeURIComponent 後用 '&' 串接，語意與 toString() 一致）。
+  //       新增 test/verify_forward_sandbox.mjs：模擬真實沙箱（拿掉
+  //       URLSearchParams / TextEncoder / Buffer…），讓同類問題本機就現形。
+  //   (2) 電影的 link 不再帶 season。電影沒有季別概念（clean 階段刻意
+  //       不提升 season），但 v49 的 fallback 會塞 season=1，造成
+  //       「link 說 season=1、資源 season 欄位是 undefined」的矛盾。
+  WIDGET_VERSION: 50,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1446,7 +1461,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.4.3",
+  version: "3.4.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6433,11 +6448,20 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
         // （來自 _seasonFromItem，或 context.seasonNumber，或 fallback S1），
         // 而 resource.season 這個原始欄位多半是 undefined/null。
         // 讀錯會讓 link 裡的 season 永遠缺漏 → REX 切季無效。
-        const linkSeason = Number.isFinite(clean.season) && clean.season > 0
-          ? clean.season
-          : (Number.isFinite(context.seasonNumber) && context.seasonNumber > 0
-              ? context.seasonNumber
-              : null);
+        //
+        // ★ movie 不帶 season：電影沒有「季」的概念（clean 階段刻意
+        //   不提升 season 到頂層，見 type === 'tv' 的判斷）。若這裡
+        //   fallback 到 context.seasonNumber，電影的 link 會出現
+        //   「season=1」但資源本身的 season 欄位是 undefined ——
+        //   兩者不一致，REX 開詳情頁時會拿到一個不存在的季別。
+        //   電影的續集序號另有 _rawName 的方式表達，不需要 season。
+        const linkSeason = type === 'tv'
+          ? (Number.isFinite(clean.season) && clean.season > 0
+              ? clean.season
+              : (Number.isFinite(context.seasonNumber) && context.seasonNumber > 0
+                  ? context.seasonNumber
+                  : null))
+          : null;
         const linkEpisode = Number.isFinite(clean.episode) ? clean.episode : null;
         clean.link = buildDetailLink({
           title: linkTitle,
@@ -7067,7 +7091,12 @@ targetInfo.searchQuery = aliasQ;
               title: linkTitle,
               // 季別優先用物件自己的 season（快取裡通常已帶），
               // 沒有就用本次請求的目標季。
-              season: Number.isFinite(r.season) ? r.season : targetSeason,
+              // ★ movie 不帶 season（電影沒有季別概念）——
+              //   跟 cleanResourceForOutput 裡的處理一致，
+              //   否則電影的 link 會出現 season=1 但 season 欄位是 undefined。
+              season: type === 'tv'
+                ? (Number.isFinite(r.season) ? r.season : targetSeason)
+                : null,
               episode: Number.isFinite(r.episode) ? r.episode : targetEpisode,
               type,
             });
@@ -9103,8 +9132,13 @@ function parseDetailLink(link) {
   const raw = String(link).trim();
   if (!raw.startsWith(DETAIL_LINK_PREFIX)) return null;
   const rest = raw.slice(DETAIL_LINK_PREFIX.length);
-  // query string 用 urlsearchparams 解。中文與空格由 encodeURIComponent
-  // 處理；不要在這裡直接 split('&')，使用者標題可能含 &。
+  // query string 手動解析，不使用 URLSearchParams ——
+  // Forward 的 widget 沙箱（iOS/Android JavaScriptCore）沒有那個全域。
+  // 詳見 buildDetailLink 的註解。
+  //
+  // 不用 split('&') 直接切：使用者標題可能含 &，但標題在 '?' 之前
+  // 且已 encodeURIComponent（& → %26），所以 queryPart 裡的 '&'
+  // 一定是參數分隔符。值的部分再 decodeURIComponent。
   const qIdx = rest.indexOf('?');
   const titlePart = qIdx >= 0 ? rest.slice(0, qIdx) : rest;
   const queryPart = qIdx >= 0 ? rest.slice(qIdx + 1) : '';
@@ -9113,32 +9147,64 @@ function parseDetailLink(link) {
 
   const meta = { title };
   if (queryPart) {
-    const sp = new URLSearchParams(queryPart);
-    if (sp.has('season')) {
-      const s = parseInt(sp.get('season'), 10);
+    const params = {};
+    for (const kv of queryPart.split('&')) {
+      if (!kv) continue;
+      const eq = kv.indexOf('=');
+      const k = eq >= 0 ? kv.slice(0, eq) : kv;
+      const v = eq >= 0 ? kv.slice(eq + 1) : '';
+      if (!k) continue;
+      try {
+        params[decodeURIComponent(k)] = decodeURIComponent(v);
+      } catch {
+        params[k] = v;   // decode 失敗就原樣保留，不要讓整個解析爆掉
+      }
+    }
+    if (params.season != null) {
+      const s = parseInt(params.season, 10);
       if (Number.isFinite(s) && s >= 1) meta.season = s;
     }
-    if (sp.has('episode')) {
-      const e = parseInt(sp.get('episode'), 10);
+    if (params.episode != null) {
+      const e = parseInt(params.episode, 10);
       if (Number.isFinite(e) && e >= 1) meta.episode = e;
     }
-    if (sp.has('type')) {
-      const t = String(sp.get('type') || '').toLowerCase();
+    if (params.type != null) {
+      const t = String(params.type).toLowerCase();
       if (t === 'tv' || t === 'movie') meta.type = t;
     }
-    if (sp.has('id')) meta.id = String(sp.get('id') || '');
+    if (params.id != null) meta.id = String(params.id);
   }
   return meta;
 }
 
+/**
+ * 建立詳情頁 link。
+ *
+ * ★ 為什麼手動組 query string 而不用 URLSearchParams：
+ *
+ *   Forward 的 widget 跑在 iOS/Android 的 JavaScriptCore 沙箱裡，
+ *   那個環境**沒有 URLSearchParams**（Node 有，所以本機測試不會爆）。
+ *   buildDetailLink 原本只在 loadDetail 被呼叫（REX 的 stream 模組
+ *   在較完整的 runtime 裡跑），但 v49 把它拉進 loadResource 的熱路徑
+ *   —— loadResource 在 Forward 的沙箱裡執行，於是直接炸：
+ *
+ *     [error] 模組執行錯誤：Can't find variable: URLSearchParams
+ *
+ *   修法：自己組 query string。參數值都是數字或 'tv'/'movie' 這種
+ *   固定字串，encodeURIComponent 後直接用 '&' 串起來即可，
+ *   語意與 URLSearchParams.toString() 完全一致。
+ *
+ *   ★ 對應的解析端 parseDetailLink 也一併改掉（見下），
+ *     否則一邊不用 URLSearchParams 一邊用，兩邊格式會不一致。
+ */
 function buildDetailLink({ title, season, episode, type, id }) {
   const enc = encodeURIComponent(String(title || '').trim());
-  const sp = new URLSearchParams();
-  if (season && Number.isFinite(season) && season >= 1) sp.set('season', String(season));
-  if (episode && Number.isFinite(episode) && episode >= 1) sp.set('episode', String(episode));
-  if (type === 'tv' || type === 'movie') sp.set('type', type);
-  if (id) sp.set('id', String(id));
-  const qs = sp.toString();
+  const parts = [];
+  if (season && Number.isFinite(season) && season >= 1) parts.push(`season=${encodeURIComponent(String(season))}`);
+  if (episode && Number.isFinite(episode) && episode >= 1) parts.push(`episode=${encodeURIComponent(String(episode))}`);
+  if (type === 'tv' || type === 'movie') parts.push(`type=${encodeURIComponent(type)}`);
+  if (id) parts.push(`id=${encodeURIComponent(String(id))}`);
+  const qs = parts.join('&');
   return `${DETAIL_LINK_PREFIX}${enc}${qs ? `?${qs}` : ''}`;
 }
 
