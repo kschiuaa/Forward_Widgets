@@ -1208,7 +1208,24 @@ const CONFIG = {
   //   (2) 電影的 link 不再帶 season。電影沒有季別概念（clean 階段刻意
   //       不提升 season），但 v49 的 fallback 會塞 season=1，造成
   //       「link 說 season=1、資源 season 欄位是 undefined」的矛盾。
-  WIDGET_VERSION: 50,
+  //
+  // bump 到 51：修掉「有些劇可以切季、有些不行」的主因 —— loadDetail
+  //   的回傳結構不符 Forward / REX 的官方 VideoItem 契約。
+  //   (3) ★ loadDetail 現在回傳 childItems（每季一個 child，該季的集數
+  //       在該 child 的 episodeItems）。這是官方契約對 TV 多季的規定：
+  //         return [{ id, type, mediaType, childItems: [
+  //           { id, title:"第1季", episodeItems: [...] } ] }]
+  //       舊做法把 S1/S2 的集數全平鋪在頂層 episodeItems、靠每筆的
+  //       season 欄位區分 —— 但 REX 的 VideoItemChild 契約根本沒有
+  //       season 欄位（@rexnow/libs 的 video.d.ts 只有 episode），
+  //       所以「靠 season 欄位分季」在 REX 端無效，季別下拉列也
+  //       沒有 childItems 這種「季的集合」可讀 → 切季看起來沒反應。
+  //       頂層 episodeItems 保留「當前季」的集數（單季客戶端相容，
+  //       舊行為不變），另加 seasonNumber / seasonIndex 欄位
+  //       （REX 原生 MediaItem / StreamSource 的欄位名）。
+  //   (4) search 區塊加上 cacheDuration: 0。REX 首頁搜尋走 search 區塊，
+  //       未設時 REX 用預設 86400（24 小時），季別變了也可能拿回舊快取。
+  WIDGET_VERSION: 51,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1461,7 +1478,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.4.4",
+  version: "3.4.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1717,6 +1734,22 @@ WidgetMetadata = {
   // REX 用 search 區塊作為首頁搜尋；對應到 loadResource 函式簽名。
   search: {
     title: "搜尋",
+    // ★ cacheDuration 必須是 0。
+    //
+    //   REX 首頁搜尋走的就是這個 search 區塊。未設此值時 REX 用預設
+    //   86400（24 小時）——實測 REX 儲存的 metadata 確認：
+    //     "search": { ..., "cacheDuration": 86400 }
+    //
+    //   問題：search 區塊的參數裡有 season / episode，但 REX 的模組層
+    //   快取鍵並不保證把季別算進去。使用者先搜「白粉飛」（S1）→
+    //   命中 24 小時快取 → 詳細頁切到 S2 時，若 REX 沿用這份快取，
+    //   拿回來的還是 S1 的清單 → 畫面看起來完全沒刷新。
+    //
+    //   模組內部已有精確到「片名+序號+年份+季+集」的快取
+    //   （vod_smart_..._s${season}_... / vod_batch_..._s${season}_...），
+    //   重複請求不會重打站台，不需要靠這一層快取。
+    //   與 modules 裡的 loadResource（cacheDuration: 0）保持一致。
+    cacheDuration: 0,
     functionName: "loadResource",
     params: [
       { name: "title", title: "關鍵字", type: "input", value: "" },
@@ -9383,45 +9416,6 @@ async function loadDetail(link) {
       return a.episode - b.episode;
     });
 
-    const episodeItems = sortedGroups.map((g) => {
-      const first = g.resources[0];
-      const epLink = buildDetailLink({
-        title,
-        season: g.season,         // 用資源自己的 season，跨季載入 metadata
-        episode: g.episode ?? undefined,
-        type,
-        id,
-      });
-      // 從第一個資源取首選線路當 episode 級入口播主源。
-      // REX 詳細頁若未另外呼叫 loadResource，可直接播這個 videoUrl。
-      // 若有呼叫 loadResource，videoUrl 仍保留，REX 可當 fallback。
-      const displayTitle = g.episode != null
-        ? `第${g.episode}集`
-        : (first?.description || '未命名');
-      return {
-        id: epLink,
-        type: 'url',
-        title: displayTitle,
-        mediaType: type,
-        description: first?.description || title,
-        season: g.season,         // 必須是資源歸屬季，客戶端用它過濾切換季別
-        episode: g.episode ?? undefined,
-        // 該集首選播放 URL；其他站的來源可透過 loadResource 重新取得。
-        videoUrl: first?.url,
-        link: epLink,
-        // 攜帶該集的所有備選線路，方便 REX 直接顯示多源而不需再呼叫 loadResource。
-        // 自訂頂層欄位，REX 不會認得但不會破壞既有 schema。
-        // 為避免 REX 客戶端報「未知欄位」警告，這裡放在 description 字串裡。
-        ...(g.resources.length > 1 ? {
-          customLines: g.resources.map(r => ({
-            name: r.name,
-            url: r.url,
-            description: r.description,
-          }))
-        } : {})
-      };
-    });
-
     // 主 VideoItem 的 season 標籤：採「當前請求的 season」。
     //
     // 重要：REX 客戶端的詳細頁切換季別時可能會用主 VideoItem.season
@@ -9441,16 +9435,158 @@ async function loadDetail(link) {
 
     const mainLink = buildDetailLink({ title, season: mainSeason, type, id });
 
+    // ★★★ 多季結構：childItems（季）→ 該季的 episodeItems（集）★★★
+    //
+    // 這是本次「有些劇可以切、有些不行」的主因。
+    //
+    // Forward / REX 的官方 VideoItem 契約（InchStudio/ForwardWidgets README）
+    // 對 TV 多季的規定是：
+    //
+    //   return [{
+    //     id: "tv.123", type: "tmdb", mediaType: "tv",
+    //     childItems: [{                        // ← 每個 child = 一季
+    //       id: "tv.123.s1", title: "第1季",
+    //       episodeItems: [{ id: "tv.123.s1e1", title: "第1集", videoUrl: "..." }]
+    //     }]
+    //   }]
+    //
+    // 也就是：**季在 childItems，集在該季 child 的 episodeItems**。
+    // 客戶端（Forward 與 REX 都是）看到 childItems 才知道「有幾季」，
+    // 季別下拉列的資料來源就是 childItems。
+    //
+    // 我們舊的做法是把 S1、S2 的集數「全部平鋪」在頂層 episodeItems，
+    // 靠每筆的 season 欄位去區分。這在只有一季時看起來沒問題，但：
+    //   1. 客戶端建立季別下拉列時，沒有 childItems 就沒有「季」的集合，
+    //      它只能把頂層 episodeItems 當成單一的一季 → 使用者切到 S2 時
+    //      顯示的還是同一份（已按 season 過濾或根本沒過濾的）清單。
+    //   2. REX 端的 season 欄位甚至不在 VideoItemChild 契約裡
+    //      （@rexnow/libs 的 VideoItemChild 只有 episode，沒有 season），
+    //      所以頂層 season 欄位在 REX 端**不會被解碼**——我們靠它分季
+    //      的機制在 REX 上是無效的。
+    //   3. 「有些劇可以、有些不行」正是這個結構差異造成的：
+    //      站方檔名帶季別（「仁醫 第2季 完結篇」）的劇，loadResource
+    //      在 S1 批次裡就混進了 S2 的資源，客戶端即使只有單一季也
+    //      「看起來能切」；檔名沒季別的劇就完全卡在 S1。
+    //
+    // 修法（同時維持舊相容）：
+    //   • 頂層 episodeItems：保留「當前季」的集數（單季時客戶端就用這個，
+    //     行為與舊版完全一致，不破壞既有功能）。
+    //   • childItems：每季一個 child，該季的集數放進該 child 的
+    //     episodeItems，並在 child 上帶 seasonNumber / seasonIndex /
+    //     season 三種欄位名（不同客戶端認的名字不同，全帶最保險）。
+    //   • 季別下拉列因此有真實資料，切季時客戶端會帶著新季別回來。
+    const groupsBySeason = new Map();
+    for (const g of sortedGroups) {
+      if (!groupsBySeason.has(g.season)) groupsBySeason.set(g.season, []);
+      groupsBySeason.get(g.season).push(g);
+    }
+
+    const childItems = Array.from(groupsBySeason.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([s, groups]) => {
+        const seasonEpisodes = groups.map((g) => {
+          const first = g.resources[0];
+          const epLink = buildDetailLink({
+            title,
+            season: g.season,
+            episode: g.episode ?? undefined,
+            type,
+            id,
+          });
+          const displayTitle = g.episode != null
+            ? `第${g.episode}集`
+            : (first?.description || '未命名');
+          return {
+            id: epLink,
+            type: 'url',
+            title: displayTitle,
+            mediaType: type,
+            description: first?.description || title,
+            season: g.season,
+            episode: g.episode ?? undefined,
+            videoUrl: first?.url,
+            link: epLink,
+            ...(g.resources.length > 1 ? {
+              customLines: g.resources.map(r => ({
+                name: r.name,
+                url: r.url,
+                description: r.description,
+              }))
+            } : {})
+          };
+        });
+
+        const childLink = buildDetailLink({ title, season: s, type, id });
+        return {
+          id: childLink,
+          type: 'url',
+          title: `第${s}季`,
+          mediaType: type,
+          description: `${title} 第${s}季（${seasonEpisodes.length} 集）`,
+          link: childLink,
+          // 三種季別欄位名都帶：不同客戶端 / 不同版本認的名字不同。
+          //   season       — Forward VideoItem 風格
+          //   seasonNumber — REX 原生 MediaItem / TMDB 風格
+          //   seasonIndex  — REX 原生 StreamSource 風格
+          season: s,
+          seasonNumber: s,
+          seasonIndex: s,
+          episodeItems: seasonEpisodes,
+        };
+      });
+
+    // 頂層 episodeItems = 當前季的集數（單季客戶端直接用；多季客戶端
+    // 會改讀 childItems）。保持與舊版一致的「單季」語意。
+    const currentSeasonGroups = groupsBySeason.get(mainSeason) || [];
+    const topEpisodeItems = currentSeasonGroups.map((g) => {
+      const first = g.resources[0];
+      const epLink = buildDetailLink({
+        title,
+        season: g.season,
+        episode: g.episode ?? undefined,
+        type,
+        id,
+      });
+      const displayTitle = g.episode != null
+        ? `第${g.episode}集`
+        : (first?.description || '未命名');
+      return {
+        id: epLink,
+        type: 'url',
+        title: displayTitle,
+        mediaType: type,
+        description: first?.description || title,
+        season: g.season,
+        episode: g.episode ?? undefined,
+        videoUrl: first?.url,
+        link: epLink,
+        ...(g.resources.length > 1 ? {
+          customLines: g.resources.map(r => ({
+            name: r.name,
+            url: r.url,
+            description: r.description,
+          }))
+        } : {})
+      };
+    });
+
     return {
       id: mainLink,
       type: 'url',
       title,
       mediaType: type,
-      description: type === 'movie' ? `電影：${title}` : `${title}（共 ${episodeItems.length} 集）`,
+      description: type === 'movie'
+        ? `電影：${title}`
+        : `${title}（共 ${topEpisodeItems.length} 集）`,
       link: mainLink,
       season: mainSeason,
+      seasonNumber: mainSeason,
+      seasonIndex: mainSeason,
       // 電影沒有 episodeItems；REX UI 會自動隱藏集數面板。
-      ...(type === 'tv' ? { episodeItems } : {}),
+      ...(type === 'tv' ? { episodeItems: topEpisodeItems } : {}),
+      // ★ 多季：childItems 是「季別下拉列」的資料來源。
+      //   每個 child = 一季，該季的集數在該 child 的 episodeItems。
+      ...(type === 'tv' && childItems.length > 0 ? { childItems } : {}),
     };
   } catch (e) {
     console.error('[loadDetail] 失敗:', e?.message || e);
