@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.3.9",
+  version: "3.4.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -9043,16 +9043,17 @@ async function loadDetail(link) {
     // ★ 多季合併（明確季優先）+ 以資源自帶季標分組。
     //
     //   明確切季（link 帶 season=N，例如白粉飛切 S2）時把 N 放第一個：
-    //   N 批次優先佔位，後續批次同 URL 去重會被擋掉 → REX 切到哪季，
-    //   哪季的真身一定在。
+    //   保證分組排序與 log 輸出都以當前季開頭；去重鍵帶季別後，
+    //   先後順序不再決定生死 —— 同 URL 在不同季各保留一條。
     //
     //   S1/S2 批次各自帶嚴格季過濾（loadResource 內部 filterBySequel），
     //   不依賴「某季含另一季」的偶然。白粉飛 S1 批次拿回的全是 season=1、
     //   S2 批次拿回的全是 season=2，REX 切季有真數據可切。
     //
     //   分組鍵用「資源自己的 season」（clean 階段從站方 _seasonFromItem 提升），
-    //   同 URL 在兩季都出現（同 CDN 被兩季引用）時先到先得 —— S1 和 S2
-    //   各有自己真身，去重只殺重複 URL，不殺季。
+    //   去重鍵同樣帶季別（s${season}||url）：同名季（白粉飛 S1/S2 站方
+    //   同名、同一查詢回同一批 URL）下兩季各保留一條，REX 切到哪季
+    //   都有東西可顯示；站方真有分季（不同 URL）時更不受影響。
     //
     //   補季規則：站方檔名沒季標（白粉飛/仁醫同名季、_seasonFromItem=null）
     //   的才 fallback 到批次季 s；有季標的保持原樣，避免把 S2 真身
