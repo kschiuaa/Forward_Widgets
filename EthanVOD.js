@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.3.6",
+  version: "3.3.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -9053,7 +9053,21 @@ async function loadDetail(link) {
     //
     // cacheKey 在 loadResource 內部帶 _s${season}，S1/S2 各有獨立 cache，
     // 兩次呼叫分別命中各自的快取，不會重打站台。
-    const seasonsToFetch = [1, 2];
+    //
+    // ★ 切季殘留修正（只動這一塊，不碰搜尋/過濾/cache）：
+    //   1. 明確切季（link 帶 season=N）時把 N 放進請求隊列。
+    //      原寫死 [1,2]，切到 S3+ 永遠拿不到 S3，REX 找不到 season==N
+    //      就只能顯示舊季。本改動讓 S3+ 也能載入；N=1/2 時去重後
+    //      等同原 [1,2]，行為不變。
+    //   2. 去重以「先跑的批次優先」：S2 批次經 filterBySequel 過濾較純，
+    //      S1 批次不過濾（targetSeason<=1 原樣返回）混有 S2 條目且會被
+    //      clean 誤標 season=1。同 URL 兩季都出現時，必須讓較純的
+    //      S2 結果先佔位，否則 S2 真身被誤標為 S1 殺掉，分組就只剩舊季。
+    //      URL 不重疊時順序無影響（動漫/正常劇集行為不變）。
+    const explicitSeason = meta.season ?? null;
+    const seasonsToFetch = explicitSeason != null
+      ? [...new Set([explicitSeason, 1, 2])]
+      : [2, 1];
     const seenUrl = new Set();
     let allResults = [];
     for (const s of seasonsToFetch) {
