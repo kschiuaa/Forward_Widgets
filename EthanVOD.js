@@ -1153,7 +1153,7 @@ const CONFIG = {
   //   問題從設定層消失，但舊 cache 內可能還存著「上一次設定為 2 時
   //   抓到的 AGE 結果」—— 直接讀出來仍會看到 AGE。bump 版本強迫
   //   syncWidgetVersion 清掉全部 cache，下次搜會依新設定只查金牌。
-  WIDGET_VERSION: 46,
+  WIDGET_VERSION: 47,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.3.8",
+  version: "3.3.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -9010,16 +9010,22 @@ async function loadDetail(link) {
     if (!meta) return null;
 
     const title = meta.title;
-    // 季別處理策略（嚴格季隔離）：
+    // 季別處理策略（多季合併 + 標籤隔離）：
     //
-    //   只抓當前請求的季。初次載入（link 不帶 season）→ season 推斷/
-    //   默認為 1，只抓 S1；切季時 REX 用新 link（season=N）重新呼叫
-    //   loadDetail，到時再抓第 N 季。各季 cache key 獨立，切回舊季
-    //   命中快取，不重打站台。
+    //   一次抓回多季（明確切季時把 N 放最前），原因：
+    //   REX 切季時不保證用新 season link 重調 loadDetail —— 可能是本地
+    //   按 season 過濾已有的 episodeItems，也可能是拿舊 link 重調。
+    //   兩種模式都要求「一次回應帶齊多季」：
+    //     - 「仁醫」能切是偶然：S1 批次裡本來就混著「仁醫完結篇」這類
+    //       S2 命名的條目（_seasonFromItem=2），REX 手上有兩季可切。
+    //     - 「白粉飛」兩季站方同名，S1 批次全被標成 S1，REX 手上沒有
+    //       S2 episodeItems，切季就只能繼續顯示 S1（就是這次回報的現象）。
+    //   所以嚴格單季隔離在 loadDetail 這層行不通，必須合併。
     //
-    //   不合併多季：合併會讓 S1 的未過濾結果混進 S2 視圖，同 URL 去重
-    //   還會誤殺 S2 真身 → 切季殘留舊列表。單季請求保證搜 S1 只出 S1、
-    //   搜 S2 只出 S2。
+    //   「搜 S1 只出 S1」的純度改由標籤保證：每個資源的 season 取自它
+    //   自己的站方季標（_seasonFromItem），不是批次季；REX 顯示 S1 時
+    //   只拿 season=1 的 items。而 loadResource（播放源/模擬器入口）
+    //   本身仍是單季嚴格過濾，S2 只出 S2（模擬器 log 已驗證）。
     let season = meta.season;
     if (season == null) {
       // 沒帶 season 時先從標題推斷（「仁醫完結篇」「仁醫第二季」之類），
@@ -9034,25 +9040,36 @@ async function loadDetail(link) {
 
     console.log(`📡 [loadDetail] link="${link}" → title="${title}" season=${season} episode=${episode ?? '-'} type=${type}`);
 
-    // ★ 嚴格季隔離（只抓當前請求的季，不合併其他季）：
+    // ★ 多季合併（明確季優先）+ 以資源自帶季標分組。
     //
-    //   需求：搜 S1 只出 S1，搜 S2 只出 S2。之前「合併 S1+S2」會讓
-    //   S1 的未過濾結果（含 S2 條目、誤標 season=1）混進 S2 視圖，
-    //   同 URL 去重還會把 S2 真身殺掉 → 切季看起來沒變。
-    //   改為單季請求後，分組只會有當前季，REX 按 season 過濾不會殘留舊季。
+    //   明確切季（link 帶 season=N，例如白粉飛切 S2）時把 N 放第一個：
+    //   N 批次優先佔位，後續批次同 URL 去重會被擋掉 → REX 切到哪季，
+    //   哪季的真身一定在。
     //
-    //   初次載入（link 不帶 season）：season 已在上方推斷/默認為 1，
-    //   只抓 S1。使用者切季時 REX 會用新 link（season=N）重新呼叫
-    //   loadDetail，到時再抓 N 即可；各季 cache key 獨立（_s${season}），
-    //   切回舊季直接命中快取，不會重打站台。
+    //   S1/S2 批次各自帶嚴格季過濾（loadResource 內部 filterBySequel），
+    //   不依賴「某季含另一季」的偶然。白粉飛 S1 批次拿回的全是 season=1、
+    //   S2 批次拿回的全是 season=2，REX 切季有真數據可切。
     //
-    //   不影響其他功能：loadResource 的搜尋/過濾/cache 照舊，
-    //   只是這裡不再發第二次跨季請求。
-    const seasonsToFetch = [season];
-    const seenUrl = new Set();
+    //   分組鍵用「資源自己的 season」（clean 階段從站方 _seasonFromItem 提升），
+    //   同 URL 在兩季都出現（同 CDN 被兩季引用）時先到先得 —— S1 和 S2
+    //   各有自己真身，去重只殺重複 URL，不殺季。
+    //
+    //   補季規則：站方檔名沒季標（白粉飛/仁醫同名季、_seasonFromItem=null）
+    //   的才 fallback 到批次季 s；有季標的保持原樣，避免把 S2 真身
+    //   誤歸到 S1 批次裡。
+    //
+    //   各季 cache key 獨立（loadResource 內部 _s${season}），切回舊季
+    //   命中快取，不重打站台。
+    const explicitSeason = meta.season ?? null;
+    const seasonsToFetch = explicitSeason != null
+      ? [...new Set([explicitSeason, 1, 2])]
+      : [1, 2, 3];
+    const seenKey = new Set();
     let allResults = [];
-    for (const s of seasonsToFetch) {
-      const batchResults = await loadResource({
+    // ★ 併發抓多季：三個 loadResource 各自走獨立 cache key（_s${s}），
+    //   無共享狀態，併發安全。總時間 = max(各季) 而非 sum。
+    const batchArrays = await Promise.all(
+      seasonsToFetch.map((s) => loadResource({
         seriesName: title,
         title,
         type,
@@ -9071,21 +9088,29 @@ async function loadDetail(link) {
         // 簽名型 adapter 站是否繞開過濾廣告伺服器。漏了這行會讓「相關作品」
         // 走預設 'skip'，使用者設成 'filter' 也不生效。
         m3u8FilterAdapterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterAdapterMode') || {}).value || 'skip',
-      });
-      for (const r of batchResults || []) {
-        // 跨季去重：以 URL 為主鍵。同一 URL 出現在多季可能是因為多站
-        // 都引用了同個 CDN 資源（例如「仁醫」「仁醫完結篇」會被不同
-        // 站歸到不同季，但 URL 是同一個）。
-        if (!r.url || seenUrl.has(r.url)) continue;
-        seenUrl.add(r.url);
-        // 補上 season：S1 結果中很多資源 _seasonFromItem=null（站方檔名
-        // 沒寫「第N季」），cleanResourceForOutput 不會設置 season 頂層字段。
-        // 分組時若沒 season 會 fallback 到外層 season，可能把 S1 資源
-        // 誤歸到 S2（在 season=2 載入時）。呼叫端已知是查詢哪一季，
-        // 直接補上保證分組正確。
+      }))
+    );
+    for (let bi = 0; bi < seasonsToFetch.length; bi++) {
+      const s = seasonsToFetch[bi];
+      const batchResults = batchArrays[bi] || [];
+      for (const r of batchResults) {
+        if (!r.url) continue;
+        // 補季先行：站方檔名沒季標（白粉飛/仁醫同名季、_seasonFromItem=null）
+        // 的才 fallback 到批次季 s；有季標的保持原樣，避免把 S2 真身
+        // 誤歸到 S1 批次裡。
         if (r.season == null) r.season = s;
+        // ★ 去重鍵必須帶季別：同名季（白粉飛 S1/S2 站方同名、同一查詢
+        //   回同一批 URL）用裸 URL 去重會把後到的整季殺掉 —— 初始載入
+        //   [1,2,3] 時 S1 先佔位，S2 同 URL 全被跳過，REX 手上永遠只有
+        //   S1，切季看起來完全沒變（就是這次回報的現象）。
+        //   同 URL 在不同季各保留一條：REX 切到哪季都有東西可顯示；
+        //   站方真有分季（不同 URL）時更不受影響。
+        const dkey = `s${r.season}||${r.url}`;
+        if (seenKey.has(dkey)) continue;
+        seenKey.add(dkey);
         allResults.push(r);
       }
+      console.log(`📡 [loadDetail] 季 S${s}: ${batchResults.length} 條（去重後累計 ${allResults.length}）`);
     }
     const results = allResults;
 
