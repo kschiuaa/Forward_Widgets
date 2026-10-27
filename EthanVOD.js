@@ -1153,7 +1153,23 @@ const CONFIG = {
   //   問題從設定層消失，但舊 cache 內可能還存著「上一次設定為 2 時
   //   抓到的 AGE 結果」—— 直接讀出來仍會看到 AGE。bump 版本強迫
   //   syncWidgetVersion 清掉全部 cache，下次搜會依新設定只查金牌。
-  WIDGET_VERSION: 47,
+  // bump 到 48：修正 REX 詳細頁「切季不換內容」。
+  //   REX 切季不是靠 loadDetail，而是走 stream 模組重新呼叫
+  //   loadResource（REX 客戶端二進位的 stage=resources.route
+  //   stream=%{bool}d season=%ld episode=%ld 明確記錄了這條路徑）。
+  //   兩根因：
+  //   (1) 「未指定季別」原本用 `params.season == null` 判斷，但 REX 的
+  //       參數型別是 season?: string，未選季時傳的是**空字串**而非省略
+  //       欄位。空字串對 == null 而言是「已指定」→ link 裡的 season=2
+  //       被忽略 → 整批結果退回 S1。實測：同一組參數在修正前回 S1 的
+  //       31 筆，修正後回 S2 第 3 集（4 筆，season=2）。
+  //   (2) type 只認 params.type，但 REX 二進位裡 mediaType 與 type
+  //       兩種寫法並存，只認 type 會讓某些呼叫點的 type 落到預設 'tv'
+  //       （電影被當影集搜，結果是空）。
+  //   兩者都屬「輸入解析」層修正，不改變任何輸出內容，cache 內容格式
+  //   也不變 —— 但舊 cache 內的 S1 結果正是 bug 症狀，bump 版本讓
+  //   syncWidgetVersion 清掉重搜。
+  WIDGET_VERSION: 48,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1406,7 +1422,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.4.1",
+  version: "3.4.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6523,18 +6539,50 @@ async function loadResource(params, onStreamResult = null) {
   // 原因：loadDetail 內部呼叫 loadResource 時，link 跟 season 都是同步
   // 設定的；link 解析出來的只是備援。REX 直接呼叫 loadResource 時，
   // 季別多半是從 link 拿（因為 REX 呼叫 loadResource 不一定會帶 season）。
+  //
+  // ★ 「未指定」不能只用 == null 判斷。
+  //
+  // REX 的參數型別是 season?: string / episode?: string（見 REX 規範
+  // BaseParams），而 REX 在「使用者還沒選季別 / 沒選集數」時會傳**空字串**
+  // 而不是省略欄位。空字串對 == null 判斷而言是「已指定」→ link 解析出來
+  // 的季別被忽略 → 整批結果退回 S1。
+  //
+  // 實測（REX 只帶 link 的呼叫形狀）：
+  //   link=search:白粉飛?season=2&episode=3, season='', episode=''
+  //   → 舊邏輯回 S1 的 31 筆（season=1），使用者切到 S2 卻看到第一季。
+  //   改成「空字串視為未指定」後，同一組參數回 S2 第 3 集（4 筆，season=2）。
+  //
+  // 判斷用「去空白後是否為空」：null / undefined / '' / '  ' 都算未指定。
+  const _isUnset = (v) => v == null || (typeof v === 'string' && v.trim() === '');
   if (params?.link && typeof params.link === 'string' && params.link.startsWith(DETAIL_LINK_PREFIX)) {
     const meta = parseDetailLink(params.link);
     if (meta) {
-      if (params.season == null && meta.season != null) params.season = meta.season;
-      if (params.episode == null && meta.episode != null) params.episode = meta.episode;
-      if ((params.type == null || params.type === 'tv') && meta.type === 'movie') params.type = meta.type;
+      if (_isUnset(params.season) && meta.season != null) params.season = meta.season;
+      if (_isUnset(params.episode) && meta.episode != null) params.episode = meta.episode;
+      // type 的判定要和下面 mediaType 的後備邏輯一致：params.type 未指定
+      // （空字串也算未指定）且 mediaType 也沒給 movie 時，link 的 movie 才採用。
+      const _curType = _isUnset(params.type) ? params.mediaType : params.type;
+      if ((_isUnset(_curType) || _curType === 'tv') && meta.type === 'movie') params.type = meta.type;
       if (!params.id && meta.id) params.id = meta.id;
     }
   }
 
+  // ★ type 的後備來源是 mediaType。
+  //
+  // REX 規範的 BaseParams 定義的是 `type: 'tv' | 'movie'`，但 REX 客戶端
+  // 二進位裡同時存在 `mediaType`（34 次）與 `type`（41 次）兩種寫法，
+  // 而 VideoItem 的輸出欄位又叫 mediaType。REX 在不同呼叫點可能給其中
+  // 一個。只認 `type` 會讓某些路徑的 type 落到預設 'tv'（電影被當影集
+  // 搜，結果是空）。
+  //
+  // 取值優先序：params.type > params.mediaType > 'tv'。
+  // 兩者皆為合法值（tv/movie）才採用；其他值（variety 等內部值）不覆蓋。
+  // ★ 用 _isUnset 判斷而非 ??：REX 未指定時傳的是空字串，?? 不會 fallback。
+  const _rawType = _isUnset(params.type) ? params.mediaType : params.type;
+  const _resolvedType = (_rawType === 'tv' || _rawType === 'movie') ? _rawType : 'tv';
+
   const {
-    type = 'tv',
+    type = _resolvedType,
     season,
     episode,
     multiSource,
