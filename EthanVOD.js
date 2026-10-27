@@ -1406,7 +1406,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.3.7",
+  version: "3.3.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -9010,25 +9010,16 @@ async function loadDetail(link) {
     if (!meta) return null;
 
     const title = meta.title;
-    // 季別處理策略：
+    // 季別處理策略（嚴格季隔離）：
     //
-    // 場景 A — 初次載入詳細頁：link 不帶 season 參數 → season=null。
-    //   必須拿「所有季」的結果，REX 客戶端才能從 episodeItems 中
-    //   提取唯一 season 值列表顯示「季下拉」，使用者切換 S1↔S2 時
-    //   UI 才能即時對應到正確的 episodeItems。
+    //   只抓當前請求的季。初次載入（link 不帶 season）→ season 推斷/
+    //   默認為 1，只抓 S1；切季時 REX 用新 link（season=N）重新呼叫
+    //   loadDetail，到時再抓第 N 季。各季 cache key 獨立，切回舊季
+    //   命中快取，不重打站台。
     //
-    //   實作上呼叫兩次 loadResource（S=1, S=2 各自一次）合併結果。
-    //   為什麼不一次呼叫帶 season=null：loadResource 內部 cacheKey 帶
-    //   season，null 會命中 S1 的 cache key（S1 路徑），S2 結果就被忽略。
-    //   為什麼不只依賴 S1 + 從用戶點選的季再請求：使用者若從未點過 S2，
-    //   S2 episodeItems 永遠空，切換就沒反應。
-    //
-    // 場景 B — 切換季別時：link 帶 season=2 → 直接拿 S2 結果。
-    //   但我們仍把 S1 結果也合併進來，避免 S1 切到 S2 後 REX 客戶端
-    //   內部 state 把 S1 episodeItems 清空（只剩 S2），再次切回 S1 又得
-    //   重新發一次 loadDetail。
-    //
-    // 簡化為「任何場景都合併所有已知季別」即可滿足 REX UI 需求。
+    //   不合併多季：合併會讓 S1 的未過濾結果混進 S2 視圖，同 URL 去重
+    //   還會誤殺 S2 真身 → 切季殘留舊列表。單季請求保證搜 S1 只出 S1、
+    //   搜 S2 只出 S2。
     let season = meta.season;
     if (season == null) {
       // 沒帶 season 時先從標題推斷（「仁醫完結篇」「仁醫第二季」之類），
@@ -9043,31 +9034,21 @@ async function loadDetail(link) {
 
     console.log(`📡 [loadDetail] link="${link}" → title="${title}" season=${season} episode=${episode ?? '-'} type=${type}`);
 
-    // 合併多季結果：S1 + S2 各自一次。
+    // ★ 嚴格季隔離（只抓當前請求的季，不合併其他季）：
     //
-    // 為什麼是 2 次而不是全部可能季別：實務上 VOD 站對「仁醫」這類
-    // 跨多季作品的搜尋，前三站通常就能 cover S1 + S2 結果，S3+ 極少見
-    // 且命中率低（不同關鍵字不同 id）；況且 S3+ 大多需要用戶主動指定
-    // 季別才合理。第一次載入時先收 S1+S2，使用者點 S3 觸發的切換
-    // 會重新走場景 B（link 帶 season=3）拿到 S3 episodeItems。
+    //   需求：搜 S1 只出 S1，搜 S2 只出 S2。之前「合併 S1+S2」會讓
+    //   S1 的未過濾結果（含 S2 條目、誤標 season=1）混進 S2 視圖，
+    //   同 URL 去重還會把 S2 真身殺掉 → 切季看起來沒變。
+    //   改為單季請求後，分組只會有當前季，REX 按 season 過濾不會殘留舊季。
     //
-    // cacheKey 在 loadResource 內部帶 _s${season}，S1/S2 各有獨立 cache，
-    // 兩次呼叫分別命中各自的快取，不會重打站台。
+    //   初次載入（link 不帶 season）：season 已在上方推斷/默認為 1，
+    //   只抓 S1。使用者切季時 REX 會用新 link（season=N）重新呼叫
+    //   loadDetail，到時再抓 N 即可；各季 cache key 獨立（_s${season}），
+    //   切回舊季直接命中快取，不會重打站台。
     //
-    // ★ 切季殘留修正（只動這一塊，不碰搜尋/過濾/cache）：
-    //   1. 明確切季（link 帶 season=N）時把 N 放進請求隊列。
-    //      原寫死 [1,2]，切到 S3+ 永遠拿不到 S3，REX 找不到 season==N
-    //      就只能顯示舊季。本改動讓 S3+ 也能載入；N=1/2 時去重後
-    //      等同原 [1,2]，行為不變。
-    //   2. 去重以「先跑的批次優先」：S2 批次經 filterBySequel 過濾較純，
-    //      S1 批次不過濾（targetSeason<=1 原樣返回）混有 S2 條目且會被
-    //      clean 誤標 season=1。同 URL 兩季都出現時，必須讓較純的
-    //      S2 結果先佔位，否則 S2 真身被誤標為 S1 殺掉，分組就只剩舊季。
-    //      URL 不重疊時順序無影響（動漫/正常劇集行為不變）。
-    const explicitSeason = meta.season ?? null;
-    const seasonsToFetch = explicitSeason != null
-      ? [...new Set([explicitSeason, 1, 2])]
-      : [2, 1];
+    //   不影響其他功能：loadResource 的搜尋/過濾/cache 照舊，
+    //   只是這裡不再發第二次跨季請求。
+    const seasonsToFetch = [season];
     const seenUrl = new Set();
     let allResults = [];
     for (const s of seasonsToFetch) {
