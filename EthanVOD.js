@@ -1497,7 +1497,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.4.5",
+  version: "3.5.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4915,7 +4915,33 @@ async function syncWidgetVersion() {
   }
 }
 
-loadRejectingTypeSites(); // 不需要 await：這只是 warm-up storage，第一個實際搜尋會等它完成
+// ★ 一次性初始化（純加速，輸出不變）。
+//
+// loadResource 每次呼叫都在這裡串行等四個 storage 初始化：
+//   syncWidgetVersion → loadRejectingTypeSites →
+//   _preloadTmdbAliasCacheFromStorage → _purgeStaleTmdbAliasCache
+// 四個都是冪等操作（版本對齊只清一次、Set 載入去重、preload 跳過
+// 已載入/stale、purge 跑第二次就找不到東西），且都與本次搜尋參數無關。
+// 換集/切季每次重跑等於每次多付 4 次 storage 往返 + 2 次全量 keys 掃描。
+// 改成模組級 promise 只跑一次，後續呼叫直接複用已完成的結果。
+// 併發安全：loadDetail 同時開 3 個 loadResource 時共用同一個 promise，
+// 原本三路各自清 cache / 掃 keys 還可能互相競速，現在只跑一次。
+let _INIT_PROMISE = null;
+function ensureInitOnce() {
+  if (!_INIT_PROMISE) {
+    // 內層四個函式各自 try/catch（storage 不可用也不拋），這裡再加 catch
+    // 保底：任何意外都不讓初始化異常中斷搜尋（與改前行為一致）。
+    _INIT_PROMISE = (async () => {
+      await syncWidgetVersion();
+      await loadRejectingTypeSites();
+      await _preloadTmdbAliasCacheFromStorage();
+      await _purgeStaleTmdbAliasCache();
+    })().catch(() => {});
+  }
+  return _INIT_PROMISE;
+}
+
+ensureInitOnce(); // 不需要 await：warm-up，第一次實際搜尋會等它完成（原 loadRejectingTypeSites warm-up 的超集）
 
 const API_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
@@ -7018,22 +7044,10 @@ async function loadResource(params, onStreamResult = null) {
   // 與 TTL 計算錯誤也會殘留。
   //
   // 實作：把當前版本寫進 storage，第一次載入會對齊；版本不同就清掉全部 cache。
-  await syncWidgetVersion();
-
-  // 確保「拒絕 type 參數」的站台清單從 storage 載入完再開始搜尋，
-  // 否則 SITES_REJECTING_TYPE_PARAM 在第一次呼叫時是空的，
-  // 要等到該站搜失敗才知道它不收 type，白白浪費一次請求。
-  await loadRejectingTypeSites();
-
-  // v2.9.2：啟動時預載 storage 內已有 CN 簡體別名的 TMDB cache 到 in-memory
-  // 避免 cold caller 等 200ms storage 讀 + 6s race TMDB 慢回
-  await _preloadTmdbAliasCacheFromStorage();
-
-  // v2.9.2：清掉 v2.8.15 早寫入但 IIFE 沒覆蓋完成的 stale entry
-  // （只有 baseName + hit 內欄位，無 CN 簡體）— 否則 cold caller 拿 stale
-  // 進 tryExpand → 無 bestAlias → fallback。v2.9.2+ cold caller 會被
-  // quality check 識別為 stale 重新 fetch，但主動清更快且省一次 TMDB 打。
-  await _purgeStaleTmdbAliasCache();
+  // ★ 一次性初始化：見 syncWidgetVersion 下方的 ensureInitOnce。
+  // loadResource 每次換集都重跑 sync / preload / purge 四件事，
+  // 全是冪等且與參數無關的初始化 → 只跑一次，後續直接沿用。
+  await ensureInitOnce();
 
   // 記錄 Forward 實際帶進來的片名相關欄位。
   // 詳細頁切換作品時，Forward 不一定會更新所有欄位，需要實際觀察才知道
@@ -9078,11 +9092,22 @@ targetInfo.searchQuery = aliasQ;
   }
 
   let finalResults = allResults;
+  // ★ 集數過濾短路（純加速，輸出逐字不變）。
+  // 原邏輯是寬鬆版（保留未知集數 label===null，下游 loadResource 會再跑
+  // 嚴格版 filterByEpisode 收斂），且寫 cache 發生在這裡之後 —— 改成
+  // 嚴格版會改變 cache 內容，不可取。這裡只跳過「註定無操作」的那次：
+  // 當所有條目的 label 已是目標集或未知時，filter 結果與輸入逐字相同。
   if (type === 'tv' && targetEpisode) {
-    finalResults = allResults.filter(res => {
+    const needFilter = allResults.some(res => {
       const label = episodeLabelOf(res);
-      return label === null || label === targetEpisode;
+      return label !== null && label !== targetEpisode;
     });
+    if (needFilter) {
+      finalResults = allResults.filter(res => {
+        const label = episodeLabelOf(res);
+        return label === null || label === targetEpisode;
+      });
+    }
   }
 
   // 版本過濾，理由與串流模式相同。
@@ -9475,6 +9500,17 @@ async function loadDetail(link) {
     //   修法：內層一律 episode=null，且 link 重建成「不帶 episode」
     //   的季連結，避免 loadResource 頂部的 link 解析又把 episode
     //   從 link 補回來（_isUnset(null)=true 會被 link 覆寫）。
+    //
+    // ★ TMDB 別名預熱（純加速，輸出不變）。
+    //   三路內層 loadResource 都會對同一 (title, type) 跑
+    //   tryExpandWithTMDBAliases，底層 getTMDBAliasesBlocking 已有
+    //   in-flight 去重所以 TMDB 只打一次，但三路仍會各做一次 storage
+    //   讀 + 各自 race 等待。先在這裡暖一次 Alias cache，內層大概率
+    //   直接走 in-memory 命中（<1ms），算出的別名逐字相同。
+    //   上限只給 2.5s（= TMDB 單次 REQUEST_TIMEOUT）：預熱只是盡力而為，
+    //   超時就放行，內層照舊走自己的 expand + in-flight 共用邏輯，
+    //   行為與改前完全一致（不會出現「預熱等 6s、內層又等 6s」的疊加）。
+    try { await getTMDBAliasesBlocking(title, type, 2500); } catch {}
     const batchArrays = await Promise.all(
       seasonsToFetch.map((s) => loadResource({
         seriesName: title,
