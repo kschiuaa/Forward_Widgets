@@ -3534,6 +3534,18 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           //   使用者看到「這集搜不到」。見 _macEpNumber 註解。
           const episodeNumber = _macEpNumber(epName);
 
+          // ★ 綜藝型集名的判斷依據（「第N期」）。
+          //
+          //   這裡必須重新宣告 epMatch：改成 _macEpNumber 後原本的
+          //   `const epMatch = epName.match(/第(\d+)(集|期)/)` 已被移除，
+          //   但下面的 _isVariety 仍在讀 epMatch —— 參照未宣告的變數會拋
+          //   ReferenceError，而呼叫端 _adapterPool 的 `catch {}` 會把它
+          //   靜默吞成 null，症狀是「每個 MacCMS 站都回 0 筆、日誌無任何錯誤」。
+          //   （實機日誌：抓到 8 條播放網址，最終結果 0 筆。）
+          // ★ 群組編號刻意維持與原版一致：第 1 組是數字、第 2 組是
+          //   「集/期」—— 下方 _isVariary 的 epMatch?.[2] === '期' 依賴它。
+          const epMatch = epName.match(/第(\d+)\s*(集|期)/);
+
           const resolutionInfo = extractResolutionInfo(vod_name, epName);
 
           const dateMatch = epName.match(/(\d{4}年\d{1,2}月\d{1,2}日|\d{4}\.\d{1,2}\.\d{1,2}|\d{4}\d{2}\d{2})/);
@@ -7298,8 +7310,22 @@ targetInfo.searchQuery = aliasQ;
   //   buildSearchQuery，type/season 來自同一份 params），
   //   所以沿用上游結果不會改變任何搜尋行為，只是省掉重複的 TMDB 呼叫。
   //   沒有 _preSearchQuery 時（獨立呼叫 performBatchSearch）行為不變。
+  //
+  // ★ seriesName 必須用「本地補過的值」，不能只靠 ...params。
+  //
+  //   切集 / 自動連播下一集時，Forward 有時只帶 link
+  //   （search:<標題>?season=N&episode=M）而不帶 seriesName。
+  //   上面已從 link 解析出標題補進本地 seriesName 變數，但沒有寫回
+  //   params —— 下游 performBatchSearch / performSmartSearch 讀的是
+  //   params.seriesName，拿到 undefined 會讓搜尋查空字串 → 0 筆。
+  //
+  //   實測日誌（只帶 link 的呼叫形狀）：
+  //     🔍 启动批量搜索: undefined
+  //     📊 批量搜索完成: 921ms, 结果: 0
+  //   症狀正是使用者回報的「播放時選擇下一集都找不到下一集」。
   const _searchParams = {
     ...params,
+    seriesName,
     _preSearchQuery: targetInfo.searchQuery,
   };
 
