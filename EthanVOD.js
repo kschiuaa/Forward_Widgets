@@ -1497,7 +1497,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.5.0",
+  version: "3.5.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6044,15 +6044,23 @@ class SmartSearchExecutor {
     const uniqueResults = [];
     const urlMap = new Map();
     const contentMap = new Map();
-    
-    results.sort((a, b) => calculateResourceScore(b) - calculateResourceScore(a));
+
+    // 純查表：calculateResourceScore 只讀 resource 欄位 + CONFIG，不寫任何狀態，
+    // 同一物件在同一次調用內結果恆定；Map 以物件身份為 key，作用域僅限本次調用。
+    const scoreCache = new Map();
+    const scoreOf = (r) => {
+      if (!scoreCache.has(r)) scoreCache.set(r, calculateResourceScore(r));
+      return scoreCache.get(r);
+    };
+
+    results.sort((a, b) => scoreOf(b) - scoreOf(a));
     
     for (const resource of results) {
       const url = resource.url;
       
       if (urlMap.has(url)) {
         const existing = urlMap.get(url);
-        if (calculateResourceScore(resource) > calculateResourceScore(existing)) {
+        if (scoreOf(resource) > scoreOf(existing)) {
           const index = uniqueResults.indexOf(existing);
           if (index > -1) {
             uniqueResults.splice(index, 1);
@@ -6071,7 +6079,7 @@ class SmartSearchExecutor {
         if (existingKey === contentKey) {
           isDuplicate = true;
           
-          if (calculateResourceScore(resource) > calculateResourceScore(existingResource)) {
+          if (scoreOf(resource) > scoreOf(existingResource)) {
             const index = uniqueResults.indexOf(existingResource);
             if (index > -1) {
               uniqueResults.splice(index, 1);
@@ -7833,7 +7841,14 @@ function filterBySequel(results, targetInfo) {
   };
 
   // 命中群：明確標為第 targetSeason 季的候選，用它們的年份決定 pooledYearMin。
-  const sequelMatched = results.filter(res => extractSequelNumber(nameOf(res)) === targetSeason);
+  // 純查表：extractSequelNumber 只讀傳入字串、無副作用；filterBySequel 內不改
+  // _rawName/description，同一 res 的結果恆定；Map 以物件身份為 key。
+  const sequelCache = new Map();
+  const sequelOf = (res) => {
+    if (!sequelCache.has(res)) sequelCache.set(res, extractSequelNumber(nameOf(res)));
+    return sequelCache.get(res);
+  };
+  const sequelMatched = results.filter(res => sequelOf(res) === targetSeason);
   const yearsOfMatched = sequelMatched.map(yearOf).filter(Boolean);
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
@@ -7842,7 +7857,7 @@ function filterBySequel(results, targetInfo) {
   const unversionedBases = new Map();
   for (const res of results) {
     const rawName = nameOf(res);
-    if (extractSequelNumber(rawName) === targetSeason) continue;
+    if (sequelOf(res) === targetSeason) continue;
     const candYear = yearOf(res);
     if (candYear) continue;
     const base = (res._baseName || rawName.replace(/第[0-9一二三四五六七八九十百零〇]+[集話話回]/g, '').replace(/第[0-9]+季|Season\s*[0-9]+/gi, '')).trim();
@@ -7854,7 +7869,7 @@ function filterBySequel(results, targetInfo) {
   const dropped = [];
   for (const res of results) {
     const rawName = nameOf(res);
-    const sequel = extractSequelNumber(rawName);
+    const sequel = sequelOf(res);
 
     // 規則 0（最高優先）：sub-series marker 先 drop，**即使 sequel===targetSeason 也要 drop**。
     //
