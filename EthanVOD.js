@@ -1497,7 +1497,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.4.7",
+  version: "3.4.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -9642,6 +9642,10 @@ async function loadDetail(link) {
             type,
             id,
           });
+          // ★ 方案A（加欄位不改值）：title 保持「第N集」原樣。
+          //   Forward / REX 可能用 title 正則抓集數，改成 S2E1 會抓不到；
+          //   episode 數字欄位本來就是對的，不動顯示字串最安全。
+          //   季別區分度改由下方新增的結構欄位提供。
           const displayTitle = g.episode != null
             ? `第${g.episode}集`
             : (first?.description || '未命名');
@@ -9652,6 +9656,12 @@ async function loadDetail(link) {
             mediaType: type,
             description: first?.description || title,
             season: g.season,
+            // ★ 方案A新增：episodeItems 補齊三種季別欄位名。
+            //   純新增（舊欄位一個不動）：child 已有三種寫法，episode 只有
+            //   season；不同客戶端認的名字不同，全帶最保險。
+            //   未知欄位在 Swift / REX 解碼時會被忽略，不影響舊客戶端。
+            seasonNumber: g.season,
+            seasonIndex: g.season,
             episode: g.episode ?? undefined,
             videoUrl: first?.url,
             link: epLink,
@@ -9660,6 +9670,13 @@ async function loadDetail(link) {
                 name: r.name,
                 url: r.url,
                 description: r.description,
+                // ★ 方案A新增：customLines 補季/集/年結構欄位。
+                //   純新增：name / url / description 原樣保留，一個字不改；
+                //   REX 若按 episode 配對舊資料，可用這三個欄位區分 S1E1/S2E1。
+                //   StreamSourceItem 契約外欄位會被忽略，不影響解碼。
+                season: r.season ?? g.season,
+                episode: r.episode ?? g.episode,
+                ...(r.year != null ? { year: r.year } : {}),
               }))
             } : {})
           };
@@ -9696,6 +9713,7 @@ async function loadDetail(link) {
         type,
         id,
       });
+      // ★ 方案A（加欄位不改值）：title 保持「第N集」原樣，理由同 childItems。
       const displayTitle = g.episode != null
         ? `第${g.episode}集`
         : (first?.description || '未命名');
@@ -9706,6 +9724,9 @@ async function loadDetail(link) {
         mediaType: type,
         description: first?.description || title,
         season: g.season,
+        // ★ 方案A新增：頂層 episodeItems 同樣補齊三種季別欄位名。
+        seasonNumber: g.season,
+        seasonIndex: g.season,
         episode: g.episode ?? undefined,
         videoUrl: first?.url,
         link: epLink,
@@ -9714,6 +9735,10 @@ async function loadDetail(link) {
             name: r.name,
             url: r.url,
             description: r.description,
+            // ★ 方案A新增：同 childItems，補季/集/年結構欄位。
+            season: r.season ?? g.season,
+            episode: r.episode ?? g.episode,
+            ...(r.year != null ? { year: r.year } : {}),
           }))
         } : {})
       };
