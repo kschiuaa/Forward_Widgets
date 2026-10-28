@@ -1225,7 +1225,26 @@ const CONFIG = {
   //       （REX 原生 MediaItem / StreamSource 的欄位名）。
   //   (4) search 區塊加上 cacheDuration: 0。REX 首頁搜尋走 search 區塊，
   //       未設時 REX 用預設 86400（24 小時），季別變了也可能拿回舊快取。
-  WIDGET_VERSION: 51,
+  //
+  // bump 到 52：修掉「詳細頁選另外一集搜不到、連播下一集找不到」。
+  //   三個獨立根因，各自都會讓切集回 0 筆：
+  //   (1) loadDetail 把外層 link 的 episode 透傳給內層 loadResource。
+  //       外層 link 常帶 episode（搜尋結果每筆的 link 都是
+  //       search:標題?season=N&episode=M），內層 targetEpisode=M 會把整批
+  //       結果過濾到只剩 M 一集 —— 詳情頁只剩 1 集可點。
+  //       修法：內層一律 episode=null，且 link 重建成不帶 episode 的季連結
+  //       （避免 link 解析又把 episode 補回來）。
+  //   (2) episode 參數洗成 NaN 時 smart 路徑殺光結果。REX 傳的字串不保證
+  //       是純數字，舊寫法 parseInt 得 NaN；executor 用 !== null 判斷，
+  //       NaN !== null 為 true → filterByEpisode(NaN) 殺掉所有有集數來源。
+  //       修法：三處 targetEpisode 統一走 _toEpisodeNumber，非法值回 null。
+  //   (3) macCacheKey 全季共用，但站方只回已播集。切到未播集時 merged 非空
+  //       → 跳過搜尋 → 尾端 filterByEpisode 殺光 → 回 0 筆。
+  //       修法：merged 缺 targetEpisode 時強制 MacCMS 重抓（_macCacheHit=false）。
+  //   另加 _macEpNumber：集數抽取認全格式（「01」「EP01」「第1話」），
+  //   只認「第N集/期」時其他格式 _ep=null，切到那集就被丟掉。
+  //   舊 cache 內是缺集/單集的髒結果，bump 版本讓 syncWidgetVersion 清掉重搜。
+  WIDGET_VERSION: 52,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2802,6 +2821,68 @@ function playSourceKeyOf(resource) {
 }
 
 /**
+ * 從 MacCMS 站的集名抽出集數（給 _ep 用），抽不到回 null（未知）。
+ *
+ * 為什麼要比「第N集」寬：站方集名格式不統一，實測有「01」「EP01」
+ * 「第1話」「E3」等多種寫法。舊正則只認「第N集/期」，其他格式
+ * _ep 會是 null；切到那一集時 filterByEpisode 因 hasExact=true
+ * 把整條來源丟掉 —— 使用者看到的就是「這集搜不到」。
+ *
+ * 回 null 而不是 1：沒數字的名字（「正片」「預告」「HD中字」）
+ * 不能硬判成第 1 集，否則點第 1 集會混進預告片。null 交給
+ * filterByEpisode 的 hasExact 後備邏輯決定去留。
+ */
+function _macEpNumber(epName) {
+  const s = String(epName ?? '').trim();
+  if (!s) return null;
+  // 「第01集」「第1期」「第1話」「第2回」（含全形話/回與空白）
+  let m = s.match(/第\s*0*(\d+)\s*[集期話话回]/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  // 「EP01」「E3」「ep 12」（前有分隔或在開頭，避免誤抓片名內的 E）
+  m = s.match(/(?:^|[^A-Za-z\d])E[Pp]?\s*0*(\d+)\b/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  // 純數字「01」「3」
+  m = s.match(/^\s*0*(\d+)\s*$/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+/**
+ * 把各路呼叫端傳入的 episode 參數正規化成正整數，非法值回 null（= 不指定）。
+ *
+ * 為什麼需要：REX 傳的是字串，但內容不保證是純數字（「第5集」
+ * 「EP5」這類都出現過）。舊寫法 `episode ? parseInt(episode) : null`
+ * 對這類輸入得到 NaN，而 NaN 在下游行為不一致：
+ *   - loadResource / batch 尾端用 `if (type==='tv' && targetEpisode)`，
+ *     NaN 判 falsy → 不過濾（僥倖沒事）
+ *   - SmartSearchExecutor 用 `this.targetEpisode !== null`，
+ *     NaN !== null 為 true → filterByEpisode(resources, NaN)，
+ *     而 NaN 永遠 !== 任何 label → 所有有集數的來源被殺光，
+ *     使用者看到的就是「這集完全搜不到」
+ * 統一在源頭洗成 null，各路徑行為一致。
+ */
+function _toEpisodeNumber(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  let n = parseInt(s, 10);
+  if (!Number.isFinite(n) || n < 1) {
+    const m = s.match(/\d+/);
+    n = m ? parseInt(m[0], 10) : NaN;
+  }
+  return Number.isFinite(n) && n >= 1 ? n : null;
+}
+
+/**
  * 依集數挑出該集的來源。
  *
  * 有些站用日期命名集數（「- 1 -」而不是「第1集」），這類來源抽不出集數。
@@ -3448,8 +3529,10 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       episodes.forEach(ep => {
         const [epName, url] = ep.split('$');
         if (url && isPlayableUrl(url)) {
-          const epMatch = epName.match(/第(\d+)(集|期)/);
-          const episodeNumber = epMatch ? parseInt(epMatch[1]) : null;
+          // ★ 集數抽取必須認全格式（「01」「EP01」「第1話」…），
+          //   只認「第N集/期」時其他格式的 _ep=null，切到那集就整批被丟，
+          //   使用者看到「這集搜不到」。見 _macEpNumber 註解。
+          const episodeNumber = _macEpNumber(epName);
 
           const resolutionInfo = extractResolutionInfo(vod_name, epName);
 
@@ -6738,13 +6821,24 @@ async function loadResource(params, onStreamResult = null) {
   // 但由相關作品卡片切換進場時可能走別的欄位。任何一個欄位帶著
   // 與上次不同的片名就代表使用者換片，必須優先採用。
   // 全部取不到時直接放棄 —— 拿舊片名續搜只會得到舊片的來源。
-  const seriesName =
+  //
+  // ★ link 兜底：切集 / 自動連播下一集時，客戶端有時只帶 link
+  //   （search:<標題>?season=N&episode=M）而不帶 seriesName。
+  //   之前這裡直接 return []，使用者看到的就是「切集後搜不到、
+  //   下一集永遠找不到」。link 本身是自描述的，直接拿它的標題當片名。
+  let seriesName =
     params.seriesName ||
     params.episodeName ||
     params.title ||
     params.name ||
     params.movieName ||
     '';
+  if (!seriesName && typeof params.link === 'string' && params.link.startsWith(DETAIL_LINK_PREFIX)) {
+    try {
+      const linkMeta = parseDetailLink(params.link);
+      if (linkMeta?.title) seriesName = linkMeta.title;
+    } catch {}
+  }
 
   if (multiSource !== "enabled" || !seriesName) {
     return [];
@@ -6967,7 +7061,9 @@ async function loadResource(params, onStreamResult = null) {
     targetInfo.type = type;
   }
   let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
-  const targetEpisode = episode ? parseInt(episode) : null;
+  // ★ episode 必須走 _toEpisodeNumber（見其註解）：舊寫法對「第5集」
+  //   這類輸入得 NaN，下游 smart 路徑用 !== null 判斷會把整批結果殺光。
+  const targetEpisode = _toEpisodeNumber(episode);
 
   // 修正「仁医 / season=第二季」情境。
   //
@@ -8005,7 +8101,7 @@ async function performSmartSearch(params, onStreamResult) {
     season
   } = params;
 
-  const targetEpisode = episode ? parseInt(episode, 10) : null;
+  const targetEpisode = _toEpisodeNumber(episode);
   const startTime = Date.now();
 
   const siteManager = new SiteManager();
@@ -8156,7 +8252,8 @@ async function performBatchSearch(params) {
     targetInfo.type = type;
   }
   let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
-  const targetEpisode = episode ? parseInt(episode) : null;
+  // ★ 同 loadResource：episode 走 _toEpisodeNumber，NaN 會殺光結果。
+  const targetEpisode = _toEpisodeNumber(episode);
   // 中文季別容錯
   if (Number.isNaN(targetSeason) && typeof season === 'string') {
     const m = season.match(/\d+|[一二三四五六七八九十零]+/);
@@ -8338,7 +8435,8 @@ targetInfo.searchQuery = aliasQ;
     _macCacheHit = true;
   }
 
-  // ★ 進入搜尋區段的條件：完全 cache miss 或部分 cache miss。
+  // ★ 進入搜尋區段的條件：完全 cache miss、部分 cache miss、
+  //   或「換集後 cache 內沒有該集」。
   //
   //   修正前：只看 allResults.length（被 cache 填滿就不搜）→ adapter miss 時
   //     永遠不會被補抓，使用者切到該集只看到 MacCMS 站。
@@ -8346,9 +8444,25 @@ targetInfo.searchQuery = aliasQ;
   //     但 MacCMS 命中（部分 miss），都會進入搜尋區段；搜尋區段內部
   //     依 _macCacheHit 決定要不要跑 MacCMS 任務（避免重抓已命中的
   //     MacCMS 站，省下 5 站 detail 重抓時間）。
+  //
+  // ★ 切集補抓（本次新增）：macCacheKey 是「全季共用」的 —— 搜 E1 時
+  //   各站只回傳 E1 當下在播的集數範圍（站方 detail 頁只列已更新集），
+  //   未播出的後面集數根本不在 cache 裡。使用者切到別集時 merged 非空
+  //   → 直接跳過搜尋 → 尾端 filterByEpisode 殺光 → 回 0 筆，
+  //   使用者看到的就是「選另外一集時搜不到」。
+  //   修法：merged 裡沒有 targetEpisode 時，強制 MacCMS 重抓一次
+  //   （_macCacheHit=false，且全程不寫髒 cache）。
+  if (type === 'tv' && targetEpisode && allResults.length > 0) {
+    const hasTargetEp = allResults.some(r => episodeLabelOf(r) === targetEpisode);
+    if (!hasTargetEp) {
+      console.log(`🔄 切集補抓: cache 有 ${allResults.length} 條但缺 E${targetEpisode}，MacCMS 重抓`);
+      _macCacheHit = false;
+    }
+  }
   const _needRefetch = (
     allResults.length === 0
     || (!_adapterCacheHit && _adapterIsEnabled(params))
+    || (!_macCacheHit && allResults.length > 0)
   );
   if (_needRefetch) {
     const stats = { total: resourceSites.length, success: 0, failed: 0 };
@@ -9326,15 +9440,24 @@ async function loadDetail(link) {
     let allResults = [];
     // ★ 併發抓多季：三個 loadResource 各自走獨立 cache key（_s${s}），
     //   無共享狀態，併發安全。總時間 = max(各季) 而非 sum。
+    //
+    // ★ 詳情頁必須拿「整季」而非「單集」：外層 link 常帶 episode
+    //  （搜尋結果每筆的 link 都是 search:標題?season=N&episode=M），
+    //   若把 episode 透傳給 loadResource，targetEpisode=N 會把整批
+    //   結果過濾到只剩 M 一集 —— 詳情頁就只剩 1 集可點，
+    //   使用者看到的就是「選另外一集時搜不到」。
+    //   修法：內層一律 episode=null，且 link 重建成「不帶 episode」
+    //   的季連結，避免 loadResource 頂部的 link 解析又把 episode
+    //   從 link 補回來（_isUnset(null)=true 會被 link 覆寫）。
     const batchArrays = await Promise.all(
       seasonsToFetch.map((s) => loadResource({
         seriesName: title,
         title,
         type,
         season: s,
-        episode,
+        episode: null,
         id,
-        link,
+        link: buildDetailLink({ title, season: s, type, id }),
         searchMode: 'batch',
         matchStrictness: 'standard',
         preferResolution: 'auto',
