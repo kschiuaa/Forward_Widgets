@@ -1262,7 +1262,7 @@ const CONFIG = {
   //         Forward 端 JS 寬鬆解碼不受影響（child 照讀）。
   //     (2) 回傳前加一行季結構 log（季數=[..] 每季集數），以後判本地/重調
   //         不用再猜。bump 版本清掉手機裡修復前寫的髒 cache。
-  WIDGET_VERSION: 54,
+  WIDGET_VERSION: 55,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1515,7 +1515,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.3",
+  version: "3.6.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2975,12 +2975,22 @@ function _toEpisodeNumber(v) {
 function filterByEpisode(results, targetEpisode) {
   if (!targetEpisode) return results;
   const hasExact = results.some(res => episodeLabelOf(res) === targetEpisode);
-  return results.filter(res => {
+  const filtered = results.filter(res => {
     const label = episodeLabelOf(res);
     if (label === targetEpisode) return true;
     if (label !== null) return false;
     return !hasExact;
   });
+  // ★ S2 修復（實機 Rex season=2 episode=1 回空陣列）：
+  //   S2 批次的集數標籤若抽不出來（站方 S2 命名與 S1 不一致），而又有
+  //   1 條湊巧抽出數字（hasExact=true），所有 label===null 會被整批殺光
+  //   → 直接回空。殺到 0 筆就保留原樣（與季過濾的 fallback 同策略），
+  //   寧可多給幾條混在裡面，也不要給空白頁。
+  if (filtered.length === 0 && results.length > 0) {
+    console.log(`⚠️ 集数过滤殺到 0 筆（目標 E${targetEpisode}，共 ${results.length} 筆），保留全部候選`);
+    return results;
+  }
+  return filtered;
 }
 
 /**
