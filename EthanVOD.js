@@ -1515,7 +1515,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.0",
+  version: "3.6.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6957,29 +6957,34 @@ async function loadResource(params, onStreamResult = null) {
   // 一個。只認 `type` 會讓某些路徑的 type 落到預設 'tv'（電影被當影集
   // 搜，結果是空）。
   //
-  // 取值優先序：params.type > params.mediaType > 'tv'。
-  // 兩者皆為合法值（tv/movie）才採用；其他值（variety 等內部值）不覆蓋。
+  // 取值優先序：params.type > params.mediaType > link 解析 > 'tv'。
+  // 只有 'tv' / 'movie' 才是真正的媒體類型；其他值一律視為「未指定」。
   // ★ 用 _isUnset 判斷而非 ??：REX 未指定時傳的是空字串，?? 不會 fallback。
-  const _rawType = _isUnset(params.type) ? params.mediaType : params.type;
-  const _resolvedType = (_rawType === 'tv' || _rawType === 'movie') ? _rawType : 'tv';
-  // ★ type 正規化必須寫回 params：解構 default 接不住空字串。
-  //
-  //   實機形狀：REX 從 episodeItems 點 S2E10 回調時，params 只有 link
-  //   （search:<標題>?season=2&episode=10&type=tv），type 欄位是 ''。
-  //   `const { type = _resolvedType }` 只在 undefined 時 fallback，
-  //   '' 會原樣穿透，之後一路污染：
-  //     - cacheKey 的 `_${type}` 段變空 → 與正常呼叫的 key 分家
-  //       （同 S2E10 寫兩份 cache，命中率對半）；
+  // ★ 借鏡 zen.cheyong：它的 type 只認 tv/movie，其他一律忽略。
+  //   實機形狀：REX 把整條 episodeItem 展開回調時，params.type 是 VideoItem
+  //   的類型標記（'url' / 'detail'），不是媒體類型。
+  //   舊寫法只在「未指定」時寫回，'url' 會原樣穿透，之後一路污染：
+  //     - cacheKey 的 `_${type}` 段變成 `_url` → 與正常呼叫的 key 分家；
   //     - `if (type === 'tv' && targetEpisode)` 集數過濾整個跳過；
-  //     - cleanResourceForOutput(resource, '' ) 內所有 `type === 'tv'`
+  //     - cleanResourceForOutput(resource, 'url') 內所有 `type === 'tv'`
   //       守門全滅 → 頂層 season 不提升、description 不注入「第2季」、
   //       link 重建因 `type === 'tv'||'movie'` 不成立而掉 season 與 type
-  //       （實測 link 變成 `search:..?episode=10`）。
+  //      （實測 link 變成 `search:..?episode=10`）。
   //   最終物件 season=null + link 無季別 → REX 播放頁按季過濾剩 0 筆，
   //   而 S1（初始載入 type 正確）正常，看起來就是「非首季掛零」。
-  //   只處理「未指定」（null/undefined/''/空白）；顯式值（tv/movie/
-  //   variety 等）原樣保留，避免改變 variety 等內部路徑的行為。
-  if (_isUnset(params.type)) params.type = _resolvedType;
+  const _isMediaType = (v) => v === 'tv' || v === 'movie';
+  const _pickType = () => {
+    if (_isMediaType(params.type)) return params.type;
+    if (_isMediaType(params.mediaType)) return params.mediaType;
+    if (_isMediaType(_metaType)) return _metaType;
+    // variety 是內部路徑的顯式值，原樣保留。
+    if (params.type === 'variety' || params.mediaType === 'variety') return 'variety';
+    return 'tv';
+  };
+  const _resolvedType = _pickType();
+  // ★ type 正規化必須寫回 params：解構 default 接不住空字串/'url'。
+  //   只處理「未指定或無意義的值」；顯式值（tv/movie/variety）原樣保留。
+  if (_isUnset(params.type) || (!_isMediaType(params.type) && params.type !== 'variety')) params.type = _resolvedType;
 
   const {
     type = _resolvedType,
