@@ -1262,7 +1262,7 @@ const CONFIG = {
   //         Forward 端 JS 寬鬆解碼不受影響（child 照讀）。
   //     (2) 回傳前加一行季結構 log（季數=[..] 每季集數），以後判本地/重調
   //         不用再猜。bump 版本清掉手機裡修復前寫的髒 cache。
-  WIDGET_VERSION: 57,
+  WIDGET_VERSION: 58,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1515,7 +1515,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.0",
+  version: "3.6.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4220,6 +4220,50 @@ const _ADAPTER_DETAIL_CACHE = new Map();
 // TTL 取自 CONFIG（在 CONFIG 定義之後才讀取，故用延遲 getter 的等價寫法）。
 const _ADAPTER_DETAIL_TTL = CONFIG.ADAPTERS?.DETAIL_CACHE_TTL ?? 30000;
 
+// ★ MacCMS 搜尋回應跨季共用（純加速，輸出不變）。
+//
+//   為什麼：loadDetail 一次抓 S1~S6，每季各自跑一次 performBatchSearch，
+//   而 buildSearchQuery 已把年份剝掉 → 六季的 `wd` 逐字相同。
+//   之前六季各打一次同 URL（6×RTT），最慢站拖住成批。
+//   加 30s TTL + in-flight 共用：同 URL 同 wd 只打一次 HTTP，
+//   六季讀同一份 list，下游比對/過濾/排序各自獨立重跑，結果逐字相同。
+//   TTL 只覆蓋「同一次 loadDetail 內相隔數百毫秒的六次呼叫」，不跨片殘留。
+const _MAC_SEARCH_CACHE = new Map();   // key=`url|json(params)` -> { val, ts }
+const _MAC_SEARCH_INFLIGHT = new Map(); // key -> Promise
+const _MAC_SEARCH_TTL = 30000;
+function _macSearchKey(url, params) {
+  try { return `${url}|${JSON.stringify(params || {})}`; }
+  catch { return `${url}|${String(params)}`; }
+}
+
+// ★ Adapter 搜尋/集數跨季共用（純加速，輸出不變）。
+//   loadDetail 一次跑 S1~S6，每季 _adapterSearch 同 keyword、同 type，
+//   第二階段 episodes(vodId) 亦與季無關（只差 targetEpisode 選集）。
+//   search 結果與 episodeList 各 cache 30s，六季只打一次站方 API。
+const _ADAPTER_SEARCH_CACHE = new Map();   // key=`siteId|keyword` -> { val, ts }
+const _ADAPTER_EPS_CACHE = new Map();      // key=`siteId|vodId` -> { val, ts }
+const _ADAPTER_SEARCH_TTL = 30000;
+function _adapterCacheGet(map, key, ttl) {
+  try {
+    const hit = map.get(key);
+    if (!hit) return null;
+    if ((Date.now() - hit.ts) < ttl) return hit.val;
+    map.delete(key);
+  } catch {}
+  return null;
+}
+function _adapterCacheSet(map, key, val, ttl) {
+  try {
+    map.set(key, { val, ts: Date.now() });
+    if (map.size > 120) {
+      const now = Date.now();
+      for (const [k, v] of map) {
+        if (now - v.ts > ttl) map.delete(k);
+      }
+    }
+  } catch {}
+}
+
 /**
  * 帶簽名的 GET。
  * site 設定可覆寫 httpGet（如某站需特殊 header / 不需簽名）。
@@ -4850,12 +4894,22 @@ async function _adapterPool(tasks, limit = 4) {
 async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode) {
   const t0 = Date.now();
   let items;
+  // ★ 跨季共用：同 keyword 同站只打一次 search（loadDetail S1~S6 同字）。
+  //   只快取「原始搜尋結果」，下游 standard 比對每季各自重跑，輸出逐字相同。
+  const _searchKey = `${site.id}|${String(searchQuery || '')}|${String(type || '')}`;
+  const _cachedSearch = _adapterCacheGet(_ADAPTER_SEARCH_CACHE, _searchKey, _ADAPTER_SEARCH_TTL);
+  if (_cachedSearch) {
+    items = _cachedSearch;
+  } else {
   try {
     items = (site.search || _adapterDefaultSearch)(site, searchQuery);
     items = await items;
   } catch (e) {
     console.warn(`[adapter:${site.id}] search 失敗: ${e?.message || e}`);
     return [];
+  }
+  if (!Array.isArray(items) || items.length === 0) return [];
+  _adapterCacheSet(_ADAPTER_SEARCH_CACHE, _searchKey, items, _ADAPTER_SEARCH_TTL);
   }
   if (!Array.isArray(items) || items.length === 0) return [];
 
@@ -4879,7 +4933,14 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
     matched.map(item => async () => {
       let playUrl = '';
       try {
-        const eps = await (site.episodes || _adapterDefaultEpisodes)(site, item.vod_id);
+        // ★ 跨季共用：同 vodId 的 episodeList 與季無關，只差 targetEpisode 選集。
+        //   六季共用同一份 eps，_adapterBuildPlayUrl 每季各自按自己 targetEpisode 選集。
+        const _epsKey = `${site.id}|${String(item.vod_id || '')}`;
+        let eps = _adapterCacheGet(_ADAPTER_EPS_CACHE, _epsKey, _ADAPTER_SEARCH_TTL);
+        if (!eps) {
+          eps = await (site.episodes || _adapterDefaultEpisodes)(site, item.vod_id);
+          _adapterCacheSet(_ADAPTER_EPS_CACHE, _epsKey, eps || [], _ADAPTER_SEARCH_TTL);
+        }
         playUrl = _adapterBuildPlayUrl(site, item.vod_id, eps, targetEpisode);
       } catch (e) {
         // 詳情頁失敗 = 這筆沒有可播資源，跳過而非送出空播放項
@@ -5054,6 +5115,41 @@ async function httpGetApi(baseUrl, params, timeout) {
   // 實測延遲不穩定的站需要更寬裕的逾時，否則會在半路被砍掉。
   const slow = CONFIG.SLOW_SITE_MATCH.some(m => baseUrl.includes(m));
   const effective = timeout || (slow ? CONFIG.SLOW_SITE_TIMEOUT : CONFIG.REQUEST_TIMEOUT);
+  // ★ 跨季共用：只對 MacCMS 搜尋 (ac=detail + wd) 做 30s 共用。
+  //   loadDetail 一次跑 S1~S6，同 wd 打 6 次同 URL → 只打 1 次 HTTP，
+  //   其餘 5 次讀同一份 list。detail 仍各季獨立抓，結果逐字相同。
+  //   非搜尋請求（detail by ids / adapter）不走這裡，原樣直打。
+  try {
+    const isSearch = params && typeof params === 'object' && params.ac === 'detail' && params.wd != null;
+    if (isSearch) {
+      const key = _macSearchKey(baseUrl, params);
+      const hit = _MAC_SEARCH_CACHE.get(key);
+      if (hit && (Date.now() - hit.ts) < _MAC_SEARCH_TTL) return hit.val;
+      if (hit) _MAC_SEARCH_CACHE.delete(key);
+      const inflight = _MAC_SEARCH_INFLIGHT.get(key);
+      if (inflight) return inflight;
+      const p = Widget.http.get(buildRequestUrl(baseUrl, params), {
+        headers: { 'User-Agent': API_USER_AGENT },
+        timeout: effective
+      });
+      _MAC_SEARCH_INFLIGHT.set(key, p);
+      try {
+        const resp = await p;
+        try {
+          _MAC_SEARCH_CACHE.set(key, { val: resp, ts: Date.now() });
+          if (_MAC_SEARCH_CACHE.size > 60) {
+            const now = Date.now();
+            for (const [k, v] of _MAC_SEARCH_CACHE) {
+              if (now - v.ts > _MAC_SEARCH_TTL) _MAC_SEARCH_CACHE.delete(k);
+            }
+          }
+        } catch {}
+        return resp;
+      } finally {
+        if (_MAC_SEARCH_INFLIGHT.get(key) === p) _MAC_SEARCH_INFLIGHT.delete(key);
+      }
+    }
+  } catch {}
   return Widget.http.get(buildRequestUrl(baseUrl, params), {
     headers: { 'User-Agent': API_USER_AGENT },
     timeout: effective
@@ -9784,15 +9880,31 @@ async function loadDetail(link) {
     //   從 link 補回來（_isUnset(null)=true 會被 link 覆寫）。
     //
     // ★ TMDB 別名預熱（純加速，輸出不變）。
-    //   三路內層 loadResource 都會對同一 (title, type) 跑
+    //   六路內層 loadResource 都會對同一 (title, type) 跑
     //   tryExpandWithTMDBAliases，底層 getTMDBAliasesBlocking 已有
-    //   in-flight 去重所以 TMDB 只打一次，但三路仍會各做一次 storage
+    //   in-flight 去重所以 TMDB 只打一次，但六路仍會各做一次 storage
     //   讀 + 各自 race 等待。先在這裡暖一次 Alias cache，內層大概率
     //   直接走 in-memory 命中（<1ms），算出的別名逐字相同。
     //   上限只給 2.5s（= TMDB 單次 REQUEST_TIMEOUT）：預熱只是盡力而為，
     //   超時就放行，內層照舊走自己的 expand + in-flight 共用邏輯，
     //   行為與改前完全一致（不會出現「預熱等 6s、內層又等 6s」的疊加）。
-    try { await getTMDBAliasesBlocking(title, type, 2500); } catch {}
+    //
+    // ★ v58：預熱不再阻塞六季開跑（純加速，輸出不變）。
+    //   舊寫法 `await getTMDBAliasesBlocking(..., 2500)` 讓首屏必等 TMDB
+    //   （cache miss 時 1~2.5s），六條 loadResource 全部企定定等佢。
+    //   改成 fire-and-forget 起跑、只等最多 150ms：
+    //   cache 命中（第二次進場/切季）時 150ms 內已 resolve，內層全走
+    //   in-memory 命中，別名與舊寫法逐字相同；
+    //   cache miss（第一次進場）時 150ms 即放行，六季先用原名開搜，
+    //   TMDB 回來後內層第二次搜尋（fallback/切季）自然吃到別名。
+    //   輸出不變的理由：預熱只寫 _tmdbAliasCache，不改任何 targetInfo；
+    //   各季 loadResource 仍走自己原有的 tryExpandWithTMDBAliases 邏輯。
+    try {
+      await Promise.race([
+        getTMDBAliasesBlocking(title, type, 2500).catch(() => {}),
+        new Promise(resolve => setTimeout(resolve, 150)),
+      ]);
+    } catch {}
     const batchArrays = await Promise.all(
       seasonsToFetch.map((s) => loadResource({
         seriesName: title,
