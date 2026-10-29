@@ -1262,7 +1262,7 @@ const CONFIG = {
   //         Forward 端 JS 寬鬆解碼不受影響（child 照讀）。
   //     (2) 回傳前加一行季結構 log（季數=[..] 每季集數），以後判本地/重調
   //         不用再猜。bump 版本清掉手機裡修復前寫的髒 cache。
-  WIDGET_VERSION: 55,
+  WIDGET_VERSION: 57,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1515,7 +1515,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.6",
+  version: "3.6.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7923,12 +7923,26 @@ function resolveFinalSearchQuery(targetInfo, originalQuery) {
 
 // 套用 Forward 傳來的版本覆寫（首播年份、國別）。
 // Forward 並非每次都傳 premiereDate（實測多數為空），因此片名仍是主要來源。
+//
+// ★ S2+ 季節不套用 premiereDate 年份（實機 S2/S3 歸零的兇手）：
+//   詳細頁的 premiereDate 是「全劇首播年」（永遠是 S1 年份，例如白粉飛
+//   S1=2017）。切到 S2/S3 時站方該季 vod_year 是 2018/2019，下游
+//   filterByTargetVersion 拿 2017 去比對會把整季 4 條全殺（4 -> 0），
+//   而 S1 因為同年所以倖存 —— 看起來就是「只有第一季有反應」。
+//   實測：premiereDate=2017-01-01 + season=3 → 版本過濾 4->0；
+//         premiereDate=2019-01-01 + season=3 → 4 條全留。
+//   修法：targetSeason > 1 時跳過年份覆寫（地區照舊）。單季電影/ S1 不受影響。
 function applyDetailVersion(params, targetInfo) {
   const detailYear = extractVersionMarker(params.premiereDate) ||
     extractVersionMarker(params.airDate) || null;
   if (detailYear && detailYear !== targetInfo.year) {
-    console.log(`📅 詳細頁指定版本: ${detailYear}年 (片名推導: ${targetInfo.year ?? '無'})`);
-    targetInfo.year = detailYear;
+    const tSeason = Number(targetInfo?.seasonNumber);
+    if (Number.isFinite(tSeason) && tSeason > 1) {
+      console.log(`📅 詳細頁版本年份 ${detailYear}年 已跳過（目標 S${tSeason}，premiereDate 是 S1 年份，不可作季過濾）`);
+    } else {
+      console.log(`📅 詳細頁指定版本: ${detailYear}年 (片名推導: ${targetInfo.year ?? '無'})`);
+      targetInfo.year = detailYear;
+    }
   }
   const detailArea = resolveTargetArea(params, targetInfo);
   if (detailArea) targetInfo.region = detailArea;
