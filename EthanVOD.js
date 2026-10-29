@@ -1515,7 +1515,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.5.8",
+  version: "3.6.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6900,18 +6900,54 @@ async function loadResource(params, onStreamResult = null) {
   //
   // 判斷用「去空白後是否為空」：null / undefined / '' / '  ' 都算未指定。
   const _isUnset = (v) => v == null || (typeof v === 'string' && v.trim() === '');
-  if (params?.link && typeof params.link === 'string' && params.link.startsWith(DETAIL_LINK_PREFIX)) {
-    const meta = parseDetailLink(params.link);
-    if (meta) {
-      if (_isUnset(params.season) && meta.season != null) params.season = meta.season;
-      if (_isUnset(params.episode) && meta.episode != null) params.episode = meta.episode;
-      // type 的判定要和下面 mediaType 的後備邏輯一致：params.type 未指定
-      // （空字串也算未指定）且 mediaType 也沒給 movie 時，link 的 movie 才採用。
-      const _curType = _isUnset(params.type) ? params.mediaType : params.type;
-      if ((_isUnset(_curType) || _curType === 'tv') && meta.type === 'movie') params.type = meta.type;
-      if (!params.id && meta.id) params.id = meta.id;
+  // ★ REX 傳進來的「片名」欄位可能是集/季標籤，不能直接當搜尋關鍵字。
+  //   實機形狀：點 S2E10 時 REX 可能帶 seriesName="第2季"/title="第10集"/
+  //   episodeName="第10集"，真正的劇名只剩 link/id 裡的 search:<標題>。
+  //   舊寫法把 episodeName/title 直接當 seriesName → 搜「第10集」→ 0 筆，
+  //   而 S1 因為是初始載入（seriesName 正確）所以正常，看起來就是「非首季掛零」。
+  const _looksLikeEpOrSeasonLabel = (v) => {
+    const s = String(v == null ? '' : v).trim();
+    if (!s) return true;
+    if (/^\d{1,4}$/.test(s)) return true;
+    if (/^第\s*[0-9一二三四五六七八九十零〇兩两]+\s*[集話話回期]/.test(s)) return true;
+    if (/^第\s*[0-9一二三四五六七八九十零〇兩两]+\s*[季部]/.test(s)) return true;
+    if (/^[SE]\s*\d{1,3}$/i.test(s)) return true;
+    if (/^S\s*\d{1,3}\s*E\s*\d{1,4}$/i.test(s)) return true;
+    if (/^第\d+集$/.test(s)) return true;
+    return false;
+  };
+  // ★ link 與 id 都可能是 search: 載體。
+  //   我們的 episodeItems 把 id 和 link 都設成同一條 search: 連結，
+  //   REX 回調時可能只帶其中一個（尤其只帶 id 不帶 link）。
+  //   舊寫法只解析 params.link → 只帶 id 的呼叫拿不到季別 → 退回 S1 →
+  //   播放頁按 S2E10 過濾 S1 結果 → 0 筆。模擬直調都帶 link 所以正常。
+  let _linkMeta = null, _idMeta = null;
+  try {
+    if (params?.link && typeof params.link === 'string' && params.link.startsWith(DETAIL_LINK_PREFIX)) {
+      _linkMeta = parseDetailLink(params.link);
     }
+  } catch {}
+  try {
+    if (params?.id && typeof params.id === 'string' && params.id.startsWith(DETAIL_LINK_PREFIX)) {
+      _idMeta = parseDetailLink(params.id);
+    }
+  } catch {}
+  const _metaSeason = (_linkMeta && _linkMeta.season != null) ? _linkMeta.season
+    : ((_idMeta && _idMeta.season != null) ? _idMeta.season : null);
+  const _metaEpisode = (_linkMeta && _linkMeta.episode != null) ? _linkMeta.episode
+    : ((_idMeta && _idMeta.episode != null) ? _idMeta.episode : null);
+  const _metaType = (_linkMeta && _linkMeta.type) || (_idMeta && _idMeta.type) || null;
+  const _metaId = (_linkMeta && _linkMeta.id) || (_idMeta && _idMeta.id) || null;
+  const _metaTitle = (_linkMeta && _linkMeta.title) || (_idMeta && _idMeta.title) || null;
+  if (_metaSeason != null && _isUnset(params.season)) params.season = _metaSeason;
+  if (_metaEpisode != null && _isUnset(params.episode)) params.episode = _metaEpisode;
+  if (_metaType === 'movie') {
+    // type 的判定要和下面 mediaType 的後備邏輯一致：params.type 未指定
+    // （空字串也算未指定）且 mediaType 也沒給 movie 時，link 的 movie 才採用。
+    const _curType = _isUnset(params.type) ? params.mediaType : params.type;
+    if (_isUnset(_curType) || _curType === 'tv') params.type = _metaType;
   }
+  if (!params.id && _metaId) params.id = _metaId;
 
   // ★ type 的後備來源是 mediaType。
   //
@@ -6926,6 +6962,24 @@ async function loadResource(params, onStreamResult = null) {
   // ★ 用 _isUnset 判斷而非 ??：REX 未指定時傳的是空字串，?? 不會 fallback。
   const _rawType = _isUnset(params.type) ? params.mediaType : params.type;
   const _resolvedType = (_rawType === 'tv' || _rawType === 'movie') ? _rawType : 'tv';
+  // ★ type 正規化必須寫回 params：解構 default 接不住空字串。
+  //
+  //   實機形狀：REX 從 episodeItems 點 S2E10 回調時，params 只有 link
+  //   （search:<標題>?season=2&episode=10&type=tv），type 欄位是 ''。
+  //   `const { type = _resolvedType }` 只在 undefined 時 fallback，
+  //   '' 會原樣穿透，之後一路污染：
+  //     - cacheKey 的 `_${type}` 段變空 → 與正常呼叫的 key 分家
+  //       （同 S2E10 寫兩份 cache，命中率對半）；
+  //     - `if (type === 'tv' && targetEpisode)` 集數過濾整個跳過；
+  //     - cleanResourceForOutput(resource, '' ) 內所有 `type === 'tv'`
+  //       守門全滅 → 頂層 season 不提升、description 不注入「第2季」、
+  //       link 重建因 `type === 'tv'||'movie'` 不成立而掉 season 與 type
+  //       （實測 link 變成 `search:..?episode=10`）。
+  //   最終物件 season=null + link 無季別 → REX 播放頁按季過濾剩 0 筆，
+  //   而 S1（初始載入 type 正確）正常，看起來就是「非首季掛零」。
+  //   只處理「未指定」（null/undefined/''/空白）；顯式值（tv/movie/
+  //   variety 等）原樣保留，避免改變 variety 等內部路徑的行為。
+  if (_isUnset(params.type)) params.type = _resolvedType;
 
   const {
     type = _resolvedType,
@@ -6951,22 +7005,38 @@ async function loadResource(params, onStreamResult = null) {
   // 與上次不同的片名就代表使用者換片，必須優先採用。
   // 全部取不到時直接放棄 —— 拿舊片名續搜只會得到舊片的來源。
   //
-  // ★ link 兜底：切集 / 自動連播下一集時，客戶端有時只帶 link
+  // ★ link/id 兜底 + 標籤過濾：切集 / 自動連播下一集時，客戶端有時只帶 link/id
   //   （search:<標題>?season=N&episode=M）而不帶 seriesName。
   //   之前這裡直接 return []，使用者看到的就是「切集後搜不到、
-  //   下一集永遠找不到」。link 本身是自描述的，直接拿它的標題當片名。
-  let seriesName =
-    params.seriesName ||
-    params.episodeName ||
-    params.title ||
-    params.name ||
-    params.movieName ||
-    '';
-  if (!seriesName && typeof params.link === 'string' && params.link.startsWith(DETAIL_LINK_PREFIX)) {
-    try {
-      const linkMeta = parseDetailLink(params.link);
-      if (linkMeta?.title) seriesName = linkMeta.title;
-    } catch {}
+  //   下一集永遠找不到」。link/id 本身是自描述的，直接拿它的標題當片名。
+  //
+  //   更隱蔽的是反方向：點 S2E10 時 REX 可能帶 seriesName="第2季" /
+  //   title="第10集" / episodeName="第10集"（集/季標籤），真正的劇名只剩
+  //   link/id 裡的 search:<標題>。舊寫法把 episodeName/title 直接當 seriesName
+  //   → 搜「第10集」→ 0 筆，而 S1 因為是初始載入（seriesName 正確）所以正常，
+  //   看起來就是「非首季掛零」。所以這裡必須把純集/季標籤過濾掉。
+  //   episodeName 最可能是集標籤，放最後。
+  const _nameCandidates = [
+    params.seriesName,
+    params.movieName,
+    params.name,
+    params.title,
+    params.episodeName,
+  ];
+  let seriesName = '';
+  for (const _cand of _nameCandidates) {
+    const _s = String(_cand == null ? '' : _cand).trim();
+    if (!_s || _looksLikeEpOrSeasonLabel(_s)) continue;
+    seriesName = _s;
+    break;
+  }
+  if (_metaTitle) {
+    if (!seriesName) {
+      seriesName = _metaTitle;
+    } else if (seriesName !== _metaTitle && (seriesName.includes(_metaTitle) || _metaTitle.includes(seriesName))) {
+      // 「白粉飛 第2季」這類帶修飾的片名一律清洗回乾淨劇名，避免關鍵字被污染。
+      seriesName = _metaTitle;
+    }
   }
 
   // ★ Rex 直調時 params 裡沒有 multiSource（它不是 BaseParams 欄位，
@@ -9839,11 +9909,25 @@ async function loadDetail(link) {
           seasonNumber: s,
           seasonIndex: s,
           episodeItems: seasonEpisodes,
+          // ★ v55：同上，REX 契約合法欄位再掛一份（見頂層註解）。
+          childItems: seasonEpisodes,
         };
       });
 
     // 頂層 episodeItems = 當前季的集數（單季客戶端直接用；多季客戶端
     // 會改讀 childItems）。保持與舊版一致的「單季」語意。
+    //
+    // ★ v55：切季重調（REX 點季 → 新 season link 重調 loadDetail），
+    //   所以頂層 episodeItems 必須是當前季、且 child 季點下去要能重調。
+    //   但 REX 官方契約 VideoItemChild 沒有 episodeItems 欄位
+    //   （@rexnow/libs video.d.ts：VideoItemChild 只有 episode；
+    //   childItems?: VideoItemChild[]，child.episodeItems 會被解碼丟掉）。
+    //   也就是 REX 端「季下拉有幾季」看得見（childItems 本身合法），
+    //   但點進 S2/S3 時該季的集數它拿不到 —— 頂層又是 S1 的集數，
+    //   看起來就是「有季可點、點進去 0 集」（所有多季劇都一樣的症狀）。
+    //   修法：child 季同時帶 episodeItems（Forward 端照讀）與 childItems
+    //   （把同一份集數再掛一份在契約合法欄位，REX 端走這份）。
+    //   兩份是同一陣列引用，不佔雙倍記憶體；未知欄位在 Swift 解碼時忽略。
     const currentSeasonGroups = groupsBySeason.get(mainSeason) || [];
     const topEpisodeItems = currentSeasonGroups.map((g) => {
       const first = g.resources[0];
