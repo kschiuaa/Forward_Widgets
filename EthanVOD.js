@@ -1515,7 +1515,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.1",
+  version: "3.6.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -8200,7 +8200,17 @@ function filterBySequel(results, targetInfo) {
 
     // 片名沒寫季也沒年份、且跨多站回傳同一 baseName → 上一季嫌疑
     // （只有 1 站回的可能是另一季沒寫季的合法結果，2 站以上才殺）
-    if (sequel === null && pooledYearMin !== null) {
+    //
+    // ★ Zen 對齊（v55）：同名季（白粉飛 S1/S2 站方同名、無季標無年份）
+    //   在這裡會被整批殺光 —— 只要有一站回了「白粉飛 第二季」
+    //  （sequelMatched 非空 → pooledYearMin 成立），其他站的裸名
+    //   「白粉飛」就會因 unversionedBases >= 2 被 drop。剩下的只有
+    //   帶季標的那一兩條；那站一旦超時，kept 就是空 → S2 歸零。
+    //   Zen 的 fallback（dsFallbackScore）對無季標只扣 5 分、永不 drop。
+    //   修法：sequel===null 且無年份的裸名一律放行，不再數站數。
+    //   誤混入的 S1 裸名由後續 filterByEpisode（集數對齊）與排序自然沉底，
+    //   比整季歸零好得多。寧可多給，不可全無。
+    if (false && sequel === null && pooledYearMin !== null) {
       const candYear = yearOf(res);
       if (!candYear) {
         const base = (res._baseName || rawName.replace(/第[0-9一二三四五六七八九十百零〇]+[集話話回]/g, '').replace(/第[0-9]+季|Season\s*[0-9]+/gi, '')).trim();
@@ -9119,8 +9129,14 @@ targetInfo.searchQuery = aliasQ;
     const newSearched = executor.smartDeduplicate(fulfilledResults);
     if (allResults.length > 0) {
       // 合併：cache 內的 MacCMS + 新搜的 adapter（或部分 MacCMS）
-      const existingUrls = new Set(allResults.map(r => r.url).filter(Boolean));
-      const additions = newSearched.filter(r => !r.url || !existingUrls.has(r.url));
+      // ★ 去重鍵必須帶季別（與 loadDetail 的 s${season}||url 一致）。
+      //   同名季（白粉飛 S1/S2 站方同名、同一查詢回同一批 URL）用裸 URL
+      //   去重會把後到的整季殺掉：S1 cache 先佔位，S2 新搜的同 URL 被當成
+      //   「已存在」丟掉，留下來的是 S1 的舊物件（season=1），後續
+      //   filterBySequel 再把它殺掉 → S2 歸零。Zen 無此問題（無 cache 合併）。
+      const _seasonKeyOf = (r) => (Number.isFinite(r?.season) ? r.season : (r?._seasonFromItem ?? 'x'));
+      const existingKeys = new Set(allResults.map(r => r.url ? `s${_seasonKeyOf(r)}||${r.url}` : null).filter(Boolean));
+      const additions = newSearched.filter(r => !r.url || !existingKeys.has(`s${_seasonKeyOf(r)}||${r.url}`));
       allResults = [...allResults, ...additions];
     } else {
       allResults = newSearched;
@@ -9231,6 +9247,74 @@ targetInfo.searchQuery = aliasQ;
         }
       } catch (e) {
         console.warn('[fallback] loose 重試失敗:', e?.message || e);
+      }
+    }
+
+    // ★ Zen 對齊（v55）：S2+ 空結果時，用「裸名+季數字」再查一次 MacCMS。
+    //
+    //   鏡像 Zen 的兩段式（zen.cheyong.rex.stream.js:956-960）：
+    //   Zen 先搜原字串（含季），0 筆再拿 dsBaseTitle（剝季）重搜；
+    //   我們是反方向 —— 平時搜裸名（仁醫行為），0 筆時補一次帶季後綴。
+    //
+    //   場景：站方真用「XXX2」命名的劇（如部分站的「白粉飛2」），
+    //   裸名 `wd=白粉飞` 在該站回 0 筆，macResponseCache 裡根本沒 list，
+    //   上面的 loose 重試也只是對空 list 重跑 → 永遠 0。
+    //   帶季後綴 `wd=白粉飞2` 才能命中。
+    //
+    //   安全閘：
+    //   - 只在 S2+ 且仍 0 筆時觸發（S1 不受影響）；
+    //   - 只重查 MacCMS（adapter 另有自己的搜尋字串邏輯，不碰）；
+    //   - 比對仍走 standard（spin-off 照擋），不是無條件放行。
+    if (allResults.length === 0 && Number.isFinite(targetSeason) && targetSeason > 1 && type !== 'movie') {
+      try {
+        const bareBase = String(targetInfo.searchQuery || targetInfo.baseName || '').trim();
+        const suffixedQ = bareBase ? `${bareBase}${targetSeason}` : '';
+        // 後綴已存在（如裸名尾本來就是數字）就不重查，避免同字串再打一次。
+        if (suffixedQ && suffixedQ !== bareBase) {
+          console.log(`🆘 [fallback] S${targetSeason} 仍 0 筆，用帶季字串重查一次: "${suffixedQ}"`);
+          const sufTasks = resourceSites.map(site => async () => {
+            try {
+              const resp = await fetchWithSmartRetry(
+                site.value,
+                { params: { ac: 'detail', wd: suffixedQ } },
+                0, site.title);
+              if (!resp?.list?.length) return [];
+              const eligible = [];
+              for (const it of resp.list) {
+                if (!it?.vod_name) continue;
+                if (/剧场版|劇場版|电影解说|電影解說|外传|外傳|总集篇|總集篇|番外|＊|∽/u.test(it.vod_name)) continue;
+                const ci = extractEnhancedInfo(it.vod_name, it);
+                const mr = isSmartSeriesMatch(targetInfo, ci, matchStrictness);
+                if (!mr.match) continue;
+                eligible.push({ item: it, matchResult: mr });
+              }
+              if (eligible.length === 0) return [];
+              const sufLimit = CONFIG.MAC?.DETAIL_CONCURRENCY ?? 4;
+              const detailResults = await _adapterPool(
+                eligible.map(({ item: it, matchResult: mr }) => async () =>
+                  await extractPlayInfoForCache(it, site.title, type, mr, targetInfo)
+                ),
+                sufLimit
+              );
+              const out = [];
+              for (const res of detailResults) {
+                if (res) out.push(...res);
+              }
+              return out;
+            } catch { return []; }
+          });
+          const sufResults = await Promise.allSettled(sufTasks.map(t => t()));
+          const sufFlat = sufResults.filter(r => r.status === 'fulfilled').flatMap(r => r.value || []);
+          if (sufFlat.length > 0) {
+            const sufDedup = new SmartSearchExecutor(new SiteManager(), targetInfo, type, matchStrictness).smartDeduplicate(sufFlat);
+            if (sufDedup.length > 0) {
+              console.log(`🆘 [fallback] 帶季重查取得 ${sufDedup.length} 筆`);
+              allResults = sufDedup;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[fallback] 帶季重查失敗:', e?.message || e);
       }
     }
     
