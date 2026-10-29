@@ -1262,7 +1262,7 @@ const CONFIG = {
   //         Forward 端 JS 寬鬆解碼不受影響（child 照讀）。
   //     (2) 回傳前加一行季結構 log（季數=[..] 每季集數），以後判本地/重調
   //         不用再猜。bump 版本清掉手機裡修復前寫的髒 cache。
-  WIDGET_VERSION: 53,
+  WIDGET_VERSION: 54,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1515,7 +1515,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.5.5",
+  version: "3.5.6",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2684,6 +2684,26 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   // 一律視為第一季（seasonNumber 的預設值），若照單全收會誤殺大量正確
   // 結果 —— 資源站對「仁醫」這種沒寫季度的項目不會標 Season1。
   // 因此判準是：候選明確寫出不同於目標的季度才排除。
+  //
+  // ★ v54：target>1 時「明確標 S1」的候選也必須判 season_conflict。
+  //   實測：target S3 對上「白粉飞第一季」時，下方 `!== 1` 豁免讓它以
+  //   exact(100) 混入（seasonMatch=false 但 match=true），只能靠下游
+  //   filterBySequel 丟掉 —— 但 loadResource 的 cache 命中路徑不重跑
+  //   filter，髒資料直達 UI（切 S3 在電影天堂看到 S1 正是此路徑）。
+  //   只擋「明確寫出 S1」的（第一季/S1/Season 1/第1部）；無季標的裸名
+  //   （白粉飞）仍放行交給 filterBySequel 年份規則，避免誤殺仁醫這類裸名。
+  //   這是 Zen `season>1 && foundSeason!==season → 0` 的同義實現。
+  if (candidateInfo.seasonNumber === 1 && targetInfo.seasonNumber > 1 &&
+      /第\s*[一1１]\s*[季部]|Season\s*1\b|\bS1\b/i.test(candidateInfo.rawName || '')) {
+    return {
+      match: false, type: 'season_conflict', score: 0,
+      similarity: 0,
+      seasonMatch: false,
+      targetSeason: targetInfo.seasonNumber,
+      candidateSeason: 1,
+      confidence: 0
+    };
+  }
   if (candidateInfo.seasonNumber !== 1 && candidateInfo.seasonNumber !== targetInfo.seasonNumber) {
     return {
       match: false, type: 'season_conflict', score: 0,
@@ -9555,9 +9575,17 @@ async function loadDetail(link) {
     //   各季 cache key 獨立（loadResource 內部 _s${season}），切回舊季
     //   命中快取，不重打站台。
     const explicitSeason = meta.season ?? null;
+    // ★ v54：取回 1~6 季（不只 1~3），explicit 季放最前。
+    //   舊寫法 [explicit,1,2] / [1,2,3] 讓 S4~S6 永遠進不了詳情頁：
+    //   白粉飛有 6 季，初次載入只拿 S1~S3，切 S4 時 REX 手上無該季資料
+    //   只能顯示舊季（整體切季壞掉的另一半原因；S1 豁免是另一半，已在
+    //   isSmartSeriesMatch 修掉）。
+    //   任何被明確選中的季（explicit）一定在首位被抓回，所以 S7+ 點選時
+    //   也能按需拿回；初始 1~6 覆蓋絕大多數劇集的首屏季下拉。
+    const _seasonUniverse = [1, 2, 3, 4, 5, 6];
     const seasonsToFetch = explicitSeason != null
-      ? [...new Set([explicitSeason, 1, 2])]
-      : [1, 2, 3];
+      ? [...new Set([explicitSeason, ..._seasonUniverse])]
+      : [..._seasonUniverse];
     const seenKey = new Set();
     let allResults = [];
     // ★ 併發抓多季：三個 loadResource 各自走獨立 cache key（_s${s}），
