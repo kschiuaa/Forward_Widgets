@@ -1244,7 +1244,25 @@ const CONFIG = {
   //   另加 _macEpNumber：集數抽取認全格式（「01」「EP01」「第1話」），
   //   只認「第N集/期」時其他格式 _ep=null，切到那集就被丟掉。
   //   舊 cache 內是缺集/單集的髒結果，bump 版本讓 syncWidgetVersion 清掉重搜。
-  WIDGET_VERSION: 52,
+  //
+  // bump 到 53：修掉「REX 詳情頁切季源名永遠停在 S1、集數會動季數不動」。
+  //   根因（已由 S1E3/S2E3 兩次直調 log + 使用者症狀雙重定案）：
+  //   loadResource 本體已對（S1/S2 四站 URL 全不同、季標一致），問題在
+  //   loadDetail 回傳的季結構 REX 解碼器看不見：
+  //     - REX 官方契約 VideoItemChild 沒有 season 欄位，也沒有 episodeItems
+  //       欄位（@rexnow/libs video.d.ts：VideoItemChild 只有 episode；
+  //       childItems?: VideoItemChild[]，所以 child.episodeItems 會被丟掉）。
+  //     - 舊寫法把 child 季標成 type:'url'（可直接播放），REX 點季時認為
+  //       無需再調 loadDetail，直接本地過濾手上唯一的 S1 清單 → 季卡住、
+  //       集在同季內能動（與回報症狀字字對上）。
+  //   修法（只動結構，不動搜尋/過濾）：
+  //     (1) childItems 每季的 type 改為 'detail'（可鑽取），link 已帶
+  //         search:<標題>?season=S，REX 點季時用該 link 重調 loadDetail，
+  //         拿回該季頂層 episodeItems，再走 stream 重調 loadResource。
+  //         Forward 端 JS 寬鬆解碼不受影響（child 照讀）。
+  //     (2) 回傳前加一行季結構 log（季數=[..] 每季集數），以後判本地/重調
+  //         不用再猜。bump 版本清掉手機裡修復前寫的髒 cache。
+  WIDGET_VERSION: 53,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1497,7 +1515,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.5.3",
+  version: "3.5.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -9774,7 +9792,13 @@ async function loadDetail(link) {
         const childLink = buildDetailLink({ title, season: s, type, id });
         return {
           id: childLink,
-          type: 'url',
+          // ★ v53：child 季必須是 'detail'（可鑽取）而非 'url'（可直接播放）。
+          //   type:'url' 時 REX 認為點季無需再調 loadDetail，直接本地過濾
+          //   手上唯一的 S1 清單 → 季卡住、集在同季內能動（本次回報症狀）。
+          //   type:'detail' + link 帶 season=S 時，REX 點季用該 link 重調
+          //   loadDetail，拿回該季頂層 episodeItems，再走 stream 重調。
+          //   episodeItems 同時保留：Forward 端照讀，行為不變。
+          type: 'detail',
           title: `第${s}季`,
           mediaType: type,
           description: `${title} 第${s}季（${seasonEpisodes.length} 集）`,
@@ -9832,6 +9856,14 @@ async function loadDetail(link) {
         } : {})
       };
     });
+
+    // ★ v53：季結構可視化 log。以後判「本地過濾 vs 重調」不用再猜：
+    //   這行印出 loadDetail 一次回了幾季、每季幾集。REX 切季若沒再調，
+    //   就是在本地用這份結構過濾；若季數=[1] 只有一季，季下拉自然沒 S2 可點。
+    try {
+      console.log(`📡 [loadDetail] 季結構: 季數=[${Array.from(groupsBySeason.keys()).sort((a, b) => a - b).join(',')}] ` +
+        Array.from(groupsBySeason.entries()).sort((a, b) => a[0] - b[0]).map(([s, gs]) => `S${s}:${gs.length}集`).join(' '));
+    } catch {}
 
     return {
       id: mainLink,
