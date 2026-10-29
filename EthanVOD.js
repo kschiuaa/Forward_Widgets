@@ -1497,7 +1497,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.5.1",
+  version: "3.5.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2001,6 +2001,51 @@ function parseChineseNumeral(text) {
   }
   total = section + current;
   return total > 0 && total < 100 ? total : 0;
+}
+
+/**
+ * Zen 式季數正規化：params.season 優先，片名次之，保證永遠回有效數字。
+ *
+ * 借鏡 zen.cheyong.rex.stream.js 的 `Number(params.season) || dsSeason(wanted)`：
+ * Rex 詳細頁切季 = 帶新 params 重調一次 loadResource，季數放在 params.season。
+ * 但 Rex 的 season 型別是 string，未選季時傳空字串而非省略欄位，且實機出現過
+ * "第二季" / "S2" / "Season 2" / 數字型 2 等多種形狀，舊的三處複製寫法各行其是：
+ *   - `season ? parseInt(season)` 對 "第二季" 得 NaN，靠後面正則救
+ *   - 對 "S2" / "Season 2" 處理不一致
+ *   - `season="  "`（全空白）會進 parseInt 得 NaN，正則救不回來 → cacheKey 變 _sNaN_
+ *
+ * 本函式把三處收斂成一套：純數字 > S2/Season 2 > 中文數字 > 片名 fallback > 1。
+ * 有值但解不出來時不回 NaN，掉下去用片名再猜一次（跟 Zen 的 || 語意一致）。
+ */
+function resolveRexSeason(seasonParam, seriesName, fallbackSeason) {
+  const fb = Number.isFinite(fallbackSeason) && fallbackSeason >= 1 ? fallbackSeason : 1;
+  const raw = seasonParam == null ? '' : String(seasonParam).trim();
+  if (raw) {
+    // 純數字 "2" / 數字型 2
+    if (/^\d+$/.test(raw)) {
+      const n = parseInt(raw, 10);
+      if (n >= 1) return n;
+    } else {
+      // S2 / Season 2
+      const mEn = raw.match(/(?:season\s*|s)(\d{1,2})/i);
+      if (mEn) {
+        const n = parseInt(mEn[1], 10);
+        if (n >= 1) return n;
+      } else {
+        // 第二季 / 第二部 / 二
+        const mCn = raw.match(/\d+|[一二三四五六七八九十零〇兩两]+/);
+        if (mCn) {
+          const tok = mCn[0];
+          const n = /^\d+$/.test(tok) ? parseInt(tok, 10) : parseChineseNumeral(tok);
+          if (Number.isFinite(n) && n >= 1) return n;
+        }
+      }
+    }
+    // season 參數有值但解不出來 → 掉下去用片名再猜，不直接回 NaN
+  }
+  // 從片名猜：extractEnhancedInfo 已經會解 第X季 / S2，拿它的結果
+  if (Number.isFinite(fb) && fb > 1) return fb;
+  return 1;
 }
 
 /**
@@ -7094,32 +7139,18 @@ async function loadResource(params, onStreamResult = null) {
   if (type === 'tv' || type === 'movie' || type === 'variety') {
     targetInfo.type = type;
   }
-  let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
+  // ★ Zen 式季數接收：params.season 優先（純數字/S2/Season 2/中文數字），
+  //   片名次之，保證永遠有效數字。舊寫法見 resolveRexSeason 註解。
+  let targetSeason = resolveRexSeason(season, seriesName, targetInfo.seasonNumber);
   // ★ episode 必須走 _toEpisodeNumber（見其註解）：舊寫法對「第5集」
   //   這類輸入得 NaN，下游 smart 路徑用 !== null 判斷會把整批結果殺光。
   const targetEpisode = _toEpisodeNumber(episode);
 
-  // 修正「仁医 / season=第二季」情境。
-  //
-  // 實機日誌：seriesName=仁医 + season=第二季 + airDate 空 → 推播 100 筆全
-  // 是「仁醫2012」韓版，完全找不到愛蛋站實際有的「仁医2」（仁醫第二季）。
-  // 根本原因有兩個：
-  //   1. parseInt('第二季') = NaN，targetSeason 變成 NaN。
-  //   2. 就算 targetSeason 是 2，extractSequelNumber('仁医') = null，
-  //      extractSequelNumber('仁医2') = 2，target 與 candidate 的序號一個
-  //      是 null 一個是 2 → sequelShapeMismatch → sequelConflict → 匹配失敗，
-  //      「仁医2」整個被拒絕。
+  // 修正「仁医 / season=第二季」情境（targetSeason 已由 resolveRexSeason 解出，
+  // 此處只負責把「明確要第 N 季」的語意餵給 sequel 比對）。
   //
   // 正確解讀：season 參數帶著「第二季」這個語意時，候選檔名帶序號 2
   // （「仁医2」）才是正確答案，不該因序號不對稱而被當成不同作品。
-  //
-  // 補救：當 season 參數存在但 parseInt 失敗（中文 / 「S2」之類）時，
-  // 嘗試從 season 字串抽數字；若 targetSeason 是有效數字且 > 1，把它視為
-  // 「明確要第 N 季」，讓 sequel 序號比對通過。
-  if (Number.isNaN(targetSeason) && typeof season === 'string') {
-    const m = season.match(/\d+|[一二三四五六七八九十零]+/);
-    targetSeason = m ? (parseInt(m[0], 10) || parseChineseNumeral(m[0]) || NaN) : NaN;
-  }
   if (Number.isFinite(targetSeason) && targetSeason > 1) {
     targetInfo._expectedSequel = targetSeason;
   }
@@ -7810,8 +7841,20 @@ function applyDetailVersion(params, targetInfo) {
 // 退而求其次保留全部候選 —— 比「空白」好。
 function filterBySequel(results, targetInfo) {
   const targetSeason = targetInfo?.seasonNumber;
+  // ★ Zen 式 S1 反向阻擋（借鏡 zen.cheyong `season==1 && foundSeason>1 → 0`）：
+  //   使用者明確要 S1 時，站方混回來的「XXX第二季」必須丟掉，否則 S2 內容
+  //   會混進 S1 結果。安全網：擋到 0 筆就全部放行，跟 S2+ 的 fallback 同策略。
   if (!Number.isFinite(targetSeason) || targetSeason <= 1) {
-    return { kept: results, dropped: [] };
+    const kept = [];
+    const dropped = [];
+    for (const res of results) {
+      const nm = res._rawName || res.description || '';
+      const sq = extractSequelNumber(nm);
+      if (sq !== null && sq > 1) { dropped.push(res); continue; }
+      kept.push(res);
+    }
+    if (kept.length === 0) return { kept: results, dropped: [] };
+    return { kept, dropped };
   }
 
   const before = results.length;
@@ -8167,13 +8210,8 @@ async function performSmartSearch(params, onStreamResult) {
 
   // season 參數不會出現在 seriesName 裡，必須在這裡套用，否則搜尋字串
   // 永遠是裸片名。使用者切換季別時拿到的是第一季的內容，畫面看起來
-  // 就完全沒有刷新。理由與寫法見 loadResource 內的說明。
-  let targetSeason = season ? parseInt(season, 10) : targetInfo.seasonNumber;
-  // 中文季別（「第二季」之類）容錯，理由見 loadResource。
-  if (Number.isNaN(targetSeason) && typeof season === 'string') {
-    const m = season.match(/\d+|[一二三四五六七八九十零]+/);
-    targetSeason = m ? (parseInt(m[0], 10) || parseChineseNumeral(m[0]) || NaN) : NaN;
-  }
+  // 就完全沒有刷新。★ 統一走 resolveRexSeason（見其註解），與 loadResource 一致。
+  let targetSeason = resolveRexSeason(season, seriesName, targetInfo.seasonNumber);
   if (Number.isFinite(targetSeason) && targetSeason > 1) {
     targetInfo._expectedSequel = targetSeason;
   }
@@ -8306,14 +8344,10 @@ async function performBatchSearch(params) {
   if (type === 'tv' || type === 'movie' || type === 'variety') {
     targetInfo.type = type;
   }
-  let targetSeason = season ? parseInt(season) : targetInfo.seasonNumber;
+  // ★ 統一走 resolveRexSeason（見其註解），與 loadResource 一致。
+  let targetSeason = resolveRexSeason(season, seriesName, targetInfo.seasonNumber);
   // ★ 同 loadResource：episode 走 _toEpisodeNumber，NaN 會殺光結果。
   const targetEpisode = _toEpisodeNumber(episode);
-  // 中文季別容錯
-  if (Number.isNaN(targetSeason) && typeof season === 'string') {
-    const m = season.match(/\d+|[一二三四五六七八九十零]+/);
-    targetSeason = m ? (parseInt(m[0], 10) || parseChineseNumeral(m[0]) || NaN) : NaN;
-  }
   if (Number.isFinite(targetSeason) && targetSeason > 1) {
     targetInfo._expectedSequel = targetSeason;
   }
