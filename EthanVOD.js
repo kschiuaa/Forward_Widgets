@@ -1497,7 +1497,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.5.2",
+  version: "3.5.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6931,7 +6931,11 @@ async function loadResource(params, onStreamResult = null) {
     } catch {}
   }
 
-  if (multiSource !== "enabled" || !seriesName) {
+  // ★ Rex 直調時 params 裡沒有 multiSource（它不是 BaseParams 欄位，
+  //   只是自家 globalParams 設定項），用 !== "enabled" 會把 Rex 切季/切集
+  //   的呼叫全部擋掉（undefined !== "enabled" → return []）。
+  //   改成「顯式關掉才擋」，沒帶就當啟用。Zen 支無此守門，故不受影響。
+  if (multiSource === "disabled" || !seriesName) {
     return [];
   }
 
