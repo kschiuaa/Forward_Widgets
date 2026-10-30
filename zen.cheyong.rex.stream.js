@@ -4,7 +4,7 @@ WidgetMetadata = {
   "description": "只走官方索引 + 索引下發的第三方解析。",
   "author": "TG@ZenMoFiShi",
   "site": "http://app2.dsx.ac",
-  "version": "1.6.1",
+  "version": "1.6.3",
   "requiredVersion": "0.0.1",
   "modules": [
     {
@@ -515,8 +515,8 @@ function dsPlayData(object) {
 }
 async function dsLine(source, episode, title, deadline) {
   var start = Date.now(), headers = dsHeaders(source.headers), targetList = dsParseTargets(source, episode.origin);
-  // 來源放 name（官方線路·平臺X / 無平臺才留線路X）；description 只留劇名·集數，保持 REX 顯示乾淨。
-  // 索引原名若含「獨家」字樣洗成中性「線路」；有平臺名時不再加「線路」二字，只留編號區分。
+  // 來源放 name（官方頻道直接顯示頻道名 / 其餘顯示官方線路·線路X）；description 只留劇名·集數，保持 REX 顯示乾淨。
+  // 索引原名若含「獨家」字樣洗成中性「線路」；官方頻道不加前綴、不加編號。
   function dsCleanLineName(value) {
     var name = dsText(value) || "未知線路";
     name = name.replace(/獨家|独家|獨播|独播|專享|专享|專屬|专属|獨享|独享/g, "線路");
@@ -537,13 +537,13 @@ async function dsLine(source, episode, title, deadline) {
     var plat = dsPlatformShort(source, episode.origin, play.url);
     var lineName, suffix = result.quality ? "·" + result.quality : "";
     if (plat) {
-      // 有平臺名 → 只留編號區分，不再加「線路」二字（如 官方線路·西瓜視頻1）。
-      var num = String(source.name || source.code || "").match(/(\d{1,2})/);
-      lineName = "官方線路·" + plat + (num ? num[1] : "") + suffix;
+      // 官方頻道 → 直接顯示頻道名，不加「官方線路·」前綴、不加編號（如 西瓜視頻、騰訊視頻）。
+      lineName = plat + suffix;
     } else {
       lineName = "官方線路·" + dsCleanLineName(source.name || source.code) + suffix;
     }
-    return { name: lineName, description: title + " · " + episode.title, url: result.url, headers: mediaHeaders, customHeaders: mediaHeaders, _latency: Date.now() - start };
+    var platRank = !plat ? 10 : (plat === "騰訊視頻" ? 0 : (plat === "西瓜視頻" ? 1 : 2));
+    return { name: lineName, description: title + " · " + episode.title, url: result.url, headers: mediaHeaders, customHeaders: mediaHeaders, _latency: Date.now() - start, _platRank: platRank };
   }
   if (source.parse_secret) {
     try {
@@ -619,7 +619,7 @@ async function dsPool(items, limit, task) {
 //  不含任何公開 MacCMS 資源站。
 //
 // 命名規則（REX 顯示用：來源放 name，description 只留劇名·集數）：
-//   主路徑  → name「官方線路·平臺X / 官方線路·線路X[·清晰度]」，description「劇名 · 集」
+//   主路徑  → name「西瓜視頻 / 騰訊視頻 / 官方線路·線路X[·清晰度]」，description「劇名 · 集」
 //   快照    → 同上，name 追加「·快照」
 // ============================================================
 // ---------- 本地快照 ----------
@@ -713,10 +713,12 @@ async function dsReplaySnapshot(snapshot, wanted, requested, deadline) {
     if (Date.now() >= deadline) return null;
     return dsLine(entry.source, entry.episode, dsText(snapshot.vod_name || wanted), deadline);
   });
+  all.sort(function (a, b) { if (!a) return 1; if (!b) return -1; return ((a._platRank == null ? 10 : a._platRank) - (b._platRank == null ? 10 : b._platRank)) || (a._latency - b._latency); });
   all.forEach(function (entry) {
     if (!entry) return;
     // 快照重放走同一第三方解析；name 追加「·快照」以區分時效，description 保持乾淨。
     entry.name = dsText(entry.name) + "·快照";
+    delete entry._latency; delete entry._platRank;
     results.push(entry);
   });
   return results;
@@ -829,7 +831,7 @@ async function loadResource(params) {
         var all = await dsPool(candidates.slice(0, 20), 12, function (entry) {
           return Date.now() >= deadline ? null : dsLine(entry.source, entry.episode, dsText(detail.vod_name), deadline);
         });
-        var used = {}, output = all.filter(function (entry) { if (!entry || used[entry.url]) return false; used[entry.url] = true; return true; }).sort(function (a, b) { return a._latency - b._latency; }).map(function (entry) { delete entry._latency; return entry; });
+        var used = {}, output = all.filter(function (entry) { if (!entry || used[entry.url]) return false; used[entry.url] = true; return true; }).sort(function (a, b) { return (a._platRank - b._platRank) || (a._latency - b._latency); }).map(function (entry) { delete entry._latency; delete entry._platRank; return entry; });
         // 主路徑成功時順手存快照，供索引不可達時重放。
         if (output.length) { try { await dsSnapshotSave(wanted, dsMakeSnapshot(detail, wanted)); } catch (error) {} }
         if (output.length) return output;
