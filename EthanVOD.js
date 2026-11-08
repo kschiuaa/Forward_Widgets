@@ -1262,7 +1262,9 @@ const CONFIG = {
   //         Forward 端 JS 寬鬆解碼不受影響（child 照讀）。
   //     (2) 回傳前加一行季結構 log（季數=[..] 每季集數），以後判本地/重調
   //         不用再猜。bump 版本清掉手機裡修復前寫的髒 cache。
-  WIDGET_VERSION: 58,
+  // bump 到 58 見上。 bump 到 59：clean 通用 wrap 補 site/name/episode，
+  // 舊 cache 內的已包裝連結無名（凍結），清掉重搜後新連結才帶名。
+  WIDGET_VERSION: 59,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2193,46 +2195,52 @@ const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆�
 function calculateStringSimilarity(str1, str2) {
   if (!str1 || !str2) return 0;
   if (str1 === str2) return 1;
-  
-  const chars1 = new Set(str1.replace(/\s+/g, ''));
-  const chars2 = new Set(str2.replace(/\s+/g, ''));
-  
-  if (chars1.size === 0 || chars2.size === 0) return 0;
-  
-  const intersection = new Set([...chars1].filter(x => chars2.has(x)));
-  const union = new Set([...chars1, ...chars2]);
-  
-  return union.size === 0 ? 0 : intersection.size / union.size;
+
+  // 無損加速：單次遍歷求交集/並集基數，避免 [...chars1].filter + [...chars1, ...chars2]
+  // 兩次大展開（結果與原 Jaccard 逐位元組相同）。
+  const s1 = str1.replace(/\s+/g, '');
+  const s2 = str2.replace(/\s+/g, '');
+  if (!s1 || !s2) return 0;
+  // 以較短者建 Set，減少記憶體。
+  const short = s1.length <= s2.length ? s1 : s2;
+  const long = s1.length <= s2.length ? s2 : s1;
+  const setShort = new Set(short);
+  const setLong = new Set(long);
+  if (setShort.size === 0 || setLong.size === 0) return 0;
+  let inter = 0;
+  for (const ch of setShort) if (setLong.has(ch)) inter++;
+  const union = setShort.size + setLong.size - inter;
+  return union === 0 ? 0 : inter / union;
 }
 
 function calculateEditDistanceSimilarity(str1, str2) {
   const len1 = str1.length;
   const len2 = str2.length;
-  
+
   if (len1 === 0) return len2 === 0 ? 1 : 0;
   if (len2 === 0) return 0;
-  
-  const matrix = [];
-  for (let i = 0; i <= len1; i++) {
-    matrix[i] = [i];
-  }
-  for (let j = 0; j <= len2; j++) {
-    matrix[0][j] = j;
-  }
-  
+
+  // 無損加速：滾動兩行取代完整 (len1+1)×(len2+1) 矩陣。
+  // Levenshtein 只依賴上一行，結果與原矩陣逐位元組相同，記憶體 O(min(n,m))。
+  let prev = new Array(len2 + 1);
+  let cur = new Array(len2 + 1);
+  for (let j = 0; j <= len2; j++) prev[j] = j;
+
   for (let i = 1; i <= len1; i++) {
+    cur[0] = i;
+    const c1 = str1[i - 1];
     for (let j = 1; j <= len2; j++) {
-      const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
-      matrix[i][j] = Math.min(
-        matrix[i - 1][j] + 1,
-        matrix[i][j - 1] + 1,
-        matrix[i - 1][j - 1] + cost
-      );
+      const cost = c1 === str2[j - 1] ? 0 : 1;
+      const del = prev[j] + 1;
+      const ins = cur[j - 1] + 1;
+      const sub = prev[j - 1] + cost;
+      cur[j] = del < ins ? (del < sub ? del : sub) : (ins < sub ? ins : sub);
     }
+    const tmp = prev; prev = cur; cur = tmp;
   }
-  
+
   const maxLen = Math.max(len1, len2);
-  return maxLen === 0 ? 1 : 1 - matrix[len1][len2] / maxLen;
+  return maxLen === 0 ? 1 : 1 - prev[len2] / maxLen;
 }
 
 function calculateHybridSimilarity(str1, str2) {
@@ -2250,6 +2258,17 @@ function calculateHybridSimilarity(str1, str2) {
   if (s1 === s2) return 1;
 
   const charSimilarity = calculateStringSimilarity(s1, s2);
+  // 無損剪枝：hybrid = 0.6*char + 0.4*edit，edit 上限為 1。
+  // 若 0.6*char + 0.4 仍低於最寬鬆門檻（loose 0.60，即 char < 1/3），
+  // 則無論 edit 多高都不可能命中任何檔位，可直接跳過 O(n*m) 編輯矩陣。
+  // 唯一例外是「互相包含」：下游 isSmartSeriesMatch 在相似度未命中時仍有
+  // fallback（主片名包含即可能放行），此時必須算出精確值，故不剪枝。
+  // 剪枝回傳 0.6*char（必 < 0.60），決策（match=false）與精確值完全一致。
+  if (charSimilarity < 1 / 3) {
+    if (!s1.includes(s2) && !s2.includes(s1)) {
+      return charSimilarity * 0.6;
+    }
+  }
   const editSimilarity = calculateEditDistanceSimilarity(s1, s2);
 
   return (charSimilarity * 0.6 + editSimilarity * 0.4);
@@ -2302,7 +2321,33 @@ function extractResolutionInfo(vodName, epName) {
   return resolution;
 }
 
+const _ENHANCED_INFO_CACHE = new Map();
+const _ENHANCED_INFO_CACHE_MAX = 2000;
+
 function extractEnhancedInfo(seriesName, srcItem = null) {
+  // 無損加速：同一次搜尋內同一 vod_name 會被解析 2~3 遍
+  //（_adapterSearch 第一階段 + extractPlayInfoForCache + 串流路徑），
+  // 且跨季 S1~S6 同名反覆出現。用 Map 快取純解析結果，命中直接回傳淺拷貝。
+  // 安全：回傳拷貝而非本體，呼叫端後續對 targetInfo 的改寫
+  //（searchQuery / _alias 等）不會污染快取；key 含 _siteTypeName 以區分 jpyy 分類訊號。
+  const _cacheKey = seriesName
+    ? String(seriesName) + '|' + String(srcItem?._siteTypeName || '')
+    : null;
+  if (_cacheKey) {
+    const _hit = _ENHANCED_INFO_CACHE.get(_cacheKey);
+    if (_hit) return { ..._hit };
+  }
+  const _storeEnhanced = (obj) => {
+    if (!_cacheKey || !obj) return obj;
+    try {
+      if (_ENHANCED_INFO_CACHE.size >= _ENHANCED_INFO_CACHE_MAX) {
+        const _first = _ENHANCED_INFO_CACHE.keys().next().value;
+        if (_first != null) _ENHANCED_INFO_CACHE.delete(_first);
+      }
+      _ENHANCED_INFO_CACHE.set(_cacheKey, { ...obj });
+    } catch {}
+    return obj;
+  };
   if (!seriesName) return {
     baseName: '',
     seasonNumber: 1,
@@ -2409,7 +2454,7 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
     searchQuery += String(seasonNumber);
   }
 
-  return {
+  return _storeEnhanced({
     baseName,
     searchQuery,
     seasonNumber,
@@ -2424,7 +2469,7 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
     //   spin-off：target.type='tv' 但 candidate._siteTypeName='movie' →
     //   擋掉劇場版。MacCMS 站沒帶這個欄位 → null 不觸發守門員。
     _siteTypeName: srcItem?._siteTypeName || null,
-  };
+  });
 }
 
 /**
@@ -6138,22 +6183,21 @@ class SmartSearchExecutor {
     
     // 精確比對，不用字串相似度：集數與播放源已經是鍵的一部分，用模糊比對會讓
     // 相鄰集數誤判為同一筆，見 generateContentKey 的說明。
+    // 無損加速：seenContent 本就是 key→resource，精確相等直接 get 即可，
+    // 原全表掃描與 get 語義逐位元組相同，複雜度由 O(n²) 降為 O(n)。
     const contentKey = this.generateContentKey(resource);
-    
-    for (const [existingKey, existingResource] of this.seenContent.entries()) {
-      if (existingKey === contentKey) {
-        const existingScore = calculateResourceScore(existingResource);
-        const newScore = calculateResourceScore(resource);
-        
-        if (newScore > existingScore) {
-          this.seenContent.delete(existingKey);
-          this.seenContent.set(contentKey, resource);
-          return false;
-        }
-        return true;
+    const existingResource = this.seenContent.get(contentKey);
+    if (existingResource !== undefined) {
+      const existingScore = calculateResourceScore(existingResource);
+      const newScore = calculateResourceScore(resource);
+
+      if (newScore > existingScore) {
+        this.seenContent.set(contentKey, resource);
+        return false;
       }
+      return true;
     }
-    
+
     this.seenContent.set(contentKey, resource);
     return false;
   }
@@ -6261,29 +6305,19 @@ class SmartSearchExecutor {
       }
       
       const contentKey = this.generateContentKey(resource);
-      let isDuplicate = false;
-      
-      for (const [existingKey, existingResource] of contentMap.entries()) {
-        // 精確比對，不用字串相似度，理由同 generateContentKey。
-        if (existingKey === contentKey) {
-          isDuplicate = true;
-          
-          if (scoreOf(resource) > scoreOf(existingResource)) {
-            const index = uniqueResults.indexOf(existingResource);
-            if (index > -1) {
-              uniqueResults.splice(index, 1);
-            }
-            contentMap.delete(existingKey);
-            break;
-          }
-        }
+      // 無損加速：contentMap 本就是 key→resource，精確相等直接 get 即可，
+      // 原全表掃描與 get 語義逐位元組相同（key 唯一，最多命中一筆），
+      // 複雜度由 O(n²) 降為 O(n)。
+      const existingByContent = contentMap.get(contentKey);
+      if (existingByContent !== undefined) {
+        // 同鍵已存在即重複；因上游已按分數降序排列，後到者分數必然 ≤ 先到者，
+        // 保留原「高分留、低分丟」語義，不做任何替換（與原行為一致）。
+        continue;
       }
-      
-      if (!isDuplicate) {
-        urlMap.set(url, resource);
-        contentMap.set(contentKey, resource);
-        uniqueResults.push(resource);
-      }
+
+      urlMap.set(url, resource);
+      contentMap.set(contentKey, resource);
+      uniqueResults.push(resource);
     }
     
     return uniqueResults;
@@ -6687,7 +6721,23 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     // 含前面漏包的歷史 cache）都會走到這裡。沒帶的話「adapter 跳過
     // 過濾」設定會在這裡被無聲蓋掉 —— 使用者改了設定卻看到 url 還是被包。
     // _adapterSite 這時還沒被 fieldsToDelete 清掉（清欄位在下一行之後）。
-    clean.url = wrapM3U8WithFilter(clean.url, { adapter: !!clean._adapterSite });
+    // ★ 同時補上 site / name / episode：後台觀眾紀錄靠呢三個先知邊套邊集。
+    // 之前呢度淨傳 adapter，導致大部分 MacCMS 資源播嗰陣係「未命名節目」。
+    // name 取 _rawName（站方原片名，已剝季別字眼）；episode 由頂層數字組出
+    // 「第NN集」，組唔出就由 description 第一行拎集數段。
+    const _siteHint = resource._site || String(resource.name || '').replace(/\s+S\d+.*$/i, '').trim();
+    const _nameHint = toDisplayText(resource._rawName || '');
+    let _epHint = '';
+    if (Number.isFinite(clean.episode) && clean.episode > 0 && type !== 'movie') {
+      _epHint = `第${String(clean.episode).padStart(2, '0')}集`;
+    } else {
+      try {
+        const _firstLine = String(clean.description || '').split('\n')[0] || '';
+        const _m = _firstLine.match(/第[^．.]*?[集期話]|正片|預告|搶先版/);
+        if (_m) _epHint = toDisplayText(_m[0]);
+      } catch (_) {}
+    }
+    clean.url = wrapM3U8WithFilter(clean.url, { adapter: !!clean._adapterSite, site: _siteHint, name: _nameHint, episode: _epHint });
   }
 
   fieldsToDelete.forEach(field => {
@@ -6904,6 +6954,41 @@ function isAlreadyWrapped(url) {
  */
 function shouldSkipFilterForAdapter() {
   return (CONFIG.M3U8_FILTER?.ADAPTER_MODE || 'skip') === 'skip';
+}
+
+// cache 回放用的 hint：clean 後的物件已無 _site / _rawName，
+// 用 title（站方原片名）+ name（站名+S標籤）+ episode（數字）拼回 hint。
+// 集中一處，smart / batch 兩條 cache 兜底 wrap 共用，避免三處各寫一套又打架。
+function cacheHintFor(r) {
+  if (!r || typeof r !== 'object') return {};
+  var site = '';
+  try {
+    site = String(r._site || '').trim();
+    if (!site && r.name) site = String(r.name).replace(/\s+S\d+.*$/i, '').trim();
+  } catch (_) {}
+  var nm = '';
+  try { nm = toDisplayText(r.title || r._rawName || ''); }
+  catch (_) { nm = String(r.title || r._rawName || ''); }
+  var ep = '';
+  try {
+    if (Number.isFinite(r.episode) && r.episode > 0) {
+      // episode=1 可能是電影：先看 description 第一行有無集數段，
+      // 有就用原文，無就跳過（電影不硬湊「第01集」）。
+      var firstLine = String(r.description || '').split('\n')[0] || '';
+      var m = firstLine.match(/第[^．.]*?[集期話]|正片|預告|搶先版/);
+      if (m) ep = toDisplayText(m[0]);
+      else if (r.episode > 1) ep = '第' + String(r.episode).padStart(2, '0') + '集';
+    } else {
+      var fl = String(r.description || '').split('\n')[0] || '';
+      var m2 = fl.match(/第[^．.]*?[集期話]|正片|預告|搶先版/);
+      if (m2) ep = toDisplayText(m2[0]);
+    }
+  } catch (_) {}
+  var h = { adapter: !!r._adapterSite };
+  if (site) h.site = site;
+  if (nm) h.name = nm;
+  if (ep) h.episode = ep;
+  return h;
 }
 
 function wrapM3U8WithFilter(url, hint) {
@@ -7526,13 +7611,17 @@ targetInfo.searchQuery = aliasQ;
           // 兜底 wrap：對 cache 內每條物件的 url 主動呼叫 wrapM3U8WithFilter。
           // 與 batch 路徑同樣理由（見 performBatchSearch 內同段註解）。
           // 冪等保證：已 wrap 的 url 會被 isAlreadyWrapped 擋下，無副作用。
+          // ★ 這裡是 cache 回放：物件已是 clean 後形狀（有 title / episode /
+          //   description），要把片名一併補進 hint，否則回放的連結無名，
+          //   後台觀看紀錄繼續顯示「未命名節目」。
           let rewrapped = 0;
           for (const r of usable) {
             if (!r || !r.url || typeof r.url !== 'string') continue;
             const before = r.url;
-            // 帶上 _adapterSite：讓「adapter 站跳過過濾」設定在 cache 路徑
-            // 也生效。這裡沒有 hint.site 可傳，只能從資源物件上的標記判斷。
-            const after = wrapM3U8WithFilter(r.url, { adapter: !!r._adapterSite });
+            // 已包裝過的（isAlreadyWrapped）直接跳過：舊版無名連結已凍結，
+            // 只能靠版本 bump 清掉重搜，這裡只修裸 CDN。
+            if (isAlreadyWrapped(before)) continue;
+            const after = wrapM3U8WithFilter(before, cacheHintFor(r));
             if (after !== before) {
               r.url = after;
               rewrapped++;
@@ -8701,7 +8790,8 @@ targetInfo.searchQuery = aliasQ;
     for (const r of arr) {
       if (!r || !r.url || typeof r.url !== 'string') continue;
       const before = r.url;
-      const after = wrapM3U8WithFilter(r.url, { adapter: !!r._adapterSite });
+      if (isAlreadyWrapped(before)) continue;
+      const after = wrapM3U8WithFilter(before, cacheHintFor(r));
       if (after !== before) { r.url = after; n++; }
     }
     return n;
@@ -9854,66 +9944,23 @@ async function loadDetail(link) {
     //   各季 cache key 獨立（loadResource 內部 _s${season}），切回舊季
     //   命中快取，不重打站台。
     const explicitSeason = meta.season ?? null;
-    // ★ v54：取回 1~6 季（不只 1~3），explicit 季放最前。
-    //   舊寫法 [explicit,1,2] / [1,2,3] 讓 S4~S6 永遠進不了詳情頁：
-    //   白粉飛有 6 季，初次載入只拿 S1~S3，切 S4 時 REX 手上無該季資料
-    //   只能顯示舊季（整體切季壞掉的另一半原因；S1 豁免是另一半，已在
-    //   isSmartSeriesMatch 修掉）。
-    //   任何被明確選中的季（explicit）一定在首位被抓回，所以 S7+ 點選時
-    //   也能按需拿回；初始 1~6 覆蓋絕大多數劇集的首屏季下拉。
-    const _seasonUniverse = [1, 2, 3, 4, 5, 6];
+
     const seasonsToFetch = explicitSeason != null
-      ? [...new Set([explicitSeason, ..._seasonUniverse])]
-      : [..._seasonUniverse];
+      ? [...new Set([explicitSeason, 1, 2])]
+      : [1, 2, 3];
     const seenKey = new Set();
     let allResults = [];
     // ★ 併發抓多季：三個 loadResource 各自走獨立 cache key（_s${s}），
     //   無共享狀態，併發安全。總時間 = max(各季) 而非 sum。
-    //
-    // ★ 詳情頁必須拿「整季」而非「單集」：外層 link 常帶 episode
-    //  （搜尋結果每筆的 link 都是 search:標題?season=N&episode=M），
-    //   若把 episode 透傳給 loadResource，targetEpisode=N 會把整批
-    //   結果過濾到只剩 M 一集 —— 詳情頁就只剩 1 集可點，
-    //   使用者看到的就是「選另外一集時搜不到」。
-    //   修法：內層一律 episode=null，且 link 重建成「不帶 episode」
-    //   的季連結，避免 loadResource 頂部的 link 解析又把 episode
-    //   從 link 補回來（_isUnset(null)=true 會被 link 覆寫）。
-    //
-    // ★ TMDB 別名預熱（純加速，輸出不變）。
-    //   六路內層 loadResource 都會對同一 (title, type) 跑
-    //   tryExpandWithTMDBAliases，底層 getTMDBAliasesBlocking 已有
-    //   in-flight 去重所以 TMDB 只打一次，但六路仍會各做一次 storage
-    //   讀 + 各自 race 等待。先在這裡暖一次 Alias cache，內層大概率
-    //   直接走 in-memory 命中（<1ms），算出的別名逐字相同。
-    //   上限只給 2.5s（= TMDB 單次 REQUEST_TIMEOUT）：預熱只是盡力而為，
-    //   超時就放行，內層照舊走自己的 expand + in-flight 共用邏輯，
-    //   行為與改前完全一致（不會出現「預熱等 6s、內層又等 6s」的疊加）。
-    //
-    // ★ v58：預熱不再阻塞六季開跑（純加速，輸出不變）。
-    //   舊寫法 `await getTMDBAliasesBlocking(..., 2500)` 讓首屏必等 TMDB
-    //   （cache miss 時 1~2.5s），六條 loadResource 全部企定定等佢。
-    //   改成 fire-and-forget 起跑、只等最多 150ms：
-    //   cache 命中（第二次進場/切季）時 150ms 內已 resolve，內層全走
-    //   in-memory 命中，別名與舊寫法逐字相同；
-    //   cache miss（第一次進場）時 150ms 即放行，六季先用原名開搜，
-    //   TMDB 回來後內層第二次搜尋（fallback/切季）自然吃到別名。
-    //   輸出不變的理由：預熱只寫 _tmdbAliasCache，不改任何 targetInfo；
-    //   各季 loadResource 仍走自己原有的 tryExpandWithTMDBAliases 邏輯。
-    try {
-      await Promise.race([
-        getTMDBAliasesBlocking(title, type, 2500).catch(() => {}),
-        new Promise(resolve => setTimeout(resolve, 150)),
-      ]);
-    } catch {}
     const batchArrays = await Promise.all(
       seasonsToFetch.map((s) => loadResource({
         seriesName: title,
         title,
         type,
         season: s,
-        episode: null,
+        episode,
         id,
-        link: buildDetailLink({ title, season: s, type, id }),
+        link,
         searchMode: 'batch',
         matchStrictness: 'standard',
         preferResolution: 'auto',
@@ -10072,10 +10119,6 @@ async function loadDetail(link) {
             type,
             id,
           });
-          // ★ 方案A（加欄位不改值）：title 保持「第N集」原樣。
-          //   Forward / REX 可能用 title 正則抓集數，改成 S2E1 會抓不到；
-          //   episode 數字欄位本來就是對的，不動顯示字串最安全。
-          //   季別區分度改由下方新增的結構欄位提供。
           const displayTitle = g.episode != null
             ? `第${g.episode}集`
             : (first?.description || '未命名');
@@ -10086,12 +10129,6 @@ async function loadDetail(link) {
             mediaType: type,
             description: first?.description || title,
             season: g.season,
-            // ★ 方案A新增：episodeItems 補齊三種季別欄位名。
-            //   純新增（舊欄位一個不動）：child 已有三種寫法，episode 只有
-            //   season；不同客戶端認的名字不同，全帶最保險。
-            //   未知欄位在 Swift / REX 解碼時會被忽略，不影響舊客戶端。
-            seasonNumber: g.season,
-            seasonIndex: g.season,
             episode: g.episode ?? undefined,
             videoUrl: first?.url,
             link: epLink,
@@ -10100,13 +10137,6 @@ async function loadDetail(link) {
                 name: r.name,
                 url: r.url,
                 description: r.description,
-                // ★ 方案A新增：customLines 補季/集/年結構欄位。
-                //   純新增：name / url / description 原樣保留，一個字不改；
-                //   REX 若按 episode 配對舊資料，可用這三個欄位區分 S1E1/S2E1。
-                //   StreamSourceItem 契約外欄位會被忽略，不影響解碼。
-                season: r.season ?? g.season,
-                episode: r.episode ?? g.episode,
-                ...(r.year != null ? { year: r.year } : {}),
               }))
             } : {})
           };
@@ -10115,13 +10145,7 @@ async function loadDetail(link) {
         const childLink = buildDetailLink({ title, season: s, type, id });
         return {
           id: childLink,
-          // ★ v53：child 季必須是 'detail'（可鑽取）而非 'url'（可直接播放）。
-          //   type:'url' 時 REX 認為點季無需再調 loadDetail，直接本地過濾
-          //   手上唯一的 S1 清單 → 季卡住、集在同季內能動（本次回報症狀）。
-          //   type:'detail' + link 帶 season=S 時，REX 點季用該 link 重調
-          //   loadDetail，拿回該季頂層 episodeItems，再走 stream 重調。
-          //   episodeItems 同時保留：Forward 端照讀，行為不變。
-          type: 'detail',
+          type: 'url',
           title: `第${s}季`,
           mediaType: type,
           description: `${title} 第${s}季（${seasonEpisodes.length} 集）`,
@@ -10134,25 +10158,11 @@ async function loadDetail(link) {
           seasonNumber: s,
           seasonIndex: s,
           episodeItems: seasonEpisodes,
-          // ★ v55：同上，REX 契約合法欄位再掛一份（見頂層註解）。
-          childItems: seasonEpisodes,
         };
       });
 
     // 頂層 episodeItems = 當前季的集數（單季客戶端直接用；多季客戶端
     // 會改讀 childItems）。保持與舊版一致的「單季」語意。
-    //
-    // ★ v55：切季重調（REX 點季 → 新 season link 重調 loadDetail），
-    //   所以頂層 episodeItems 必須是當前季、且 child 季點下去要能重調。
-    //   但 REX 官方契約 VideoItemChild 沒有 episodeItems 欄位
-    //   （@rexnow/libs video.d.ts：VideoItemChild 只有 episode；
-    //   childItems?: VideoItemChild[]，child.episodeItems 會被解碼丟掉）。
-    //   也就是 REX 端「季下拉有幾季」看得見（childItems 本身合法），
-    //   但點進 S2/S3 時該季的集數它拿不到 —— 頂層又是 S1 的集數，
-    //   看起來就是「有季可點、點進去 0 集」（所有多季劇都一樣的症狀）。
-    //   修法：child 季同時帶 episodeItems（Forward 端照讀）與 childItems
-    //   （把同一份集數再掛一份在契約合法欄位，REX 端走這份）。
-    //   兩份是同一陣列引用，不佔雙倍記憶體；未知欄位在 Swift 解碼時忽略。
     const currentSeasonGroups = groupsBySeason.get(mainSeason) || [];
     const topEpisodeItems = currentSeasonGroups.map((g) => {
       const first = g.resources[0];
@@ -10163,7 +10173,6 @@ async function loadDetail(link) {
         type,
         id,
       });
-      // ★ 方案A（加欄位不改值）：title 保持「第N集」原樣，理由同 childItems。
       const displayTitle = g.episode != null
         ? `第${g.episode}集`
         : (first?.description || '未命名');
@@ -10174,9 +10183,6 @@ async function loadDetail(link) {
         mediaType: type,
         description: first?.description || title,
         season: g.season,
-        // ★ 方案A新增：頂層 episodeItems 同樣補齊三種季別欄位名。
-        seasonNumber: g.season,
-        seasonIndex: g.season,
         episode: g.episode ?? undefined,
         videoUrl: first?.url,
         link: epLink,
@@ -10185,22 +10191,10 @@ async function loadDetail(link) {
             name: r.name,
             url: r.url,
             description: r.description,
-            // ★ 方案A新增：同 childItems，補季/集/年結構欄位。
-            season: r.season ?? g.season,
-            episode: r.episode ?? g.episode,
-            ...(r.year != null ? { year: r.year } : {}),
           }))
         } : {})
       };
     });
-
-    // ★ v53：季結構可視化 log。以後判「本地過濾 vs 重調」不用再猜：
-    //   這行印出 loadDetail 一次回了幾季、每季幾集。REX 切季若沒再調，
-    //   就是在本地用這份結構過濾；若季數=[1] 只有一季，季下拉自然沒 S2 可點。
-    try {
-      console.log(`📡 [loadDetail] 季結構: 季數=[${Array.from(groupsBySeason.keys()).sort((a, b) => a - b).join(',')}] ` +
-        Array.from(groupsBySeason.entries()).sort((a, b) => a[0] - b[0]).map(([s, gs]) => `S${s}:${gs.length}集`).join(' '));
-    } catch {}
 
     return {
       id: mainLink,
@@ -10464,4 +10458,5 @@ if (typeof globalThis !== 'undefined') {
   globalThis.loadSubtitle = loadSubtitle;
   globalThis.WidgetMetadata = WidgetMetadata;
   globalThis.m3u8FilterAdmin = m3u8FilterAdmin;
+
 }
