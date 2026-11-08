@@ -1283,7 +1283,10 @@ const CONFIG = {
 // 舊 cache 內沒有 actualResolution 欄位，清掉重搜後新結果才會帶實測行。
 // bump 到 66：移除「聚合搜尋」開關（預設一定開啟，鎖死行為）。
 // bump 到 67：新增每站開關（等同多選），cache key 帶站點選擇簽名。
-  WIDGET_VERSION: 67,
+// bump 到 68：播放列表必顯示 📺 行（clean 即寫站方行、probe 回來升級實測）+
+// 粵語置頂 + 固定站序（金牌影視 > 電影天堂 > 如意資源，分數加成+comparator 硬性 tier）。
+// 舊 cache 內無 📺 行且排序是舊規則，清掉重搜後才會看到新行與新順序。
+  WIDGET_VERSION: 68,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1438,6 +1441,12 @@ const CONFIG = {
     // （片名只差年份，文字比對分不出來）。
     AREA_MISMATCH_PENALTY: 150,
     AREA_MATCH_BONUS: 40,
+    // ★ 粵語優先 + 固定站序（使用者要求；comparator 另有硬性 tier，這裡讓去重/串流同向）。
+    CANTONESE_BONUS: 80,
+    BILINGUAL_BONUS: 40,
+    SITE_RANK_JPYY: 60,
+    SITE_RANK_DYTT: 40,
+    SITE_RANK_RYCJ: 20,
   },
 
   // m3u8 過濾廣告伺服器設定
@@ -1536,7 +1545,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.8",
+  version: "3.6.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4245,7 +4254,22 @@ function applyActualResolutions(results) {
           }
         }
       } catch {}
-      if (r.actualResolution) continue; // 已套過（冪等，重複 clean 安全）
+      if (r.actualResolution) {
+        // 已有實測但 description 缺 📺 行（舊 cache / clean 後）→ 補行，不跳過。
+        try {
+          const _ar = String(r.actualResolution);
+          const _line = `📺 ${_ar}`;
+          const _d = String(r.description || '');
+          if (/📺\s*實測/.test(_d)) {
+            const _m = _d.match(/📺\s*實測\s*(4K|1080P|720P|480P|360P)/);
+            r.description = _m ? _d.replace(/📺\s*實測[^\n]*/g, _line) : (_d.includes(_line) ? _d : (_d ? `${_d}\n${_line}` : _line));
+          } else if (!_d.includes(_line)) {
+            r.description = _d ? `${_d}\n${_line}` : _line;
+          }
+        } catch {}
+        applied++;
+        continue;
+      } // 已套過（冪等，重複 clean 安全）
       const inner = _unwrapFilterInnerUrl(r.url);
       const key = String(inner || r.url || '').split(/[?#]/)[0].trim();
       // cache 內存的是包裝 url，in-memory key 是裸路徑 —— 兩邊都試。
@@ -4256,10 +4280,10 @@ function applyActualResolutions(results) {
       r.actualResolutionWH = `${hit.w}x${hit.h}`;
       const desc = String(r.description || '');
       const line = `📺 ${hit.label}`;
-      if (/📺\s*實測/.test(desc)) {
-        // 舊格式「📺 實測1080P(1920x1080)」遷移到新格式「📺 1080P」。
-        r.description = desc.replace(/📺\s*實測[^\n]*/g, line);
-      } else if (!desc.includes(line)) {
+      if (/📺[^\n]*/.test(desc)) {
+        // 已有 📺 行（clean 時寫的站方行，或舊格式實測行）→ 直接升級為實測，不另起一行。
+        r.description = desc.replace(/📺[^\n]*/g, line);
+      } else {
         r.description = desc ? `${desc}\n${line}` : line;
       }
       // 實測比站方標的高才升級排序依據（站方寫 720P 實測 1080P 的情況很常見）；
@@ -5782,9 +5806,53 @@ function resolveTargetArea(params, targetInfo) {
   return normalizeArea(targetInfo?.region);
 }
 
+// ★ 固定排序 tier（使用者要求）：粵語 > 站序（金牌影視 > 電影天堂 > 如意資源）。
+//   只看欄位不做網路，sort comparator 用（分數加成另在 calculateResourceScore，
+//   去重/串流同向；comparator 的硬性 tier 保證同分也不亂序）。
+function _langRankOf(r) {
+  try {
+    const hay = [r?.language, r?._rawName, r?._versionLabel, r?.description]
+      .filter(Boolean).join(' ');
+    const t = extractLanguageTag(hay);
+    if (t === '粵語') return 0;
+    if (t === '國粵雙語') return 1;
+  } catch {}
+  return 2;
+}
+function _siteRankOf(r) {
+  try {
+    const hay = `${r?._adapterSite || ''} ${r?.name || ''} ${r?._site || ''}`;
+    if (/jpyy|金牌/.test(hay)) return 0;
+    if (/dytt|電影天堂|电影天堂/.test(hay)) return 1;
+    if (/rycj|如意/.test(hay)) return 2;
+  } catch {}
+  return 3;
+}
+
 function calculateResourceScore(resource, preferResolution = 'auto') {
   let score = resource._matchScore || 0;
   const weights = CONFIG.SORT_WEIGHTS;
+
+  // ★ 粵語優先（使用者要求）：有粵語的片源排前面。
+  //   語言線索散在 _rawName / _versionLabel / description / language 四處
+  //   （金牌把語言放片名尾、樂子把語言放 description），四路都看才不漏。
+  try {
+    const langHay = [
+      resource.language, resource._rawName,
+      resource._versionLabel, resource.description,
+    ].filter(Boolean).join(' ');
+    const _langTag = extractLanguageTag(langHay);
+    if (_langTag === '粵語') score += weights.CANTONESE_BONUS ?? 80;
+    else if (_langTag === '國粵雙語') score += weights.BILINGUAL_BONUS ?? 40;
+  } catch {}
+  // ★ 固定站序加成（使用者要求）：金牌影視 > 電影天堂 > 如意資源。
+  //   comparator 另有硬性 tier，這裡加分讓去重保留 / 串流排序同向。
+  try {
+    const siteHay = `${resource._adapterSite || ''} ${resource.name || ''} ${resource._site || ''}`;
+    if (/jpyy|金牌/.test(siteHay)) score += weights.SITE_RANK_JPYY ?? 60;
+    else if (/dytt|電影天堂|电影天堂/.test(siteHay)) score += weights.SITE_RANK_DYTT ?? 40;
+    else if (/rycj|如意/.test(siteHay)) score += weights.SITE_RANK_RYCJ ?? 20;
+  } catch {}
   
   if (resource._matchType === 'exact') score += weights.EXACT_MATCH;
   else if (resource._matchType === 'fuzzy') score += weights.FUZZY_MATCH;
@@ -7079,6 +7147,35 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     }
   }
 
+  // ★ 📺 清晰度行（使用者要求：播放列表一定顯示實際清晰度）。
+  //   根因：舊邏輯只靠背景 probe（fire-and-forget）回來才加 📺 行，
+  //   第一輪搜尋 return 時 probe 還沒跑完 → 永遠沒行；單檔 TS 無
+  //   RESOLUTION 更永遠探不到 → 永遠空白。
+  //   修法：clean 時就寫一行 —— 有 actualResolution 用實測，
+  //   沒有就用站方 resolution（extractResolutionInfo 已從片名/quality 抽出，
+  //   總比空白好；probe 回來後 applyActualResolutions 會覆蓋升級）。
+  //   冪等：已有 📺 行就不重複加；有實測時把站方行升級為實測行。
+  try {
+    const _resLabel = String(resource.actualResolution || clean.actualResolution || '').trim()
+      || String(clean.resolution || '').trim();
+    if (_resLabel && _resLabel !== '未知') {
+      const _resLine = `📺 ${_resLabel}`;
+      const _d = String(clean.description || '');
+      if (/📺[^\n]*/.test(_d)) {
+        // 已有行：有實測就升級，無實測不動（避免把實測降級回站方標註）。
+        const _ar = String(resource.actualResolution || clean.actualResolution || '').trim();
+        if (_ar && _ar !== '未知') {
+          clean.description = _d.replace(/📺[^\n]*/g, `📺 ${_ar}`);
+        }
+      } else {
+        clean.description = _d ? `${_d}\n${_resLine}` : _resLine;
+      }
+      if (!clean.actualResolution && resource.actualResolution) {
+        clean.actualResolution = resource.actualResolution;
+      }
+    }
+  } catch {}
+
   // m3u8 過濾 wrap。customHeaders 保留在物件上(REX 客戶端會用),過濾廣告伺服器端
   // 收到 m3u8 子請求時自動從 Referer 解析或回退到 customHeaders(伺服器端邏輯,
   // 見 m3u8-ad-filter-worker.js)。
@@ -8126,6 +8223,12 @@ targetInfo.searchQuery = aliasQ;
     const aMedia = isDirectMediaUrl(a.url) ? 0 : 1;
     const bMedia = isDirectMediaUrl(b.url) ? 0 : 1;
     if (aMedia !== bMedia) return aMedia - bMedia;
+    // ★ 硬性 tier（使用者要求）：粵語置頂，其次金牌影視 > 電影天堂 > 如意資源。
+    //   分數加成在 calculateResourceScore（管去重/串流），這裡保證同分也不亂序。
+    const aLang = _langRankOf(a), bLang = _langRankOf(b);
+    if (aLang !== bLang) return aLang - bLang;
+    const aSite = _siteRankOf(a), bSite = _siteRankOf(b);
+    if (aSite !== bSite) return aSite - bSite;
     if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
     if (b.resolutionLevel !== a.resolutionLevel) return b.resolutionLevel - a.resolutionLevel;
     if (b.qualityScore !== a.qualityScore) return b.qualityScore - a.qualityScore;
@@ -9992,6 +10095,11 @@ targetInfo.searchQuery = aliasQ;
     const aMedia = isDirectMediaUrl(a.url) ? 0 : 1;
     const bMedia = isDirectMediaUrl(b.url) ? 0 : 1;
     if (aMedia !== bMedia) return aMedia - bMedia;
+    // ★ 硬性 tier（使用者要求）：粵語置頂，其次金牌影視 > 電影天堂 > 如意資源。
+    const aLang = _langRankOf(a), bLang = _langRankOf(b);
+    if (aLang !== bLang) return aLang - bLang;
+    const aSite = _siteRankOf(a), bSite = _siteRankOf(b);
+    if (aSite !== bSite) return aSite - bSite;
     if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
     // ★ 穩定排序：同分時按站名 + URL 兜底（理由見 smart 路徑同名註解）。
     const an = String(a.name || ''), bn = String(b.name || '');
