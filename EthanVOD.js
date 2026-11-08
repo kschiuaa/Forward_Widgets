@@ -1271,7 +1271,10 @@ const CONFIG = {
 // REX「繼續播放」才能按新 id 穩定回找上次來源。
 // bump 到 61：修掉 VARIANT_CHARS 反向寫入（'回'->'迴'），舊 cache 內
 // description 已寫死「迴到未來」，清掉重搜後顯示才會變回「回到未來」。
-  WIDGET_VERSION: 61,
+// bump 到 62：對齊 ZIP0 顯示風格——name 改「站名 · S1E1」（· 分隔）、
+// 語言下行改純詞多標籤（「國語 中字」，去掉 🌐︎ 前綴讓 REX 渲染藍標）。
+// 舊 cache 內是舊 name/舊 🌐︎ 行，清掉重搜後才會變新排版。
+  WIDGET_VERSION: 62,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1524,7 +1527,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.3",
+  version: "3.6.4",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6387,8 +6390,11 @@ function _stablePlaybackPath(url) {
 }
 
 function _stableSourceId(resource, clean) {
+  // ★ 站名要剥掉 S/E tag（含 ZIP0 風格的「 · S1E1」分隔符），否则 id 會漂。
+  //   改前只認「\s+S\d+」：「金牌影視 · S1E1」會殘留「 ·」→ siteBase 變
+  //   「金牌影視 ·」→ 與舊「金牌影視」算出不同 id → 繼續播放又對不上。
   const siteBase = String(clean.name || resource.name || '')
-    .replace(/\s+S\d+.*$/i, '').trim() || 'src';
+    .replace(/\s*[·•]?\s*S\d+.*$/i, '').trim() || 'src';
   const seasonPart = Number.isFinite(clean.season) && clean.season > 0
     ? `s${clean.season}` : 'sx';
   const epPart = Number.isFinite(clean.episode) && clean.episode > 0
@@ -6644,13 +6650,13 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   if (areaText) clean.area = areaText;
   if (itemLang) clean.language = itemLang;
 
-  // ★ 把「S{N}E{M}」加到 source name（使用者要求）。
+  // ★ 把「S{N}E{M}」加到 source name（使用者要求，ZIP0 風格用「·」分隔）。
   //
-  // 範例：
+  // 範例（對齊 ZIP0「線路 3 · HD 中字」的排版）：
   //   tv 改前: name = "金牌影視"
-  //   tv 改後: name = "金牌影視 S1E1"      (S1, E1)
-  //   tv 改後: name = "金牌影視 S2E10"     (S2, E10)
-  //   movie:  name = "非凡 S1"              (電影不拼 E)
+  //   tv 改後: name = "金牌影視 · S1E1"      (S1, E1)
+  //   tv 改後: name = "金牌影視 · S2E10"     (S2, E10)
+  //   movie:  name 不拼（使用者決定，見下方長註解）。
   //
   // 規則：
   //   - tv 模式：season 與 episode 都有 → `S{N}E{M}`；只有 season → `S{N}`
@@ -6658,7 +6664,7 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   //   - movie 模式：**完全不拼**（使用者決定，見下方長註解）。
   //
   // 冪等：name 末尾已含任何 S/E tag 時不重複加（見下方說明）。
-  // 拼在 name 末尾，與 name 之間用半形空格分隔。
+  // 拼在 name 末尾，與 name 之間用「 · 」分隔（ZIP0 同款分隔符）。
   //
   // ★ 為什麼電影完全不拼 S 標籤（使用者決策）：
   //   觀察 1：續集電影的序號站方本來就寫在檔名裡（「疾速追殺4」「战狼2」，
@@ -6695,10 +6701,11 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
       // 修法：只要 name 末尾已有任何 S{N} / S{N}E{M} 形式的 tag 就跳過。
       // 站名本身不會以「S數字」結尾（站名是「金牌影視」「電影天堂」這類），
       // 所以這個判斷不會誤傷正常站名。
-      const hasAnySeasonEpisodeTag = /\bS\d+(?:\s*E\d+)?\s*$/i.test(nameStr.trim())
+      // ★ 同時相容 ZIP0 風格的「 · S1E1」分隔符（中點前後可有空白）。
+      const hasAnySeasonEpisodeTag = /[·•]?\s*\bS\d+(?:\s*E\d+)?\s*$/i.test(nameStr.trim())
         || /\bS\d+\s*E\d+\b/i.test(nameStr);
       if (!hasAnySeasonEpisodeTag) {
-        clean.name = `${nameStr} ${tag}`;
+        clean.name = `${nameStr} · ${tag}`;
       }
     }
   }
@@ -6754,27 +6761,61 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
       .trim();
   }
 
-  // ★★★ 語言下行（人類可讀版）
+  // ★★★ 語言下行（ZIP0 風格，人類可讀版）
   //
-  // 把 language 視覺上拼到 description 第二行。REX 端詳細頁的
-  // 「播放列表」目前主要看 description —— 把語言擺在片名／集數下方
-  // 獨立一行，搭配 🌐︎ emoji 圖示，比塞在標題後面清楚。
+  // 對齊 zip0.com.resource.js 在 REX 端的顯示（見截圖）：
+  //   第一行："回到未來2 · 1989 · HD中字 · 探測 3528 ms"（標題 · 年 · 版本 · 集數）
+  //   第二行："CHI 中字" / "中字"（純語言小字，客戶端渲染成藍色小標籤）。
+  //
+  // 關鍵發現：ZIP0 根本沒回傳任何 language 欄位、description 裡也沒寫過
+  // "CHI"—— 藍色小標是 REX 客戶端從 description 純文字裡的語言關鍵字
+  // （粵語版/國語/中字…）自動識別渲染的。所以：
+  //   1. 第二行必須是「純語言詞、空格分隔」，不能帶 🌐︎ emoji 前綴——
+  //      emoji 會打斷客戶端的關鍵字識別，藍標就出不來。
+  //   2. 音頻（國語/粵語）與字幕（中字）要同時保留：「破地獄 國語中字」
+  //      只取第一個命中會丟掉「中字」，ZIP0 那行是兩個藍標並排。
   //
   // 規則：
-  //   1. 只在「有語言」時拼下行 —— 抽不到就維持單行（不拼 🌐︎ 原聲/不明），
-  //      因為沒語言字眼就代表「不知道」，拼個假資料比留空還糟。
-  //   2. 冪等：若 description 已有同樣的 🌐︎ 行就不重複拼（重複 clean 安全）。
+  //   1. 只在「有語言」時拼下行 —— 抽不到就維持單行，不拼假資料。
+  //   2. 冪等：description 已有同樣的語言行就不重複拼（重複 clean 安全）；
+  //      舊版 🌐︎ 行若殘留，先遷移到新格式（去掉 emoji，只留純詞）。
   //   3. 第一行保持片名/季/集原樣，下行只放語言。
   //
   // 範例：
   //   改前："輕功．第01集"
-  //   改後："輕功．第01集\n🌐︎ 國語"
+  //   改後："輕功．第01集\n國語"
+  //   改後："破·地獄．國語中字" → 第一行不動，下行："國語 中字"
   //
-  // 頂層 clean.language 仍保留（給 REX 客戶端機器讀用，與 description
-  // 視覺行**同時存在不衝突**——一個是顯示字串、一個是結構欄位）。
+  // 頂層 clean.language 仍保留第一命中（給去重鍵/機器讀用，與 description
+  // 視覺行同時存在不衝突——一個是結構欄位、一個是顯示字串）。
   if (itemLang) {
-    const langLine = `🌐︎ ${itemLang}`;
-    if (!clean.description.includes(langLine)) {
+    // 先把舊版 emoji 行遷走（同一次版本內重複 clean 不會疊兩種格式）。
+    clean.description = String(clean.description || '').replace(/\n?\s*🌐︎\s*/g, '\n').replace(/\n+/g, '\n').trim();
+    // 從站方原文收集「全部」命中的語言/字幕標籤（保序去重），不只取第一個。
+    const langSourceText = [
+      resource._rawName, resource.description, resource._versionLabel,
+    ].filter(Boolean).join(' ');
+    const allLangTags = [];
+    for (const { re, label } of LANGUAGE_TAGS) {
+      try {
+        if (re.test(langSourceText) && !allLangTags.includes(label)) allLangTags.push(label);
+      } catch {}
+    }
+    if (!allLangTags.includes(itemLang)) allLangTags.unshift(itemLang);
+    const langLine = allLangTags.join(' ');
+    // ★ 若末行已是「純語言行」（舊版單標籤或殘留行），直接替換而非追加，
+    //   否則「國語」會疊成「國語 / 國語 中字」兩行。
+    const KNOWN_LANG_LABELS = new Set(LANGUAGE_TAGS.map(t => t.label));
+    const descLines = String(clean.description || '').split('\n');
+    const lastLine = (descLines[descLines.length - 1] || '').trim();
+    const lastTokens = lastLine ? lastLine.split(/\s+/) : [];
+    const lastIsLangLine = lastTokens.length > 0 && lastTokens.every(t => KNOWN_LANG_LABELS.has(t));
+    if (lastIsLangLine) {
+      if (lastLine !== langLine) {
+        descLines[descLines.length - 1] = langLine;
+        clean.description = descLines.join('\n');
+      }
+    } else if (lastLine !== langLine) {
       clean.description = clean.description
         ? `${clean.description}\n${langLine}`
         : langLine;
@@ -6793,7 +6834,7 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     // 之前呢度淨傳 adapter，導致大部分 MacCMS 資源播嗰陣係「未命名節目」。
     // name 取 _rawName（站方原片名，已剝季別字眼）；episode 由頂層數字組出
     // 「第NN集」，組唔出就由 description 第一行拎集數段。
-    const _siteHint = resource._site || String(resource.name || '').replace(/\s+S\d+.*$/i, '').trim();
+    const _siteHint = resource._site || String(resource.name || '').replace(/\s*[·•]?\s*S\d+.*$/i, '').trim();
     const _nameHint = toDisplayText(resource._rawName || '');
     let _epHint = '';
     if (Number.isFinite(clean.episode) && clean.episode > 0 && type !== 'movie') {
