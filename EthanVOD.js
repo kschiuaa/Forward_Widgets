@@ -1313,10 +1313,7 @@ const CONFIG = {
 // remark 的集數進度/完結狀態/純畫質字一律丟，只剩「第32集」；
 // 片名尾「粵語版/國語版」的「版」後綴跟著語言一起剝（語言由 🌐︎ 行承擔）。
 // 舊 cache 描述帶雜訊尾巴，清掉重搜後乾淨。
-// bump 到 72：不再寫 description 的 📺 清晰度文字行（REX 自己有徽章/篩選會顯示）。
-// 清晰度只走結構化欄位（resolution/resolutionLevel/actualResolution），
-// 舊 cache 若帶 📺 行會在 clean/apply 時順手清掉。篩選與排序行為不變。
-  WIDGET_VERSION: 72,
+  WIDGET_VERSION: 71,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1575,7 +1572,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.8.0",
+  version: "3.7.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4326,38 +4323,42 @@ async function probeActualResolutions(urls, opts = {}) {
 }
 
 // 把已知的實測清晰度套到一批結果上（冪等，可在 cache 命中路徑調用）。
-// 只寫結構化欄位（resolution / resolutionLevel / actualResolution），不再寫
-// description 的 📺 行 —— REX 自己有清晰度徽章/篩選顯示，文字行只會重複。
-// 舊 cache 若帶著 📺 行，這裡順手清掉（冪等）。
+// 只升級、不降級：實測 level 高於站方標註才覆蓋 resolution；無實測時不動。
+// 無論升不升級，只要有實測就寫 actualResolution + description 第三行「📺 實測…」。
 function applyActualResolutions(results) {
   if (!Array.isArray(results) || results.length === 0) return 0;
   let applied = 0;
-  const _stripTvLine = (d) => {
-    try {
-      const s = String(d || '');
-      if (!s.includes('📺')) return s;
-      return s.split('\n').filter((ln) => !ln.includes('📺'))
-        .join('\n').replace(/\n+$/, '').trim();
-    } catch { return d; }
-  };
   for (const r of results) {
     try {
       if (!r || typeof r.url !== 'string') continue;
-      // 舊格式遷移（無需網路）：舊 cache 的 description 可能帶著
-      // 「📺 實測1080P(1920x1080)」/「📺 1080P」—— 抽出 actualResolution
-      // 後把文字行清掉，結構化欄位照常升級。
+      // 舊格式遷移（無需網路）：重啟後 in-memory 實測快取是空的，
+      // 但 cache 裡的 description 可能還留著「📺 實測1080P(1920x1080)」，
+      // 直接改寫成新格式「📺 1080P」，不需重新探測。
+      // 有 actualResolution 的也要遷（舊 cache 在 v62 寫入時就是長格式）。
       try {
         const d0 = String(r.description || '');
-        if (/📺/.test(d0)) {
-          const m0 = d0.match(/📺\s*(?:實測\s*)?(4K|1080P|720P|480P|360P)/);
-          if (m0 && !r.actualResolution) r.actualResolution = m0[1];
-          const stripped = _stripTvLine(d0);
-          if (stripped !== d0) { r.description = stripped; applied++; }
-          if (m0) continue;
+        if (/📺\s*實測/.test(d0)) {
+          const m0 = d0.match(/📺\s*實測\s*(4K|1080P|720P|480P|360P)/);
+          if (m0) {
+            r.description = d0.replace(/📺\s*實測[^\n]*/g, `📺 ${m0[1]}`);
+            if (!r.actualResolution) r.actualResolution = m0[1];
+            applied++;
+            continue;
+          }
         }
       } catch {}
       if (r.actualResolution) {
+        // 已有實測但 description 缺 📺 行（舊 cache / clean 後）→ 補行，不跳過。
         try {
+          const _ar = String(r.actualResolution);
+          const _line = `📺 ${_ar}`;
+          const _d = String(r.description || '');
+          if (/📺\s*實測/.test(_d)) {
+            const _m = _d.match(/📺\s*實測\s*(4K|1080P|720P|480P|360P)/);
+            r.description = _m ? _d.replace(/📺\s*實測[^\n]*/g, _line) : (_d.includes(_line) ? _d : (_d ? `${_d}\n${_line}` : _line));
+          } else if (!_d.includes(_line)) {
+            r.description = _d ? `${_d}\n${_line}` : _line;
+          }
           // ★ 舊 cache 遷移：有 actualResolution 但結構化欄位仍是「未知」
           //   （v69 前只寫 description 不升欄位）→ 這裡補升，篩選才能認。
           //   TC/槍版不升（見下方同規則）。
@@ -4385,9 +4386,17 @@ function applyActualResolutions(results) {
       if (!hit) continue;
       r.actualResolution = hit.label;
       r.actualResolutionWH = `${hit.w}x${hit.h}`;
+      const desc = String(r.description || '');
+      const line = `📺 ${hit.label}`;
+      if (/📺[^\n]*/.test(desc)) {
+        // 已有 📺 行（clean 時寫的站方行，或舊格式實測行）→ 直接升級為實測，不另起一行。
+        r.description = desc.replace(/📺[^\n]*/g, line);
+      } else {
+        r.description = desc ? `${desc}\n${line}` : line;
+      }
       // ★ 實測同步升級結構化欄位：REX 的 720P/1080P 篩選讀的是
-      //   resolution / resolutionLevel（不是 description 文字），
-      //   欄位升級篩選才認得。description 不再加 📺 行。
+      //   resolution / resolutionLevel（不是 description 的 📺 行），
+      //   只改 description 不改欄位 → 篩選永遠進「其他」。
       //   規則：TC/槍版（qualityScore===8）不升級 —— 實測像素再高也是槍版，
       //   升級會把「搶先版」洗成 1080P 正片；其餘一律以實測為準
       //   （含往下糾正：預設 720P 實測 480P 也要認）。
@@ -7268,24 +7277,32 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     }
   }
 
-  // ★ 不再寫 📺 清晰度行（使用者要求：REX 已有清晰度徽章/篩選會自己顯示）。
-  //   清晰度只走結構化欄位（resolution / resolutionLevel / isHD / is4K /
-  //   actualResolution），不再寫進 description 文字，避免跟 REX 原生顯示重複。
-  //   這裡只做兩件事：把舊 cache 可能帶著的 📺 行清掉；把實測欄位透傳下去。
+  // ★ 📺 清晰度行（使用者要求：播放列表一定顯示實際清晰度）。
+  //   根因：舊邏輯只靠背景 probe（fire-and-forget）回來才加 📺 行，
+  //   第一輪搜尋 return 時 probe 還沒跑完 → 永遠沒行；單檔 TS 無
+  //   RESOLUTION 更永遠探不到 → 永遠空白。
+  //   修法：clean 時就寫一行 —— 有 actualResolution 用實測，
+  //   沒有就用站方 resolution（extractResolutionInfo 已從片名/quality 抽出，
+  //   總比空白好；probe 回來後 applyActualResolutions 會覆蓋升級）。
+  //   冪等：已有 📺 行就不重複加；有實測時把站方行升級為實測行。
   try {
-    if (typeof clean.description === 'string' && clean.description.includes('📺')) {
-      clean.description = clean.description
-        .split('\n')
-        .filter((ln) => !ln.includes('📺'))
-        .join('\n')
-        .replace(/\n+$/, '')
-        .trim();
-    }
-    if (!clean.actualResolution && resource.actualResolution) {
-      clean.actualResolution = resource.actualResolution;
-    }
-    if (!clean.actualResolutionWH && resource.actualResolutionWH) {
-      clean.actualResolutionWH = resource.actualResolutionWH;
+    const _resLabel = String(resource.actualResolution || clean.actualResolution || '').trim()
+      || String(clean.resolution || '').trim();
+    if (_resLabel && _resLabel !== '未知') {
+      const _resLine = `📺 ${_resLabel}`;
+      const _d = String(clean.description || '');
+      if (/📺[^\n]*/.test(_d)) {
+        // 已有行：有實測就升級，無實測不動（避免把實測降級回站方標註）。
+        const _ar = String(resource.actualResolution || clean.actualResolution || '').trim();
+        if (_ar && _ar !== '未知') {
+          clean.description = _d.replace(/📺[^\n]*/g, `📺 ${_ar}`);
+        }
+      } else {
+        clean.description = _d ? `${_d}\n${_resLine}` : _resLine;
+      }
+      if (!clean.actualResolution && resource.actualResolution) {
+        clean.actualResolution = resource.actualResolution;
+      }
     }
   } catch {}
 
