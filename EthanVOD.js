@@ -90,9 +90,11 @@ const VARIANT_CHARS = {
 };
 for (const _t of Object.keys(VARIANT_CHARS)) {
   const _s = VARIANT_CHARS[_t];
-  // 只補「表裡沒有」的，不覆蓋既有正確映射。
+  // 只補繁→簡（搜尋用），絕不補簡→繁（顯示用）。
+  // 反例：'迴'->'回' 若反向寫入會變成 '回'->'迴'，
+  // 站方簡體「回到未来」顯示時「回」被誤轉成「迴」，變成「迴到未來」。
+  // 「回/台/周/里」這類字簡繁同形，顯示層保持原字才是對的。
   if (!_tradToSimpMap.has(_t)) _tradToSimpMap.set(_t, _s);
-  if (!_simpToTradMap.has(_s)) _simpToTradMap.set(_s, _t);
 }
 
 /**
@@ -1267,7 +1269,9 @@ const CONFIG = {
 // bump 到 60：id 改為去簽名穩定身份（站名/季/集/語言/分組/清晰度+去參數路徑），
 // 舊 cache 內是 `forward-vod-<完整URL>` 舊 id（帶 t/sign，會漂移），清掉重搜後
 // REX「繼續播放」才能按新 id 穩定回找上次來源。
-  WIDGET_VERSION: 60,
+// bump 到 61：修掉 VARIANT_CHARS 反向寫入（'回'->'迴'），舊 cache 內
+// description 已寫死「迴到未來」，清掉重搜後顯示才會變回「回到未來」。
+  WIDGET_VERSION: 61,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1520,7 +1524,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.2",
+  version: "3.6.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
