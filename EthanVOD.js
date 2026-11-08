@@ -1282,7 +1282,8 @@ const CONFIG = {
 // bump 到 62：新增實際清晰度探測（master m3u8 RESOLUTION → 📺 實測行）。
 // 舊 cache 內沒有 actualResolution 欄位，清掉重搜後新結果才會帶實測行。
 // bump 到 66：移除「聚合搜尋」開關（預設一定開啟，鎖死行為）。
-  WIDGET_VERSION: 66,
+// bump 到 67：新增每站開關（等同多選），cache key 帶站點選擇簽名。
+  WIDGET_VERSION: 67,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1535,7 +1536,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.7",
+  version: "3.6.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1547,6 +1548,76 @@ WidgetMetadata = {
       type: "input",
       description: "留空 = 用內建預設源，不用改\n自訂時每行一個，格式：站名,API網址\n範例：我的源A,https://abc.com/api.php/provide/vod\n# 開頭 = 停用該行\n只支援 MacCMS 採集介面",
       value: RESOURCE_SITES
+    },
+    {
+      // MacCMS 內建站開關（等同多選：每站一個啟用/停用）。
+      // Rex/Forward 設定頁沒有多選元件，只能用多個單選拼出同等效果。
+      // 自訂源（VodData 手填的行）不受這裡影響，仍用 # 註解停用。
+      name: "siteDytt",
+      title: "站點開關・電影天堂",
+      type: "enumeration",
+      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      name: "siteFfzy",
+      title: "站點開關・非凡資源",
+      type: "enumeration",
+      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      name: "siteRycj",
+      title: "站點開關・如意資源",
+      type: "enumeration",
+      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      name: "siteLzi",
+      title: "站點開關・樂子",
+      type: "enumeration",
+      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      // 簽名型站每站開關（與下方 jpyyEnabled 總開關疊加：總開關關掉則兩站全停）。
+      name: "siteJpyy",
+      title: "站點開關・金牌影視",
+      type: "enumeration",
+      description: "停用後不再查金牌影視\n動畫可只留 AGE 動漫",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      name: "siteAgedm",
+      title: "站點開關・AGE動漫",
+      type: "enumeration",
+      description: "停用後不再查 AGE 動漫\n只看真人劇可關掉",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
     },
     {
       name: "matchStrictness",
@@ -5244,6 +5315,64 @@ function _adapterIsEnabled(params) {
   return setting === 'enabled';
 }
 
+// ---------- 每站開關（等同多選） ----------
+//
+// Rex/Forward 設定頁沒有多選元件，這裡用「每站一個啟用/停用」拼出同等效果。
+// 讀值三層思路與 _adapterIsEnabled 一致：params 顯式 > globalParams > 預設啟用。
+// 自訂源（VodData 手填、站名不在下表）一律啟用，不受開關影響，仍用 # 註解停用。
+const MAC_SITE_SWITCH = {
+  '電影天堂': 'siteDytt',
+  '非凡資源': 'siteFfzy',
+  '如意資源': 'siteRycj',
+  '樂子': 'siteLzi',
+};
+const ADAPTER_SITE_SWITCH = { jpyy: 'siteJpyy', agedm: 'siteAgedm' };
+function _siteSwitch(name, params, fallback = 'enabled') {
+  try {
+    const p = params?.[name];
+    if (p != null && String(p).trim() !== '') {
+      return String(p).trim() === 'disabled' ? 'disabled' : 'enabled';
+    }
+  } catch {}
+  return _adapterGp(name, fallback) === 'disabled' ? 'disabled' : 'enabled';
+}
+/** MacCMS 站是否啟用：內建四站看開關，自訂源一律啟用。 */
+function _isMacSiteEnabled(title, params) {
+  const sw = MAC_SITE_SWITCH[title];
+  if (!sw) return true;
+  return _siteSwitch(sw, params) === 'enabled';
+}
+/** 過濾 MacCMS 站清單：關掉的站不發請求、不佔併發、不進結果。 */
+function _filterMacSites(sites, params) {
+  if (!Array.isArray(sites)) return sites;
+  return sites.filter(s => _isMacSiteEnabled(s?.title, params));
+}
+/** 站點選擇簽名：進 cache key 用。開關變了就換 key，不會讀回含已關站的舊結果。 */
+function _siteSelectionTag(params) {
+  try {
+    return ['siteDytt', 'siteFfzy', 'siteRycj', 'siteLzi', 'siteJpyy', 'siteAgedm']
+      .map(k => _siteSwitch(k, params) === 'enabled' ? '1' : '0').join('');
+  } catch { return '111111'; }
+}
+/** 按當前站點開關過濾已拿到的結果（擋 legacy/舊 key 混入已關站）。 */
+function _filterResultsBySiteSelection(arr, params) {
+  if (!Array.isArray(arr) || arr.length === 0) return arr;
+  return arr.filter(r => {
+    try {
+      if (r && r._adapterSite) {
+        const sw = ADAPTER_SITE_SWITCH[r._adapterSite];
+        if (!sw) return true;
+        return _siteSwitch(sw, params) === 'enabled';
+      }
+      const base = String((r && (r._site || r.name)) || '').replace(/\s+S\d+.*$/i, '').trim();
+      if (base && MAC_SITE_SWITCH[base]) {
+        return _siteSwitch(MAC_SITE_SWITCH[base], params) === 'enabled';
+      }
+    } catch {}
+    return true;
+  });
+}
+
 /**
  * 選取本次要查詢的簽名型站。
  *
@@ -5257,11 +5386,14 @@ function _adapterIsEnabled(params) {
  * 是誤刪 AGE，使用者會看到動漫查不到。
  */
 function _adapterActiveSites(params) {
-  const raw = _adapterGp('adapterSiteLimit', '2');
+  const raw = (params?.adapterSiteLimit != null && String(params.adapterSiteLimit).trim() !== '')
+    ? String(params.adapterSiteLimit).trim() : _adapterGp('adapterSiteLimit', '2');
   const n = (raw === '1' || raw === '2') ? parseInt(raw, 10) : 2;
   const debug = _adapterGp('adapterDebug', 'disabled') === 'enabled';
   if (debug) CONFIG.ADAPTERS.DEBUG = true;
-  return ADAPTER_SITES.slice(0, n);
+  // 先按每站開關過濾，再套站數上限：關掉金牌只留 AGE 時 limit=1 仍能查到 AGE。
+  const enabled = ADAPTER_SITES.filter(s => _siteSwitch(ADAPTER_SITE_SWITCH[s.id], params) === 'enabled');
+  return enabled.slice(0, n);
 }
 
 const WIDGET_VERSION_KEY = 'vod_widget_version';
@@ -7658,7 +7790,7 @@ async function loadResource(params, onStreamResult = null) {
   
   const startTime = Date.now();
   
-  const resourceSites = parseResourceSites(VodData);
+  const resourceSites = _filterMacSites(parseResourceSites(VodData), params);
   if (resourceSites.length === 0) {
     onStreamResult && onStreamResult([], { type: 'error', message: '無可用資源站' });
     return [];
@@ -7764,13 +7896,17 @@ targetInfo.searchQuery = aliasQ;
   // 片名只有在使用者自己輸入年份時才是權威來源。
   const versionTag = targetInfo.year ?? extractVersionMarker(targetInfo.rawName) ?? 'x';
   const areaTag = targetInfo.region ?? 'x';
-  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_y${versionTag}_a${areaTag}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
+  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_y${versionTag}_a${areaTag}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}_sites${_siteSelectionTag(params)}`;
   let cachedResults = [];
   
   if (CONFIG.CACHE_TTL > 0) {
     try {
       const raw = await Widget.storage?.get?.(cacheKey);
       cachedResults = parseCacheValue(raw);
+      if (cachedResults.length > 0) {
+        // 站點開關：舊 key 混入已關站時先剔除，避免關掉仍顯示。
+        cachedResults = _filterResultsBySiteSelection(cachedResults, params);
+      }
       if (cachedResults.length > 0) {
         // 快取是整部劇的結果，指定集數時仍需過濾，否則會把其他集數的連結
         // 當成這一集回傳。
@@ -8731,7 +8867,7 @@ async function performSmartSearch(params, onStreamResult) {
   const startTime = Date.now();
 
   const siteManager = new SiteManager();
-  const resourceSites = parseResourceSites(VodData);
+  const resourceSites = _filterMacSites(parseResourceSites(VodData), params);
   const sortedSites = siteManager.initializeSites(resourceSites);
 
   const targetInfo = extractEnhancedInfo(seriesName);
@@ -8862,7 +8998,7 @@ async function performBatchSearch(params) {
   console.log(`🔍 启动批量搜索: ${seriesName}`);
   const startTime = Date.now();
   
-  const resourceSites = parseResourceSites(VodData);
+  const resourceSites = _filterMacSites(parseResourceSites(VodData), params);
   if (resourceSites.length === 0) {
     return [];
   }
@@ -8964,7 +9100,7 @@ targetInfo.searchQuery = aliasQ;
   //   兼容：舊 key（vod_batch_..._e${ep} 含全部類型）保留讀取。命中時
   //   legacy 結果會跟 mac / ad 結果合併（用 url 去重），讓使用者無感升級；
   //   30 分鐘後舊 key 自然過期，不再佔用 storage。
-  const baseCacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}`;
+  const baseCacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}_sites${_siteSelectionTag(params)}`;
   const macCacheKey = baseCacheKey + '_mac';
   const adCacheKey  = baseCacheKey + `_adapter_e${targetEpisode || 'all'}`;
   // 舊格式 key（向後相容：v 之前的版本存進去的整批結果）
@@ -9026,7 +9162,7 @@ targetInfo.searchQuery = aliasQ;
         const isInAd  = adCached.some(a => a.url === r.url);
         return !isInMac && !isInAd;
       });
-      const merged = [...macCached, ...adCached, ...fromLegacy];
+      const merged = _filterResultsBySiteSelection([...macCached, ...adCached, ...fromLegacy], params);
       if (merged.length > 0) {
         console.log(`💾 batch cache 命中: mac=${macCached.length} adapter=${adCached.length} legacy=${fromLegacy.length}（合併 ${merged.length}）`);
         allResults = merged;
