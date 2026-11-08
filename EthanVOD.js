@@ -1262,9 +1262,12 @@ const CONFIG = {
   //         Forward 端 JS 寬鬆解碼不受影響（child 照讀）。
   //     (2) 回傳前加一行季結構 log（季數=[..] 每季集數），以後判本地/重調
   //         不用再猜。bump 版本清掉手機裡修復前寫的髒 cache。
-  // bump 到 58 見上。 bump 到 59：clean 通用 wrap 補 site/name/episode，
-  // 舊 cache 內的已包裝連結無名（凍結），清掉重搜後新連結才帶名。
-  WIDGET_VERSION: 59,
+// bump 到 58 見上。 bump 到 59：clean 通用 wrap 補 site/name/episode，
+// 舊 cache 內的已包裝連結無名（凍結），清掉重搜後新連結才帶名。
+// bump 到 60：id 改為去簽名穩定身份（站名/季/集/語言/分組/清晰度+去參數路徑），
+// 舊 cache 內是 `forward-vod-<完整URL>` 舊 id（帶 t/sign，會漂移），清掉重搜後
+// REX「繼續播放」才能按新 id 穩定回找上次來源。
+  WIDGET_VERSION: 60,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -6342,6 +6345,67 @@ class SmartSearchExecutor {
 //
 // 用法：呼叫端從 targetInfo.seasonNumber（或 buildDetailLink 的 season 參數）
 //   拿 playlist 級別季別傳進 context.seasonNumber；type 仍依本資源的型別。
+//
+// ★ 穩定身份（給 REX「繼續播放」回找上次來源用）。
+//
+// 背景：REX 的繼續播放會記住上次選的那路來源（按 id / url 回找），
+// 下次進來重新搜尋後拿新結果逐筆比對。舊 id 直接拿完整 m3u8 拼出
+// （`forward-vod-${rawUrl}`），而站方 URL 幾乎都帶短效簽名
+// （jpyy 的 `?t=..&sign=..`、每次 _adapterResolvePlay 現換現簽；
+// MacCMS 站的 CDN host 也會輪換）—— 兩次搜尋同一路來源的 url
+// 字面完全不同 → id 跟著漂 → REX 比對不上 → 偶發「找不回上次選的源」。
+//
+// 修法：id 只用「去簽名的規範路徑 + 穩定維度」（站名/季/集/語言/
+// CDN 分組/清晰度）組成。同一路來源換了簽名仍是同一個 id；
+// 不同站、不同語言、不同 CDN 分組、不同清晰度仍是不同 id。
+// 顯示欄位（name / description / url / title / link）一律不動。
+function _unwrapFilterInnerUrl(url) {
+  let cur = String(url || '');
+  for (let i = 0; i < 3; i++) {
+    const m = cur.match(/[?&]url=([^&#]*)/);
+    if (!m || !m[1]) break;
+    try {
+      const inner = decodeURIComponent(m[1]);
+      if (!inner || inner === cur) break;
+      cur = inner;
+    } catch { break; }
+  }
+  return cur;
+}
+
+// 去掉簽名與 fragment，只留 scheme://host/path。
+// 同一路來源換了 ?t/sign 仍回同一個字串；裸 token / 非 http 字串原樣返回。
+function _stablePlaybackPath(url) {
+  const inner = _unwrapFilterInnerUrl(url);
+  if (!inner) return '';
+  const cut = inner.split(/[?#]/)[0].trim();
+  return cut;
+}
+
+function _stableSourceId(resource, clean) {
+  const siteBase = String(clean.name || resource.name || '')
+    .replace(/\s+S\d+.*$/i, '').trim() || 'src';
+  const seasonPart = Number.isFinite(clean.season) && clean.season > 0
+    ? `s${clean.season}` : 'sx';
+  const epPart = Number.isFinite(clean.episode) && clean.episode > 0
+    ? `e${clean.episode}` : 'ex';
+  let langPart = 'x';
+  try {
+    langPart = clean.language
+      || extractLanguageTag(resource._rawName || resource._versionLabel) || 'x';
+  } catch { langPart = 'x'; }
+  const groupPart = clean.group || resource._groupLabel || 'x';
+  const resPart = `${clean.resolution || 'x'}-L${
+    Number.isFinite(clean.resolutionLevel) ? clean.resolutionLevel : 'x'}`;
+  const pathPart = _stablePlaybackPath(
+    typeof resource.url === 'string' ? resource.url : '');
+  if (pathPart) {
+    return `forward-vod-${siteBase}|${seasonPart}${epPart}|${langPart}|${groupPart}|${resPart}|${pathPart}`;
+  }
+  const epOnly = clean.episode != null ? String(clean.episode) : '';
+  return `forward-vod-${resource._rawName || clean.name || 'item'}|${epOnly}`;
+}
+
 function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   const clean = { ...resource };
   // playlist 級別已識別的季別。null/0/負數一律視為無效。
@@ -6781,10 +6845,10 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   // 這裡採「最小補充」策略：只補欄位，不動現有的 name/description/url，
   // 避免影響已驗證過的 UI 顯示。
   {
-    // 用「原始(未 wrap)url + 集數」當 id。因為 wrapM3U8WithFilter 會改寫
-    // clean.url，而過濾伺服器每次呼叫產生的 t/sign 參數都不同 —— 若拿
-    // wrap 後的 url 當 id，同一條資源在 cache 命中前後會拿到不同 id，
-    // 客戶端會當成兩筆。
+    // 用「穩定身份」當 id，供 REX「繼續播放」回找上次來源。
+    // 舊寫法拿完整 m3u8 拼 id，站方短效簽名（?t/sign）一換就漂成另一筆。
+    // 新寫法只用去簽名路徑 + 站名/季/集/語言/分組/清晰度（見 _stableSourceId），
+    // 同一路來源換簽名仍是同一個 id；顯示欄位（name/url/title/link）一律不動。
     //
     // ★ 冪等性：loadResource 會把 cleaned 的欄位寫回原 res 物件
     //   （Object.assign(res, cleaned)），因此同一筆資源可能「清兩次」。
@@ -6794,10 +6858,7 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     if (typeof resource.id === 'string' && resource.id) {
       clean.id = resource.id;
     } else {
-      const rawUrl = typeof resource.url === 'string' ? resource.url : '';
-      const epPart = clean.episode != null ? String(clean.episode) : '';
-      const idBase = rawUrl || `${resource._rawName || clean.name || 'item'}|${epPart}`;
-      clean.id = `forward-vod-${idBase}`;
+      clean.id = _stableSourceId(resource, clean);
     }
     // 這批資源都是可直接播放的直連 m3u8/mp4，對應契約裡的 "url" 型別。
     clean.type = 'url';
@@ -7830,6 +7891,13 @@ if (type === 'tv' && searchMode !== 'batch') {
     if (b.resolutionLevel !== a.resolutionLevel) return b.resolutionLevel - a.resolutionLevel;
     if (b.qualityScore !== a.qualityScore) return b.qualityScore - a.qualityScore;
     if (b.isHttps !== a.isHttps) return b.isHttps ? 1 : -1;
+    // ★ 穩定排序：同分時按站名 + URL 兜底，避免 V8 非穩定排序
+    //   在同分段內隨機換序 → REX「繼續播放」按位置/名稱回找時偶發對不上。
+    //   純排序行為，不改變任何內容與分數。
+    const an = String(a.name || ''), bn = String(b.name || '');
+    if (an !== bn) return an < bn ? -1 : 1;
+    const au = String(a.url || ''), bu = String(b.url || '');
+    if (au !== bu) return au < bu ? -1 : 1;
     return 0;
   });
   
@@ -9660,7 +9728,13 @@ targetInfo.searchQuery = aliasQ;
     const aMedia = isDirectMediaUrl(a.url) ? 0 : 1;
     const bMedia = isDirectMediaUrl(b.url) ? 0 : 1;
     if (aMedia !== bMedia) return aMedia - bMedia;
-    return b._finalScore - a._finalScore;
+    if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
+    // ★ 穩定排序：同分時按站名 + URL 兜底（理由見 smart 路徑同名註解）。
+    const an = String(a.name || ''), bn = String(b.name || '');
+    if (an !== bn) return an < bn ? -1 : 1;
+    const au = String(a.url || ''), bu = String(b.url || '');
+    if (au !== bu) return au < bu ? -1 : 1;
+    return 0;
   });
 
   const fieldsToDelete = ['_finalScore', '_matchType', '_matchScore', '_seasonMatch',
