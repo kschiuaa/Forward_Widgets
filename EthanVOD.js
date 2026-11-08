@@ -1304,24 +1304,19 @@ const CONFIG = {
 // 根因：REX 篩選讀結構化 resolution/resolutionLevel，不是 description 的 📺 行；
 // MacCMS 站集名多為「第01集」無畫質字眼 → 全部標「未知」level 0 → 全進其他，
 // 只有金牌（jpyy 自帶 resolution 數字）能進 720P/1080P。
-// 修法：(1) extractResolutionInfo 無字眼保持「未知」（不猜、不寫假 720P），TC/槍版優先判 480P；
-// (2) 回傳前實探 m3u8 master RESOLUTION（blocking，只讀 playlist 文字），
-//     探到才寫 📺 行 + 結構化欄位（TC 不升），探不到誠實留未知；
+// 修法：(1) extractResolutionInfo 無字眼預設 720P（15分，低於明示20分），TC/槍版優先判 480P；
+// (2) applyActualResolutions 實測同步升級結構化欄位（TC 不升）；
 // (3) _stableSourceId 去掉清晰度維度（升級不漂 id，繼續播放不受影響）；
 // (4) _resolutionLabelFromWH 以寬度為輔（1080x608 這類高清檔不再掉到 480P）。
-// 舊 cache 內全是「未知」或假 720P，清掉重搜後篩選才正常。
+// 舊 cache 內全是「未知」，清掉重搜後篩選才正常。
 // bump 到 71：清 TV 描述尾巴雜訊（截圖：優質「全32集」、暴風「完結」）。
 // remark 的集數進度/完結狀態/純畫質字一律丟，只剩「第32集」；
 // 片名尾「粵語版/國語版」的「版」後綴跟著語言一起剝（語言由 🌐︎ 行承擔）。
 // 舊 cache 描述帶雜訊尾巴，清掉重搜後乾淨。
-// bump 到 72：拿掉假預設 720P，改回傳前實探真實清晰度。
-// 無字眼保持「未知」；loadResource / batch 回傳前 blocking 抓一次
-// m3u8 master RESOLUTION，探到才寫 📺 + 結構化欄位，探不到留未知。
-// 舊 cache 內有假 720P，清掉重搜後才誠實。
-// bump 到 73：不再寫 📺 文字行（Rex 篩選讀結構化欄位，不需佔一行）。
-// 實測只寫 actualResolution + resolution/resolutionLevel/isHD/is4K；
-// 舊 cache 回放殘留的 📺 行在 clean / apply 時順手剝掉。
-  WIDGET_VERSION: 73,
+// bump 到 72：不再寫 description 的 📺 清晰度文字行（REX 自己有徽章/篩選會顯示）。
+// 清晰度只走結構化欄位（resolution/resolutionLevel/actualResolution），
+// 舊 cache 若帶 📺 行會在 clean/apply 時順手清掉。篩選與排序行為不變。
+  WIDGET_VERSION: 72,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1580,7 +1575,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.7.4",
+  version: "3.8.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2385,10 +2380,21 @@ function extractResolutionInfo(vodName, epName) {
     resolution = { level: 2, label: '480P', isHD: false, is4K: false, tags: [], qualityScore: 10 };
   } else if (/360[Pp]/.test(text)) {
     resolution = { level: 1, label: '360P', isHD: false, is4K: false, tags: [], qualityScore: 5 };
+  } else {
+    // ★ 預設 720P（原先是「未知」level 0）。
+    //
+    // 為什麼：MacCMS 站的集名幾乎都是「第01集」這種純集數，vod_name /
+    // vod_remarks 也常只有「已完结」—— 站方文字裡根本沒有畫質字眼，
+    // 全部落到「未知」。REX 的 720P/1080P 篩選讀的是結構化欄位
+    // （resolution / resolutionLevel），「未知」一律進「其他」。
+    // 只有金牌（jpyy 自帶 resolution 數字）能進篩選，正是本次問題。
+    //
+    // 預設 720P 的依據：這些 CDN m3u8 實測多為 960x540~1080x608
+    // （高清檔），標 720P 比「未知」誠實；probe 回來後
+    // applyActualResolutions 會按實測糾正（升级结构化字段）。
+    // 分數 15（低於明示 720P 的 20）：同站「明示畫質」仍排在前面。
+    resolution = { level: 3, label: '720P', isHD: true, is4K: false, tags: [], qualityScore: 15 };
   }
-  // ★ 無字眼 = 未知（不猜）：MacCMS 站集名多為「第01集」，站方文字無畫質線索時
-  //   不寫假資料。真實值由回傳前的實探（抓 m3u8 RESOLUTION）決定，
-  //   探不到就誠實顯示未知、Rex 篩選進「其他」。
   
   if (/HDR|杜比/.test(text)) {
     resolution.tags.push('hdr');
@@ -4288,8 +4294,6 @@ async function _probeOneActualResolution(url) {
 
 // 批量探測實際清晰度，回傳與輸入同長度的陣列（探不到= null）。
 // 與 probeUrlsAlive 同樣的分批啟動，保证最多 concurrency 個同時在飛。
-// ★ 回傳前實探（blocking）：呼叫端在 return 前 await 本函式，
-//   只讀 playlist 文字、不下 .ts；探不到回 null、不寫假資料。
 async function probeActualResolutions(urls, opts = {}) {
   const timeout = opts.timeout ?? CONFIG.ACTUAL_RES_PROBE_TIMEOUT ?? 2500;
   const concurrency = opts.concurrency ?? CONFIG.ACTUAL_RES_PROBE_CONCURRENCY ?? 6;
@@ -4322,31 +4326,37 @@ async function probeActualResolutions(urls, opts = {}) {
 }
 
 // 把已知的實測清晰度套到一批結果上（冪等，可在 cache 命中路徑調用）。
-// 只寫結構化欄位（resolution / resolutionLevel / isHD / is4K）+ actualResolution，
-// 不再寫 description 的 📺 文字行（Rex 篩選讀結構化欄位，不需佔一行）。
-// 舊 cache 回放帶著 📺 行 → 這裡順手剝掉，保持描述乾淨。
+// 只寫結構化欄位（resolution / resolutionLevel / actualResolution），不再寫
+// description 的 📺 行 —— REX 自己有清晰度徽章/篩選顯示，文字行只會重複。
+// 舊 cache 若帶著 📺 行，這裡順手清掉（冪等）。
 function applyActualResolutions(results) {
   if (!Array.isArray(results) || results.length === 0) return 0;
   let applied = 0;
+  const _stripTvLine = (d) => {
+    try {
+      const s = String(d || '');
+      if (!s.includes('📺')) return s;
+      return s.split('\n').filter((ln) => !ln.includes('📺'))
+        .join('\n').replace(/\n+$/, '').trim();
+    } catch { return d; }
+  };
   for (const r of results) {
     try {
       if (!r || typeof r.url !== 'string') continue;
-      // 舊格式清理（無需網路）：description 殘留「📺 …」行 → 直接剝掉。
+      // 舊格式遷移（無需網路）：舊 cache 的 description 可能帶著
+      // 「📺 實測1080P(1920x1080)」/「📺 1080P」—— 抽出 actualResolution
+      // 後把文字行清掉，結構化欄位照常升級。
       try {
         const d0 = String(r.description || '');
-        if (/📺[^\n]*/.test(d0)) {
-          r.description = d0.replace(/📺[^\n]*/g, '').replace(/\n{2,}/g, '\n').trim();
-        }
-        // 舊 cache 的「📺 實測1080P」行被剝掉後，若有 actualResolution 會在下方
-        // 重新以結構化欄位生效；若 description 裡只剩舊實測行而無欄位，
-        // 從行內還原出 actualResolution（只還原欄位，不重建文字行）。
-        if (!r.actualResolution) {
+        if (/📺/.test(d0)) {
           const m0 = d0.match(/📺\s*(?:實測\s*)?(4K|1080P|720P|480P|360P)/);
-          if (m0) r.actualResolution = m0[1];
+          if (m0 && !r.actualResolution) r.actualResolution = m0[1];
+          const stripped = _stripTvLine(d0);
+          if (stripped !== d0) { r.description = stripped; applied++; }
+          if (m0) continue;
         }
       } catch {}
       if (r.actualResolution) {
-        // 已有實測 → 只補結構化欄位（不寫 📺 文字行，Rex 讀欄位即可）。
         try {
           // ★ 舊 cache 遷移：有 actualResolution 但結構化欄位仍是「未知」
           //   （v69 前只寫 description 不升欄位）→ 這裡補升，篩選才能認。
@@ -4376,8 +4386,8 @@ function applyActualResolutions(results) {
       r.actualResolution = hit.label;
       r.actualResolutionWH = `${hit.w}x${hit.h}`;
       // ★ 實測同步升級結構化欄位：REX 的 720P/1080P 篩選讀的是
-      //   resolution / resolutionLevel（不再看 description 的 📺 行，
-      //   文字行已不再寫入）。
+      //   resolution / resolutionLevel（不是 description 文字），
+      //   欄位升級篩選才認得。description 不再加 📺 行。
       //   規則：TC/槍版（qualityScore===8）不升級 —— 實測像素再高也是槍版，
       //   升級會把「搶先版」洗成 1080P 正片；其餘一律以實測為準
       //   （含往下糾正：預設 720P 實測 480P 也要認）。
@@ -7258,18 +7268,24 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     }
   }
 
-  // ★ 不再寫 📺 文字行：Rex 篩選讀的是結構化欄位
-  //   （resolution / resolutionLevel / isHD / is4K），description 不需要再佔一行
-  //   顯示清晰度。實測值只寫 actualResolution + 結構化欄位。
-  //   舊 cache 回放可能還帶著 📺 行 → 這裡順手剝掉，保持描述乾淨
-  //   （只剩標題/集數 + 🌐︎ 語言行）。冪等：無 📺 行時不動。
+  // ★ 不再寫 📺 清晰度行（使用者要求：REX 已有清晰度徽章/篩選會自己顯示）。
+  //   清晰度只走結構化欄位（resolution / resolutionLevel / isHD / is4K /
+  //   actualResolution），不再寫進 description 文字，避免跟 REX 原生顯示重複。
+  //   這裡只做兩件事：把舊 cache 可能帶著的 📺 行清掉；把實測欄位透傳下去。
   try {
-    const _d0 = String(clean.description || '');
-    if (/📺[^\n]*/.test(_d0)) {
-      clean.description = _d0.replace(/📺[^\n]*/g, '').replace(/\n{2,}/g, '\n').trim();
+    if (typeof clean.description === 'string' && clean.description.includes('📺')) {
+      clean.description = clean.description
+        .split('\n')
+        .filter((ln) => !ln.includes('📺'))
+        .join('\n')
+        .replace(/\n+$/, '')
+        .trim();
     }
     if (!clean.actualResolution && resource.actualResolution) {
       clean.actualResolution = resource.actualResolution;
+    }
+    if (!clean.actualResolutionWH && resource.actualResolutionWH) {
+      clean.actualResolutionWH = resource.actualResolutionWH;
     }
   } catch {}
 
@@ -7304,16 +7320,16 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     if (field in clean) delete clean[field];
   });
   
-  // ★ 缺欄位兜底：保持「未知」誠實（不猜）。
-  //   站方文字無畫質線索時不寫假資料；真實值由回傳前的實探決定，
-  //   探不到就顯示未知、Rex 篩選進「其他」。
+  // ★ 缺欄位兜底：新邏輯下 extractResolutionInfo 永遠有值（最低預設 720P），
+  //   這裡只處理「舊 cache 回放、欄位根本缺失」的情況，同樣給預設 720P
+  //   而不是「未知」—— 未知會被 REX 篩選丟進「其他」。
   if (!clean.resolution || clean.resolution === '未知') {
-    clean.resolution = '未知';
-    clean.resolutionLevel = 0;
-    clean.isHD = false;
+    clean.resolution = '720P';
+    clean.resolutionLevel = 3;
+    clean.isHD = true;
     clean.is4K = false;
     clean.qualityTags = [];
-    clean.qualityScore = 0;
+    clean.qualityScore = 15;
     clean.isHttps = clean.url.startsWith('https');
   }
   
@@ -8366,25 +8382,6 @@ targetInfo.searchQuery = aliasQ;
     Object.assign(res, cleaned);
   });
   
-  // ★ 回傳前實探真實清晰度（blocking，不寫假資料）。
-  //   站方文字無畫質字眼時 resolution 保持「未知」；在這裡抓一次
-  //   m3u8 master RESOLUTION（只讀 playlist 文字、不下 .ts），探到才寫
-  //   結構化欄位（不再寫 📺 文字行），探不到就誠實留未知、進 Rex「其他」。
-  //   成本：in-memory 已探到的零成本；未探的最多等
-  //   ACTUAL_RES_PROBE_LIMIT 條 × 2.5s timeout / 6 併發（實測多為 1-2s）。
-  try {
-    const _seen = new Set();
-    const _urls = [];
-    for (const r of finalResults) {
-      if (!r || typeof r.url !== 'string' || _seen.has(r.url)) continue;
-      _seen.add(r.url);
-      _urls.push(r.url);
-      if (_urls.length >= (CONFIG.ACTUAL_RES_PROBE_LIMIT ?? 20)) break;
-    }
-    if (_urls.length > 0) await probeActualResolutions(_urls);
-    try { applyActualResolutions(finalResults); } catch {}
-  } catch {}
-
   // cache 寫入前做 URL 健康檢查：m3u8 URL 失效（CDN 清理資源回 502）的話
   // 寫進 cache 會讓「播一會斷線重頭」持續 30 分鐘，直到 TTL 過期重新搜尋。
   // 對 finalResults 內每個 m3u8 探測一次，失效的就過濾掉再寫 cache。
@@ -8437,7 +8434,7 @@ targetInfo.searchQuery = aliasQ;
         //   與 HEAD 存活探測同一個背景 IIFE，不阻塞回傳。只讀 playlist 文字，
         //   不下載任何 .ts 分片；單檔 TS 無 STREAM-INF 會回 null（預期內，
         //   保留站方標註）。結果寫進 in-memory + 隨 cache 持久化，
-        //   下次 cache 命中時直接以結構化欄位生效（不再顯示 📺 文字行）。
+        //   下次 cache 命中時直接顯示「📺 實測…」行。
         try {
           const aliveList = probeUrls.filter((_, i) => alive[i]);
           const resLimit = Math.min(CONFIG.ACTUAL_RES_PROBE_LIMIT ?? 20, aliveList.length);
@@ -10264,22 +10261,6 @@ targetInfo.searchQuery = aliasQ;
   //   • Adapter（有 _adapterSite）→ adCacheKey，直接覆蓋（綁定單集）
   // ★ 實測清晰度先套 in-memory 已探到的（無網路，不阻塞回傳）。
   try { applyActualResolutions(finalResults); } catch {}
-  // ★ 回傳前實探真實清晰度（blocking，不寫假資料）。
-  //   站方文字無畫質字眼時 resolution 保持「未知」；在這裡抓一次
-  //   m3u8 master RESOLUTION（只讀 playlist 文字、不下 .ts），探到才寫
-  //   結構化欄位（不再寫 📺 文字行），探不到就誠實留未知、進 Rex「其他」。
-  try {
-    const _seen2 = new Set();
-    const _urls2 = [];
-    for (const r of finalResults) {
-      if (!r || typeof r.url !== 'string' || _seen2.has(r.url)) continue;
-      _seen2.add(r.url);
-      _urls2.push(r.url);
-      if (_urls2.length >= (CONFIG.ACTUAL_RES_PROBE_LIMIT ?? 20)) break;
-    }
-    if (_urls2.length > 0) await probeActualResolutions(_urls2);
-    try { applyActualResolutions(finalResults); } catch {}
-  } catch {}
   if (finalResults.length > 0 && CONFIG.CACHE_TTL > 0) {
     // ★ 背景補探 master RESOLUTION + 分流寫 cache（同一個 IIFE，保證順序）。
     //   只讀 playlist 文字、不下 .ts；探完把「📺 實測…」寫進結果再持久化，
