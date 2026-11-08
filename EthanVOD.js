@@ -1313,7 +1313,7 @@ const CONFIG = {
 // remark 的集數進度/完結狀態/純畫質字一律丟，只剩「第32集」；
 // 片名尾「粵語版/國語版」的「版」後綴跟著語言一起剝（語言由 🌐︎ 行承擔）。
 // 舊 cache 描述帶雜訊尾巴，清掉重搜後乾淨。
-  WIDGET_VERSION: 71,
+  WIDGET_VERSION: 72,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1572,7 +1572,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.7.5",
+  version: "3.8.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2121,20 +2121,27 @@ function resolveRexSeason(seasonParam, seriesName, fallbackSeason) {
     // 純數字 "2" / 數字型 2
     if (/^\d+$/.test(raw)) {
       const n = parseInt(raw, 10);
-      if (n >= 1) return n;
+      // ★ 明確 >1 直接採用；==1 不直接回，要讓片名續集有機會覆寫。
+      //   電影在 REX 沒有季概念，詳細頁常固定傳 season=1，但片名自帶
+      //   序號（海王2、回到未來3）。舊寫法 season=1 直接回 1 → 下游
+      //   filterBySequel 走 S1 反向阻擋，把真續集當雜訊丟掉。
+      //   TV 切季 season>1 不受影響（直接回）。
+      if (n > 1) return n;
     } else {
       // S2 / Season 2
       const mEn = raw.match(/(?:season\s*|s)(\d{1,2})/i);
       if (mEn) {
         const n = parseInt(mEn[1], 10);
-        if (n >= 1) return n;
+        // ★ ==1 不直接回，掉下去讓片名續集覆寫（理由同上純數字分支）。
+        if (n > 1) return n;
       } else {
         // 第二季 / 第二部 / 二
         const mCn = raw.match(/\d+|[一二三四五六七八九十零〇兩两]+/);
         if (mCn) {
           const tok = mCn[0];
           const n = /^\d+$/.test(tok) ? parseInt(tok, 10) : parseChineseNumeral(tok);
-          if (Number.isFinite(n) && n >= 1) return n;
+          // ★ ==1 同理不直接回。
+          if (Number.isFinite(n) && n > 1) return n;
         }
       }
     }
@@ -2142,6 +2149,17 @@ function resolveRexSeason(seasonParam, seriesName, fallbackSeason) {
   }
   // 從片名猜：extractEnhancedInfo 已經會解 第X季 / S2，拿它的結果
   if (Number.isFinite(fb) && fb > 1) return fb;
+  // ★ 電影續集：片名自帶序號（海王2、回到未來3、疾速追殺4）。
+  //   extractEnhancedInfo 只解「第X季 / S2 / Season」，這類「裸數字續集」
+  //   會得 seasonNumber=1 → 下游 filterBySequel 走 S1 反向阻擋分支，
+  //   把真正的續集（sq=2/3）當 S2 雜訊丟掉、留下第一部（實測海王2反選）。
+  //   isSmartSeriesMatch 同理拿不到 _expectedSequel，fallback 誤放行。
+  //   年份不誤觸：extractSequelNumber 已排除年份（>100）與解說/預告。
+  //   序號 1 視為原版不提升（慶餘年1 仍是 S1）。
+  try {
+    const seq = (typeof extractSequelNumber === 'function') ? extractSequelNumber(seriesName) : null;
+    if (Number.isFinite(seq) && seq > 1) return seq;
+  } catch {}
   return 1;
 }
 
@@ -2815,8 +2833,18 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   if (candidateSequel === 1) candidateSequel = null;
   // target 端同理：使用者輸入「庆余年1」時不應被當成有續集序號。
   const targetSequelNorm = targetSequel === 1 ? null : targetSequel;
+  // ★ target 片名明寫續集序號（海王2、回到未來3）vs 候選無序號（海王）：
+  //   這是「第 N 部 vs 第一部」，必須判衝突。舊邏輯只擋「target 無序號
+  //   candidate 有序號」單向，導致「海王2 vs 海王」相似度 0.27 仍走
+  //   fallback 的 finaleMatches 旁路混入（實測）、「回到未來3 vs 回到未來」
+  //   相似度 0.8 直接走 loose 混入。
+  //   只認「片名明寫」的序號（不用 _expectedSequel 補的）：仁醫 S2
+  //  （target「仁醫」+ expected=2）vs 候選裸名「仁醫」是合法互補，必須放行。
+  const targetExplicitSequel = extractSequelNumber(targetInfo.rawName);
+  const targetExplicitNorm = targetExplicitSequel === 1 ? null : targetExplicitSequel;
+  const sequelShapeMismatchReverse = (targetExplicitNorm !== null) && (candidateSequel === null);
   const sequelShapeMismatch = (targetSequelNorm === null) && (candidateSequel !== null);
-  const sequelConflict = sequelShapeMismatch ||
+  const sequelConflict = sequelShapeMismatch || sequelShapeMismatchReverse ||
     (targetSequelNorm !== null && candidateSequel !== null && targetSequelNorm !== candidateSequel);
 
   // 季度衝突：使用者選第一季，候選卻是第二季，就不是他要的內容。
@@ -8775,6 +8803,31 @@ function filterBySequel(results, targetInfo) {
   const yearsOfMatched = sequelMatched.map(yearOf).filter(Boolean);
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
+  // ★ 規則 1 前置：目標主片名（去副標題/去尾數/去虛詞）。
+  //   實測海王2（targetSeason=2）：「上海王2」sequel 也是 2，舊規則 1
+  //   「sequel===targetSeason → 無條件 kept」直接放行，同序號不同片混入。
+  //   回到未來3 同理（「挑戰未來3：殘酷獵殺」sequel=3）。
+  //   isSmartSeriesMatch 雖已擋（none 不 match），但 batch 路徑的
+  //   filterBySequel 是獨立第二道門，必須同樣認主片名。
+  //   與 isSmartSeriesMatch 的 coreMatches 同義（相等/去虛詞相等/去尾數相等）。
+  const _stripFillerFS = (s) => String(s || '').replace(/的|之/g, '');
+  let _tCore = '', _tCoreNoDigit = '';
+  try {
+    const _tBase = String(targetInfo?.baseName || targetInfo?.rawName || '');
+    _tCore = normalizeTitleForMatch(stripSubtitle(_tBase).replace(/完结篇|完結篇/g, ''));
+    _tCoreNoDigit = _stripFillerFS(_tCore).replace(/\d+$/, '');
+  } catch {}
+  const _coreMatchesFS = (rawName) => {
+    if (!_tCore) return true;
+    try {
+      let cCore = normalizeTitleForMatch(stripSubtitle(String(rawName || '')).replace(/完结篇|完結篇/g, ''));
+      if (!cCore) return false;
+      if (cCore === _tCore || _stripFillerFS(cCore) === _stripFillerFS(_tCore)) return true;
+      const cNoDigit = _stripFillerFS(cCore).replace(/\d+$/, '');
+      return Boolean(_tCoreNoDigit && cNoDigit && _tCoreNoDigit === cNoDigit);
+    } catch { return true; }
+  };
+
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
   const unversionedBases = new Map();
@@ -8818,7 +8871,13 @@ function filterBySequel(results, targetInfo) {
       dropped.push(res); continue;
     }
 
-    if (sequel === targetSeason) { kept.push(res); continue; }
+    if (sequel === targetSeason) {
+      // ★ 規則 1 收斂：同序號還必須主片名一致，不同片（上海王2 vs 海王2、
+      //   挑戰未來3 vs 回到未來3）即使序號相同也 drop。
+      //   安全網：主片名抽不到（_tCore 空）時維持舊行為全放行，避免誤殺。
+      if (!_coreMatchesFS(rawName)) { dropped.push(res); continue; }
+      kept.push(res); continue;
+    }
 
   // 規則 X：candidate 的 sequel 明確標示為其他季，無條件 drop。
   //
