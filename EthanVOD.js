@@ -1000,6 +1000,14 @@ const CONFIG = {
   URL_PROBE_TIMEOUT: 2000,
   // 同時進行的 HEAD probe 數。m3u8 在不同 CDN，併發可壓低總時間。
   URL_PROBE_CONCURRENCY: 24,
+  // 實際清晰度探測（master m3u8 的 #EXT-X-STREAM-INF:RESOLUTION）。
+  // 只讀 master playlist 文字，不下載 TS 分片；在 cache 寫入前的背景任務裡跑，
+  // 不阻塞搜尋回傳。單檔 TS（media playlist，無 STREAM-INF）沒有解析度標籤，
+  // 探不到是預期的，會保留站方文字標註、不寫假資料。
+  ACTUAL_RES_PROBE_TIMEOUT: 2500,
+  ACTUAL_RES_PROBE_CONCURRENCY: 6,
+  ACTUAL_RES_PROBE_LIMIT: 20,
+  ACTUAL_RES_CACHE_TTL: 1800,
   // widget 版本號。任何 cache schema 變更時（例如加了版本標籤、改了
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
@@ -1271,7 +1279,10 @@ const CONFIG = {
 // REX「繼續播放」才能按新 id 穩定回找上次來源。
 // bump 到 61：修掉 VARIANT_CHARS 反向寫入（'回'->'迴'），舊 cache 內
 // description 已寫死「迴到未來」，清掉重搜後顯示才會變回「回到未來」。
-  WIDGET_VERSION: 61,
+// bump 到 62：新增實際清晰度探測（master m3u8 RESOLUTION → 📺 實測行）。
+// 舊 cache 內沒有 actualResolution 欄位，清掉重搜後新結果才會帶實測行。
+// bump 到 66：移除「聚合搜尋」開關（預設一定開啟，鎖死行為）。
+  WIDGET_VERSION: 66,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1524,44 +1535,24 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.5",
+  version: "3.6.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
   site: "",
   globalParams: [
     {
-      name: "multiSource",
-      title: "聚合搜尋",
-      type: "enumeration",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
-    },
-    {
       name: "VodData",
       title: "自訂源設定",
       type: "input",
-      description: "留空 = 使用下方預設源。手動填寫時,每行一個源,格式為「站名,API URL」(以 http 開頭),例:我的源A,https://abc.com/api.php/provide/vod。以 # 開頭為註解停用。需為 MacCMS 採集介面(/api.php/provide/vod)。僅站名等於 預設源名(電影天堂/非凡資源/如意資源/樂子)會獲得排序加成。",
+      description: "留空 = 用內建預設源，不用改\n自訂時每行一個，格式：站名,API網址\n範例：我的源A,https://abc.com/api.php/provide/vod\n# 開頭 = 停用該行\n只支援 MacCMS 採集介面",
       value: RESOURCE_SITES
-    },
-    {
-      name: "searchMode",
-      title: "搜尋模式",
-      type: "enumeration",
-      enumOptions: [
-        { title: "智慧流式", value: "smart_stream" },
-        { title: "批次搜尋 ", value: "batch" },
-        { title: "自動選擇", value: "auto" }
-      ],
-      value: "batch"
     },
     {
       name: "matchStrictness",
       title: "匹配嚴格度",
       type: "enumeration",
+      description: "預設標準即可\n寬鬆 = 結果更多\n嚴格 = 結果更準",
       enumOptions: [
         { title: "寬鬆(匹配更多)", value: "loose" },
         { title: "標準", value: "standard" },
@@ -1570,67 +1561,11 @@ WidgetMetadata = {
       value: "standard"
     },
     {
-      name: "preferResolution",
-      title: "清晰度偏好",
-      type: "enumeration",
-      enumOptions: [
-        { title: "自動", value: "auto" },
-        { title: "4K", value: "4k" },
-        { title: "1080p", value: "1080p" },
-        { title: "720p", value: "720p" }
-      ],
-      value: "auto"
-    },
-    {
-      name: "convertChinese",
-      title: "繁簡自動轉換",
-      type: "enumeration",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
-    },
-    {
-      name: "m3u8FilterEnabled",
-      title: "m3u8 廣告過濾",
-      type: "enumeration",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
-    },
-    {
       name: "m3u8FilterWorkerUrl",
       title: "過濾廣告伺服器 URL",
       type: "input",
-      description: "完整 URL(含 https://,結尾不要斜線)。預設值就是官方伺服器,直接用即可。",
+      description: "預設不用改\n結尾不要加斜線",
       value: "https://m3u8-adfliter.kschiuaa.com"
-    },
-    {
-      name: "m3u8FilterAdminUser",
-      title: "過濾廣告伺服器 管理帳號 (選填)",
-      type: "input",
-      description: "填入後可從 console 呼叫 m3u8FilterAdmin.*() 動態管理 patterns。留空 = 唯讀模式。需要同時填寫管理密碼。",
-      value: ""
-    },
-    {
-      name: "m3u8FilterAdminPass",
-      title: "過濾廣告伺服器 管理密碼 (選填)",
-      type: "input",
-      description: "管理帳號的密碼。Widget 啟動時會自動登入取得 session cookie。",
-      value: ""
-    },
-    {
-      name: "m3u8FilterAutoLoad",
-      title: "啟動時載入 patterns",
-      type: "enumeration",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
     },
     {
       // ts 走哪裡 —— 跟播放速度直接相關。
@@ -1649,6 +1584,7 @@ WidgetMetadata = {
       name: "m3u8FilterTsMode",
       title: "ts 分片走哪 (速度/過濾 取捨)",
       type: "enumeration",
+      description: "預設第一個，不用改\n第二個較慢\n第三個不過濾，只用來除錯",
       enumOptions: [
         { title: "純去廣告 (playlist 過濾 + ts 原站,推薦)", value: "hybrid" },
         { title: "伺服器代理 (全部走過濾廣告伺服器,流量過本機)", value: "proxy" },
@@ -1674,6 +1610,7 @@ WidgetMetadata = {
       name: "m3u8FilterAdapterMode",
       title: "簽名型來源走不走廣告過濾",
       type: "enumeration",
+      description: "預設第一個，不用改\n這類站本身沒廣告",
       enumOptions: [
         { title: "直接播放 (跳過過濾,推薦 — 這類站沒廣告)", value: "skip" },
         { title: "照常過濾 (與其他站相同)", value: "filter" }
@@ -1692,6 +1629,7 @@ WidgetMetadata = {
       name: "tmdbAliasEnabled",
       title: "TMDB 跨地區別名查詢",
       type: "enumeration",
+      description: "預設啟用\n解決兩岸片名不同問題\n例如陰屍路也能找到行屍走肉",
       enumOptions: [
         { title: "啟用", value: "enabled" },
         { title: "停用", value: "disabled" }
@@ -1710,7 +1648,7 @@ WidgetMetadata = {
       name: "tmdbApiKey",
       title: "TMDB API Key",
       type: "input",
-      description: "v3 API Key。留空 = 純繁簡模式，行為與舊版一致。",
+      description: "留空即可\n一般人不用申請\n有 Key 才填",
       value: ""
     },
     {
@@ -1724,6 +1662,7 @@ WidgetMetadata = {
       name: "jpyyEnabled",
       title: "簽名型站(金牌影視等)",
       type: "enumeration",
+      description: "預設啟用\n站方壞掉才需要關",
       enumOptions: [
         { title: "啟用", value: "enabled" },
         { title: "停用", value: "disabled" }
@@ -1736,6 +1675,7 @@ WidgetMetadata = {
       name: "adapterSiteLimit",
       title: "簽名型站 同時查詢站數",
       type: "enumeration",
+      description: "預設 2 站\n想更快可選 1 站",
       // 預設 2：目前有兩個站（金牌影視 = 綜合內容、AGE動漫 = 動畫）。
       // 兩者內容不重疊 —— AGE 只有動畫，動漫番這類查詢金牌影視多半零命中，
       // 反過來劇集 AGE 也是零命中。一起開的實際效益高於其 6 次請求的成本。
@@ -1751,6 +1691,7 @@ WidgetMetadata = {
       name: "adapterDebug",
       title: "簽名型站 除錯日誌",
       type: "enumeration",
+      description: "預設關閉\n除錯才開",
       enumOptions: [
         { title: "關閉", value: "disabled" },
         { title: "開啟", value: "enabled" }
@@ -3773,8 +3714,16 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           results.push(resource);
         }
       });
-    } else if (type === 'movie' && !isTV) {
-      const firstM3U8 = playSource.split('#').find(v => isM3U8Url(v.split('$')[1]));
+    } else if (type === 'movie') {
+      // ★ 電影多版本 `#`：MacCMS 站常把同一部片的多語言/多版本拼在同一條
+      //   playSource（`HD国语$url1#HD粤语$url2`），`#` 在這裡不是「多集」，
+      //   而是「多版本」。舊條件 `type === 'movie' && !isTV` 遇到 `#` 就整條
+      //   跳過 → 電影天堂 / 非凡這類站直接 0 筆（大話西遊只剩樂子正是如此）。
+      //   修法：movie 不分 isTV，一律把 `#` 切成多個候選版本，每版各建一條
+      //   resource；單版本時行為與舊版逐字相同（只取 firstM3U8、一條輸出）。
+      const variants = playSource.split('#').filter(Boolean)
+        .filter(v => isM3U8Url(v.split('$')[1]));
+      const firstM3U8 = variants[0];
       if (firstM3U8) {
         // ★ 過濾「預告片 / 預告 / 花絮 / 片段」之類非正片
         //
@@ -3790,18 +3739,34 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         const isNonMainRelease = /[\[【（(]\s*(预告片|預告片|预告|預告|花絮|片段|彩蛋|片花|幕后|幕後|特辑|特輯|先行|先导|先導|幕后花絮|幕後花絮)[\]】）)]/i.test(vod_name)
             || /\b(预告|預告|花絮|片段|彩蛋|片花|幕后|幕後|特辑|特輯|先行|先导|先導)\b/i.test(vod_name);
         if (!isNonMainRelease) {
-          const [quality, url] = firstM3U8.split('$');
-        const qualityText = quality.toLowerCase().includes('tc') ? '搶先版' : '正片';
+          // 單版本時走舊路徑（逐字同輸出）；多版本時每版各建一條 resource，
+          // 用語言標籤區分（否則去重鍵撞在一起只剩一版）。
+          const multiVersion = variants.length > 1;
+          for (const variant of variants) {
+          const [quality, url] = variant.split('$');
 
         const resolutionInfo = extractResolutionInfo(vod_name, quality);
 
         const displayName = _adapterSeasonLabel(vod_name, type);
-        // Movie 描述：正片（默認）不附標記；搶先版/TC/其他非正片
-        // 標籤以「．」中點附在片名後。
-        const isMainRelease = qualityText === '正片';
+        // Movie 描述第一行：只留純片名（+ TC 搶先版警示）。
+        //   - 多版本的語言（HD国语/HD粤语）不拼在第一行，改走 _rawName
+        //     → cleanResourceForOutput 統一加第二行「🌐︎ 語言」（與 tv 一致）。
+        //     第一行拼語言會跟第二行重複（標題尾．國語 + 🌐︎ 國語同時出現）。
+        //   - HD/高清/藍光等多餘畫質字眼不進描述（已由 resolution 欄位承擔，
+        //     第一行留著只是噪音）。TC 搶先版保留 —— 它是「槍版警示」，
+        //     拿掉後 TC 跟正片在清單裡長得一模一樣，會誤點。
+        // 單版本時 desc 與舊版逐字相同（displayName [+．搶先版]）。
+        const variantLang = multiVersion ? (extractLanguageTag(quality) || '') : '';
+        let baseName = displayName
+          .replace(/[．.]\s*(HD|高清|超清|超高清|藍光|蓝光|BD|1080\s*P|720\s*P|4\s*K)\s*$/i, '')
+          .trim() || displayName;
+        const alreadyTC = /搶先版|抢先版|\bTC\b/i.test(baseName);
+        const needTC = quality.toLowerCase().includes('tc') && !alreadyTC;
+        const isMainRelease = !needTC;
+        const baseDesc = needTC ? `${baseName}．搶先版` : baseName;
         const resource = {
           name: siteTitle,
-          description: isMainRelease ? displayName : `${displayName}．${qualityText}`,
+          description: baseDesc,
           // movie 分支必須在這裡 wrap。cleanResourceForOutput 雖然也會 wrap，
           // 但它是搜尋結果清理階段才跑；movie 走的是直接 results.push 路徑，
           // 漏掉會讓電影全部裸奔 CDN —— 「設定改了但播放沒走過濾伺服器」
@@ -3836,7 +3801,11 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           // 站方原始片名。去重要用它區分「片名相同但其實是不同版本」的情況：
           // 有幾個站同時存在日版與韓版、兩者檔名都只寫「仁医」且不帶年份欄位，
           // 只靠 _year 無法分辨，會被去重吃掉其中一版。
-          _rawName: vod_name,
+          // ★ 多版本時把語言寫進 _rawName（`片名（國語）`），否則兩版 _rawName
+          //   相同 → generateContentKey 的 langKey 撞鍵只剩一版。
+          //   單版本時與舊版逐字相同；cleanResourceForOutput 會再把括弧語言
+          //   抽成頂層 language 並剝掉顯示，不污染標題。
+          _rawName: (multiVersion && variantLang) ? `${vod_name}（${variantLang}）` : vod_name,
           _seasonFromItem: extractSequelNumber(vod_name),
           _seasonMatch: matchInfo.seasonMatch,
           _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
@@ -3846,9 +3815,10 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         };
 
         results.push(resource);
-        }
-      }
-    }
+          } // for variant
+        } // if !isNonMainRelease
+      } // if firstM3U8
+    } // else if movie
   });
 
   return results;
@@ -4037,6 +4007,202 @@ async function probeUrlsAlive(urls, opts = {}) {
   const out = new Array(urls.length);
   for (let i = 0; i < urls.length; i++) out[i] = uniqueResults[posToUnique[i]];
   return out;
+}
+
+// ==================== 實際清晰度探測（master m3u8 RESOLUTION）====================
+//
+// 背景：清單上的 resolution 全是「站方文字推的」（extractResolutionInfo 看
+// vod_name / quality 有沒有 1080P/4K 字眼）。站方寫 HD 實際可能是 720P 也
+// 可能是 1080P；寫「高清」更是什麼都可能是。TS 單檔（media playlist，裡面
+// 全是 #EXTINF + .ts）本身沒有 RESOLUTION 標籤 —— 解析度只存在於 master
+// playlist 的 #EXT-X-STREAM-INF:RESOLUTION=1920x1080 BANDWIDTH=... 行。
+//
+// 做法：GET 那條 m3u8（只讀文字，不下載任何 .ts 分片），抓所有 RESOLUTION=WxH
+// 取最大面積者為「實測」。分三種回落：
+//   1. master 多清晰度 → 取最大 RESOLUTION（這就是播放器會選的最高檔）。
+//   2. 單檔 media playlist（無 STREAM-INF）→ 回 null，不寫假資料，保留站方標註。
+//   3. 包過過濾廣告伺服器的 url → 先 _unwrapFilterInnerUrl 還原出真實 CDN 再探，
+//      探的是同一路來源，結果可直接對應回包裝 url。
+//
+// 成本控制（不拖慢搜尋）：只在 cache 寫入前的背景任務裡跑（fire-and-forget，
+// 與 probeUrlsAlive 同一個 IIFE），不阻塞回傳；併發 6、超時 2.5s、最多 20 條，
+// 結果寫進 in-memory + 隨 cache 一起持久化。下次 cache 命中時直接顯示實測，
+// 使用者第二次進來就看得到 —— 第一次顯示站方標註是預期的。
+const _ACTUAL_RES_CACHE = new Map(); // stablePath -> { label, level, w, h, ts }
+const _ACTUAL_RES_INFLIGHT = new Map();
+
+function _parseM3U8MaxResolution(text) {
+  if (!text || typeof text !== 'string') return null;
+  // 只認 master 行。單檔 TS 沒有這行 → 回 null（不是失敗，是「本來就沒有」）。
+  const re = /#EXT-X-STREAM-INF:[^\n]*RESOLUTION=(\d+)\s*x\s*(\d+)/gi;
+  let m, best = null;
+  while ((m = re.exec(text)) !== null) {
+    const w = parseInt(m[1], 10), h = parseInt(m[2], 10);
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) continue;
+    if (!best || w * h > best.w * best.h) best = { w, h };
+  }
+  return best;
+}
+
+function _resolutionLabelFromWH(w, h) {
+  const pixels = w * h;
+  // 以高度為主、面積為輔：1920x1080 與 1920x800（電影黑邊）都算 1080P。
+  if (h >= 2000 || pixels >= 3840 * 2000) return { label: '4K', level: 5, isHD: true, is4K: true };
+  if (h >= 1000 || pixels >= 1800 * 900) return { label: '1080P', level: 4, isHD: true, is4K: false };
+  if (h >= 650 || pixels >= 1100 * 600) return { label: '720P', level: 3, isHD: true, is4K: false };
+  if (h >= 430) return { label: '480P', level: 2, isHD: false, is4K: false };
+  return { label: '360P', level: 1, isHD: false, is4K: false };
+}
+
+function _actualResCacheGet(stablePath) {
+  try {
+    const hit = _ACTUAL_RES_CACHE.get(stablePath);
+    if (!hit) return null;
+    const ttl = (CONFIG.ACTUAL_RES_CACHE_TTL || 1800) * 1000;
+    if (Date.now() - hit.ts > ttl) { _ACTUAL_RES_CACHE.delete(stablePath); return null; }
+    return hit;
+  } catch { return null; }
+}
+
+async function _fetchM3U8Text(url) {
+  const timeout = CONFIG.ACTUAL_RES_PROBE_TIMEOUT ?? 2500;
+  const resp = await Widget.http.get(url, {
+    headers: { 'User-Agent': API_USER_AGENT },
+    timeout,
+  });
+  // Forward 回傳三種形狀：string / { data } / { statusCode, data, headers }。
+  // m3u8 是 text/plain，通常是 string 或 data=string；JSON parse 會失敗，
+  // 所以這裡只取 raw string，不走 _unwrapHttpResponse（那是給 JSON 用的）。
+  let body = resp;
+  if (body && typeof body === 'object' && 'data' in body) body = body.data;
+  if (typeof body !== 'string') {
+    // 有些 runtime 把 body 放在 .body / .text
+    if (body && typeof body.body === 'string') body = body.body;
+    else if (body && typeof body.text === 'string') body = body.text;
+    else return null;
+  }
+  return body;
+}
+
+async function _probeOneActualResolution(url) {
+  // 還原包裝 → 去簽名 → 穩定路徑（同一路來源換簽名仍命中同一 cache）。
+  const inner = _unwrapFilterInnerUrl(url);
+  const noQuery = String(inner || url || '').split(/[?#]/)[0].trim();
+  if (!/^https?:\/\//i.test(noQuery)) return null;
+  const key = noQuery;
+  const cached = _actualResCacheGet(key);
+  if (cached) return cached;
+  if (_ACTUAL_RES_INFLIGHT.has(key)) return _ACTUAL_RES_INFLIGHT.get(key);
+  const p = (async () => {
+    try {
+      const text = await _fetchM3U8Text(inner || url);
+      if (!text || text.indexOf('#EXTM3U') === -1) return null;
+      const best = _parseM3U8MaxResolution(text);
+      if (!best) return null; // 單檔 TS：本來就沒有 RESOLUTION，不算失敗
+      const mapped = _resolutionLabelFromWH(best.w, best.h);
+      const val = { ...mapped, w: best.w, h: best.h, ts: Date.now() };
+      try {
+        if (_ACTUAL_RES_CACHE.size > 500) {
+          const first = _ACTUAL_RES_CACHE.keys().next().value;
+          if (first != null) _ACTUAL_RES_CACHE.delete(first);
+        }
+        _ACTUAL_RES_CACHE.set(key, val);
+      } catch {}
+      return val;
+    } catch { return null; }
+    finally { if (_ACTUAL_RES_INFLIGHT.get(key) === p) _ACTUAL_RES_INFLIGHT.delete(key); }
+  })();
+  _ACTUAL_RES_INFLIGHT.set(key, p);
+  return p;
+}
+
+// 批量探測實際清晰度，回傳與輸入同長度的陣列（探不到= null）。
+// 與 probeUrlsAlive 同樣的分批啟動，保证最多 concurrency 個同時在飛。
+async function probeActualResolutions(urls, opts = {}) {
+  const timeout = opts.timeout ?? CONFIG.ACTUAL_RES_PROBE_TIMEOUT ?? 2500;
+  const concurrency = opts.concurrency ?? CONFIG.ACTUAL_RES_PROBE_CONCURRENCY ?? 6;
+  void timeout;
+  if (!Array.isArray(urls) || urls.length === 0) return [];
+  if (!Widget?.http?.get) return urls.map(() => null);
+  // 去重（保持回傳長度）：同一穩定路徑只探一次。
+  const keyOf = (u) => {
+    try {
+      const inner = _unwrapFilterInnerUrl(u);
+      return String(inner || u || '').split(/[?#]/)[0].trim();
+    } catch { return String(u || ''); }
+  };
+  const uniqueUrls = [];
+  const posToUnique = new Array(urls.length);
+  const seen = new Map();
+  for (let i = 0; i < urls.length; i++) {
+    const k = keyOf(urls[i]);
+    let idx = seen.get(k);
+    if (idx === undefined) { idx = uniqueUrls.length; uniqueUrls.push(urls[i]); seen.set(k, idx); }
+    posToUnique[i] = idx;
+  }
+  const uniqueResults = new Array(uniqueUrls.length);
+  for (let k = 0; k < uniqueUrls.length; k += concurrency) {
+    const batch = [];
+    for (let j = k; j < Math.min(k + concurrency, uniqueUrls.length); j++) batch.push(j);
+    await Promise.all(batch.map(async (j) => { uniqueResults[j] = await _probeOneActualResolution(uniqueUrls[j]); }));
+  }
+  return posToUnique.map((idx) => uniqueResults[idx] || null);
+}
+
+// 把已知的實測清晰度套到一批結果上（冪等，可在 cache 命中路徑調用）。
+// 只升級、不降級：實測 level 高於站方標註才覆蓋 resolution；無實測時不動。
+// 無論升不升級，只要有實測就寫 actualResolution + description 第三行「📺 實測…」。
+function applyActualResolutions(results) {
+  if (!Array.isArray(results) || results.length === 0) return 0;
+  let applied = 0;
+  for (const r of results) {
+    try {
+      if (!r || typeof r.url !== 'string') continue;
+      // 舊格式遷移（無需網路）：重啟後 in-memory 實測快取是空的，
+      // 但 cache 裡的 description 可能還留著「📺 實測1080P(1920x1080)」，
+      // 直接改寫成新格式「📺 1080P」，不需重新探測。
+      // 有 actualResolution 的也要遷（舊 cache 在 v62 寫入時就是長格式）。
+      try {
+        const d0 = String(r.description || '');
+        if (/📺\s*實測/.test(d0)) {
+          const m0 = d0.match(/📺\s*實測\s*(4K|1080P|720P|480P|360P)/);
+          if (m0) {
+            r.description = d0.replace(/📺\s*實測[^\n]*/g, `📺 ${m0[1]}`);
+            if (!r.actualResolution) r.actualResolution = m0[1];
+            applied++;
+            continue;
+          }
+        }
+      } catch {}
+      if (r.actualResolution) continue; // 已套過（冪等，重複 clean 安全）
+      const inner = _unwrapFilterInnerUrl(r.url);
+      const key = String(inner || r.url || '').split(/[?#]/)[0].trim();
+      // cache 內存的是包裝 url，in-memory key 是裸路徑 —— 兩邊都試。
+      const hit = _actualResCacheGet(key)
+        || _actualResCacheGet(String(r.url || '').split(/[?#]/)[0].trim());
+      if (!hit) continue;
+      r.actualResolution = hit.label;
+      r.actualResolutionWH = `${hit.w}x${hit.h}`;
+      const desc = String(r.description || '');
+      const line = `📺 ${hit.label}`;
+      if (/📺\s*實測/.test(desc)) {
+        // 舊格式「📺 實測1080P(1920x1080)」遷移到新格式「📺 1080P」。
+        r.description = desc.replace(/📺\s*實測[^\n]*/g, line);
+      } else if (!desc.includes(line)) {
+        r.description = desc ? `${desc}\n${line}` : line;
+      }
+      // 實測比站方標的高才升級排序依據（站方寫 720P 實測 1080P 的情況很常見）；
+      // ★ 不升級 resolution 本體：_stableSourceId 用 resolution 算 id，
+      //   升級會讓同一路來源在「有實測/無實測」兩次搜尋間 id 漂移，
+      //   REX「繼續播放」會對不上。排序維持站方標註，實測只做顯示。
+      //   （如未來要按實測排序，需把 actualResolution 納入 id 的 resPart。）
+      applied++;
+    } catch {}
+  }
+  if (applied > 0) {
+    try { console.log(`📺 實測清晰度: ${applied}/${results.length} 條已套用`); } catch {}
+  }
+  return applied;
 }
 
 async function loadRejectingTypeSites() {
@@ -7246,12 +7412,8 @@ async function loadResource(params, onStreamResult = null) {
     type = _resolvedType,
     season,
     episode,
-    multiSource,
     VodData,
     matchStrictness = 'standard',
-    preferResolution = 'auto',
-    searchMode = 'batch',
-    m3u8FilterEnabled = 'enabled',
     m3u8FilterWorkerUrl,
     m3u8FilterMode = 'filter',
     m3u8FilterAdminUser,
@@ -7260,6 +7422,11 @@ async function loadResource(params, onStreamResult = null) {
     // 簽名型 adapter 站是否跳過過濾廣告伺服器（'skip' | 'filter'）
     m3u8FilterAdapterMode
   } = params;
+
+  // 設定頁已精簡：搜尋模式 / 清晰度偏好 / 繁簡轉換 / m3u8 廣告過濾開關
+  // 全部移除 UI，一律走預設（批次搜尋 / 最清晰 / 轉換開啟 / 過濾開啟）。
+  const searchMode = 'batch';
+  const preferResolution = 'auto';
 
   // Forward 傳入片名的欄位名並非只有一種：詳細頁通常給 seriesName，
   // 但由相關作品卡片切換進場時可能走別的欄位。任何一個欄位帶著
@@ -7300,11 +7467,8 @@ async function loadResource(params, onStreamResult = null) {
     }
   }
 
-  // ★ Rex 直調時 params 裡沒有 multiSource（它不是 BaseParams 欄位，
-  //   只是自家 globalParams 設定項），用 !== "enabled" 會把 Rex 切季/切集
-  //   的呼叫全部擋掉（undefined !== "enabled" → return []）。
-  //   改成「顯式關掉才擋」，沒帶就當啟用。Zen 支無此守門，故不受影響。
-  if (multiSource === "disabled" || !seriesName) {
+  // 聚合搜尋已鎖死開啟（設定頁開關已移除）。
+  if (!seriesName) {
     return [];
   }
 
@@ -7318,11 +7482,9 @@ async function loadResource(params, onStreamResult = null) {
   //
   // 優先級：params 顯式傳入 > globalParams 設定項 > 模組預設值。
   //
-  // 為什麼一定要 fallback 到 globalParams：REX 客戶端在詳細頁切換集數時會
-  // 直接呼叫 loadResource(params)，params 裡只有 link / seriesName 等，
-  // 沒有 m3u8FilterWorkerUrl。原本的寫法 `m3u8FilterEnabled = 'enabled'`
-  // 在解構時就給了 default，掩盖了「參數根本沒來」這件事；
-  // 一旦使用者把設定改成 disabled 再呼叫，就會意外開啟過濾。
+  // m3u8 廣告過濾已鎖死開啟（設定頁開關已移除），其餘項仍走三層 fallback：
+  // REX 客戶端在詳細頁切換集數時只帶 link / seriesName 等，
+  // 沒有 m3u8FilterWorkerUrl，所以仍需 fallback 到 globalParams。
   // 反過來 m3u8FilterWorkerUrl 沒 default，undefined 時 if 不成立，
   // CONFIG 會停在「上一次有人寫進去的值」—— 可能是上一輪的雲端網址，
   // 這正是「設定改了卻沒生效、看播放紀錄沒東西」的原因。
@@ -7336,12 +7498,9 @@ async function loadResource(params, onStreamResult = null) {
     }
   };
 
-  // ENABLED 預設 'enabled'：使用者沒設定時維持過濾開啟（原本行為），
-  // 但 explicit 的 'disabled' 一定會被尊重。
-  const enabledParam = (m3u8FilterEnabled != null && m3u8FilterEnabled !== '')
-    ? m3u8FilterEnabled
-    : gpValue('m3u8FilterEnabled', 'enabled');
-  CONFIG.M3U8_FILTER.ENABLED = (enabledParam === 'enabled');
+  // 設定頁已移除 m3u8 廣告過濾開關：一律開啟過濾（預設行為鎖死）。
+  // params / globalParams 即使殘留舊值也不再讀取，避免舊設定把過濾關掉。
+  CONFIG.M3U8_FILTER.ENABLED = true;
 
   // WORKER_URL 三層 fallback。
   const workerParam = (typeof m3u8FilterWorkerUrl === 'string' && m3u8FilterWorkerUrl.trim())
@@ -7449,7 +7608,6 @@ async function loadResource(params, onStreamResult = null) {
       fromParams: !!m3u8FilterWorkerUrl,
       // globalParams 層的原始值（'' 代表 Forward 沒存到設定）
       gpWorkerUrl: gpValue('m3u8FilterWorkerUrl', '(空)'),
-      gpEnabled: gpValue('m3u8FilterEnabled', '(空)'),
       gpTsMode: gpValue('m3u8FilterTsMode', '(空)'),
       gpAdapterMode: gpValue('m3u8FilterAdapterMode', '(空)'),
       gpCount: allGp.length,
@@ -7696,6 +7854,10 @@ targetInfo.searchQuery = aliasQ;
             console.log(`🩹 smart cache 兜底 wrap: ${rewrapped}/${usable.length} 條裸 CDN 已修復`);
           }
 
+          // ★ 實測清晰度：把背景已探到的 master RESOLUTION 套上（純 in-memory，
+          //   無網路，不阻塞回傳）。還沒探到的這次不顯示，下次 cache 命中時會有。
+          try { applyActualResolutions(usable); } catch {}
+
           if (onStreamResult) {
             const batchSize = 5;
             for (let i = 0; i < usable.length; i += batchSize) {
@@ -7757,16 +7919,15 @@ targetInfo.searchQuery = aliasQ;
     ...params,
     seriesName,
     _preSearchQuery: targetInfo.searchQuery,
+    // 設定頁已移除搜尋模式 / 清晰度偏好：鎖死批次搜尋 + 最清晰排序，
+    // 覆寫任何殘留的舊 params，避免舊客戶端傳入 smart_stream。
+    searchMode: 'batch',
+    preferResolution: 'auto',
   };
 
-  if (searchMode === 'smart_stream' || searchMode === 'auto') {
-    console.log('🎯 使用智能流式搜索模式');
-    finalResults = await performSmartSearch(_searchParams, onStreamResult);
-  } else {
-    // 'batch' 為預設,涵蓋未來任何未知值(寬鬆驗證一致)
-    console.log('🔍 使用批量搜索模式');
-    finalResults = await performBatchSearch(_searchParams);
-  }
+  // 設定頁已移除搜尋模式開關：一律批次搜尋（預設最快組合）。
+  console.log('🔍 使用批量搜索模式');
+  finalResults = await performBatchSearch(_searchParams);
   
   if (type === 'tv' && targetEpisode) {
     const beforeFilter = finalResults.length;
@@ -7790,12 +7951,9 @@ targetInfo.searchQuery = aliasQ;
   // 至少使用者會看到候選項目（會包含第一季內容，但比「空白」好）。
 // 續集季別過濾（共用 helper，cache 命中路徑與 batch 路徑都會經過）。
 //
-// 為什麼 batch 模式跳過：performBatchSearch 內部（file 結尾的 batch 路徑）
-// 已套用 filterBySequel 並把結果回傳，loadResource 收到時 _rawName / _year
-// 都已被 cleanResourceForOutput 剝掉，再跑一次 filter 會全部 fall back 到
-// description 解析，雖然「碰巧」能正確判斷（description 還含「第三季」字
-// 樣），但屬於無謂的二次處理、浪費效能、也容易因 log 顯示「_rawName=undefined」
-// 誤導除錯。stream / auto 模式仍需在此 filter（performSmartSearch 內部不跑）。
+// performBatchSearch 內部（file 結尾的 batch 路徑）已套用 filterBySequel
+// 並把結果回傳，loadResource 收到時 _rawName / _year 都已被
+// cleanResourceForOutput 剝掉，不在此重跑（無謂二次處理、浪費效能）。
   // ★ 電影續集過濾（movie 分支）：篩掉「第一部／第二部」等無關續集。
 //
 // 場景：REX 詳細頁搜「疾速追殺」season=4（John Wick Chapter 4, 2023），
@@ -7815,67 +7973,8 @@ targetInfo.searchQuery = aliasQ;
 //   - filterBySequel 開頭就檢查 `targetSeason <= 1` 直接原樣返回，
 //     所以單部電影（REX 傳 season=1 或空）完全不受影響。
 //   - movie 不套用下面的 S4 fallback（那是「愛丽丝篇异界战争」tv 專屬）。
-if (type === 'movie' && searchMode !== 'batch') {
-  const r = filterBySequel(finalResults, targetInfo);
-  if (r.kept && r.before !== undefined && r.kept.length < r.before) {
-    console.log(`🎬 電影續集過濾(第${targetInfo.seasonNumber}部): ${r.before} -> ${r.kept.length}（pooledYearMin=${r.pooledYearMin ?? 'null'}）`);
-    finalResults = r.kept;
-  } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
-    // 一部都殺不掉（站方沒寫序號）→ 保留全部，不要讓使用者看到空清單。
-    console.log(`⚠️ 電影續集過濾無命中(${r.before}筆)，保留全部候選`);
-  }
-}
-
-if (type === 'tv' && searchMode !== 'batch') {
-    const r = filterBySequel(finalResults, targetInfo);
-    let s4FallbackUsed = false;
-    if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
-      finalResults = r.kept;
-      console.log(`🎯 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
-      // 進入此分支表示 filterBySequel 確實有做 drop（kept < before），
-      // 若同時也有 s4FallbackCandidates 表示 r.kept 不包含 S3 後半候選，
-      // 需要把 fallback 候選塞回去並排在最前。
-      if (r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
-        s4FallbackUsed = true;
-      }
-    } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
-      console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾無命中(${r.before}筆)，保留全部候選`);
-    } else if (r.kept && r.kept.length === r.before && r.before > 0) {
-      // 全部通過即「沒 S4 命中」+ 「全部候選都是 S1 沒人可殺」 —— 退回保留全部。
-      // log 寫明這是 fallback，不要讓人誤會成「filter 確認這就是答案」。
-      const poolYr = r.pooledYearMin ?? 'null';
-      console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${r.before}（無 targetSeason 命中群，pooledYearMin=${poolYr}，已是最終候選）`);
-      // 退化情境 (最常見：user 查 season>=4 但站方全名以季名命名)：把這些候選放到最前並加註。
-      if (r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
-        s4FallbackUsed = true;
-      }
-    } else if (r.kept && r.kept.length < r.before && r.before > 0 && r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
-      // S4 fallback 把候選抽出後 kept < before 的補接分支。
-      finalResults = r.kept;
-      s4FallbackUsed = true;
-    }
-    if (s4FallbackUsed) {
-      // 給 fallback 候選一個「最大 score」標記，確保後續 sort 不會被同分
-      // exact-match 的 S1 資源擠回中間位置（同一個 match 群分數相同）。
-      // 設在 description 改寫之後，避免誤觸 _finalScore 計算。
-      for (const cand of r.s4FallbackCandidates) {
-        cand._s4FallbackBoost = true;
-        if (cand.description && !cand.description.includes('⚠️')) {
-          cand.description = `⚠️ 站方無「第${targetInfo.seasonNumber}季」資料，這是依片名推算的 S3 後半候選\n${cand.description}`;
-        }
-      }
-      // 純化：使用者搜第4季，要看到的每一條都跟 S3 後半相關，
-      // 不要混入 S1/S2 等無關季內容。S4 站方沒資料，S3 後半 (2020) 是
-      // 已知最接近的內容，列為唯一切分才不會讓使用者誤點。
-      //
-      // 僅在 s4FallbackCandidates.length > 0 時才純化，避免空清單。
-      if (r.s4FallbackCandidates.length > 0) {
-        finalResults = [...r.s4FallbackCandidates];
-      } else {
-        finalResults = [...r.s4FallbackCandidates, ...finalResults];
-      }
-    }
-  }
+// 設定頁已移除搜尋模式開關：一律批次搜尋，batch 路徑內部已跑過
+// filterBySequel，這裡不再重跑（見上方註解）。
 
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
@@ -7976,7 +8075,18 @@ if (type === 'tv' && searchMode !== 'batch') {
         // 沒探測到的 URL 仍寫入 cache（保守策略，下次重搜時它們會被探測）。
         // 探測為 dead 的 URL 不寫 cache。
         const deadUrls = new Set(probeUrls.filter((_, i) => !alive[i]));
+        // ★ 實測清晰度（master m3u8 RESOLUTION）：只對活著的 URL 探，
+        //   與 HEAD 存活探測同一個背景 IIFE，不阻塞回傳。只讀 playlist 文字，
+        //   不下載任何 .ts 分片；單檔 TS 無 STREAM-INF 會回 null（預期內，
+        //   保留站方標註）。結果寫進 in-memory + 隨 cache 持久化，
+        //   下次 cache 命中時直接顯示「📺 實測…」行。
+        try {
+          const aliveList = probeUrls.filter((_, i) => alive[i]);
+          const resLimit = Math.min(CONFIG.ACTUAL_RES_PROBE_LIMIT ?? 20, aliveList.length);
+          if (resLimit > 0) await probeActualResolutions(aliveList.slice(0, resLimit));
+        } catch {}
         const cacheable = finalResults.filter(r => !r.url || !deadUrls.has(r.url));
+        try { applyActualResolutions(cacheable); } catch {}
         if (cacheable.length > 0) {
           Widget.storage?.set?.(cacheKey, JSON.stringify(cacheable), CONFIG.CACHE_TTL);
           console.log(`💾 已缓存 ${cacheable.length} 个结果`);
@@ -8564,6 +8674,16 @@ function filterBySequel(results, targetInfo) {
 function filterByTargetVersion(results, targetInfo) {
   // 目標帶年份：只留同年份與無年份的候選。
   if (targetInfo.year) {
+    // ★ 電影不做年份硬過濾（TV 維持原行為）。
+    //   原因：REX 詳細頁的 premiereDate 是「全片首映年」（如大話西遊 1995），
+    //   但 MacCMS 站的 vod_year 常是「重映/上架年」（如意回 2014）或缺欄位，
+    //   硬比會把同部片的不同語言版整批殺掉（大話西遊只剩樂子正是如此）。
+    //   電影續集靠 filterBySequel（序號+年份群）區分，慢版/重映版都該留給
+    //   使用者用版本標籤自己挑 —— 與下方「目標沒帶年份：兩個版本都留」的
+    //   策略一致。TV 不受影響（仁医日/韓版仍靠此處分開）。
+    if (targetInfo?.type === 'movie') {
+      return results;
+    }
     const want = String(targetInfo.year);
     const before = results.length;
     const filtered = results.filter(res => {
@@ -8910,6 +9030,10 @@ targetInfo.searchQuery = aliasQ;
       if (merged.length > 0) {
         console.log(`💾 batch cache 命中: mac=${macCached.length} adapter=${adCached.length} legacy=${fromLegacy.length}（合併 ${merged.length}）`);
         allResults = merged;
+        // ★ 實測清晰度：純 in-memory 套用（無網路，不阻塞）。背景已探到的
+        //   master RESOLUTION 會在這裡顯示出「📺 實測…」行；還沒探到的
+        //   這次不顯示，下次命中時會有。
+        try { applyActualResolutions(allResults); } catch {}
         // ★ 記住「哪邊 cache 命中」：決定要不要重抓補上 miss 的部分。
         //
         //   修正前：合併後 non-empty 就直接跳過搜尋 → adapter miss 時
@@ -9775,13 +9899,32 @@ targetInfo.searchQuery = aliasQ;
   //   • MacCMS（無 _adapterSite）→ macCacheKey，與舊內容按 url 去重合併
   //     （跨集累積，避免從 E5 開始搜時把 E1~E4 洗掉）
   //   • Adapter（有 _adapterSite）→ adCacheKey，直接覆蓋（綁定單集）
+  // ★ 實測清晰度先套 in-memory 已探到的（無網路，不阻塞回傳）。
+  try { applyActualResolutions(finalResults); } catch {}
   if (finalResults.length > 0 && CONFIG.CACHE_TTL > 0) {
-    try {
+    // ★ 背景補探 master RESOLUTION + 分流寫 cache（同一個 IIFE，保證順序）。
+    //   只讀 playlist 文字、不下 .ts；探完把「📺 實測…」寫進結果再持久化，
+    //   下次命中直接顯示。不阻塞 return（fire-and-forget，與 smart 路徑同策略）。
+    //   必須同一個 IIFE：分開兩個 IIFE 會有競速 —— 寫 cache 的 IIFE 可能搶在
+    //   探測完成前把「無實測」的結果先寫進去，實測永遠存不進 cache。
+    (async () => {
+      try {
+        const seen = new Set();
+        const urls = [];
+        for (const r of finalResults) {
+          if (!r || typeof r.url !== 'string' || seen.has(r.url)) continue;
+          seen.add(r.url);
+          urls.push(r.url);
+          if (urls.length >= (CONFIG.ACTUAL_RES_PROBE_LIMIT ?? 20)) break;
+        }
+        if (urls.length > 0) await probeActualResolutions(urls);
+        try { applyActualResolutions(finalResults); } catch {}
+      } catch {}
+      try {
       const macResults = finalResults.filter(r => !r._adapterSite);
       const adResults  = finalResults.filter(r => !!r._adapterSite);
 
       if (macResults.length > 0) {
-        (async () => {
           let toWrite = macResults;
           try {
             const oldMac = parseCacheValue(await Widget.storage?.get?.(macCacheKey));
@@ -9819,7 +9962,6 @@ targetInfo.searchQuery = aliasQ;
             }
           } catch (e) { /* 合併失敗時直接寫 macResults */ }
           try { Widget.storage?.set?.(macCacheKey, JSON.stringify(toWrite), CONFIG.CACHE_TTL); } catch {}
-        })();
       }
 
       if (adResults.length > 0) {
@@ -9828,7 +9970,8 @@ targetInfo.searchQuery = aliasQ;
           console.log(`💾 adapter cache 寫入(過濾後): ${adResults.length} 條（key=..._adapter_e${targetEpisode || 'all'}）`);
         } catch (e) {}
       }
-    } catch (e) {}
+      } catch (e) {}
+    })();
   }
 
   return finalResults.slice(0, 100);
@@ -10054,9 +10197,7 @@ async function loadDetail(link) {
         searchMode: 'batch',
         matchStrictness: 'standard',
         preferResolution: 'auto',
-        multiSource: (WidgetMetadata.globalParams.find(p => p.name === 'multiSource') || {}).value || 'enabled',
         VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
-        m3u8FilterEnabled: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterEnabled') || {}).value || 'enabled',
         m3u8FilterWorkerUrl: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterWorkerUrl') || {}).value || '',
         m3u8FilterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterMode') || {}).value || 'filter',
         // 簽名型 adapter 站是否繞開過濾廣告伺服器。漏了這行會讓「相關作品」
@@ -10105,9 +10246,7 @@ async function loadDetail(link) {
               searchMode: 'batch',
               matchStrictness: 'standard',
               preferResolution: 'auto',
-              multiSource: (WidgetMetadata.globalParams.find(p => p.name === 'multiSource') || {}).value || 'enabled',
               VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
-              m3u8FilterEnabled: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterEnabled') || {}).value || 'enabled',
               m3u8FilterWorkerUrl: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterWorkerUrl') || {}).value || '',
               m3u8FilterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterMode') || {}).value || 'filter',
               m3u8FilterAdapterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterAdapterMode') || {}).value || 'skip',
