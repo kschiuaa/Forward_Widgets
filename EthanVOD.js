@@ -949,6 +949,15 @@ function buildSearchVariantsWithAliases(keyword, type) {
 //     程式已內建「空結果則去掉 t 重試」的 fallback，故保留啟用。
 //   天涯資源 → 明確回「暂不支持搜索」，暫停啟用；
 //     其 7 萬部內容的主分類 t=1/2/4 皆為空，無法透過 API 檢索。
+// 2026-11-09 新增站實測（curl 直打採集口，當天更新時間皆為今日）：
+//   暴風資源 bfzyapi.com → ac=list/ac=detail+wd 正常，total 17 萬，type_id 自有體系
+//     （t=2 回空，fallback 去 t 正常；插件內建去 t 重試已覆蓋）。
+//     play_from=bfzym3u8，play_url 標準 m3u8「集名$http#集名$http」，movie 多集分支共用。
+//   優質資源 api.1080zyku.com/inc/apijson.php → ac=detail+wd 正常，total 10 萬，
+//     回 {code:1,list} 標準 MacCMS 形狀；play_from=1080zyk，movie 用「HD国语$http#HD粤语$http」
+//     多版本 # 拼法（movie # 多版本分支已覆蓋，粵語去重維度順帶生效）。
+//   量子資源 cj.lziapi.com → 與現有「樂子」同一後端（play_from=liangzi,lzm3u8，
+//     同一 URL），加進來只會每條重複一次，故不加（見下方註解）。
 // 暫停站以 # 註解保留，站方恢復後取消註解即可重新啟用。
 const RESOURCE_SITES = `
 電影天堂,http://caiji.dyttzyapi.com/api.php/provide/vod
@@ -956,6 +965,9 @@ const RESOURCE_SITES = `
 如意資源,https://cj.rycjapi.com/api.php/provide/vod
 #天涯資源,https://tyyszy.com/api.php/provide/vod
 樂子,https://cj.lziapi.com/api.php/provide/vod
+暴風資源,https://bfzyapi.com/api.php/provide/vod
+優質資源,https://api.1080zyku.com/inc/apijson.php
+#量子資源(與樂子同一後端 cj.lziapi.com，加了只會重複，不加),https://cj.lziapi.com/api.php/provide/vod
 `;
 
 // 中文數字映射（單字，保留給舊呼叫端相容；複合數字請用 parseChineseNumeral）
@@ -1286,7 +1298,9 @@ const CONFIG = {
 // bump 到 68：播放列表必顯示 📺 行（clean 即寫站方行、probe 回來升級實測）+
 // 粵語置頂 + 固定站序（金牌影視 > 電影天堂 > 如意資源，分數加成+comparator 硬性 tier）。
 // 舊 cache 內無 📺 行且排序是舊規則，清掉重搜後才會看到新行與新順序。
-  WIDGET_VERSION: 68,
+// bump 到 69：新增暴風資源 + 優質資源（MacCMS，標準 ac=detail+wd，開關 siteBfzy/siteYzzy）。
+// 量子資源不加（與樂子同一後端 cj.lziapi.com，加了只會重複）。舊 cache 無新站結果，清掉重搜。
+  WIDGET_VERSION: 69,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1323,7 +1337,7 @@ const CONFIG = {
   SUFFICIENT_SITE_COUNT: 3,
 
   // 主力源配置：內容豐富且實測可回傳結果的站，可獲得排序加成
-  MAIN_SOURCES: ['非凡資源', '電影天堂', '如意資源', '樂子'],
+  MAIN_SOURCES: ['非凡資源', '電影天堂', '如意資源', '樂子', '暴風資源', '優質資源'],
 
   // ===== MacCMS 站並發配置 =====
   //
@@ -1545,7 +1559,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.9",
+  version: "3.7.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -1597,6 +1611,28 @@ WidgetMetadata = {
     {
       name: "siteLzi",
       title: "站點開關・樂子",
+      type: "enumeration",
+      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      name: "siteBfzy",
+      title: "站點開關・暴風資源",
+      type: "enumeration",
+      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      name: "siteYzzy",
+      title: "站點開關・優質資源",
       type: "enumeration",
       description: "停用後搜尋不再請求該站\n關掉慢站可提速",
       enumOptions: [
@@ -3960,7 +3996,13 @@ const SITES_REJECTING_TYPE_PARAM = new Set([
   // 實測：這幾站以 t=2 查詢回傳 pagecount=0，改用不帶 t 或 t=0 才有資料。
   'dyttzyapi.com',
   'ffzyapi.com',
-  'ryyshh.com'
+  'ryyshh.com',
+  // 2026-11-09 實測：bfzy 送 t=2 回空 list（total 仍 58 但 list=[]），
+  // 1080zyku 送 t=2 直接 total=0。以下用完整 baseUrl 精確命中，
+  // 與 rememberRejectingTypeSite 存的格式一致（Set.has 是精確比對，
+  // 上面三個短字串是歷史遺留、實際靠執行時 fallback 記住，這裡不動它們）。
+  'https://bfzyapi.com/api.php/provide/vod',
+  'https://api.1080zyku.com/inc/apijson.php',
 ]);
 
 const REJECTING_TYPE_STORAGE_KEY = 'vod_sites_rejecting_t';
@@ -5349,6 +5391,8 @@ const MAC_SITE_SWITCH = {
   '非凡資源': 'siteFfzy',
   '如意資源': 'siteRycj',
   '樂子': 'siteLzi',
+  '暴風資源': 'siteBfzy',
+  '優質資源': 'siteYzzy',
 };
 const ADAPTER_SITE_SWITCH = { jpyy: 'siteJpyy', agedm: 'siteAgedm' };
 function _siteSwitch(name, params, fallback = 'enabled') {
@@ -5374,9 +5418,9 @@ function _filterMacSites(sites, params) {
 /** 站點選擇簽名：進 cache key 用。開關變了就換 key，不會讀回含已關站的舊結果。 */
 function _siteSelectionTag(params) {
   try {
-    return ['siteDytt', 'siteFfzy', 'siteRycj', 'siteLzi', 'siteJpyy', 'siteAgedm']
+    return ['siteDytt', 'siteFfzy', 'siteRycj', 'siteLzi', 'siteBfzy', 'siteYzzy', 'siteJpyy', 'siteAgedm']
       .map(k => _siteSwitch(k, params) === 'enabled' ? '1' : '0').join('');
-  } catch { return '111111'; }
+  } catch { return '11111111'; }
 }
 /** 按當前站點開關過濾已拿到的結果（擋 legacy/舊 key 混入已關站）。 */
 function _filterResultsBySiteSelection(arr, params) {
