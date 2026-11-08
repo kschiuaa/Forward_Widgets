@@ -1300,7 +1300,20 @@ const CONFIG = {
 // 舊 cache 內無 📺 行且排序是舊規則，清掉重搜後才會看到新行與新順序。
 // bump 到 69：新增暴風資源 + 優質資源（MacCMS，標準 ac=detail+wd，開關 siteBfzy/siteYzzy）。
 // 量子資源不加（與樂子同一後端 cj.lziapi.com，加了只會重複）。舊 cache 無新站結果，清掉重搜。
-  WIDGET_VERSION: 69,
+// bump 到 70：修 REX 清晰度篩選全進「其他」。
+// 根因：REX 篩選讀結構化 resolution/resolutionLevel，不是 description 的 📺 行；
+// MacCMS 站集名多為「第01集」無畫質字眼 → 全部標「未知」level 0 → 全進其他，
+// 只有金牌（jpyy 自帶 resolution 數字）能進 720P/1080P。
+// 修法：(1) extractResolutionInfo 無字眼預設 720P（15分，低於明示20分），TC/槍版優先判 480P；
+// (2) applyActualResolutions 實測同步升級結構化欄位（TC 不升）；
+// (3) _stableSourceId 去掉清晰度維度（升級不漂 id，繼續播放不受影響）；
+// (4) _resolutionLabelFromWH 以寬度為輔（1080x608 這類高清檔不再掉到 480P）。
+// 舊 cache 內全是「未知」，清掉重搜後篩選才正常。
+// bump 到 71：清 TV 描述尾巴雜訊（截圖：優質「全32集」、暴風「完結」）。
+// remark 的集數進度/完結狀態/純畫質字一律丟，只剩「第32集」；
+// 片名尾「粵語版/國語版」的「版」後綴跟著語言一起剝（語言由 🌐︎ 行承擔）。
+// 舊 cache 描述帶雜訊尾巴，清掉重搜後乾淨。
+  WIDGET_VERSION: 71,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1559,7 +1572,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.7.0",
+  version: "3.7.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2349,7 +2362,12 @@ function extractResolutionInfo(vodName, epName) {
     qualityScore: 0
   };
   
-  if (/4[Kk]|UHD|2160[Pp]/.test(text)) {
+  // ★ 槍版/搶先版優先判斷（放最前）：站方常寫「HDTC」「高清TC」，
+  //   若先判 HD/高清會被洗成 720P 正片。槍版實測像素再高也是槍版，
+  //   一律歸 480P 最低檔（分數 8），排序墊底、篩選不進 720P/1080P。
+  if (/t[cs](?![a-z])|cam|搶先|槍版|枪版/.test(text)) {
+    resolution = { level: 2, label: '480P', isHD: false, is4K: false, tags: [], qualityScore: 8 };
+  } else if (/4[Kk]|UHD|2160[Pp]/.test(text)) {
     resolution = { level: 5, label: '4K', isHD: true, is4K: true, tags: [], qualityScore: 30 };
   } else if (/1080[Pp]|蓝光|FHD/.test(text)) {
     resolution = { level: 4, label: '1080P', isHD: true, is4K: false, tags: [], qualityScore: 25 };
@@ -2359,6 +2377,20 @@ function extractResolutionInfo(vodName, epName) {
     resolution = { level: 2, label: '480P', isHD: false, is4K: false, tags: [], qualityScore: 10 };
   } else if (/360[Pp]/.test(text)) {
     resolution = { level: 1, label: '360P', isHD: false, is4K: false, tags: [], qualityScore: 5 };
+  } else {
+    // ★ 預設 720P（原先是「未知」level 0）。
+    //
+    // 為什麼：MacCMS 站的集名幾乎都是「第01集」這種純集數，vod_name /
+    // vod_remarks 也常只有「已完结」—— 站方文字裡根本沒有畫質字眼，
+    // 全部落到「未知」。REX 的 720P/1080P 篩選讀的是結構化欄位
+    // （resolution / resolutionLevel），「未知」一律進「其他」。
+    // 只有金牌（jpyy 自帶 resolution 數字）能進篩選，正是本次問題。
+    //
+    // 預設 720P 的依據：這些 CDN m3u8 實測多為 960x540~1080x608
+    // （高清檔），標 720P 比「未知」誠實；probe 回來後
+    // applyActualResolutions 會按實測糾正（升级结构化字段）。
+    // 分數 15（低於明示 720P 的 20）：同站「明示畫質」仍排在前面。
+    resolution = { level: 3, label: '720P', isHD: true, is4K: false, tags: [], qualityScore: 15 };
   }
   
   if (/HDR|杜比/.test(text)) {
@@ -3748,7 +3780,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           //   「集/期」—— 下方 _isVariary 的 epMatch?.[2] === '期' 依賴它。
           const epMatch = epName.match(/第(\d+)\s*(集|期)/);
 
-          const resolutionInfo = extractResolutionInfo(vod_name, epName);
+          const resolutionInfo = extractResolutionInfo(`${vod_name} ${vod_remarks}`, epName);
 
           const dateMatch = epName.match(/(\d{4}年\d{1,2}月\d{1,2}日|\d{4}\.\d{1,2}\.\d{1,2}|\d{4}\d{2}\d{2})/);
 
@@ -3765,9 +3797,27 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           // 不再附加「已完結」或 [dyttm3u8] 等站內標記。
           // 例：「零之使魔．第01集」 /「进击的巨人 最终季．完结篇」/
           //   「银河铁道之父」+ 結尾「[2012年 - 日本]」。
-          const stripFinished = (s) => String(s || '').replace(/已完結|已完结/g, '').replace(/\s+/g, ' ').trim();
+          // ★ remark 去雜訊（2026-11-09 截圖：優質「全32集」、暴風「完結」）：
+          //   集數進度（全32集/共31集）、完結狀態（完結/已完結）、純畫質字
+          //   （HD/高清/藍光，清晰度已由 📺 行 + 結構化欄位承擔）一律丟，
+          //   只剩「第32集」本體。注意 remark 已轉繁體，匹配用繁體為主、
+          //   簡體為輔；「完結篇」是片名語意詞不在此處理（只整段等於才丟）。
+          const stripTvRemark = (s) => {
+            const t = String(s || '').replace(/\s+/g, ' ').trim();
+            if (!t) return '';
+            if (/^(已\s*完[結结]|完[結结]|全[劇剧][終终]|大[結结][局篇]?)$/.test(t)) return '';
+            if (/^(全|共)?\s*\d+\s*[集期話](\s*全)?$/.test(t)) return '';
+            if (/^(更新至|更新到|更新)\s*\d+\s*[集期話]?$/.test(t)) return '';
+            if (/^(高清|超清|超高清|藍光|蓝光|標清|标清|HD|SD|BD|BluRay|Blu-ray|1080P?|720P?|4K|HDR|TS|TC|CAM|WEB-?DL)$/i.test(t)) return '';
+            const u = t.replace(/已完[結结]|已更新|連載中|熱播中/g, '').trim();
+            if (!u) return '';
+            if (/^(全|共)?\s*\d+\s*[集期話](\s*全)?$/.test(u)) return '';
+            if (/^完[結结]$/.test(u)) return '';
+            return u;
+          };
+          const stripFinished = (s) => String(s || '').replace(/已完[結结]|已完结/g, '').replace(/\s+/g, ' ').trim();
           const epText = stripFinished(displayEp);
-          const remarkText = stripFinished(displayRemarks);
+          const remarkText = stripTvRemark(displayRemarks);
           // epName / remark 中常含多段空白分隔，保留全部並用「．」串接
           // （user 範例：「进击的巨人 最终季．完结篇」），再追加 remark 段。
           const tail = [epText, remarkText].filter(Boolean).join('．').replace(/\s+/g, ' ').trim();
@@ -3861,7 +3911,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           for (const variant of variants) {
           const [quality, url] = variant.split('$');
 
-        const resolutionInfo = extractResolutionInfo(vod_name, quality);
+        const resolutionInfo = extractResolutionInfo(`${vod_name} ${vod_remarks}`, quality);
 
         const displayName = _adapterSeasonLabel(vod_name, type);
         // Movie 描述第一行：只留純片名（+ TC 搶先版警示）。
@@ -4168,11 +4218,12 @@ function _parseM3U8MaxResolution(text) {
 
 function _resolutionLabelFromWH(w, h) {
   const pixels = w * h;
-  // 以高度為主、面積為輔：1920x1080 與 1920x800（電影黑邊）都算 1080P。
-  if (h >= 2000 || pixels >= 3840 * 2000) return { label: '4K', level: 5, isHD: true, is4K: true };
-  if (h >= 1000 || pixels >= 1800 * 900) return { label: '1080P', level: 4, isHD: true, is4K: false };
-  if (h >= 650 || pixels >= 1100 * 600) return { label: '720P', level: 3, isHD: true, is4K: false };
-  if (h >= 430) return { label: '480P', level: 2, isHD: false, is4K: false };
+  // 以高度為主、寬度為輔：1920x1080 與 1920x800（電影黑邊）都算 1080P；
+  // 1080x608（高清檔常見）寬度已達 720P 等級，不能只看高度/面積掉到 480P。
+  if (w >= 3000 || h >= 2000 || pixels >= 3840 * 2000) return { label: '4K', level: 5, isHD: true, is4K: true };
+  if (w >= 1700 || h >= 1000 || pixels >= 1800 * 900) return { label: '1080P', level: 4, isHD: true, is4K: false };
+  if (w >= 1000 || h >= 650 || pixels >= 1100 * 600) return { label: '720P', level: 3, isHD: true, is4K: false };
+  if (w >= 600 || h >= 430) return { label: '480P', level: 2, isHD: false, is4K: false };
   return { label: '360P', level: 1, isHD: false, is4K: false };
 }
 
@@ -4308,6 +4359,21 @@ function applyActualResolutions(results) {
           } else if (!_d.includes(_line)) {
             r.description = _d ? `${_d}\n${_line}` : _line;
           }
+          // ★ 舊 cache 遷移：有 actualResolution 但結構化欄位仍是「未知」
+          //   （v69 前只寫 description 不升欄位）→ 這裡補升，篩選才能認。
+          //   TC/槍版不升（見下方同規則）。
+          try {
+            const _isTC0 = Number(r.qualityScore) === 8 || /搶先版|抢先版/.test(String(r.description || ''));
+            const _lvMap = { '4K': 5, '1080P': 4, '720P': 3, '480P': 2, '360P': 1 };
+            const _lv0 = _lvMap[String(r.actualResolution).toUpperCase()] || 0;
+            if (!_isTC0 && _lv0 > 0 && (!r.resolution || r.resolution === '未知')) {
+              r.resolution = String(r.actualResolution).toUpperCase();
+              r.resolutionLevel = _lv0;
+              r.isHD = _lv0 >= 3;
+              r.is4K = _lv0 >= 5;
+              r.qualityScore = Math.max(Number(r.qualityScore) || 0, _lv0 * 5);
+            }
+          } catch {}
         } catch {}
         applied++;
         continue;
@@ -4328,11 +4394,24 @@ function applyActualResolutions(results) {
       } else {
         r.description = desc ? `${desc}\n${line}` : line;
       }
-      // 實測比站方標的高才升級排序依據（站方寫 720P 實測 1080P 的情況很常見）；
-      // ★ 不升級 resolution 本體：_stableSourceId 用 resolution 算 id，
-      //   升級會讓同一路來源在「有實測/無實測」兩次搜尋間 id 漂移，
-      //   REX「繼續播放」會對不上。排序維持站方標註，實測只做顯示。
-      //   （如未來要按實測排序，需把 actualResolution 納入 id 的 resPart。）
+      // ★ 實測同步升級結構化欄位：REX 的 720P/1080P 篩選讀的是
+      //   resolution / resolutionLevel（不是 description 的 📺 行），
+      //   只改 description 不改欄位 → 篩選永遠進「其他」。
+      //   規則：TC/槍版（qualityScore===8）不升級 —— 實測像素再高也是槍版，
+      //   升級會把「搶先版」洗成 1080P 正片；其餘一律以實測為準
+      //   （含往下糾正：預設 720P 實測 480P 也要認）。
+      //   id 穩定性：_stableSourceId 已不再含 resolution，升級不漂 id，
+      //   REX「繼續播放」不受影響。
+      try {
+        const _isTC = Number(r.qualityScore) === 8 || /搶先版|抢先版/.test(String(r.description || ''));
+        if (!_isTC) {
+          r.resolution = hit.label;
+          r.resolutionLevel = hit.level;
+          r.isHD = !!hit.isHD;
+          r.is4K = !!hit.is4K;
+          r.qualityScore = Math.max(Number(r.qualityScore) || 0, hit.level * 5);
+        }
+      } catch {}
       applied++;
     } catch {}
   }
@@ -5732,6 +5811,7 @@ function stripLanguageParen(rawName, stripHint = null) {
   //   場景：部分站把語言字眼直接黏在片名尾端，沒括號。
   //     「九五至尊粤语」→ 樂子 MacCMS 站方原標題就這樣
   //     「庆余年2 国语」  → 某些站方直接空格接
+  //     「公主嫁到粵語版」→ 優質資源(1080zyku)站方原標題就這樣，尾端多一個「版」
   //   只刪「**抽到的 itemLang 本身**」對應的字眼（含繁簡變體），
   //   **不貪心刪 LANGUAGE_TAGS 內其他字眼**。
   //
@@ -5740,8 +5820,10 @@ function stripLanguageParen(rawName, stripHint = null) {
   //   不該把「中字」（中文字幕標記）也一起剝掉。
   //   若用「所有 LANGUAGE_TAGS 字眼去 try」，會把「中字」誤刪成
   //   「破地獄 國語」—— 反而把字幕標記殘留進去。
+  //   （「中字」緊跟在語言後時如「國語中字」不刪，留給 description 顯示；
+  //   只有語言在最尾、或語言後只跟「版/話/篇」這類版本後綴時才刪。）
   //
-  //   規則：
+  // 規則：
   //     1. 只刪「最末段」是「itemLang 對應字眼」的情況。
   //     2. 前面可有可無空白或「．·・」分隔符。
   //     3. 刪完用 trim 清掉殘留的句點 / 空白。
@@ -5762,7 +5844,10 @@ function stripLanguageParen(rawName, stripHint = null) {
     // 由長到短（避免「粵語」被「語」先吃掉）
     const sorted = [...variants].sort((a, b) => b.length - a.length);
     for (const lang of sorted) {
-      const tailRe = new RegExp(`[\\s．·・]?${lang.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`);
+      // ★ 尾端允許跟一個「版/話/篇」版本後綴：「粵語版」「国语版」。
+      //   沒這層，「公主嫁到粵語版」刪不掉，description 變
+      //   「公主嫁到粵語版．第32集」+ 第二行「🌐︎ 粵語」重複三次。
+      const tailRe = new RegExp(`[\\s．·・]?${lang.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:版|話|话|篇|本)?$`);
       if (tailRe.test(out)) {
         out = out.replace(tailRe, '').replace(/[．·・\s]+$/, '').trim();
         break;
@@ -6809,12 +6894,13 @@ function _stableSourceId(resource, clean) {
       || extractLanguageTag(resource._rawName || resource._versionLabel) || 'x';
   } catch { langPart = 'x'; }
   const groupPart = clean.group || resource._groupLabel || 'x';
-  const resPart = `${clean.resolution || 'x'}-L${
-    Number.isFinite(clean.resolutionLevel) ? clean.resolutionLevel : 'x'}`;
+  // ★ id 不含清晰度：applyActualResolutions 會按實測升級 resolution，
+  //   若 id 含 resPart，「無實測/有實測」兩次搜尋 id 漂移，
+  //   REX「繼續播放」對不上。清晰度只影響篩選與排序，不參與身份。
   const pathPart = _stablePlaybackPath(
     typeof resource.url === 'string' ? resource.url : '');
   if (pathPart) {
-    return `forward-vod-${siteBase}|${seasonPart}${epPart}|${langPart}|${groupPart}|${resPart}|${pathPart}`;
+    return `forward-vod-${siteBase}|${seasonPart}${epPart}|${langPart}|${groupPart}|${pathPart}`;
   }
   const epOnly = clean.episode != null ? String(clean.episode) : '';
   return `forward-vod-${resource._rawName || clean.name || 'item'}|${epOnly}`;
@@ -7251,13 +7337,16 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     if (field in clean) delete clean[field];
   });
   
-  if (!clean.resolution) {
-    clean.resolution = '未知';
-    clean.resolutionLevel = 0;
-    clean.isHD = false;
+  // ★ 缺欄位兜底：新邏輯下 extractResolutionInfo 永遠有值（最低預設 720P），
+  //   這裡只處理「舊 cache 回放、欄位根本缺失」的情況，同樣給預設 720P
+  //   而不是「未知」—— 未知會被 REX 篩選丟進「其他」。
+  if (!clean.resolution || clean.resolution === '未知') {
+    clean.resolution = '720P';
+    clean.resolutionLevel = 3;
+    clean.isHD = true;
     clean.is4K = false;
     clean.qualityTags = [];
-    clean.qualityScore = 0;
+    clean.qualityScore = 15;
     clean.isHttps = clean.url.startsWith('https');
   }
   
