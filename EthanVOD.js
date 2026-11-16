@@ -90,11 +90,9 @@ const VARIANT_CHARS = {
 };
 for (const _t of Object.keys(VARIANT_CHARS)) {
   const _s = VARIANT_CHARS[_t];
-  // 只補繁→簡（搜尋用），絕不補簡→繁（顯示用）。
-  // 反例：'迴'->'回' 若反向寫入會變成 '回'->'迴'，
-  // 站方簡體「回到未来」顯示時「回」被誤轉成「迴」，變成「迴到未來」。
-  // 「回/台/周/里」這類字簡繁同形，顯示層保持原字才是對的。
+  // 只補「表裡沒有」的，不覆蓋既有正確映射。
   if (!_tradToSimpMap.has(_t)) _tradToSimpMap.set(_t, _s);
+  if (!_simpToTradMap.has(_s)) _simpToTradMap.set(_s, _t);
 }
 
 /**
@@ -949,15 +947,6 @@ function buildSearchVariantsWithAliases(keyword, type) {
 //     程式已內建「空結果則去掉 t 重試」的 fallback，故保留啟用。
 //   天涯資源 → 明確回「暂不支持搜索」，暫停啟用；
 //     其 7 萬部內容的主分類 t=1/2/4 皆為空，無法透過 API 檢索。
-// 2026-11-09 新增站實測（curl 直打採集口，當天更新時間皆為今日）：
-//   暴風資源 bfzyapi.com → ac=list/ac=detail+wd 正常，total 17 萬，type_id 自有體系
-//     （t=2 回空，fallback 去 t 正常；插件內建去 t 重試已覆蓋）。
-//     play_from=bfzym3u8，play_url 標準 m3u8「集名$http#集名$http」，movie 多集分支共用。
-//   優質資源 api.1080zyku.com/inc/apijson.php → ac=detail+wd 正常，total 10 萬，
-//     回 {code:1,list} 標準 MacCMS 形狀；play_from=1080zyk，movie 用「HD国语$http#HD粤语$http」
-//     多版本 # 拼法（movie # 多版本分支已覆蓋，粵語去重維度順帶生效）。
-//   量子資源 cj.lziapi.com → 與現有「樂子」同一後端（play_from=liangzi,lzm3u8，
-//     同一 URL），加進來只會每條重複一次，故不加（見下方註解）。
 // 暫停站以 # 註解保留，站方恢復後取消註解即可重新啟用。
 const RESOURCE_SITES = `
 電影天堂,http://caiji.dyttzyapi.com/api.php/provide/vod
@@ -965,9 +954,6 @@ const RESOURCE_SITES = `
 如意資源,https://cj.rycjapi.com/api.php/provide/vod
 #天涯資源,https://tyyszy.com/api.php/provide/vod
 樂子,https://cj.lziapi.com/api.php/provide/vod
-暴風資源,https://bfzyapi.com/api.php/provide/vod
-優質資源,https://api.1080zyku.com/inc/apijson.php
-#量子資源(與樂子同一後端 cj.lziapi.com，加了只會重複，不加),https://cj.lziapi.com/api.php/provide/vod
 `;
 
 // 中文數字映射（單字，保留給舊呼叫端相容；複合數字請用 parseChineseNumeral）
@@ -1012,14 +998,6 @@ const CONFIG = {
   URL_PROBE_TIMEOUT: 2000,
   // 同時進行的 HEAD probe 數。m3u8 在不同 CDN，併發可壓低總時間。
   URL_PROBE_CONCURRENCY: 24,
-  // 實際清晰度探測（master m3u8 的 #EXT-X-STREAM-INF:RESOLUTION）。
-  // 只讀 master playlist 文字，不下載 TS 分片；在 cache 寫入前的背景任務裡跑，
-  // 不阻塞搜尋回傳。單檔 TS（media playlist，無 STREAM-INF）沒有解析度標籤，
-  // 探不到是預期的，會保留站方文字標註、不寫假資料。
-  ACTUAL_RES_PROBE_TIMEOUT: 2500,
-  ACTUAL_RES_PROBE_CONCURRENCY: 6,
-  ACTUAL_RES_PROBE_LIMIT: 20,
-  ACTUAL_RES_CACHE_TTL: 1800,
   // widget 版本號。任何 cache schema 變更時（例如加了版本標籤、改了
   // _rawName 欄位、改了去重鍵）都必須 bump 這個號，否則舊 cache 會
   // 被讀回來 —— 舊 cache 內容可能跟新邏輯推論出的版本標籤衝突，
@@ -1284,36 +1262,10 @@ const CONFIG = {
   //         Forward 端 JS 寬鬆解碼不受影響（child 照讀）。
   //     (2) 回傳前加一行季結構 log（季數=[..] 每季集數），以後判本地/重調
   //         不用再猜。bump 版本清掉手機裡修復前寫的髒 cache。
-// bump 到 58 見上。 bump 到 59：clean 通用 wrap 補 site/name/episode，
-// 舊 cache 內的已包裝連結無名（凍結），清掉重搜後新連結才帶名。
-// bump 到 60：id 改為去簽名穩定身份（站名/季/集/語言/分組/清晰度+去參數路徑），
-// 舊 cache 內是 `forward-vod-<完整URL>` 舊 id（帶 t/sign，會漂移），清掉重搜後
-// REX「繼續播放」才能按新 id 穩定回找上次來源。
-// bump 到 61：修掉 VARIANT_CHARS 反向寫入（'回'->'迴'），舊 cache 內
-// description 已寫死「迴到未來」，清掉重搜後顯示才會變回「回到未來」。
-// bump 到 62：新增實際清晰度探測（master m3u8 RESOLUTION → 📺 實測行）。
-// 舊 cache 內沒有 actualResolution 欄位，清掉重搜後新結果才會帶實測行。
-// bump 到 66：移除「聚合搜尋」開關（預設一定開啟，鎖死行為）。
-// bump 到 67：新增每站開關（等同多選），cache key 帶站點選擇簽名。
-// bump 到 68：播放列表必顯示 📺 行（clean 即寫站方行、probe 回來升級實測）+
-// 粵語置頂 + 固定站序（金牌影視 > 電影天堂 > 如意資源，分數加成+comparator 硬性 tier）。
-// 舊 cache 內無 📺 行且排序是舊規則，清掉重搜後才會看到新行與新順序。
-// bump 到 69：新增暴風資源 + 優質資源（MacCMS，標準 ac=detail+wd，開關 siteBfzy/siteYzzy）。
-// 量子資源不加（與樂子同一後端 cj.lziapi.com，加了只會重複）。舊 cache 無新站結果，清掉重搜。
-// bump 到 70：修 REX 清晰度篩選全進「其他」。
-// 根因：REX 篩選讀結構化 resolution/resolutionLevel，不是 description 的 📺 行；
-// MacCMS 站集名多為「第01集」無畫質字眼 → 全部標「未知」level 0 → 全進其他，
-// 只有金牌（jpyy 自帶 resolution 數字）能進 720P/1080P。
-// 修法：(1) extractResolutionInfo 無字眼預設 720P（15分，低於明示20分），TC/槍版優先判 480P；
-// (2) applyActualResolutions 實測同步升級結構化欄位（TC 不升）；
-// (3) _stableSourceId 去掉清晰度維度（升級不漂 id，繼續播放不受影響）；
-// (4) _resolutionLabelFromWH 以寬度為輔（1080x608 這類高清檔不再掉到 480P）。
-// 舊 cache 內全是「未知」，清掉重搜後篩選才正常。
-// bump 到 71：清 TV 描述尾巴雜訊（截圖：優質「全32集」、暴風「完結」）。
-// remark 的集數進度/完結狀態/純畫質字一律丟，只剩「第32集」；
-// 片名尾「粵語版/國語版」的「版」後綴跟著語言一起剝（語言由 🌐︎ 行承擔）。
-// 舊 cache 描述帶雜訊尾巴，清掉重搜後乾淨。
-  WIDGET_VERSION: 72,
+  // bump 到 58 見上。 bump 到 59：clean 通用 wrap 補 site/name/episode，
+  // 舊 cache 內的已包裝連結無名（凍結），清掉重搜後新連結才帶名。
+  // bump 到 60：併入官方線路（zen.cheyong 官方索引＋第三方解析），舊 cache 無官方來源，清掉重搜。
+  WIDGET_VERSION: 60,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1350,7 +1302,7 @@ const CONFIG = {
   SUFFICIENT_SITE_COUNT: 3,
 
   // 主力源配置：內容豐富且實測可回傳結果的站，可獲得排序加成
-  MAIN_SOURCES: ['非凡資源', '電影天堂', '如意資源', '樂子', '暴風資源', '優質資源'],
+  MAIN_SOURCES: ['非凡資源', '電影天堂', '如意資源', '樂子'],
 
   // ===== MacCMS 站並發配置 =====
   //
@@ -1406,6 +1358,26 @@ const CONFIG = {
     // 只給「非短效憑證」的 detail 用：這裡重放的 player_jx 前綴是
     // 站方固定設定；播放 token 不走這個快取（見 _ADAPTER_GET 說明）。
     DETAIL_CACHE_TTL: 30000,
+  },
+
+  // ===== 官方線路（zen.cheyong 官方索引＋第三方解析）=====
+  //
+  // 與 MacCMS / adapter 完全並行的第三條管線。只走官方索引服務
+  // （search / video_detail）＋索引下發的第三方 parse_api 解析，
+  // 不含任何 MacCMS 資源站。
+  //
+  // 特性（插件實測）：官方 CDN 直連（西瓜視頻/騰訊視頻等），無廣告片頭；
+  // 列表＋點播兩級探測（#EXTM3U 驗證＋分片媒體頭＋錯誤頁排除），壞線不回；
+  // 多索引主機並行競速＋本地快照重放，索引掛掉仍可能出片。
+  OFFICIALS: {
+    // 主開關。globalParams.officialEnabled 為 'disabled' 時完全跳過。
+    ENABLED: true,
+    DEBUG: false,
+    // 單集最多探測幾條線路（插件原值 20，進主檔後收斂到 8 以免拖慢首屏）。
+    MAX_LINES: 8,
+    // 整鏈硬上限（搜尋＋詳情＋解析＋探測）。逾時即放棄本輪官方結果，
+    // MacCMS / adapter 結果不受影響。
+    HARD_TIMEOUT: 9000,
   },
 
   // 流式搜尋配置
@@ -1468,12 +1440,6 @@ const CONFIG = {
     // （片名只差年份，文字比對分不出來）。
     AREA_MISMATCH_PENALTY: 150,
     AREA_MATCH_BONUS: 40,
-    // ★ 粵語優先 + 固定站序（使用者要求；comparator 另有硬性 tier，這裡讓去重/串流同向）。
-    CANTONESE_BONUS: 80,
-    BILINGUAL_BONUS: 40,
-    SITE_RANK_JPYY: 60,
-    SITE_RANK_DYTT: 40,
-    SITE_RANK_RYCJ: 20,
   },
 
   // m3u8 過濾廣告伺服器設定
@@ -1572,116 +1538,44 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.8.0",
+  version: "3.6.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
   site: "",
   globalParams: [
     {
+      name: "multiSource",
+      title: "聚合搜尋",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
       name: "VodData",
       title: "自訂源設定",
       type: "input",
-      description: "留空 = 用內建預設源，不用改\n自訂時每行一個，格式：站名,API網址\n範例：我的源A,https://abc.com/api.php/provide/vod\n# 開頭 = 停用該行\n只支援 MacCMS 採集介面",
+      description: "留空 = 使用下方預設源。手動填寫時,每行一個源,格式為「站名,API URL」(以 http 開頭),例:我的源A,https://abc.com/api.php/provide/vod。以 # 開頭為註解停用。需為 MacCMS 採集介面(/api.php/provide/vod)。僅站名等於 預設源名(電影天堂/非凡資源/如意資源/樂子)會獲得排序加成。",
       value: RESOURCE_SITES
     },
     {
-      // MacCMS 內建站開關（等同多選：每站一個啟用/停用）。
-      // Rex/Forward 設定頁沒有多選元件，只能用多個單選拼出同等效果。
-      // 自訂源（VodData 手填的行）不受這裡影響，仍用 # 註解停用。
-      name: "siteDytt",
-      title: "站點開關・電影天堂",
+      name: "searchMode",
+      title: "搜尋模式",
       type: "enumeration",
-      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
       enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
+        { title: "智慧流式", value: "smart_stream" },
+        { title: "批次搜尋 ", value: "batch" },
+        { title: "自動選擇", value: "auto" }
       ],
-      value: "enabled"
-    },
-    {
-      name: "siteFfzy",
-      title: "站點開關・非凡資源",
-      type: "enumeration",
-      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
-    },
-    {
-      name: "siteRycj",
-      title: "站點開關・如意資源",
-      type: "enumeration",
-      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
-    },
-    {
-      name: "siteLzi",
-      title: "站點開關・樂子",
-      type: "enumeration",
-      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
-    },
-    {
-      name: "siteBfzy",
-      title: "站點開關・暴風資源",
-      type: "enumeration",
-      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
-    },
-    {
-      name: "siteYzzy",
-      title: "站點開關・優質資源",
-      type: "enumeration",
-      description: "停用後搜尋不再請求該站\n關掉慢站可提速",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
-    },
-    {
-      // 簽名型站每站開關（與下方 jpyyEnabled 總開關疊加：總開關關掉則兩站全停）。
-      name: "siteJpyy",
-      title: "站點開關・金牌影視",
-      type: "enumeration",
-      description: "停用後不再查金牌影視\n動畫可只留 AGE 動漫",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
-    },
-    {
-      name: "siteAgedm",
-      title: "站點開關・AGE動漫",
-      type: "enumeration",
-      description: "停用後不再查 AGE 動漫\n只看真人劇可關掉",
-      enumOptions: [
-        { title: "啟用", value: "enabled" },
-        { title: "停用", value: "disabled" }
-      ],
-      value: "enabled"
+      value: "batch"
     },
     {
       name: "matchStrictness",
       title: "匹配嚴格度",
       type: "enumeration",
-      description: "預設標準即可\n寬鬆 = 結果更多\n嚴格 = 結果更準",
       enumOptions: [
         { title: "寬鬆(匹配更多)", value: "loose" },
         { title: "標準", value: "standard" },
@@ -1690,11 +1584,67 @@ WidgetMetadata = {
       value: "standard"
     },
     {
+      name: "preferResolution",
+      title: "清晰度偏好",
+      type: "enumeration",
+      enumOptions: [
+        { title: "自動", value: "auto" },
+        { title: "4K", value: "4k" },
+        { title: "1080p", value: "1080p" },
+        { title: "720p", value: "720p" }
+      ],
+      value: "auto"
+    },
+    {
+      name: "convertChinese",
+      title: "繁簡自動轉換",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
+      name: "m3u8FilterEnabled",
+      title: "m3u8 廣告過濾",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    },
+    {
       name: "m3u8FilterWorkerUrl",
       title: "過濾廣告伺服器 URL",
       type: "input",
-      description: "預設不用改\n結尾不要加斜線",
+      description: "完整 URL(含 https://,結尾不要斜線)。預設值就是官方伺服器,直接用即可。",
       value: "https://m3u8-adfliter.kschiuaa.com"
+    },
+    {
+      name: "m3u8FilterAdminUser",
+      title: "過濾廣告伺服器 管理帳號 (選填)",
+      type: "input",
+      description: "填入後可從 console 呼叫 m3u8FilterAdmin.*() 動態管理 patterns。留空 = 唯讀模式。需要同時填寫管理密碼。",
+      value: ""
+    },
+    {
+      name: "m3u8FilterAdminPass",
+      title: "過濾廣告伺服器 管理密碼 (選填)",
+      type: "input",
+      description: "管理帳號的密碼。Widget 啟動時會自動登入取得 session cookie。",
+      value: ""
+    },
+    {
+      name: "m3u8FilterAutoLoad",
+      title: "啟動時載入 patterns",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
     },
     {
       // ts 走哪裡 —— 跟播放速度直接相關。
@@ -1713,7 +1663,6 @@ WidgetMetadata = {
       name: "m3u8FilterTsMode",
       title: "ts 分片走哪 (速度/過濾 取捨)",
       type: "enumeration",
-      description: "預設第一個，不用改\n第二個較慢\n第三個不過濾，只用來除錯",
       enumOptions: [
         { title: "純去廣告 (playlist 過濾 + ts 原站,推薦)", value: "hybrid" },
         { title: "伺服器代理 (全部走過濾廣告伺服器,流量過本機)", value: "proxy" },
@@ -1739,7 +1688,6 @@ WidgetMetadata = {
       name: "m3u8FilterAdapterMode",
       title: "簽名型來源走不走廣告過濾",
       type: "enumeration",
-      description: "預設第一個，不用改\n這類站本身沒廣告",
       enumOptions: [
         { title: "直接播放 (跳過過濾,推薦 — 這類站沒廣告)", value: "skip" },
         { title: "照常過濾 (與其他站相同)", value: "filter" }
@@ -1758,7 +1706,6 @@ WidgetMetadata = {
       name: "tmdbAliasEnabled",
       title: "TMDB 跨地區別名查詢",
       type: "enumeration",
-      description: "預設啟用\n解決兩岸片名不同問題\n例如陰屍路也能找到行屍走肉",
       enumOptions: [
         { title: "啟用", value: "enabled" },
         { title: "停用", value: "disabled" }
@@ -1777,7 +1724,7 @@ WidgetMetadata = {
       name: "tmdbApiKey",
       title: "TMDB API Key",
       type: "input",
-      description: "留空即可\n一般人不用申請\n有 Key 才填",
+      description: "v3 API Key。留空 = 純繁簡模式，行為與舊版一致。",
       value: ""
     },
     {
@@ -1791,7 +1738,6 @@ WidgetMetadata = {
       name: "jpyyEnabled",
       title: "簽名型站(金牌影視等)",
       type: "enumeration",
-      description: "預設啟用\n站方壞掉才需要關",
       enumOptions: [
         { title: "啟用", value: "enabled" },
         { title: "停用", value: "disabled" }
@@ -1804,7 +1750,6 @@ WidgetMetadata = {
       name: "adapterSiteLimit",
       title: "簽名型站 同時查詢站數",
       type: "enumeration",
-      description: "預設 2 站\n想更快可選 1 站",
       // 預設 2：目前有兩個站（金牌影視 = 綜合內容、AGE動漫 = 動畫）。
       // 兩者內容不重疊 —— AGE 只有動畫，動漫番這類查詢金牌影視多半零命中，
       // 反過來劇集 AGE 也是零命中。一起開的實際效益高於其 6 次請求的成本。
@@ -1820,14 +1765,27 @@ WidgetMetadata = {
       name: "adapterDebug",
       title: "簽名型站 除錯日誌",
       type: "enumeration",
-      description: "預設關閉\n除錯才開",
       enumOptions: [
         { title: "關閉", value: "disabled" },
         { title: "開啟", value: "enabled" }
       ],
       value: "disabled"
     }
-  ],
+,
+    {
+      // 官方線路（zen.cheyong 官方索引＋第三方解析）開關。
+      //
+      // 與「自訂源設定」（MacCMS）/「簽名型站」三條管線完全獨立：
+      // 這裡停用只影響官方線路，其他來源照常運作。
+      name: "officialEnabled",
+      title: "官方線路(官方索引直連)",
+      type: "enumeration",
+      enumOptions: [
+        { title: "啟用", value: "enabled" },
+        { title: "停用", value: "disabled" }
+      ],
+      value: "enabled"
+    }  ],
   modules: [
     {
       id: "loadResource",
@@ -2121,27 +2079,20 @@ function resolveRexSeason(seasonParam, seriesName, fallbackSeason) {
     // 純數字 "2" / 數字型 2
     if (/^\d+$/.test(raw)) {
       const n = parseInt(raw, 10);
-      // ★ 明確 >1 直接採用；==1 不直接回，要讓片名續集有機會覆寫。
-      //   電影在 REX 沒有季概念，詳細頁常固定傳 season=1，但片名自帶
-      //   序號（海王2、回到未來3）。舊寫法 season=1 直接回 1 → 下游
-      //   filterBySequel 走 S1 反向阻擋，把真續集當雜訊丟掉。
-      //   TV 切季 season>1 不受影響（直接回）。
-      if (n > 1) return n;
+      if (n >= 1) return n;
     } else {
       // S2 / Season 2
       const mEn = raw.match(/(?:season\s*|s)(\d{1,2})/i);
       if (mEn) {
         const n = parseInt(mEn[1], 10);
-        // ★ ==1 不直接回，掉下去讓片名續集覆寫（理由同上純數字分支）。
-        if (n > 1) return n;
+        if (n >= 1) return n;
       } else {
         // 第二季 / 第二部 / 二
         const mCn = raw.match(/\d+|[一二三四五六七八九十零〇兩两]+/);
         if (mCn) {
           const tok = mCn[0];
           const n = /^\d+$/.test(tok) ? parseInt(tok, 10) : parseChineseNumeral(tok);
-          // ★ ==1 同理不直接回。
-          if (Number.isFinite(n) && n > 1) return n;
+          if (Number.isFinite(n) && n >= 1) return n;
         }
       }
     }
@@ -2149,17 +2100,6 @@ function resolveRexSeason(seasonParam, seriesName, fallbackSeason) {
   }
   // 從片名猜：extractEnhancedInfo 已經會解 第X季 / S2，拿它的結果
   if (Number.isFinite(fb) && fb > 1) return fb;
-  // ★ 電影續集：片名自帶序號（海王2、回到未來3、疾速追殺4）。
-  //   extractEnhancedInfo 只解「第X季 / S2 / Season」，這類「裸數字續集」
-  //   會得 seasonNumber=1 → 下游 filterBySequel 走 S1 反向阻擋分支，
-  //   把真正的續集（sq=2/3）當 S2 雜訊丟掉、留下第一部（實測海王2反選）。
-  //   isSmartSeriesMatch 同理拿不到 _expectedSequel，fallback 誤放行。
-  //   年份不誤觸：extractSequelNumber 已排除年份（>100）與解說/預告。
-  //   序號 1 視為原版不提升（慶餘年1 仍是 S1）。
-  try {
-    const seq = (typeof extractSequelNumber === 'function') ? extractSequelNumber(seriesName) : null;
-    if (Number.isFinite(seq) && seq > 1) return seq;
-  } catch {}
   return 1;
 }
 
@@ -2380,12 +2320,7 @@ function extractResolutionInfo(vodName, epName) {
     qualityScore: 0
   };
   
-  // ★ 槍版/搶先版優先判斷（放最前）：站方常寫「HDTC」「高清TC」，
-  //   若先判 HD/高清會被洗成 720P 正片。槍版實測像素再高也是槍版，
-  //   一律歸 480P 最低檔（分數 8），排序墊底、篩選不進 720P/1080P。
-  if (/t[cs](?![a-z])|cam|搶先|槍版|枪版/.test(text)) {
-    resolution = { level: 2, label: '480P', isHD: false, is4K: false, tags: [], qualityScore: 8 };
-  } else if (/4[Kk]|UHD|2160[Pp]/.test(text)) {
+  if (/4[Kk]|UHD|2160[Pp]/.test(text)) {
     resolution = { level: 5, label: '4K', isHD: true, is4K: true, tags: [], qualityScore: 30 };
   } else if (/1080[Pp]|蓝光|FHD/.test(text)) {
     resolution = { level: 4, label: '1080P', isHD: true, is4K: false, tags: [], qualityScore: 25 };
@@ -2395,20 +2330,6 @@ function extractResolutionInfo(vodName, epName) {
     resolution = { level: 2, label: '480P', isHD: false, is4K: false, tags: [], qualityScore: 10 };
   } else if (/360[Pp]/.test(text)) {
     resolution = { level: 1, label: '360P', isHD: false, is4K: false, tags: [], qualityScore: 5 };
-  } else {
-    // ★ 預設 720P（原先是「未知」level 0）。
-    //
-    // 為什麼：MacCMS 站的集名幾乎都是「第01集」這種純集數，vod_name /
-    // vod_remarks 也常只有「已完结」—— 站方文字裡根本沒有畫質字眼，
-    // 全部落到「未知」。REX 的 720P/1080P 篩選讀的是結構化欄位
-    // （resolution / resolutionLevel），「未知」一律進「其他」。
-    // 只有金牌（jpyy 自帶 resolution 數字）能進篩選，正是本次問題。
-    //
-    // 預設 720P 的依據：這些 CDN m3u8 實測多為 960x540~1080x608
-    // （高清檔），標 720P 比「未知」誠實；probe 回來後
-    // applyActualResolutions 會按實測糾正（升级结构化字段）。
-    // 分數 15（低於明示 720P 的 20）：同站「明示畫質」仍排在前面。
-    resolution = { level: 3, label: '720P', isHD: true, is4K: false, tags: [], qualityScore: 15 };
   }
   
   if (/HDR|杜比/.test(text)) {
@@ -2833,18 +2754,8 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   if (candidateSequel === 1) candidateSequel = null;
   // target 端同理：使用者輸入「庆余年1」時不應被當成有續集序號。
   const targetSequelNorm = targetSequel === 1 ? null : targetSequel;
-  // ★ target 片名明寫續集序號（海王2、回到未來3）vs 候選無序號（海王）：
-  //   這是「第 N 部 vs 第一部」，必須判衝突。舊邏輯只擋「target 無序號
-  //   candidate 有序號」單向，導致「海王2 vs 海王」相似度 0.27 仍走
-  //   fallback 的 finaleMatches 旁路混入（實測）、「回到未來3 vs 回到未來」
-  //   相似度 0.8 直接走 loose 混入。
-  //   只認「片名明寫」的序號（不用 _expectedSequel 補的）：仁醫 S2
-  //  （target「仁醫」+ expected=2）vs 候選裸名「仁醫」是合法互補，必須放行。
-  const targetExplicitSequel = extractSequelNumber(targetInfo.rawName);
-  const targetExplicitNorm = targetExplicitSequel === 1 ? null : targetExplicitSequel;
-  const sequelShapeMismatchReverse = (targetExplicitNorm !== null) && (candidateSequel === null);
   const sequelShapeMismatch = (targetSequelNorm === null) && (candidateSequel !== null);
-  const sequelConflict = sequelShapeMismatch || sequelShapeMismatchReverse ||
+  const sequelConflict = sequelShapeMismatch ||
     (targetSequelNorm !== null && candidateSequel !== null && targetSequelNorm !== candidateSequel);
 
   // 季度衝突：使用者選第一季，候選卻是第二季，就不是他要的內容。
@@ -3808,7 +3719,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           //   「集/期」—— 下方 _isVariary 的 epMatch?.[2] === '期' 依賴它。
           const epMatch = epName.match(/第(\d+)\s*(集|期)/);
 
-          const resolutionInfo = extractResolutionInfo(`${vod_name} ${vod_remarks}`, epName);
+          const resolutionInfo = extractResolutionInfo(vod_name, epName);
 
           const dateMatch = epName.match(/(\d{4}年\d{1,2}月\d{1,2}日|\d{4}\.\d{1,2}\.\d{1,2}|\d{4}\d{2}\d{2})/);
 
@@ -3825,27 +3736,9 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           // 不再附加「已完結」或 [dyttm3u8] 等站內標記。
           // 例：「零之使魔．第01集」 /「进击的巨人 最终季．完结篇」/
           //   「银河铁道之父」+ 結尾「[2012年 - 日本]」。
-          // ★ remark 去雜訊（2026-11-09 截圖：優質「全32集」、暴風「完結」）：
-          //   集數進度（全32集/共31集）、完結狀態（完結/已完結）、純畫質字
-          //   （HD/高清/藍光，清晰度已由 📺 行 + 結構化欄位承擔）一律丟，
-          //   只剩「第32集」本體。注意 remark 已轉繁體，匹配用繁體為主、
-          //   簡體為輔；「完結篇」是片名語意詞不在此處理（只整段等於才丟）。
-          const stripTvRemark = (s) => {
-            const t = String(s || '').replace(/\s+/g, ' ').trim();
-            if (!t) return '';
-            if (/^(已\s*完[結结]|完[結结]|全[劇剧][終终]|大[結结][局篇]?)$/.test(t)) return '';
-            if (/^(全|共)?\s*\d+\s*[集期話](\s*全)?$/.test(t)) return '';
-            if (/^(更新至|更新到|更新)\s*\d+\s*[集期話]?$/.test(t)) return '';
-            if (/^(高清|超清|超高清|藍光|蓝光|標清|标清|HD|SD|BD|BluRay|Blu-ray|1080P?|720P?|4K|HDR|TS|TC|CAM|WEB-?DL)$/i.test(t)) return '';
-            const u = t.replace(/已完[結结]|已更新|連載中|熱播中/g, '').trim();
-            if (!u) return '';
-            if (/^(全|共)?\s*\d+\s*[集期話](\s*全)?$/.test(u)) return '';
-            if (/^完[結结]$/.test(u)) return '';
-            return u;
-          };
-          const stripFinished = (s) => String(s || '').replace(/已完[結结]|已完结/g, '').replace(/\s+/g, ' ').trim();
+          const stripFinished = (s) => String(s || '').replace(/已完結|已完结/g, '').replace(/\s+/g, ' ').trim();
           const epText = stripFinished(displayEp);
-          const remarkText = stripTvRemark(displayRemarks);
+          const remarkText = stripFinished(displayRemarks);
           // epName / remark 中常含多段空白分隔，保留全部並用「．」串接
           // （user 範例：「进击的巨人 最终季．完结篇」），再追加 remark 段。
           const tail = [epText, remarkText].filter(Boolean).join('．').replace(/\s+/g, ' ').trim();
@@ -3908,16 +3801,8 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           results.push(resource);
         }
       });
-    } else if (type === 'movie') {
-      // ★ 電影多版本 `#`：MacCMS 站常把同一部片的多語言/多版本拼在同一條
-      //   playSource（`HD国语$url1#HD粤语$url2`），`#` 在這裡不是「多集」，
-      //   而是「多版本」。舊條件 `type === 'movie' && !isTV` 遇到 `#` 就整條
-      //   跳過 → 電影天堂 / 非凡這類站直接 0 筆（大話西遊只剩樂子正是如此）。
-      //   修法：movie 不分 isTV，一律把 `#` 切成多個候選版本，每版各建一條
-      //   resource；單版本時行為與舊版逐字相同（只取 firstM3U8、一條輸出）。
-      const variants = playSource.split('#').filter(Boolean)
-        .filter(v => isM3U8Url(v.split('$')[1]));
-      const firstM3U8 = variants[0];
+    } else if (type === 'movie' && !isTV) {
+      const firstM3U8 = playSource.split('#').find(v => isM3U8Url(v.split('$')[1]));
       if (firstM3U8) {
         // ★ 過濾「預告片 / 預告 / 花絮 / 片段」之類非正片
         //
@@ -3933,34 +3818,18 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         const isNonMainRelease = /[\[【（(]\s*(预告片|預告片|预告|預告|花絮|片段|彩蛋|片花|幕后|幕後|特辑|特輯|先行|先导|先導|幕后花絮|幕後花絮)[\]】）)]/i.test(vod_name)
             || /\b(预告|預告|花絮|片段|彩蛋|片花|幕后|幕後|特辑|特輯|先行|先导|先導)\b/i.test(vod_name);
         if (!isNonMainRelease) {
-          // 單版本時走舊路徑（逐字同輸出）；多版本時每版各建一條 resource，
-          // 用語言標籤區分（否則去重鍵撞在一起只剩一版）。
-          const multiVersion = variants.length > 1;
-          for (const variant of variants) {
-          const [quality, url] = variant.split('$');
+          const [quality, url] = firstM3U8.split('$');
+        const qualityText = quality.toLowerCase().includes('tc') ? '搶先版' : '正片';
 
-        const resolutionInfo = extractResolutionInfo(`${vod_name} ${vod_remarks}`, quality);
+        const resolutionInfo = extractResolutionInfo(vod_name, quality);
 
         const displayName = _adapterSeasonLabel(vod_name, type);
-        // Movie 描述第一行：只留純片名（+ TC 搶先版警示）。
-        //   - 多版本的語言（HD国语/HD粤语）不拼在第一行，改走 _rawName
-        //     → cleanResourceForOutput 統一加第二行「🌐︎ 語言」（與 tv 一致）。
-        //     第一行拼語言會跟第二行重複（標題尾．國語 + 🌐︎ 國語同時出現）。
-        //   - HD/高清/藍光等多餘畫質字眼不進描述（已由 resolution 欄位承擔，
-        //     第一行留著只是噪音）。TC 搶先版保留 —— 它是「槍版警示」，
-        //     拿掉後 TC 跟正片在清單裡長得一模一樣，會誤點。
-        // 單版本時 desc 與舊版逐字相同（displayName [+．搶先版]）。
-        const variantLang = multiVersion ? (extractLanguageTag(quality) || '') : '';
-        let baseName = displayName
-          .replace(/[．.]\s*(HD|高清|超清|超高清|藍光|蓝光|BD|1080\s*P|720\s*P|4\s*K)\s*$/i, '')
-          .trim() || displayName;
-        const alreadyTC = /搶先版|抢先版|\bTC\b/i.test(baseName);
-        const needTC = quality.toLowerCase().includes('tc') && !alreadyTC;
-        const isMainRelease = !needTC;
-        const baseDesc = needTC ? `${baseName}．搶先版` : baseName;
+        // Movie 描述：正片（默認）不附標記；搶先版/TC/其他非正片
+        // 標籤以「．」中點附在片名後。
+        const isMainRelease = qualityText === '正片';
         const resource = {
           name: siteTitle,
-          description: baseDesc,
+          description: isMainRelease ? displayName : `${displayName}．${qualityText}`,
           // movie 分支必須在這裡 wrap。cleanResourceForOutput 雖然也會 wrap，
           // 但它是搜尋結果清理階段才跑；movie 走的是直接 results.push 路徑，
           // 漏掉會讓電影全部裸奔 CDN —— 「設定改了但播放沒走過濾伺服器」
@@ -3995,11 +3864,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           // 站方原始片名。去重要用它區分「片名相同但其實是不同版本」的情況：
           // 有幾個站同時存在日版與韓版、兩者檔名都只寫「仁医」且不帶年份欄位，
           // 只靠 _year 無法分辨，會被去重吃掉其中一版。
-          // ★ 多版本時把語言寫進 _rawName（`片名（國語）`），否則兩版 _rawName
-          //   相同 → generateContentKey 的 langKey 撞鍵只剩一版。
-          //   單版本時與舊版逐字相同；cleanResourceForOutput 會再把括弧語言
-          //   抽成頂層 language 並剝掉顯示，不污染標題。
-          _rawName: (multiVersion && variantLang) ? `${vod_name}（${variantLang}）` : vod_name,
+          _rawName: vod_name,
           _seasonFromItem: extractSequelNumber(vod_name),
           _seasonMatch: matchInfo.seasonMatch,
           _versionConflict: yearConflict || isConflictingVersion(targetInfo, vod_name),
@@ -4009,10 +3874,9 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         };
 
         results.push(resource);
-          } // for variant
-        } // if !isNonMainRelease
-      } // if firstM3U8
-    } // else if movie
+        }
+      }
+    }
   });
 
   return results;
@@ -4074,13 +3938,7 @@ const SITES_REJECTING_TYPE_PARAM = new Set([
   // 實測：這幾站以 t=2 查詢回傳 pagecount=0，改用不帶 t 或 t=0 才有資料。
   'dyttzyapi.com',
   'ffzyapi.com',
-  'ryyshh.com',
-  // 2026-11-09 實測：bfzy 送 t=2 回空 list（total 仍 58 但 list=[]），
-  // 1080zyku 送 t=2 直接 total=0。以下用完整 baseUrl 精確命中，
-  // 與 rememberRejectingTypeSite 存的格式一致（Set.has 是精確比對，
-  // 上面三個短字串是歷史遺留、實際靠執行時 fallback 記住，這裡不動它們）。
-  'https://bfzyapi.com/api.php/provide/vod',
-  'https://api.1080zyku.com/inc/apijson.php',
+  'ryyshh.com'
 ]);
 
 const REJECTING_TYPE_STORAGE_KEY = 'vod_sites_rejecting_t';
@@ -4207,246 +4065,6 @@ async function probeUrlsAlive(urls, opts = {}) {
   const out = new Array(urls.length);
   for (let i = 0; i < urls.length; i++) out[i] = uniqueResults[posToUnique[i]];
   return out;
-}
-
-// ==================== 實際清晰度探測（master m3u8 RESOLUTION）====================
-//
-// 背景：清單上的 resolution 全是「站方文字推的」（extractResolutionInfo 看
-// vod_name / quality 有沒有 1080P/4K 字眼）。站方寫 HD 實際可能是 720P 也
-// 可能是 1080P；寫「高清」更是什麼都可能是。TS 單檔（media playlist，裡面
-// 全是 #EXTINF + .ts）本身沒有 RESOLUTION 標籤 —— 解析度只存在於 master
-// playlist 的 #EXT-X-STREAM-INF:RESOLUTION=1920x1080 BANDWIDTH=... 行。
-//
-// 做法：GET 那條 m3u8（只讀文字，不下載任何 .ts 分片），抓所有 RESOLUTION=WxH
-// 取最大面積者為「實測」。分三種回落：
-//   1. master 多清晰度 → 取最大 RESOLUTION（這就是播放器會選的最高檔）。
-//   2. 單檔 media playlist（無 STREAM-INF）→ 回 null，不寫假資料，保留站方標註。
-//   3. 包過過濾廣告伺服器的 url → 先 _unwrapFilterInnerUrl 還原出真實 CDN 再探，
-//      探的是同一路來源，結果可直接對應回包裝 url。
-//
-// 成本控制（不拖慢搜尋）：只在 cache 寫入前的背景任務裡跑（fire-and-forget，
-// 與 probeUrlsAlive 同一個 IIFE），不阻塞回傳；併發 6、超時 2.5s、最多 20 條，
-// 結果寫進 in-memory + 隨 cache 一起持久化。下次 cache 命中時直接顯示實測，
-// 使用者第二次進來就看得到 —— 第一次顯示站方標註是預期的。
-const _ACTUAL_RES_CACHE = new Map(); // stablePath -> { label, level, w, h, ts }
-const _ACTUAL_RES_INFLIGHT = new Map();
-
-function _parseM3U8MaxResolution(text) {
-  if (!text || typeof text !== 'string') return null;
-  // 只認 master 行。單檔 TS 沒有這行 → 回 null（不是失敗，是「本來就沒有」）。
-  const re = /#EXT-X-STREAM-INF:[^\n]*RESOLUTION=(\d+)\s*x\s*(\d+)/gi;
-  let m, best = null;
-  while ((m = re.exec(text)) !== null) {
-    const w = parseInt(m[1], 10), h = parseInt(m[2], 10);
-    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) continue;
-    if (!best || w * h > best.w * best.h) best = { w, h };
-  }
-  return best;
-}
-
-function _resolutionLabelFromWH(w, h) {
-  const pixels = w * h;
-  // 以高度為主、寬度為輔：1920x1080 與 1920x800（電影黑邊）都算 1080P；
-  // 1080x608（高清檔常見）寬度已達 720P 等級，不能只看高度/面積掉到 480P。
-  if (w >= 3000 || h >= 2000 || pixels >= 3840 * 2000) return { label: '4K', level: 5, isHD: true, is4K: true };
-  if (w >= 1700 || h >= 1000 || pixels >= 1800 * 900) return { label: '1080P', level: 4, isHD: true, is4K: false };
-  if (w >= 1000 || h >= 650 || pixels >= 1100 * 600) return { label: '720P', level: 3, isHD: true, is4K: false };
-  if (w >= 600 || h >= 430) return { label: '480P', level: 2, isHD: false, is4K: false };
-  return { label: '360P', level: 1, isHD: false, is4K: false };
-}
-
-function _actualResCacheGet(stablePath) {
-  try {
-    const hit = _ACTUAL_RES_CACHE.get(stablePath);
-    if (!hit) return null;
-    const ttl = (CONFIG.ACTUAL_RES_CACHE_TTL || 1800) * 1000;
-    if (Date.now() - hit.ts > ttl) { _ACTUAL_RES_CACHE.delete(stablePath); return null; }
-    return hit;
-  } catch { return null; }
-}
-
-async function _fetchM3U8Text(url) {
-  const timeout = CONFIG.ACTUAL_RES_PROBE_TIMEOUT ?? 2500;
-  const resp = await Widget.http.get(url, {
-    headers: { 'User-Agent': API_USER_AGENT },
-    timeout,
-  });
-  // Forward 回傳三種形狀：string / { data } / { statusCode, data, headers }。
-  // m3u8 是 text/plain，通常是 string 或 data=string；JSON parse 會失敗，
-  // 所以這裡只取 raw string，不走 _unwrapHttpResponse（那是給 JSON 用的）。
-  let body = resp;
-  if (body && typeof body === 'object' && 'data' in body) body = body.data;
-  if (typeof body !== 'string') {
-    // 有些 runtime 把 body 放在 .body / .text
-    if (body && typeof body.body === 'string') body = body.body;
-    else if (body && typeof body.text === 'string') body = body.text;
-    else return null;
-  }
-  return body;
-}
-
-async function _probeOneActualResolution(url) {
-  // 還原包裝 → 去簽名 → 穩定路徑（同一路來源換簽名仍命中同一 cache）。
-  const inner = _unwrapFilterInnerUrl(url);
-  const noQuery = String(inner || url || '').split(/[?#]/)[0].trim();
-  if (!/^https?:\/\//i.test(noQuery)) return null;
-  const key = noQuery;
-  const cached = _actualResCacheGet(key);
-  if (cached) return cached;
-  if (_ACTUAL_RES_INFLIGHT.has(key)) return _ACTUAL_RES_INFLIGHT.get(key);
-  const p = (async () => {
-    try {
-      const text = await _fetchM3U8Text(inner || url);
-      if (!text || text.indexOf('#EXTM3U') === -1) return null;
-      const best = _parseM3U8MaxResolution(text);
-      if (!best) return null; // 單檔 TS：本來就沒有 RESOLUTION，不算失敗
-      const mapped = _resolutionLabelFromWH(best.w, best.h);
-      const val = { ...mapped, w: best.w, h: best.h, ts: Date.now() };
-      try {
-        if (_ACTUAL_RES_CACHE.size > 500) {
-          const first = _ACTUAL_RES_CACHE.keys().next().value;
-          if (first != null) _ACTUAL_RES_CACHE.delete(first);
-        }
-        _ACTUAL_RES_CACHE.set(key, val);
-      } catch {}
-      return val;
-    } catch { return null; }
-    finally { if (_ACTUAL_RES_INFLIGHT.get(key) === p) _ACTUAL_RES_INFLIGHT.delete(key); }
-  })();
-  _ACTUAL_RES_INFLIGHT.set(key, p);
-  return p;
-}
-
-// 批量探測實際清晰度，回傳與輸入同長度的陣列（探不到= null）。
-// 與 probeUrlsAlive 同樣的分批啟動，保证最多 concurrency 個同時在飛。
-async function probeActualResolutions(urls, opts = {}) {
-  const timeout = opts.timeout ?? CONFIG.ACTUAL_RES_PROBE_TIMEOUT ?? 2500;
-  const concurrency = opts.concurrency ?? CONFIG.ACTUAL_RES_PROBE_CONCURRENCY ?? 6;
-  void timeout;
-  if (!Array.isArray(urls) || urls.length === 0) return [];
-  if (!Widget?.http?.get) return urls.map(() => null);
-  // 去重（保持回傳長度）：同一穩定路徑只探一次。
-  const keyOf = (u) => {
-    try {
-      const inner = _unwrapFilterInnerUrl(u);
-      return String(inner || u || '').split(/[?#]/)[0].trim();
-    } catch { return String(u || ''); }
-  };
-  const uniqueUrls = [];
-  const posToUnique = new Array(urls.length);
-  const seen = new Map();
-  for (let i = 0; i < urls.length; i++) {
-    const k = keyOf(urls[i]);
-    let idx = seen.get(k);
-    if (idx === undefined) { idx = uniqueUrls.length; uniqueUrls.push(urls[i]); seen.set(k, idx); }
-    posToUnique[i] = idx;
-  }
-  const uniqueResults = new Array(uniqueUrls.length);
-  for (let k = 0; k < uniqueUrls.length; k += concurrency) {
-    const batch = [];
-    for (let j = k; j < Math.min(k + concurrency, uniqueUrls.length); j++) batch.push(j);
-    await Promise.all(batch.map(async (j) => { uniqueResults[j] = await _probeOneActualResolution(uniqueUrls[j]); }));
-  }
-  return posToUnique.map((idx) => uniqueResults[idx] || null);
-}
-
-// 把已知的實測清晰度套到一批結果上（冪等，可在 cache 命中路徑調用）。
-// 只升級、不降級：實測 level 高於站方標註才覆蓋 resolution；無實測時不動。
-// 無論升不升級，只要有實測就寫 actualResolution + description 第三行「📺 實測…」。
-function applyActualResolutions(results) {
-  if (!Array.isArray(results) || results.length === 0) return 0;
-  let applied = 0;
-  for (const r of results) {
-    try {
-      if (!r || typeof r.url !== 'string') continue;
-      // 舊格式遷移（無需網路）：重啟後 in-memory 實測快取是空的，
-      // 但 cache 裡的 description 可能還留著「📺 實測1080P(1920x1080)」，
-      // 直接改寫成新格式「📺 1080P」，不需重新探測。
-      // 有 actualResolution 的也要遷（舊 cache 在 v62 寫入時就是長格式）。
-      try {
-        const d0 = String(r.description || '');
-        if (/📺\s*實測/.test(d0)) {
-          const m0 = d0.match(/📺\s*實測\s*(4K|1080P|720P|480P|360P)/);
-          if (m0) {
-            r.description = d0.replace(/📺\s*實測[^\n]*/g, `📺 ${m0[1]}`);
-            if (!r.actualResolution) r.actualResolution = m0[1];
-            applied++;
-            continue;
-          }
-        }
-      } catch {}
-      if (r.actualResolution) {
-        // 已有實測但 description 缺 📺 行（舊 cache / clean 後）→ 補行，不跳過。
-        try {
-          const _ar = String(r.actualResolution);
-          const _line = `📺 ${_ar}`;
-          const _d = String(r.description || '');
-          if (/📺\s*實測/.test(_d)) {
-            const _m = _d.match(/📺\s*實測\s*(4K|1080P|720P|480P|360P)/);
-            r.description = _m ? _d.replace(/📺\s*實測[^\n]*/g, _line) : (_d.includes(_line) ? _d : (_d ? `${_d}\n${_line}` : _line));
-          } else if (!_d.includes(_line)) {
-            r.description = _d ? `${_d}\n${_line}` : _line;
-          }
-          // ★ 舊 cache 遷移：有 actualResolution 但結構化欄位仍是「未知」
-          //   （v69 前只寫 description 不升欄位）→ 這裡補升，篩選才能認。
-          //   TC/槍版不升（見下方同規則）。
-          try {
-            const _isTC0 = Number(r.qualityScore) === 8 || /搶先版|抢先版/.test(String(r.description || ''));
-            const _lvMap = { '4K': 5, '1080P': 4, '720P': 3, '480P': 2, '360P': 1 };
-            const _lv0 = _lvMap[String(r.actualResolution).toUpperCase()] || 0;
-            if (!_isTC0 && _lv0 > 0 && (!r.resolution || r.resolution === '未知')) {
-              r.resolution = String(r.actualResolution).toUpperCase();
-              r.resolutionLevel = _lv0;
-              r.isHD = _lv0 >= 3;
-              r.is4K = _lv0 >= 5;
-              r.qualityScore = Math.max(Number(r.qualityScore) || 0, _lv0 * 5);
-            }
-          } catch {}
-        } catch {}
-        applied++;
-        continue;
-      } // 已套過（冪等，重複 clean 安全）
-      const inner = _unwrapFilterInnerUrl(r.url);
-      const key = String(inner || r.url || '').split(/[?#]/)[0].trim();
-      // cache 內存的是包裝 url，in-memory key 是裸路徑 —— 兩邊都試。
-      const hit = _actualResCacheGet(key)
-        || _actualResCacheGet(String(r.url || '').split(/[?#]/)[0].trim());
-      if (!hit) continue;
-      r.actualResolution = hit.label;
-      r.actualResolutionWH = `${hit.w}x${hit.h}`;
-      const desc = String(r.description || '');
-      const line = `📺 ${hit.label}`;
-      if (/📺[^\n]*/.test(desc)) {
-        // 已有 📺 行（clean 時寫的站方行，或舊格式實測行）→ 直接升級為實測，不另起一行。
-        r.description = desc.replace(/📺[^\n]*/g, line);
-      } else {
-        r.description = desc ? `${desc}\n${line}` : line;
-      }
-      // ★ 實測同步升級結構化欄位：REX 的 720P/1080P 篩選讀的是
-      //   resolution / resolutionLevel（不是 description 的 📺 行），
-      //   只改 description 不改欄位 → 篩選永遠進「其他」。
-      //   規則：TC/槍版（qualityScore===8）不升級 —— 實測像素再高也是槍版，
-      //   升級會把「搶先版」洗成 1080P 正片；其餘一律以實測為準
-      //   （含往下糾正：預設 720P 實測 480P 也要認）。
-      //   id 穩定性：_stableSourceId 已不再含 resolution，升級不漂 id，
-      //   REX「繼續播放」不受影響。
-      try {
-        const _isTC = Number(r.qualityScore) === 8 || /搶先版|抢先版/.test(String(r.description || ''));
-        if (!_isTC) {
-          r.resolution = hit.label;
-          r.resolutionLevel = hit.level;
-          r.isHD = !!hit.isHD;
-          r.is4K = !!hit.is4K;
-          r.qualityScore = Math.max(Number(r.qualityScore) || 0, hit.level * 5);
-        }
-      } catch {}
-      applied++;
-    } catch {}
-  }
-  if (applied > 0) {
-    try { console.log(`📺 實測清晰度: ${applied}/${results.length} 條已套用`); } catch {}
-  }
-  return applied;
 }
 
 async function loadRejectingTypeSites() {
@@ -5244,6 +4862,966 @@ const ADAPTER_FILTERS = {
   ],
 };
 
+// ==================== 官方線路（zen.cheyong 官方索引＋第三方解析，原樣併入） ====================
+// 以下 ds* / DS_* / DSCrypto 全部原樣來自 zen.cheyong.rex.stream.js，
+// 唯一改名：插件的 loadResource → dsOfficialLoadResource（避免與主檔 loadResource 撞名）。
+// 主檔不拆解其內部鏈路（官方索引 search/video_detail → 第三方解析 → 探測 → 快照），只經轉接層調用。
+var DSCryptoLicense = "# License\n\n[The MIT License (MIT)](http://opensource.org/licenses/MIT)\n\nCopyright (c) 2009-2013 Jeff Mott  \nCopyright (c) 2013-2016 Evan Vosberg\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in\nall copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN\nTHE SOFTWARE.\n";
+
+var DSCrypto=(()=>{var $=(k=>typeof require!="undefined"?require:typeof Proxy!="undefined"?new Proxy(k,{get:(u,A)=>(typeof require!="undefined"?require:u)[A]}):k)(function(k){if(typeof require!="undefined")return require.apply(this,arguments);throw Error('Dynamic require of "'+k+'" is not supported')});var I=(k,u)=>()=>{try{return u||k((u={exports:{}}).exports,u),u.exports}catch(A){throw u=0,A}};var N=I((O,rr)=>{(function(k,u){typeof O=="object"?rr.exports=O=u():typeof define=="function"&&define.amd?define([],u):k.CryptoJS=u()})(O,function(){var k=k||(function(u,A){var w;if(typeof window!="undefined"&&window.crypto&&(w=window.crypto),typeof self!="undefined"&&self.crypto&&(w=self.crypto),typeof globalThis!="undefined"&&globalThis.crypto&&(w=globalThis.crypto),!w&&typeof window!="undefined"&&window.msCrypto&&(w=window.msCrypto),!w&&typeof global!="undefined"&&global.crypto&&(w=global.crypto),!w&&typeof $=="function")try{w=$("crypto")}catch(r){}var K=function(){if(w){if(typeof w.getRandomValues=="function")try{return w.getRandomValues(new Uint32Array(1))[0]}catch(r){}if(typeof w.randomBytes=="function")try{return w.randomBytes(4).readInt32LE()}catch(r){}}throw new Error("Native crypto module could not be used to get secure random number.")},H=Object.create||(function(){function r(){}return function(e){var v;return r.prototype=e,v=new r,r.prototype=null,v}})(),P={},n=P.lib={},m=n.Base=(function(){return{extend:function(r){var e=H(this);return r&&e.mixIn(r),(!e.hasOwnProperty("init")||this.init===e.init)&&(e.init=function(){e.$super.init.apply(this,arguments)}),e.init.prototype=e,e.$super=this,e},create:function(){var r=this.extend();return r.init.apply(r,arguments),r},init:function(){},mixIn:function(r){for(var e in r)r.hasOwnProperty(e)&&(this[e]=r[e]);r.hasOwnProperty("toString")&&(this.toString=r.toString)},clone:function(){return this.init.prototype.extend(this)}}})(),_=n.WordArray=m.extend({init:function(r,e){r=this.words=r||[],e!=A?this.sigBytes=e:this.sigBytes=r.length*4},toString:function(r){return(r||x).stringify(this)},concat:function(r){var e=this.words,v=r.words,h=this.sigBytes,C=r.sigBytes;if(this.clamp(),h%4)for(var z=0;z<C;z++){var F=v[z>>>2]>>>24-z%4*8&255;e[h+z>>>2]|=F<<24-(h+z)%4*8}else for(var B=0;B<C;B+=4)e[h+B>>>2]=v[B>>>2];return this.sigBytes+=C,this},clamp:function(){var r=this.words,e=this.sigBytes;r[e>>>2]&=4294967295<<32-e%4*8,r.length=u.ceil(e/4)},clone:function(){var r=m.clone.call(this);return r.words=this.words.slice(0),r},random:function(r){for(var e=[],v=0;v<r;v+=4)e.push(K());return new _.init(e,r)}}),d=P.enc={},x=d.Hex={stringify:function(r){for(var e=r.words,v=r.sigBytes,h=[],C=0;C<v;C++){var z=e[C>>>2]>>>24-C%4*8&255;h.push((z>>>4).toString(16)),h.push((z&15).toString(16))}return h.join("")},parse:function(r){for(var e=r.length,v=[],h=0;h<e;h+=2)v[h>>>3]|=parseInt(r.substr(h,2),16)<<24-h%8*4;return new _.init(v,e/2)}},l=d.Latin1={stringify:function(r){for(var e=r.words,v=r.sigBytes,h=[],C=0;C<v;C++){var z=e[C>>>2]>>>24-C%4*8&255;h.push(String.fromCharCode(z))}return h.join("")},parse:function(r){for(var e=r.length,v=[],h=0;h<e;h++)v[h>>>2]|=(r.charCodeAt(h)&255)<<24-h%4*8;return new _.init(v,e)}},p=d.Utf8={stringify:function(r){try{return decodeURIComponent(escape(l.stringify(r)))}catch(e){throw new Error("Malformed UTF-8 data")}},parse:function(r){return l.parse(unescape(encodeURIComponent(r)))}},y=n.BufferedBlockAlgorithm=m.extend({reset:function(){this._data=new _.init,this._nDataBytes=0},_append:function(r){typeof r=="string"&&(r=p.parse(r)),this._data.concat(r),this._nDataBytes+=r.sigBytes},_process:function(r){var e,v=this._data,h=v.words,C=v.sigBytes,z=this.blockSize,F=z*4,B=C/F;r?B=u.ceil(B):B=u.max((B|0)-this._minBufferSize,0);var W=B*z,q=u.min(W*4,C);if(W){for(var t=0;t<W;t+=z)this._doProcessBlock(h,t);e=h.splice(0,W),v.sigBytes-=q}return new _.init(e,q)},clone:function(){var r=m.clone.call(this);return r._data=this._data.clone(),r},_minBufferSize:0}),E=n.Hasher=y.extend({cfg:m.extend(),init:function(r){this.cfg=this.cfg.extend(r),this.reset()},reset:function(){y.reset.call(this),this._doReset()},update:function(r){return this._append(r),this._process(),this},finalize:function(r){r&&this._append(r);var e=this._doFinalize();return e},blockSize:512/32,_createHelper:function(r){return function(e,v){return new r.init(v).finalize(e)}},_createHmacHelper:function(r){return function(e,v){return new b.HMAC.init(r,v).finalize(e)}}}),b=P.algo={};return P})(Math);return k})});var Q=I((T,er)=>{(function(k,u){typeof T=="object"?er.exports=T=u(N()):typeof define=="function"&&define.amd?define(["./core"],u):u(k.CryptoJS)})(T,function(k){return(function(){var u=k,A=u.lib,w=A.WordArray,K=u.enc,H=K.Base64={stringify:function(n){var m=n.words,_=n.sigBytes,d=this._map;n.clamp();for(var x=[],l=0;l<_;l+=3)for(var p=m[l>>>2]>>>24-l%4*8&255,y=m[l+1>>>2]>>>24-(l+1)%4*8&255,E=m[l+2>>>2]>>>24-(l+2)%4*8&255,b=p<<16|y<<8|E,r=0;r<4&&l+r*.75<_;r++)x.push(d.charAt(b>>>6*(3-r)&63));var e=d.charAt(64);if(e)for(;x.length%4;)x.push(e);return x.join("")},parse:function(n){var m=n.length,_=this._map,d=this._reverseMap;if(!d){d=this._reverseMap=[];for(var x=0;x<_.length;x++)d[_.charCodeAt(x)]=x}var l=_.charAt(64);if(l){var p=n.indexOf(l);p!==-1&&(m=p)}return P(n,m,d)},_map:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="};function P(n,m,_){for(var d=[],x=0,l=0;l<m;l++)if(l%4){var p=_[n.charCodeAt(l-1)]<<l%4*2,y=_[n.charCodeAt(l)]>>>6-l%4*2,E=p|y;d[x>>>2]|=E<<24-x%4*8,x++}return w.create(d,x)}})(),k.enc.Base64})});var Y=I((V,tr)=>{(function(k,u){typeof V=="object"?tr.exports=V=u(N()):typeof define=="function"&&define.amd?define(["./core"],u):u(k.CryptoJS)})(V,function(k){return(function(){var u=k,A=u.lib,w=A.WordArray,K=A.Hasher,H=u.algo,P=[],n=H.SHA1=K.extend({_doReset:function(){this._hash=new w.init([1732584193,4023233417,2562383102,271733878,3285377520])},_doProcessBlock:function(m,_){for(var d=this._hash.words,x=d[0],l=d[1],p=d[2],y=d[3],E=d[4],b=0;b<80;b++){if(b<16)P[b]=m[_+b]|0;else{var r=P[b-3]^P[b-8]^P[b-14]^P[b-16];P[b]=r<<1|r>>>31}var e=(x<<5|x>>>27)+E+P[b];b<20?e+=(l&p|~l&y)+1518500249:b<40?e+=(l^p^y)+1859775393:b<60?e+=(l&p|l&y|p&y)-1894007588:e+=(l^p^y)-899497514,E=y,y=p,p=l<<30|l>>>2,l=x,x=e}d[0]=d[0]+x|0,d[1]=d[1]+l|0,d[2]=d[2]+p|0,d[3]=d[3]+y|0,d[4]=d[4]+E|0},_doFinalize:function(){var m=this._data,_=m.words,d=this._nDataBytes*8,x=m.sigBytes*8;return _[x>>>5]|=128<<24-x%32,_[(x+64>>>9<<4)+14]=Math.floor(d/4294967296),_[(x+64>>>9<<4)+15]=d,m.sigBytes=_.length*4,this._process(),this._hash},clone:function(){var m=K.clone.call(this);return m._hash=this._hash.clone(),m}});u.SHA1=K._createHelper(n),u.HmacSHA1=K._createHmacHelper(n)})(),k.SHA1})});var Z=I((M,nr)=>{(function(k,u){typeof M=="object"?nr.exports=M=u(N()):typeof define=="function"&&define.amd?define(["./core"],u):u(k.CryptoJS)})(M,function(k){(function(){var u=k,A=u.lib,w=A.Base,K=u.enc,H=K.Utf8,P=u.algo,n=P.HMAC=w.extend({init:function(m,_){m=this._hasher=new m.init,typeof _=="string"&&(_=H.parse(_));var d=m.blockSize,x=d*4;_.sigBytes>x&&(_=m.finalize(_)),_.clamp();for(var l=this._oKey=_.clone(),p=this._iKey=_.clone(),y=l.words,E=p.words,b=0;b<d;b++)y[b]^=1549556828,E[b]^=909522486;l.sigBytes=p.sigBytes=x,this.reset()},reset:function(){var m=this._hasher;m.reset(),m.update(this._iKey)},update:function(m){return this._hasher.update(m),this},finalize:function(m){var _=this._hasher,d=_.finalize(m);_.reset();var x=_.finalize(this._oKey.clone().concat(d));return x}})})()})});var ar=I((U,ir)=>{(function(k,u){typeof U=="object"?ir.exports=U=u(N()):typeof define=="function"&&define.amd?define(["./core"],u):u(k.CryptoJS)})(U,function(k){return(function(u){var A=k,w=A.lib,K=w.WordArray,H=w.Hasher,P=A.algo,n=[];(function(){for(var p=0;p<64;p++)n[p]=u.abs(u.sin(p+1))*4294967296|0})();var m=P.MD5=H.extend({_doReset:function(){this._hash=new K.init([1732584193,4023233417,2562383102,271733878])},_doProcessBlock:function(p,y){for(var E=0;E<16;E++){var b=y+E,r=p[b];p[b]=(r<<8|r>>>24)&16711935|(r<<24|r>>>8)&4278255360}var e=this._hash.words,v=p[y+0],h=p[y+1],C=p[y+2],z=p[y+3],F=p[y+4],B=p[y+5],W=p[y+6],q=p[y+7],t=p[y+8],c=p[y+9],g=p[y+10],a=p[y+11],S=p[y+12],D=p[y+13],L=p[y+14],R=p[y+15],i=e[0],o=e[1],s=e[2],f=e[3];i=_(i,o,s,f,v,7,n[0]),f=_(f,i,o,s,h,12,n[1]),s=_(s,f,i,o,C,17,n[2]),o=_(o,s,f,i,z,22,n[3]),i=_(i,o,s,f,F,7,n[4]),f=_(f,i,o,s,B,12,n[5]),s=_(s,f,i,o,W,17,n[6]),o=_(o,s,f,i,q,22,n[7]),i=_(i,o,s,f,t,7,n[8]),f=_(f,i,o,s,c,12,n[9]),s=_(s,f,i,o,g,17,n[10]),o=_(o,s,f,i,a,22,n[11]),i=_(i,o,s,f,S,7,n[12]),f=_(f,i,o,s,D,12,n[13]),s=_(s,f,i,o,L,17,n[14]),o=_(o,s,f,i,R,22,n[15]),i=d(i,o,s,f,h,5,n[16]),f=d(f,i,o,s,W,9,n[17]),s=d(s,f,i,o,a,14,n[18]),o=d(o,s,f,i,v,20,n[19]),i=d(i,o,s,f,B,5,n[20]),f=d(f,i,o,s,g,9,n[21]),s=d(s,f,i,o,R,14,n[22]),o=d(o,s,f,i,F,20,n[23]),i=d(i,o,s,f,c,5,n[24]),f=d(f,i,o,s,L,9,n[25]),s=d(s,f,i,o,z,14,n[26]),o=d(o,s,f,i,t,20,n[27]),i=d(i,o,s,f,D,5,n[28]),f=d(f,i,o,s,C,9,n[29]),s=d(s,f,i,o,q,14,n[30]),o=d(o,s,f,i,S,20,n[31]),i=x(i,o,s,f,B,4,n[32]),f=x(f,i,o,s,t,11,n[33]),s=x(s,f,i,o,a,16,n[34]),o=x(o,s,f,i,L,23,n[35]),i=x(i,o,s,f,h,4,n[36]),f=x(f,i,o,s,F,11,n[37]),s=x(s,f,i,o,q,16,n[38]),o=x(o,s,f,i,g,23,n[39]),i=x(i,o,s,f,D,4,n[40]),f=x(f,i,o,s,v,11,n[41]),s=x(s,f,i,o,z,16,n[42]),o=x(o,s,f,i,W,23,n[43]),i=x(i,o,s,f,c,4,n[44]),f=x(f,i,o,s,S,11,n[45]),s=x(s,f,i,o,R,16,n[46]),o=x(o,s,f,i,C,23,n[47]),i=l(i,o,s,f,v,6,n[48]),f=l(f,i,o,s,q,10,n[49]),s=l(s,f,i,o,L,15,n[50]),o=l(o,s,f,i,B,21,n[51]),i=l(i,o,s,f,S,6,n[52]),f=l(f,i,o,s,z,10,n[53]),s=l(s,f,i,o,g,15,n[54]),o=l(o,s,f,i,h,21,n[55]),i=l(i,o,s,f,t,6,n[56]),f=l(f,i,o,s,R,10,n[57]),s=l(s,f,i,o,W,15,n[58]),o=l(o,s,f,i,D,21,n[59]),i=l(i,o,s,f,F,6,n[60]),f=l(f,i,o,s,a,10,n[61]),s=l(s,f,i,o,C,15,n[62]),o=l(o,s,f,i,c,21,n[63]),e[0]=e[0]+i|0,e[1]=e[1]+o|0,e[2]=e[2]+s|0,e[3]=e[3]+f|0},_doFinalize:function(){var p=this._data,y=p.words,E=this._nDataBytes*8,b=p.sigBytes*8;y[b>>>5]|=128<<24-b%32;var r=u.floor(E/4294967296),e=E;y[(b+64>>>9<<4)+15]=(r<<8|r>>>24)&16711935|(r<<24|r>>>8)&4278255360,y[(b+64>>>9<<4)+14]=(e<<8|e>>>24)&16711935|(e<<24|e>>>8)&4278255360,p.sigBytes=(y.length+1)*4,this._process();for(var v=this._hash,h=v.words,C=0;C<4;C++){var z=h[C];h[C]=(z<<8|z>>>24)&16711935|(z<<24|z>>>8)&4278255360}return v},clone:function(){var p=H.clone.call(this);return p._hash=this._hash.clone(),p}});function _(p,y,E,b,r,e,v){var h=p+(y&E|~y&b)+r+v;return(h<<e|h>>>32-e)+y}function d(p,y,E,b,r,e,v){var h=p+(y&b|E&~b)+r+v;return(h<<e|h>>>32-e)+y}function x(p,y,E,b,r,e,v){var h=p+(y^E^b)+r+v;return(h<<e|h>>>32-e)+y}function l(p,y,E,b,r,e,v){var h=p+(E^(y|~b))+r+v;return(h<<e|h>>>32-e)+y}A.MD5=H._createHelper(m),A.HmacMD5=H._createHmacHelper(m)})(Math),k.MD5})});var X=I((j,or)=>{(function(k,u,A){typeof j=="object"?or.exports=j=u(N(),Y(),Z()):typeof define=="function"&&define.amd?define(["./core","./sha1","./hmac"],u):u(k.CryptoJS)})(j,function(k){return(function(){var u=k,A=u.lib,w=A.Base,K=A.WordArray,H=u.algo,P=H.MD5,n=H.EvpKDF=w.extend({cfg:w.extend({keySize:128/32,hasher:P,iterations:1}),init:function(m){this.cfg=this.cfg.extend(m)},compute:function(m,_){for(var d,x=this.cfg,l=x.hasher.create(),p=K.create(),y=p.words,E=x.keySize,b=x.iterations;y.length<E;){d&&l.update(d),d=l.update(m).finalize(_),l.reset();for(var r=1;r<b;r++)d=l.finalize(d),l.reset();p.concat(d)}return p.sigBytes=E*4,p}});u.EvpKDF=function(m,_,d){return n.create(d).compute(m,_)}})(),k.EvpKDF})});var fr=I((J,sr)=>{(function(k,u,A){typeof J=="object"?sr.exports=J=u(N(),X()):typeof define=="function"&&define.amd?define(["./core","./evpkdf"],u):u(k.CryptoJS)})(J,function(k){k.lib.Cipher||(function(u){var A=k,w=A.lib,K=w.Base,H=w.WordArray,P=w.BufferedBlockAlgorithm,n=A.enc,m=n.Utf8,_=n.Base64,d=A.algo,x=d.EvpKDF,l=w.Cipher=P.extend({cfg:K.extend(),createEncryptor:function(t,c){return this.create(this._ENC_XFORM_MODE,t,c)},createDecryptor:function(t,c){return this.create(this._DEC_XFORM_MODE,t,c)},init:function(t,c,g){this.cfg=this.cfg.extend(g),this._xformMode=t,this._key=c,this.reset()},reset:function(){P.reset.call(this),this._doReset()},process:function(t){return this._append(t),this._process()},finalize:function(t){t&&this._append(t);var c=this._doFinalize();return c},keySize:128/32,ivSize:128/32,_ENC_XFORM_MODE:1,_DEC_XFORM_MODE:2,_createHelper:(function(){function t(c){return typeof c=="string"?q:F}return function(c){return{encrypt:function(g,a,S){return t(a).encrypt(c,g,a,S)},decrypt:function(g,a,S){return t(a).decrypt(c,g,a,S)}}}})()}),p=w.StreamCipher=l.extend({_doFinalize:function(){var t=this._process(!0);return t},blockSize:1}),y=A.mode={},E=w.BlockCipherMode=K.extend({createEncryptor:function(t,c){return this.Encryptor.create(t,c)},createDecryptor:function(t,c){return this.Decryptor.create(t,c)},init:function(t,c){this._cipher=t,this._iv=c}}),b=y.CBC=(function(){var t=E.extend();t.Encryptor=t.extend({processBlock:function(g,a){var S=this._cipher,D=S.blockSize;c.call(this,g,a,D),S.encryptBlock(g,a),this._prevBlock=g.slice(a,a+D)}}),t.Decryptor=t.extend({processBlock:function(g,a){var S=this._cipher,D=S.blockSize,L=g.slice(a,a+D);S.decryptBlock(g,a),c.call(this,g,a,D),this._prevBlock=L}});function c(g,a,S){var D,L=this._iv;L?(D=L,this._iv=u):D=this._prevBlock;for(var R=0;R<S;R++)g[a+R]^=D[R]}return t})(),r=A.pad={},e=r.Pkcs7={pad:function(t,c){for(var g=c*4,a=g-t.sigBytes%g,S=a<<24|a<<16|a<<8|a,D=[],L=0;L<a;L+=4)D.push(S);var R=H.create(D,a);t.concat(R)},unpad:function(t){var c=t.words[t.sigBytes-1>>>2]&255;t.sigBytes-=c}},v=w.BlockCipher=l.extend({cfg:l.cfg.extend({mode:b,padding:e}),reset:function(){var t;l.reset.call(this);var c=this.cfg,g=c.iv,a=c.mode;this._xformMode==this._ENC_XFORM_MODE?t=a.createEncryptor:(t=a.createDecryptor,this._minBufferSize=1),this._mode&&this._mode.__creator==t?this._mode.init(this,g&&g.words):(this._mode=t.call(a,this,g&&g.words),this._mode.__creator=t)},_doProcessBlock:function(t,c){this._mode.processBlock(t,c)},_doFinalize:function(){var t,c=this.cfg.padding;return this._xformMode==this._ENC_XFORM_MODE?(c.pad(this._data,this.blockSize),t=this._process(!0)):(t=this._process(!0),c.unpad(t)),t},blockSize:128/32}),h=w.CipherParams=K.extend({init:function(t){this.mixIn(t)},toString:function(t){return(t||this.formatter).stringify(this)}}),C=A.format={},z=C.OpenSSL={stringify:function(t){var c,g=t.ciphertext,a=t.salt;return a?c=H.create([1398893684,1701076831]).concat(a).concat(g):c=g,c.toString(_)},parse:function(t){var c,g=_.parse(t),a=g.words;return a[0]==1398893684&&a[1]==1701076831&&(c=H.create(a.slice(2,4)),a.splice(0,4),g.sigBytes-=16),h.create({ciphertext:g,salt:c})}},F=w.SerializableCipher=K.extend({cfg:K.extend({format:z}),encrypt:function(t,c,g,a){a=this.cfg.extend(a);var S=t.createEncryptor(g,a),D=S.finalize(c),L=S.cfg;return h.create({ciphertext:D,key:g,iv:L.iv,algorithm:t,mode:L.mode,padding:L.padding,blockSize:t.blockSize,formatter:a.format})},decrypt:function(t,c,g,a){a=this.cfg.extend(a),c=this._parse(c,a.format);var S=t.createDecryptor(g,a).finalize(c.ciphertext);return S},_parse:function(t,c){return typeof t=="string"?c.parse(t,this):t}}),B=A.kdf={},W=B.OpenSSL={execute:function(t,c,g,a,S){if(a||(a=H.random(64/8)),S)var D=x.create({keySize:c+g,hasher:S}).compute(t,a);else var D=x.create({keySize:c+g}).compute(t,a);var L=H.create(D.words.slice(c),g*4);return D.sigBytes=c*4,h.create({key:D,iv:L,salt:a})}},q=w.PasswordBasedCipher=F.extend({cfg:F.cfg.extend({kdf:W}),encrypt:function(t,c,g,a){a=this.cfg.extend(a);var S=a.kdf.execute(g,t.keySize,t.ivSize,a.salt,a.hasher);a.iv=S.iv;var D=F.encrypt.call(this,t,c,S.key,a);return D.mixIn(S),D},decrypt:function(t,c,g,a){a=this.cfg.extend(a),c=this._parse(c,a.format);var S=a.kdf.execute(g,t.keySize,t.ivSize,c.salt,a.hasher);a.iv=S.iv;var D=F.decrypt.call(this,t,c,S.key,a);return D}})})()})});var vr=I((G,cr)=>{(function(k,u,A){typeof G=="object"?cr.exports=G=u(N(),Q(),ar(),X(),fr()):typeof define=="function"&&define.amd?define(["./core","./enc-base64","./md5","./evpkdf","./cipher-core"],u):u(k.CryptoJS)})(G,function(k){return(function(){var u=k,A=u.lib,w=A.BlockCipher,K=u.algo,H=[],P=[],n=[],m=[],_=[],d=[],x=[],l=[],p=[],y=[];(function(){for(var r=[],e=0;e<256;e++)e<128?r[e]=e<<1:r[e]=e<<1^283;for(var v=0,h=0,e=0;e<256;e++){var C=h^h<<1^h<<2^h<<3^h<<4;C=C>>>8^C&255^99,H[v]=C,P[C]=v;var z=r[v],F=r[z],B=r[F],W=r[C]*257^C*16843008;n[v]=W<<24|W>>>8,m[v]=W<<16|W>>>16,_[v]=W<<8|W>>>24,d[v]=W;var W=B*16843009^F*65537^z*257^v*16843008;x[C]=W<<24|W>>>8,l[C]=W<<16|W>>>16,p[C]=W<<8|W>>>24,y[C]=W,v?(v=z^r[r[r[B^z]]],h^=r[r[h]]):v=h=1}})();var E=[0,1,2,4,8,16,32,64,128,27,54],b=K.AES=w.extend({_doReset:function(){var r;if(!(this._nRounds&&this._keyPriorReset===this._key)){for(var e=this._keyPriorReset=this._key,v=e.words,h=e.sigBytes/4,C=this._nRounds=h+6,z=(C+1)*4,F=this._keySchedule=[],B=0;B<z;B++)B<h?F[B]=v[B]:(r=F[B-1],B%h?h>6&&B%h==4&&(r=H[r>>>24]<<24|H[r>>>16&255]<<16|H[r>>>8&255]<<8|H[r&255]):(r=r<<8|r>>>24,r=H[r>>>24]<<24|H[r>>>16&255]<<16|H[r>>>8&255]<<8|H[r&255],r^=E[B/h|0]<<24),F[B]=F[B-h]^r);for(var W=this._invKeySchedule=[],q=0;q<z;q++){var B=z-q;if(q%4)var r=F[B];else var r=F[B-4];q<4||B<=4?W[q]=r:W[q]=x[H[r>>>24]]^l[H[r>>>16&255]]^p[H[r>>>8&255]]^y[H[r&255]]}}},encryptBlock:function(r,e){this._doCryptBlock(r,e,this._keySchedule,n,m,_,d,H)},decryptBlock:function(r,e){var v=r[e+1];r[e+1]=r[e+3],r[e+3]=v,this._doCryptBlock(r,e,this._invKeySchedule,x,l,p,y,P);var v=r[e+1];r[e+1]=r[e+3],r[e+3]=v},_doCryptBlock:function(r,e,v,h,C,z,F,B){for(var W=this._nRounds,q=r[e]^v[0],t=r[e+1]^v[1],c=r[e+2]^v[2],g=r[e+3]^v[3],a=4,S=1;S<W;S++){var D=h[q>>>24]^C[t>>>16&255]^z[c>>>8&255]^F[g&255]^v[a++],L=h[t>>>24]^C[c>>>16&255]^z[g>>>8&255]^F[q&255]^v[a++],R=h[c>>>24]^C[g>>>16&255]^z[q>>>8&255]^F[t&255]^v[a++],i=h[g>>>24]^C[q>>>16&255]^z[t>>>8&255]^F[c&255]^v[a++];q=D,t=L,c=R,g=i}var D=(B[q>>>24]<<24|B[t>>>16&255]<<16|B[c>>>8&255]<<8|B[g&255])^v[a++],L=(B[t>>>24]<<24|B[c>>>16&255]<<16|B[g>>>8&255]<<8|B[q&255])^v[a++],R=(B[c>>>24]<<24|B[g>>>16&255]<<16|B[q>>>8&255]<<8|B[t&255])^v[a++],i=(B[g>>>24]<<24|B[q>>>16&255]<<16|B[t>>>8&255]<<8|B[c&255])^v[a++];r[e]=D,r[e+1]=L,r[e+2]=R,r[e+3]=i},keySize:256/32});u.AES=w._createHelper(b)})(),k.AES})});var dr=I((_r,hr)=>{var ur=N();Q();Y();Z();vr();hr.exports=ur});return dr();})();
+
+var DS_BUILD = "1791855838435";
+var DS_PACKAGE = "com.zyx.cheyong";
+var DS_RSA = {"p":"fbc7ab9d75533e39971e41b554990a57149ea3d115298d9d17630138a40f315339b7a69c6254dde2ffed520f5ad8c48fd2ef18ffd6c97ea0ca8d7329cf0146d5","q":"f36bda059d298c1cf92fae597fcccc5ccb715e3935b485cb4185d20c6c19a3249ca195f4e604ebf1c26f08f75174e72764499d722ee2e10232f16e3aacd9f0fb","dp":"7f28e1d0bd6f944eabb6d942c67e208dc85932ad273dfc4aa984141ad228e6257d51f670a6ecebbf78b81828af1e296fe5fd61a7dc87994f85dd189bb5f3941d","dq":"6d86a9a2bd0464b6e4a83f9aa596509db02c6268fb712e8236093069c67a029e069bee0d333223b7b3f4a1e42612a3af65c079c756b15eecce5f3369d33c7ce1","qi":"88911352f605c0254a3464d8333520eefdd06e5a985c1f88873714dfbb0764e9fa6b8e95e5e24369d6af22fb849a8c491d64f26e2fb566437b2de514838ca50b"};
+
+function dsText(value) { return value == null ? "" : String(value).trim(); }
+function dsBytes(word) {
+  var out = [];
+  for (var i = 0; i < word.sigBytes; i++) out.push((word.words[i >>> 2] >>> (24 - (i % 4) * 8)) & 255);
+  return out;
+}
+function dsWord(bytes) {
+  var words = [];
+  for (var i = 0; i < bytes.length; i++) words[i >>> 2] = (words[i >>> 2] || 0) | ((bytes[i] & 255) << (24 - (i % 4) * 8));
+  return DSCrypto.lib.WordArray.create(words, bytes.length);
+}
+function dsBase64(value) {
+  value = dsText(value).replace(/-/g, "+").replace(/_/g, "/").replace(/\s/g, "");
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value) || value.length % 4 === 1) throw new Error("解析響應編碼無效");
+  while (value.length % 4) value += "=";
+  return dsBytes(DSCrypto.enc.Base64.parse(value));
+}
+function dsStatus(response) { return Number(response && (response.statusCode || response.status)) || 0; }
+function dsHeader(headers, name) {
+  headers = headers || {};
+  var target = name.toLowerCase();
+  for (var key in headers) if (key.toLowerCase() === target) return dsText(headers[key]);
+  return "";
+}
+function dsOK(response) { var s = dsStatus(response); return s >= 200 && s < 300; }
+function dsJSON(value) {
+  if (value && typeof value === "object") return value;
+  return JSON.parse(dsText(value).replace(/^\uFEFF/, ""));
+}
+function dsUTF8(bytes) { return DSCrypto.enc.Utf8.stringify(dsWord(bytes)); }
+function dsRandomIV() {
+  var a = [];
+  for (var i = 0; i < 16; i++) a.push(Math.floor(Math.random() * 256));
+  return dsWord(a);
+}
+function dsRequest(method, data) {
+  var key = DSCrypto.MD5(DS_BUILD + "^~!@#[-" + DS_PACKAGE);
+  var iv = dsRandomIV();
+  var input = {};
+  Object.keys(data || {}).forEach(function (k) { input[k] = data[k]; });
+  input.token = "";
+  var body = JSON.stringify({ method: method, data: input, csrf: Date.now() });
+  var encrypted = DSCrypto.AES.encrypt(body, key, { iv: iv, mode: DSCrypto.mode.CBC, padding: DSCrypto.pad.Pkcs7 });
+  return iv.clone().concat(encrypted.ciphertext).toString(DSCrypto.enc.Base64).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function dsPow(base, exponent, modulus) {
+  var out = BigInt(1), zero = BigInt(0), one = BigInt(1);
+  base %= modulus;
+  while (exponent > zero) {
+    if ((exponent & one) !== zero) out = out * base % modulus;
+    exponent >>= one;
+    if (exponent > zero) base = base * base % modulus;
+  }
+  return out;
+}
+var dsRSAState;
+function dsRSA(value) {
+  if (typeof BigInt !== "function") throw new Error("播放器的 JavaScript 引擎不支持片源解析");
+  if (!dsRSAState) {
+    var k = DS_RSA;
+    dsRSAState = { p: BigInt("0x" + k.p), q: BigInt("0x" + k.q), dp: BigInt("0x" + k.dp), dq: BigInt("0x" + k.dq), qi: BigInt("0x" + k.qi) };
+  }
+  var bytes = dsBase64(value), size = 128, decoded = [], r = dsRSAState;
+  if (!bytes.length || bytes.length % size || bytes.length > 8192) throw new Error("解析響應分塊無效");
+  for (var offset = 0; offset < bytes.length; offset += size) {
+    var hex = "";
+    for (var i = offset; i < offset + size; i++) hex += ("0" + bytes[i].toString(16)).slice(-2);
+    var c = BigInt("0x" + hex), a = dsPow(c, r.dp, r.p), b = dsPow(c, r.dq, r.q);
+    var h = (a - b) % r.p;
+    if (h < BigInt(0)) h += r.p;
+    var m = b + r.q * (r.qi * h % r.p);
+    var blockHex = m.toString(16);
+    while (blockHex.length < size * 2) blockHex = "0" + blockHex;
+    var block = [];
+    for (var z = 0; z < blockHex.length; z += 2) block.push(parseInt(blockHex.slice(z, z + 2), 16));
+    if (block.length !== size || block[0] !== 0 || (block[1] !== 2 && block[1] !== 1)) throw new Error("解析響應填充校驗失敗");
+    var end = 2;
+    while (end < block.length && block[end] !== 0) end++;
+    if (end < 10 || end === block.length) throw new Error("解析響應填充過短");
+    for (var n = end + 1; n < block.length; n++) decoded.push(block[n]);
+  }
+  return dsUTF8(decoded);
+}
+function dsReply(value) {
+  if (value && typeof value === "object") return value;
+  var text = dsText(value);
+  if (/^[\[{]/.test(text)) return dsJSON(text);
+  if (/^https?:\/\//i.test(text)) return { code: 200, url: text };
+  return dsJSON(dsRSA(text));
+}
+// ---------- 主機容錯 ----------
+//
+// 背景：本腳本只走官方索引（search/video_detail），
+// 一旦該主機不可達就會搜不到片，因此同時嘗試多個索引主機，
+// 並與本地快照重放平行進行。
+//
+// 索引主機候選：app/app2/app3（歷史觀察：app 與 app3 曾解析到同一網段）。
+// 平行而非循序：循序嘗試會把整體時間預算燒光，導致快照重放來不及跑；
+// 改成全部同時打、第一個成功者贏。
+var dsAPIHosts = ["http://app2.dsx.ac", "http://app.dsx.ac", "http://app3.dsx.ac"];
+// 單一主機的連線逾時上限（毫秒）。超過就放棄該主機。
+// Widget.http 沒有 timeout 選項，所以自己用 Promise.race + setTimeout 兜底。
+var dsHostTimeout = 6000;
+// 連續失敗的主機，在這個時間窗內不再嘗試（避免每次搜尋都白等逾時）。
+var dsHostDownUntil = {};
+var dsHostDownWindow = 10 * 60 * 1000;
+function dsHostAvailable(host) {
+  return !(dsHostDownUntil[host] > Date.now());
+}
+function dsMarkHostDown(host) {
+  dsHostDownUntil[host] = Date.now() + dsHostDownWindow;
+}
+async function dsRequestWithTimeout(host, body) {
+  // Promise.race + setTimeout：若沙箱沒有 setTimeout，退化成不設逾時
+  // （Widget.http 底層 fetch 自己會因連線逾時而 reject，不會永久卡死）。
+  var request = Widget.http.post(host + "/ndsx.php/v7/logs", body, {
+    headers: { "User-Agent": "Dart/3.13 (dart:io)", "Content-Type": "text/plain", version: "2.0.0", "version-number": "220", "pk-id": DS_PACKAGE, "build-time": DS_BUILD, platform: "ios", "platform-version": "Version 27.2 (Build 24B5110a)" }
+  });
+  if (typeof setTimeout !== "function") return request;
+  var timer = null;
+  var timeout = new Promise(function (resolve) {
+    timer = setTimeout(function () { resolve({ timedOut: true }); }, dsHostTimeout);
+  });
+  try {
+    var result = await Promise.race([request, timeout]);
+    return result && result.timedOut ? Promise.reject(new Error("主機連線逾時")) : result;
+  } finally {
+    if (timer !== null) { try { clearTimeout(timer); } catch (e) {} }
+  }
+}
+// ★ 判斷是否為「連線層」故障（該換主機）。業務層錯誤（HTTP 非 2xx、
+//   code != 1）代表主機是活的，只是這次失敗 → 不換主機。
+function dsIsConnectionError(error) {
+  var message = dsText(error && error.message);
+  return /逾時|超時|timeout|ENOTFOUND|ECONN|EAI_AGAIN|fetch failed|socket|網絡|unreachable|aborted/i.test(message);
+}
+/**
+ * 對所有可用主機**平行**發請求，第一個成功者贏。
+ * 全部失敗時拋出最有代表性的錯誤。
+ */
+async function dsAPI(method, input) {
+  var body = dsRequest(method, input), candidates = dsAPIHosts.filter(dsHostAvailable);
+  if (!candidates.length) {
+    // 全部被標記為故障 → 清掉標記再試一次（避免永久鎖死）。
+    dsHostDownUntil = {};
+    candidates = dsAPIHosts.slice();
+  }
+  var attempts = candidates.map(function (host) {
+    return dsRequestWithTimeout(host, body).then(function (response) {
+      if (!dsOK(response)) throw new Error("官方索引接口暫不可用（HTTP " + dsStatus(response) + "）");
+      var data = dsJSON(response.data);
+      if (!data || Number(data.code) !== 1) throw new Error("官方索引未返回有效影視數據");
+      return { ok: true, data: data };
+    }).catch(function (error) {
+      if (dsIsConnectionError(error)) dsMarkHostDown(host);
+      return { ok: false, error: error, host: host };
+    });
+  });
+  var results = [];
+  // 競速：首個成功即回，不等最慢主機（功能不變，只是少等慢主機）。
+  await new Promise(function (resolve) {
+    var pending = attempts.length;
+    if (!pending) resolve();
+    attempts.forEach(function (p) {
+      p.then(function (r) {
+        results.push(r);
+        if (r.ok) resolve();
+        else if (--pending === 0) resolve();
+      }, function (e) {
+        results.push({ ok: false, error: e });
+        if (--pending === 0) resolve();
+      });
+    });
+  });
+  for (var i = 0; i < results.length; i++) if (results[i].ok) return results[i].data;
+  // 全部失敗：挑一個「連線層」錯誤當主要錯誤（它纔是使用者該看到的根因）。
+  var connectionError = null, businessError = null;
+  for (var j = 0; j < results.length; j++) {
+    var r = results[j];
+    if (!r.error) continue;
+    if (dsIsConnectionError(r.error)) { if (!connectionError) connectionError = r.error; }
+    else if (!businessError) businessError = r.error;
+  }
+  throw connectionError || businessError || new Error("官方索引接口暫不可用");
+}
+function dsResolve(base, value) {
+  value = dsText(value);
+  if (/^https?:\/\//i.test(value)) return value;
+  var match = dsText(base).match(/^(https?:)\/\/([^/]+)/i);
+  if (!match) return "";
+  if (value.indexOf("//") === 0) return match[1] + value;
+  var origin = match[1] + "//" + match[2], clean = String(base).split("#")[0];
+  if (value.charAt(0) === "?") return clean.split("?")[0] + value;
+  var suffix = (value.match(/[?#].*$/) || [""])[0], path = value.split(/[?#]/)[0];
+  if (path.charAt(0) !== "/") path = clean.slice(origin.length).split("?")[0].replace(/[^/]*$/, "") + path;
+  var stack = [];
+  path.split("/").forEach(function (part) { if (!part || part === ".") return; if (part === "..") stack.pop(); else stack.push(part); });
+  return origin + "/" + stack.join("/") + suffix;
+}
+function dsHeaders(value) {
+  var out = {};
+  if (value && typeof value === "object") {
+    Object.keys(value).forEach(function (key) { if (!/^(host|content-length|connection|range|cookie|authorization)$/i.test(key)) out[key] = String(value[key]); });
+    return out;
+  }
+  dsText(value).split(/\r?\n|\\n/).forEach(function (line) {
+    var m = line.match(/^\s*([^:]+):\s*(.*?)\s*$/);
+    if (m && !/^(host|content-length|connection|range|cookie|authorization)$/i.test(m[1])) out[m[1]] = m[2];
+  });
+  return out;
+}
+function dsMerge(a, b) {
+  var out = {};
+  [a || {}, b || {}].forEach(function (x) { Object.keys(x).forEach(function (k) {
+    Object.keys(out).forEach(function (old) { if (old.toLowerCase() === k.toLowerCase()) delete out[old]; });
+    out[k] = x[k];
+  }); });
+  return out;
+}
+function dsValidURL(url) {
+  var match = dsText(url).match(/^https?:\/\/([^/?#]+)/i);
+  if (!match || /@|\s/.test(match[1])) return false;
+  return !/^(?:localhost|127(?:\.\d{1,3}){1,3}|0\.0\.0\.0|\[::1\])(?::|$)/i.test(match[1]);
+}
+// 無損加速 2+3+4：單次請求逾時（避免一條死線卡住整批；正常線 1~3 秒內回，不受影響）。
+function dsWithTimeout(promise, ms) {
+  if (typeof setTimeout !== "function") return promise;
+  var timer = null;
+  var timeout = new Promise(function (resolve) {
+    timer = setTimeout(function () { resolve({ __dsTimedOut: true }); }, ms);
+  });
+  return Promise.race([promise, timeout]).then(function (r) {
+    if (timer !== null) { try { clearTimeout(timer); } catch (e) {} }
+    return r && r.__dsTimedOut ? Promise.reject(new Error("請求逾時")) : r;
+  }, function (e) {
+    if (timer !== null) { try { clearTimeout(timer); } catch (e2) {} }
+    throw e;
+  });
+}
+async function dsMedia(url, headers, binary, deadline) {
+  if (!dsValidURL(url)) throw new Error("播放地址無效");
+  for (var i = 0; i < 4; i++) {
+    if (Date.now() >= deadline) throw new Error("探測時限已到");
+    var response = await dsWithTimeout(Widget.http.get(url, { headers: headers, base64Data: !!binary, allow_redirects: false }), 5500);
+    var status = dsStatus(response);
+    if (status >= 300 && status < 400) {
+      var location = dsHeader(response.headers, "Location");
+      if (!location) throw new Error("媒體跳轉無地址");
+      url = dsResolve(url, location);
+      if (!dsValidURL(url)) throw new Error("媒體跳轉無效");
+      continue;
+    }
+    if (!dsOK(response)) throw new Error("媒體探測失敗");
+    return { response: response, url: url };
+  }
+  throw new Error("媒體跳轉過多");
+}
+function dsLooksMedia(bytes) {
+  var text = "";
+  for (var i = 0; i < Math.min(bytes.length, 64); i++) text += String.fromCharCode(bytes[i]);
+  // ★ 先擋掉「看起來像媒體但其實不是」的常見容器頭。
+  //   已知誤判類型：某些線路的 segment 302 → image/png（1x1 佔位圖），
+  //   若只看媒體頭/不擋 image/*，圖片會被當成影片回傳。
+  //   完善：PNG/GIF/WEBP 一律用位元組比對（原正則依賴源文件編碼藏 0x89，易失效）。
+  if (bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71) return false;
+  if (bytes[0] === 71 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 56) return false;
+  // RIFF 本身是容器（AVI/WAV/WebP 共用頭），只有 bytes[8..11]=="WEBP" 纔是圖片。
+  if (bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70
+    && bytes[8] === 87 && bytes[9] === 69 && bytes[10] === 66 && bytes[11] === 80) return false;
+  if (/(ftyp|styp|moof|moov|mdat)/.test(text.slice(0, 32))) return true;
+  if (bytes[0] === 26 && bytes[1] === 69 && bytes[2] === 223 && bytes[3] === 163) return true;
+  if (bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 1 && bytes[3] === 186) return true;
+  if (bytes[0] === 255 && (bytes[1] & 246) === 240) return true;
+  if (text.indexOf("ID3") === 0) return true;
+  for (var n = 0; n < Math.min(512, bytes.length - 376); n++) {
+    if (bytes[n] === 71 && bytes[n + 188] === 71 && bytes[n + 376] === 71) return true;
+  }
+  return false;
+}
+// ★ 判斷「這段內容其實是錯誤頁/文字，不是媒體」。
+//   既有缺陷：某些第三方線路的 segment 回 302 → 轉到 image/png，
+//   而舊檢查式 /^\s*(?:<!doctype|<html|<\?xml|\{"(?:code|error|message))/i
+//   漏掉了 <pre> 開頭的錯誤頁（Python/Node 風格的 stack trace），
+//   於是錯誤頁被當成「可播線路」回傳，使用者點了只會轉圈。
+function dsLooksErrorPage(head, contentType) {
+  var text = dsText(head);
+  // 明確的媒體型別 → 不可能是錯誤頁
+  if (/^(video|audio)\//.test(contentType) || /application\/(?:octet-stream|mp4|x-mpegurl|vnd\.apple\.mpegurl)/.test(contentType)) return false;
+  // HTML / JSON / XML → 直接判定不是媒體
+  if (/text\/html|application\/(?:json|xml)|image\/svg/.test(contentType)) return true;
+  // ★ 補上原本漏掉的 <pre> / <body> / <h1> 等文字型錯誤頁
+  if (/^\s*(?:<!doctype|<html|<head|<body|<pre|<h1|<h2|<title|<\?xml|\{"(?:code|error|message|msg)|error\s*[:：]|404|403|500|502|503)\b/i.test(text)) return true;
+  // 純文字（沒有二進位控制字元）→ 幾乎確定是錯誤訊息
+  var binary = 0;
+  for (var i = 0; i < Math.min(text.length, 512); i++) { var c = text.charCodeAt(i); if (c < 9 || (c > 13 && c < 32)) binary++; }
+  if (binary === 0 && text.length >= 8) return true;
+  return false;
+}
+async function dsProbeBytes(url, headers, kind, offset, length, deadline, encrypted, initial) {
+  var start = Number(offset) || 0, amount = Math.min(4096, Number(length) || 1024);
+  var requestHeaders = dsMerge(headers, { Range: "bytes=" + start + "-" + (start + amount - 1) });
+  var got = initial || await dsMedia(url, requestHeaders, true, deadline);
+  var response = got.response, type = dsHeader(response.headers, "Content-Type").toLowerCase();
+  // ★ content-type 檢查：image/* 一律不是影片（某些第三方線路的 segment
+  //   302 → image/png 的 1x1 佔位圖，原本會被當成影片放行）。
+  if (typeof response.data !== "string" || /^image\//.test(type) || /text\/html|application\/(?:json|xml)|image\/svg/.test(type)) throw new Error("媒體返回非視頻正文");
+  var bytes = dsBase64(response.data);
+  if (kind === "key") {
+    if (bytes.length !== 16) throw new Error("HLS 密鑰不是 16 字節");
+    return got.url;
+  }
+  if (bytes.length < 32) throw new Error("媒體片段爲空或過短");
+  var head = "";
+  for (var i = 0; i < Math.min(bytes.length, 64); i++) head += String.fromCharCode(bytes[i]);
+  // ★ 用擴充後的錯誤頁判定（涵蓋 <pre> stack trace、純文字錯誤訊息）。
+  if (dsLooksErrorPage(head, type)) throw new Error("媒體實際爲錯誤頁面");
+  if (!encrypted && !dsLooksMedia(bytes)) throw new Error("未識別到可解複用媒體頭");
+  return got.url;
+}
+function dsAttr(line, name) {
+  var exp = new RegExp("(?:^|[:,])\\s*" + name + "=(?:\"([^\"]*)\"|([^,]*))", "i"), m = line.match(exp);
+  return m ? (m[1] == null ? m[2] : m[1]) : "";
+}
+function dsRange(value) {
+  var m = dsText(value).match(/^(\d+)(?:@(\d+))?$/);
+  return m ? { length: Number(m[1]), offset: Number(m[2] || 0) } : { length: 1024, offset: 0 };
+}
+async function dsProbeHLS(url, headers, deadline, depth, inheritedKey) {
+  if (depth > 3) throw new Error("HLS 層級過深");
+  var got = await dsMedia(url, headers, false, deadline), text = dsText(got.response.data);
+  if (!/^#EXTM3U/.test(text) || text.length > 3000000) throw new Error("非有效 HLS 播放列表");
+  var lines = text.split(/\r?\n/).map(dsText).filter(function (x) { return !!x; }), variants = [], audio = {};
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].indexOf("#EXT-X-MEDIA:") === 0 && dsAttr(lines[i], "TYPE") === "AUDIO" && dsAttr(lines[i], "URI")) audio[dsAttr(lines[i], "GROUP-ID")] = dsResolve(got.url, dsAttr(lines[i], "URI"));
+    if (lines[i].indexOf("#EXT-X-STREAM-INF:") !== 0) continue;
+    for (var j = i + 1; j < lines.length; j++) {
+      if (lines[j].charAt(0) === "#") continue;
+      variants.push({ url: dsResolve(got.url, lines[j]), bandwidth: Number(dsAttr(lines[i], "BANDWIDTH")), resolution: dsAttr(lines[i], "RESOLUTION"), audio: dsAttr(lines[i], "AUDIO") });
+      break;
+    }
+  }
+  if (variants.length) {
+    variants.sort(function (a, b) { return b.bandwidth - a.bandwidth; });
+    for (var v = 0; v < Math.min(variants.length, 3); v++) {
+      try {
+        var child = await dsProbeHLS(variants[v].url, headers, deadline, depth + 1, inheritedKey);
+        var audioURL = audio[variants[v].audio];
+        if (audioURL) await dsProbeHLS(audioURL, headers, deadline, depth + 1, inheritedKey);
+        var res = variants[v].resolution.match(/\d+x(\d+)/i);
+        return { url: audioURL ? got.url : child.url, type: "HLS", quality: res ? res[1] + "P" : child.quality || "" };
+      } catch (error) {}
+    }
+    throw new Error("沒有子播放列表通過探測");
+  }
+  var segment = "", init = "", key = inheritedKey || "", range = { length: 1024, offset: 0 }, initRange = range;
+  for (var n = 0; n < lines.length; n++) {
+    var line = lines[n];
+    if (line.indexOf("#EXT-X-MAP:") === 0) { init = dsResolve(got.url, dsAttr(line, "URI")); initRange = dsRange(dsAttr(line, "BYTERANGE")); }
+    if (line.indexOf("#EXT-X-KEY:") === 0) {
+      var method = dsAttr(line, "METHOD");
+      if (method === "NONE") key = "";
+      else if (method === "AES-128" && dsAttr(line, "URI")) key = dsResolve(got.url, dsAttr(line, "URI"));
+      else throw new Error("不支持的加密媒體類型");
+    }
+    if (line.indexOf("#EXT-X-BYTERANGE:") === 0) range = dsRange(line.slice(17));
+    if (line.charAt(0) !== "#") { segment = dsResolve(got.url, line); break; }
+  }
+  if (!segment) throw new Error("HLS 無媒體片段");
+  var tasks = [dsProbeBytes(segment, headers, "segment", range.offset, range.length, deadline, !!key)];
+  if (init && init !== segment) tasks.push(dsProbeBytes(init, headers, "init", initRange.offset, initRange.length, deadline, false));
+  if (key) tasks.push(dsProbeBytes(key, headers, "key", 0, 16, deadline, false));
+  await Promise.all(tasks);
+  return { url: got.url, type: "HLS", quality: "" };
+}
+// ---------- 列表秒出：輕量探測（只驗文本，不拉分片） ----------
+//
+// A 方案：列表階段只打解析 + 拉一層 m3u8 驗 #EXTM3U（或直鏈驗媒體頭），
+// 不拉分片/key，點播時播放器自己會拉。所以壞線可能混進列表，點了才轉圈。
+async function dsProbeFast(url, headers, mediaHint, deadline) {
+  if (/\.m3u8(?:[?#]|$)/i.test(url)) {
+    var got = await dsMedia(url, headers, false, deadline), text = dsText(got.response.data);
+    if (!/^#EXTM3U/.test(text) || text.length > 3000000) throw new Error("非有效 HLS 播放列表");
+    return { url: got.url, type: "HLS", quality: "" };
+  }
+  var initial = await dsMedia(url, dsMerge(headers, { Range: "bytes=0-4095" }), true, deadline);
+  if (typeof initial.response.data !== "string") throw new Error("媒體首包無效");
+  var bytes = dsBase64(initial.response.data), prefix = "";
+  for (var i = 0; i < Math.min(bytes.length, 64); i++) prefix += String.fromCharCode(bytes[i]);
+  if (/^(?:\u00ef\u00bb\u00bf)?\s*#EXTM3U/.test(prefix)) {
+    var got2 = await dsMedia(initial.url, headers, false, deadline), text2 = dsText(got2.response.data);
+    if (!/^#EXTM3U/.test(text2)) throw new Error("非有效 HLS 播放列表");
+    return { url: got2.url, type: "HLS", quality: "" };
+  }
+  var head = "";
+  for (var j = 0; j < Math.min(bytes.length, 64); j++) head += String.fromCharCode(bytes[j]);
+  var ctype = dsHeader(initial.response.headers, "Content-Type").toLowerCase();
+  if (dsLooksErrorPage(head, ctype)) throw new Error("媒體實際為錯誤頁面");
+  if (!dsLooksMedia(bytes)) throw new Error("未識別到可解複用媒體頭");
+  return { url: initial.url, type: "直鏈", quality: "" };
+}
+async function dsProbe(url, headers, mediaHint, deadline) {
+  if (/\.m3u8(?:[?#]|$)/i.test(url)) return await dsProbeHLS(url, headers, deadline, 0, "");
+  var initial = await dsMedia(url, dsMerge(headers, { Range: "bytes=0-4095" }), true, deadline);
+  if (typeof initial.response.data !== "string") throw new Error("媒體首包無效");
+  var bytes = dsBase64(initial.response.data), prefix = "";
+  for (var i = 0; i < Math.min(bytes.length, 64); i++) prefix += String.fromCharCode(bytes[i]);
+  if (/^(?:\u00ef\u00bb\u00bf)?\s*#EXTM3U/.test(prefix)) return await dsProbeHLS(initial.url, headers, deadline, 0, "");
+  var finalURL = await dsProbeBytes(url, headers, "video", 0, 4096, deadline, false, initial);
+  return { url: finalURL, type: "直鏈", quality: "" };
+}
+// ==================== 繁簡互通（照 VOD源流式增強專業版做法） ====================
+// 官方索引只收簡體；Forward 帶入多為繁體。搜尋前轉簡體送索引，
+// 比對時兩邊都正規化到繁體鍵，顯示層已是繁體故不二次轉換。
+var dsSimpChars='万与丑专业丛东丝丢两严丧个丰临为丽举么义乌乐乔习乡书买乱争于亏云亘亚产亩亲亵亸亿仅仆从仑仓仪们价众优伙会伛伞伟传伡伣伤伥伦伧伪伫体余佣佥侠侣侥侦侧侨侩侪侬俣俦俨俩俪俫俭债倾偬偻偾偿傤傥傧储傩儿兑兖党兰关兴兹养兽冁内冈册写军农冯冲决况冻净凄准凉减凑凛几凤凫凭凯凶击凿刍划刘则刚创删别刬刭刹刽刿剀剂剐剑剥剧劝办务劢动励劲劳势勋勚匀匦匮区医华协单卖占卢卤卧卫却卺厂厅历厉压厌厍厐厕厘厢厣厦厨厩厮县叁参叆叇双发变叙叠台叶号叹叽吁吃后吓吕吗吣吨听启吴呐呒呓呕呖呗员呙呛呜咏咙咛咝咤咨咸响哑哒哓哔哕哗哙哜哝哟唇唛唝唠唡唢唤啧啬啭啮啯啰啴啸喂喷喽喾嗫嗳嘘嘤嘱噜嚣团园囱围囵国图圆圣圹场坏块坚坛坜坝坞坟坠垄垅垆垒垦垩垫垭垯垱垲垴埘埙埚堑堕塆墙壮声壳壶壸处备复够头夸夹夺奁奂奋奖奥妆妇妈妩妪妫姗姹娄娅娆娇娈娱娲娴婳婴婵婶媪媭嫒嫔嫱嬷孙学孪宁宝实宠审宪宫宽宾寝对寻导寿将尔尘尝尧尴尸尽层屃屉届属屡屦屿岁岂岖岗岘岚岛岩岭岳岽岿峃峄峡峣峤峥峦峰崂崃崄崭嵘嵚嵝巅巩巯币帅师帏帐帘帜带帧帮帱帻帼幂干并广庄庆床庐庑库应庙庞废庼廪开异弃弑张弥弪弯弹强归当录彟彦彨彻征径徕忆忏忧忾怀态怂怃怄怅怆怜总怼怿恋恒恳恶恸恹恺恻恼恽悦悫悬悭悮悯惊惧惨惩惫惬惭惮惯愠愤愦愿慑慭懑懒懔戆戋戏戗战戬戯户扑托执扩扪扫扬扰抚抛抟抠抡抢护报担拟拢拣拥拦拧拨择挂挚挛挜挝挞挟挠挡挢挣挤挥挦捝捞损捡换捣据掳掴掷掸掺掼揽揾揿搀搁搂搄搅携摄摅摆摇摈摊撄撑撵撷撸撺擞攒敌敚敛敩数斋斓斗斩断无旧时旷旸昙昵昼昽显晋晒晓晔晕晖暂暧术朴机杀杂权杠条来杨杩杰极构枞枢枣枥枧枨枪枫枭柜柠柽栀栅标栈栉栊栋栌栎栏树栖栗样栾桠桡桢档桤桥桦桧桨桩桪梦梼梾梿检棁棂椁椝椟椠椢椤椫椭椮楼榄榅榇榈榉榝槚槛槟槠横樯樱橥橱橹橼檩欢欤欧歼殁殇残殒殓殚殡殴毁毂毕毙毡毵氇气氢氩氲汇汉汤汹沟没沣沤沥沦沧沨沩沪泞泪泶泷泸泺泻泼泽泾洁洒洼浃浅浆浇浈浉浊测浍济浏浐浑浒浓浔浕涂涌涚涛涝涞涟涠涡涢涣涤润涧涨涩淀渊渌渍渎渐渑渔渗温游湾湿溁溃溅溆溇滗滚滞滟滠满滢滤滥滦滨滩滪漤潆潇潋潍潜潴澛澜濑濒灏灭灯灵灶灾灿炀炉炖炜炝点炼炽烁烂烃烛烟烦烧烨烩烫烬热焕焖焘煴熏爱爷牍牦牵牺犊状犷犸犹狈狝狞独狭狮狯狰狱狲猃猎猕猡猪猫猬献獭玑玙玚玛玮环现玱玺珐珑珰珲琎琏琐琼瑶瑷瑸璎瓒瓮瓯电画畅畴疖疗疟疠疡疬疭疮疯疱疴痈痉痒痖痨痪痫痳痴瘅瘆瘗瘘瘪瘫瘾瘿癞癣癫皂皑皱皲盏盐监盖盗盘眍眦眬睁睐睑瞆瞒瞩矫矶矾矿砀码砖砗砚砜砺砻砾础硁硕硖硗硙硚确硵硷碍碛碜碱礼祃祎祢祯祷祸禀禄禅离秃秆种秘积称秽秾税稣稳穑穞穷窃窍窎窑窜窝窥窦窭竖竞笃笋笔笕笺笼笾筑筚筛筜筝筹筼签筿简箓箦箧箨箩箪箫篑篓篮篯篱簖籁籴类籼粜粝粤粪粮粽糁糇糍紧絷纟纠纡红纣纤纥约级纨纩纪纫纬纭纮纯纰纱纲纳纴纵纶纷纸纹纺纻纼纽纾线绀绁绂练组绅细织终绉绊绋绌绍绎经绐绑绒结绔绕绖绗绘给绚绛络绝绞统绠绡绢绣绤绥绦继绨绩绪绫绬续绮绯绰绱绲绳维绵绶绷绸绹绺绻综绽绾绿缀缁缂缃缄缅缆缇缈缉缊缋缌缍缎缏缑缒缓缔缕编缗缘缙缚缛缜缝缞缟缠缡缢缣缤缥缦缧缨缩缪缫缬缭缮缯缰缱缲缳缴缵罂网罗罚罢罴羁羟羡群翘翙翚耢耧耸耻聂聋职聍联聩聪肃肠肤肮肴肾肿胀胁胆胜胧胨胪胫胶脉脍脏脐脑脓脔脚脱脶脸腊腌腘腭腻腼腽腾膑膻臜舆舣舰舱舻艰艳艺节芈芗芜芦苁苇苈苋苌苍苏苧苹范茎茏茑茔茕茧荆荐荙荚荛荜荝荞荟荠荡荣荤荥荦荧荨荩荪荫荬荭荮药莅莱莲莳莴莶获莸莹莺莼萚萝萤营萦萧萨葱蒀蒇蒉蒋蒌蒏蓝蓟蓠蓣蓥蓦蔂蔷蔹蔺蔼蕰蕲蕴薮藓蘖虏虑虚虫虬虮虱虽虾虿蚀蚁蚂蚃蚕蚝蚬蛊蛎蛏蛮蛰蛱蛲蛳蛴蜕蜗蜡蝇蝈蝉蝎蝼蝾螀螨蟏衅衔补衬衮袄袅袆袜袭袯装裆裈裢裣裤裥褛褴襕见观觃规觅视觇览觉觊觋觌觍觎觏觐觑觞触觯訚詟誉誊讠计订讣认讥讦讧讨让讪讫训议讯记讱讲讳讴讵讶讷许讹论讻讼讽设访诀证诂诃评诅识诇诈诉诊诋诌词诎诏诐译诒诓诔试诖诗诘诙诚诛诜话诞诟诠诡询诣诤该详诧诨诩诪诫诬语诮误诰诱诲诳说诵诶请诸诹诺读诼诽课诿谀谁谂调谄谅谆谇谈谉谊谋谌谍谎谏谐谑谒谓谔谕谖谗谙谚谛谜谝谞谟谠谡谢谣谤谥谦谧谨谩谪谫谬谭谮谯谰谱谲谳谴谵谶豮贝贞负贠贡财责贤败账货质贩贪贫贬购贮贯贰贱贲贳贴贵贶贷贸费贺贻贼贽贾贿赀赁赂赃资赅赆赇赈赉赊赋赌赍赎赏赐赑赒赓赔赕赖赗赘赙赚赛赜赝赞赟赠赡赢赣赪赵赶趋趱趸跃跄跖跞践跶跷跸跹跻踊踌踪踬踯蹑蹒蹰蹿躏躜躯车轧轨轩轪轫转轭轮软轰轱轲轳轴轵轶轷轸轹轺轻轼载轾轿辀辁辂较辄辅辆辇辈辉辊辋辌辍辎辏辐辑辒输辔辕辖辗辘辙辚辞辟辩辫边辽达迁过迈运还这进远违连迟迩迳迹适选逊递逦逻遗遥邓邝邬邮邹邺邻郁郏郐郑郓郦郧郸酂酝酦酱酽酾酿采释里鉴銮錾钅钆钇针钉钊钋钌钍钎钏钐钑钒钓钔钕钖钗钘钙钚钛钝钞钟钠钡钢钣钤钥钦钧钨钩钪钫钬钭钮钯钰钱钲钳钴钵钶钷钸钹钺钻钼钽钾钿铀铁铂铃铄铅铆铇铈铉铊铋铌铍铎铏铐铑铒铓铔铕铖铗铘铙铚铛铜铝铞铟铠铡铢铣铤铥铦铧铨铩铪铫铬铭铮铯铰铱铲铳铴铵银铷铸铹铺铻铼铽链铿销锁锂锃锄锅锆锇锈锉锊锋锌锍锎锏锐锑锒锓锔锕锖锗锘错锚锛锜锝锞锟锠锡锢锣锤锥锦锧锨锩锪锫锬锭键锯锰锱锲锳锴锵锶锷锸锹锻锼锽锾锿镀镁镂镃镄镅镆镇镈镉镊镋镌镍镎镏镐镑镒镓镔镕镖镗镘镙镚镛镜镝镞镠镡镢镣镤镥镦镧镨镩镪镫镬镭镮镯镰镱镲镳镴镵镶长门闩闪闫闬闭问闯闰闱闲闳间闵闶闷闸闹闺闻闼闽闾闿阀阁阂阃阄阅阆阇阈阉阊阋阌阍阎阏阐阑阒阓阔阕阖阗阘阙阚阛队阳阴阵阶际陆陇陈陉陕陦陧陨险随隐隶隽难雇雏雠雳雾霁霉霡霭靓靔静靥鞑鞒鞯鞲韦韧韨韩韪韫韬韵页顶顷顸项顺须顼顽顾顿颀颁颂颃预颅领颇颈颉颊颋颌颍颎颏颐频颒颓颔颕颖颗题颙颚颛颜额颞颟颠颡颢颣颤颥颦颧风飏飐飑飒飓飔飕飖飗飘飙飚飞飨餍饣饤饥饦饧饨饩饪饫饬饭饮饯饰饱饲饳饴饵饶饷饸饹饺饻饼饽饾饿馁馂馃馄馅馆馇馈馉馊馋馌馍馎馏馐馑馒馓馔馕马驭驮驯驰驱驲驳驴驵驶驷驸驹驺驻驼驽驾驿骀骁骂骃骄骅骆骇骈骉骊骋验骍骎骏骐骑骒骓骔骕骖骗骘骙骚骛骜骝骞骟骠骡骢骣骤骥骦骧髅髋髌鬓鬶魇魉鱼鱽鱾鱿鲀鲁鲂鲄鲅鲆鲇鲈鲉鲊鲋鲌鲍鲎鲏鲐鲑鲒鲓鲔鲕鲖鲗鲘鲙鲚鲛鲜鲝鲞鲟鲠鲡鲢鲣鲤鲥鲦鲧鲨鲩鲪鲫鲬鲭鲮鲯鲰鲱鲲鲳鲴鲵鲶鲷鲸鲹鲺鲻鲼鲽鲾鲿鳀鳁鳂鳃鳄鳅鳆鳇鳈鳉鳊鳋鳌鳍鳎鳏鳐鳑鳒鳓鳔鳕鳖鳗鳘鳙鳛鳜鳝鳞鳟鳠鳡鳢鳣鸟鸠鸡鸢鸣鸤鸥鸦鸧鸨鸩鸪鸫鸬鸭鸮鸯鸰鸱鸲鸳鸴鸵鸶鸷鸸鸹鸺鸻鸼鸽鸾鸿鹀鹁鹂鹃鹄鹅鹆鹇鹈鹉鹊鹋鹌鹍鹎鹏鹐鹑鹒鹓鹔鹕鹖鹗鹘鹙鹚鹛鹜鹝鹞鹟鹠鹡鹢鹣鹤鹥鹦鹧鹨鹩鹪鹫鹬鹭鹯鹰鹱鹲鹳鹴鹾麦麸黄黉黡黩黪黾鼋鼌鼍鼗鼹齐齑齿龀龁龂龃龄龅龆龇龈龉龊龋龌龙龚龛龟鿒鿔鿭';
+var dsTradChars='萬與醜專業叢東絲丟兩嚴喪個豐臨爲麗舉麼義烏樂喬習鄉書買亂爭於虧雲亙亞產畝親褻嚲億僅僕從侖倉儀們價衆優夥會傴傘偉傳俥俔傷倀倫傖僞佇體餘傭僉俠侶僥偵側僑儈儕儂俁儔儼倆儷倈儉債傾傯僂僨償儎儻儐儲儺兒兌兗黨蘭關興茲養獸囅內岡冊寫軍農馮衝決況凍淨悽準涼減湊凜幾鳳鳧憑凱兇擊鑿芻劃劉則剛創刪別剗剄剎劊劌剴劑剮劍剝劇勸辦務勱動勵勁勞勢勳勩勻匭匱區醫華協單賣佔盧滷臥衛卻巹廠廳歷厲壓厭厙龎廁釐廂厴廈廚廄廝縣叄參靉靆雙發變敘疊臺葉號嘆嘰籲喫後嚇呂嗎唚噸聽啓吳吶嘸囈嘔嚦唄員咼嗆嗚詠嚨嚀噝吒諮鹹響啞噠嘵嗶噦譁噲嚌噥喲脣嘜嗊嘮啢嗩喚嘖嗇囀齧嘓囉嘽嘯餵噴嘍嚳囁噯噓嚶囑嚕囂團園囪圍圇國圖圓聖壙場壞塊堅壇壢壩塢墳墜壟壠壚壘墾堊墊埡墶壋塏堖塒壎堝塹墮壪牆壯聲殼壺壼處備復夠頭誇夾奪奩奐奮獎奧妝婦媽嫵嫗嬀姍奼婁婭嬈嬌孌娛媧嫺嫿嬰嬋嬸媼嬃嬡嬪嬙嬤孫學孿寧寶實寵審憲宮寬賓寢對尋導壽將爾塵嘗堯尷屍盡層屓屜屆屬屢屨嶼歲豈嶇崗峴嵐島巖嶺嶽崬巋嶨嶧峽嶢嶠崢巒峯嶗崍嶮嶄嶸嶔嶁巔鞏巰幣帥師幃帳簾幟帶幀幫幬幘幗冪幹並廣莊慶牀廬廡庫應廟龐廢廎廩開異棄弒張彌弳彎彈強歸當錄彠彥彲徹徵徑徠憶懺憂愾懷態慫憮慪悵愴憐總懟懌戀恆懇惡慟懨愷惻惱惲悅愨懸慳悞憫驚懼慘懲憊愜慚憚慣慍憤憒願懾憖懣懶懍戇戔戲戧戰戩戱戶撲託執擴捫掃揚擾撫拋摶摳掄搶護報擔擬攏揀擁攔擰撥擇掛摯攣掗撾撻挾撓擋撟掙擠揮撏挩撈損撿換搗據擄摑擲撣摻摜攬搵撳攙擱摟揯攪攜攝攄擺搖擯攤攖撐攆擷擼攛擻攢敵敓斂斆數齋斕鬥斬斷無舊時曠暘曇暱晝曨顯晉曬曉曄暈暉暫曖術樸機殺雜權槓條來楊榪傑極構樅樞棗櫪梘棖槍楓梟櫃檸檉梔柵標棧櫛櫳棟櫨櫟欄樹棲慄樣欒椏橈楨檔榿橋樺檜槳樁樳夢檮棶槤檢梲欞槨槼櫝槧槶欏樿橢槮樓欖榲櫬櫚櫸樧檟檻檳櫧橫檣櫻櫫櫥櫓櫞檁歡歟歐殲歿殤殘殞殮殫殯毆毀轂畢斃氈毿氌氣氫氬氳匯漢湯洶溝沒灃漚瀝淪滄渢潙滬濘淚澩瀧瀘濼瀉潑澤涇潔灑窪浹淺漿澆湞溮濁測澮濟瀏滻渾滸濃潯濜塗湧涗濤澇淶漣潿渦溳渙滌潤澗漲澀澱淵淥漬瀆漸澠漁滲溫遊灣溼濚潰濺漵漊潷滾滯灩灄滿瀅濾濫灤濱灘澦灠瀠瀟瀲濰潛瀦瀂瀾瀨瀕灝滅燈靈竈災燦煬爐燉煒熗點煉熾爍爛烴燭煙煩燒燁燴燙燼熱煥燜燾熅燻愛爺牘犛牽犧犢狀獷獁猶狽獮獰獨狹獅獪猙獄猻獫獵獼玀豬貓蝟獻獺璣璵瑒瑪瑋環現瑲璽琺瓏璫琿璡璉瑣瓊瑤璦璸瓔瓚甕甌電畫暢疇癤療瘧癘瘍癧瘲瘡瘋皰痾癰痙癢瘂癆瘓癇痲癡癉瘮瘞瘻癟癱癮癭癩癬癲皁皚皺皸盞鹽監蓋盜盤瞘眥矓睜睞瞼瞶瞞矚矯磯礬礦碭碼磚硨硯碸礪礱礫礎硜碩硤磽磑礄確磠礆礙磧磣鹼禮禡禕禰禎禱禍稟祿禪離禿稈種祕積稱穢穠稅穌穩穡穭窮竊竅窵窯竄窩窺竇窶豎競篤筍筆筧箋籠籩築篳篩簹箏籌篔籤篠簡籙簀篋籜籮簞簫簣簍籃籛籬籪籟糴類秈糶糲粵糞糧糉糝餱餈緊縶糹糾紆紅紂纖紇約級紈纊紀紉緯紜紘純紕紗綱納紝縱綸紛紙紋紡紵紖紐紓線紺紲紱練組紳細織終縐絆紼絀紹繹經紿綁絨結絝繞絰絎繪給絢絳絡絕絞統綆綃絹繡綌綏絛繼綈績緒綾緓續綺緋綽鞝緄繩維綿綬繃綢綯綹綣綜綻綰綠綴緇緙緗緘緬纜緹緲緝縕繢緦綞緞緶緱縋緩締縷編緡緣縉縛縟縝縫縗縞纏縭縊縑繽縹縵縲纓縮繆繅纈繚繕繒繮繾繰繯繳纘罌網羅罰罷羆羈羥羨羣翹翽翬耮耬聳恥聶聾職聹聯聵聰肅腸膚骯餚腎腫脹脅膽勝朧腖臚脛膠脈膾髒臍腦膿臠腳脫腡臉臘醃膕齶膩靦膃騰臏羶臢輿艤艦艙艫艱豔藝節羋薌蕪蘆蓯葦藶莧萇蒼蘇薴蘋範莖蘢蔦塋煢繭荊薦薘莢蕘蓽萴蕎薈薺蕩榮葷滎犖熒蕁藎蓀蔭蕒葒葤藥蒞萊蓮蒔萵薟獲蕕瑩鶯蓴蘀蘿螢營縈蕭薩蔥蒕蕆蕢蔣蔞醟藍薊蘺蕷鎣驀虆薔蘞藺藹薀蘄蘊藪蘚櫱虜慮虛蟲虯蟣蝨雖蝦蠆蝕蟻螞蠁蠶蠔蜆蠱蠣蟶蠻蟄蛺蟯螄蠐蛻蝸蠟蠅蟈蟬蠍螻蠑螿蟎蠨釁銜補襯袞襖嫋褘襪襲襏裝襠褌褳襝褲襉褸襤襴見觀覎規覓視覘覽覺覬覡覿覥覦覯覲覷觴觸觶誾讋譽謄訁計訂訃認譏訐訌討讓訕訖訓議訊記訒講諱謳詎訝訥許訛論訩訟諷設訪訣證詁訶評詛識詗詐訴診詆謅詞詘詔詖譯詒誆誄試詿詩詰詼誠誅詵話誕詬詮詭詢詣諍該詳詫諢詡譸誡誣語誚誤誥誘誨誑說誦誒請諸諏諾讀諑誹課諉諛誰諗調諂諒諄誶談讅誼謀諶諜謊諫諧謔謁謂諤諭諼讒諳諺諦謎諞諝謨讜謖謝謠謗諡謙謐謹謾謫譾謬譚譖譙讕譜譎讞譴譫讖豶貝貞負貟貢財責賢敗賬貨質販貪貧貶購貯貫貳賤賁貰貼貴貺貸貿費賀貽賊贄賈賄貲賃賂贓資賅贐賕賑賚賒賦賭齎贖賞賜贔賙賡賠賧賴賵贅賻賺賽賾贗贊贇贈贍贏贛赬趙趕趨趲躉躍蹌蹠躒踐躂蹺蹕躚躋踴躊蹤躓躑躡蹣躕躥躪躦軀車軋軌軒軑軔轉軛輪軟轟軲軻轤軸軹軼軤軫轢軺輕軾載輊轎輈輇輅較輒輔輛輦輩輝輥輞輬輟輜輳輻輯轀輸轡轅轄輾轆轍轔辭闢辯辮邊遼達遷過邁運還這進遠違連遲邇逕跡適選遜遞邐邏遺遙鄧鄺鄔郵鄒鄴鄰鬱郟鄶鄭鄆酈鄖鄲酇醞醱醬釅釃釀採釋裏鑑鑾鏨釒釓釔針釘釗釙釕釷釺釧釤鈒釩釣鍆釹鍚釵鈃鈣鈈鈦鈍鈔鍾鈉鋇鋼鈑鈐鑰欽鈞鎢鉤鈧鈁鈥鈄鈕鈀鈺錢鉦鉗鈷鉢鈳鉕鈽鈸鉞鑽鉬鉭鉀鈿鈾鐵鉑鈴鑠鉛鉚鉋鈰鉉鉈鉍鈮鈹鐸鉶銬銠鉺鋩錏銪鋮鋏鋣鐃銍鐺銅鋁銱銦鎧鍘銖銑鋌銩銛鏵銓鎩鉿銚鉻銘錚銫鉸銥鏟銃鐋銨銀銣鑄鐒鋪鋙錸鋱鏈鏗銷鎖鋰鋥鋤鍋鋯鋨鏽銼鋝鋒鋅鋶鐦鐧銳銻鋃鋟鋦錒錆鍺鍩錯錨錛錡鍀錁錕錩錫錮鑼錘錐錦鑕鍁錈鍃錇錟錠鍵鋸錳錙鍥鍈鍇鏘鍶鍔鍤鍬鍛鎪鍠鍰鎄鍍鎂鏤鎡鐨鎇鏌鎮鎛鎘鑷钂鐫鎳鎿鎦鎬鎊鎰鎵鑌鎔鏢鏜鏝鏍鏰鏞鏡鏑鏃鏐鐔钁鐐鏷鑥鐓鑭鐠鑹鏹鐙鑊鐳鐶鐲鐮鐿鑔鑣鑞鑱鑲長門閂閃閆閈閉問闖閏闈閒閎間閔閌悶閘鬧閨聞闥閩閭闓閥閣閡閫鬮閱閬闍閾閹閶鬩閿閽閻閼闡闌闃闠闊闋闔闐闒闕闞闤隊陽陰陣階際陸隴陳陘陝隯隉隕險隨隱隸雋難僱雛讎靂霧霽黴霢靄靚靝靜靨韃鞽韉韝韋韌韍韓韙韞韜韻頁頂頃頇項順須頊頑顧頓頎頒頌頏預顱領頗頸頡頰頲頜潁熲頦頤頻頮頹頷頴穎顆題顒顎顓顏額顳顢顛顙顥纇顫顬顰顴風颺颭颮颯颶颸颼颻飀飄飆飈飛饗饜飠飣飢飥餳飩餼飪飫飭飯飲餞飾飽飼飿飴餌饒餉餄餎餃餏餅餑餖餓餒餕餜餛餡館餷饋餶餿饞饁饃餺餾饈饉饅饊饌饢馬馭馱馴馳驅馹駁驢駔駛駟駙駒騶駐駝駑駕驛駘驍罵駰驕驊駱駭駢驫驪騁驗騂駸駿騏騎騍騅騌驌驂騙騭騤騷騖驁騮騫騸驃騾驄驏驟驥驦驤髏髖髕鬢鬹魘魎魚魛魢魷魨魯魴魺鮁鮃鮎鱸鮋鮓鮒鮊鮑鱟鮍鮐鮭鮚鮳鮪鮞鮦鰂鮜鱠鱭鮫鮮鮺鯗鱘鯁鱺鰱鰹鯉鰣鰷鯀鯊鯇鮶鯽鯒鯖鯪鯕鯫鯡鯤鯧鯝鯢鯰鯛鯨鰺鯴鯔鱝鰈鰏鱨鯷鰮鰃鰓鱷鰍鰒鰉鰁鱂鯿鰠鰲鰭鰨鰥鰩鰟鰜鰳鰾鱈鱉鰻鰵鱅鰼鱖鱔鱗鱒鱯鱤鱧鱣鳥鳩雞鳶鳴鳲鷗鴉鶬鴇鴆鴣鶇鸕鴨鴞鴦鴒鴟鴝鴛鷽鴕鷥鷙鴯鴰鵂鴴鵃鴿鸞鴻鵐鵓鸝鵑鵠鵝鵒鷳鵜鵡鵲鶓鵪鵾鵯鵬鵮鶉鶊鵷鷫鶘鶡鶚鶻鶖鷀鶥鶩鷊鷂鶲鶹鶺鷁鶼鶴鷖鸚鷓鷚鷯鷦鷲鷸鷺鸇鷹鸌鸏鸛鸘鹺麥麩黃黌黶黷黲黽黿鼂鼉鞀鼴齊齏齒齔齕齗齟齡齙齠齜齦齬齪齲齷龍龔龕龜鿓鎶鉨';
+var dsVariantMap={'迴':'回','鍊':'炼','裡':'里','裏':'里','臺':'台','檯':'台','週':'周','餘':'余','髮':'发','佈':'布','纔':'才','眾':'众','傢':'家','牀':'床','綫':'线','絨':'绒','網':'网','嶽':'岳','麪':'面','麵':'面','祕':'秘','菸':'烟','囉':'啰','啟':'启','剋':'克','勩':'勚','囑':'嘱','彆':'别','註':'注','讚':'赞','昇':'升','誌':'志','爲':'为','牠':'它','衆':'众','妳':'你','衹':'只','祗':'只','鍾':'钟','靑':'青','儘':'尽','顛':'颠','睏':'困','稜':'棱','糉':'粽'};
+var dsTradToSimp={}, dsSimpToTrad={};
+(function(){for(var i=0;i<dsSimpChars.length;i++){var s=dsSimpChars.charAt(i),t=dsTradChars.charAt(i);if(s==='咤'&&t==='吒')continue;dsSimpToTrad[s]=t;if(!dsTradToSimp[t])dsTradToSimp[t]=s;}for(var k in dsVariantMap){if(!dsTradToSimp[k])dsTradToSimp[k]=dsVariantMap[k];var sv=dsVariantMap[k];if(!dsSimpToTrad[sv])dsSimpToTrad[sv]=k;}})();
+function dsToSimp(text){text=dsText(text);var out='';for(var i=0;i<text.length;i++){var ch=text.charAt(i);out+=dsTradToSimp[ch]||ch;}return out;}
+function dsSearchVariants(keyword){var out=[],seen={};function push(v){v=dsText(v);if(v&&!seen[v]){seen[v]=true;out.push(v);}}push(keyword);push(dsToSimp(keyword));return out;}
+function dsNormKey(text){text=dsToSimp(dsText(text)).toLowerCase().replace(/\[[^\]]*\]|【[^】]*】|\([^)]*\)|（[^）]*）/g,'').replace(/[\s\-_:：·.,，。!！?？/\\'"“”‘’]/g,'');var out='';for(var i=0;i<text.length;i++){var ch=text.charAt(i);out+=dsSimpToTrad[ch]||ch;}return out;}
+function dsTitleKey(value) {
+  return dsNormKey(value);
+}
+function dsNumber(value) {
+  if (/^\d+$/.test(value)) return Number(value);
+  var map = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 零: 0 }, parts = String(value || "").split("十");
+  if (parts.length === 2) return (map[parts[0]] || 1) * 10 + (map[parts[1]] || 0);
+  return map[value] || 0;
+}
+function dsSeason(value) {
+  var m = dsToSimp(value).match(/第\s*([一二三四五六七八九十两零\d]+)\s*季|\bseason\s*(\d+)\b|\bs(\d+)\b/i);
+  return m ? dsNumber(m[1] || m[2] || m[3]) : 0;
+}
+function dsBaseTitle(value) { return dsToSimp(value).replace(/第\s*[一二三四五六七八九十两零\d]+\s*季|\bseason\s*\d+\b|\bs\d+\b/gi, ""); }
+function dsExclude(item, wanted) { return !/解说|预告|花絮|片段/.test(wanted) && /解说|预告|花絮|片段/.test(dsText(item.vod_name) + " " + dsText(item.vod_state)); }
+function dsMatch(item, wanted, params) {
+  if (!item.vod_id || dsExclude(item, wanted)) return 0;
+  var type = dsText(params.type || params.mediaType).toLowerCase();
+  if (type === "movie" && Number(item.type_id) !== 1) return 0;
+  if (type === "tv" && Number(item.type_id) === 1) return 0;
+  var season = Number(params.season) || dsSeason(wanted), foundSeason = dsSeason(item.vod_name);
+  if (season > 1 && foundSeason !== season) return 0;
+  if (season === 1 && foundSeason > 1) return 0;
+  var key = dsTitleKey(item.vod_name), target = dsTitleKey(wanted), score = key === target ? 100 : 0;
+  if (!score && dsTitleKey(dsBaseTitle(item.vod_name)) === dsTitleKey(dsBaseTitle(wanted))) score = 95;
+  if (params.year && dsText(item.vod_year) === String(params.year)) score += score ? 5 : 0;
+  return score;
+}
+function dsEpisode(source, requested, movie) {
+  var text = dsText(source.url), entries = [], explicit = false;
+  text.split("#").forEach(function (part) {
+    var at = part.indexOf("$");
+    if (at < 1) return;
+    var title = part.slice(0, at), url = part.slice(at + 1), m = title.match(/^\s*(?:第\s*)?0*(\d{1,4})\s*(?:[集话話期]|$)/);
+    if (m) explicit = true;
+    entries.push({ title: title, origin: url, number: m ? Number(m[1]) : null });
+  });
+  if (movie) return requested === 1 ? entries[0] || null : null;
+  for (var i = 0; i < entries.length; i++) if (entries[i].number === requested) return entries[i];
+  return explicit ? null : entries[requested - 1] || null;
+}
+function dsParseTargets(source, origin) {
+  var apis = [source.parse_api].concat(dsText(source.extra_parse_api).split(/\r?\n/));
+  var seen = {}, targets = [];
+  apis.forEach(function (api) {
+    api = dsText(api);
+    if (!dsValidURL(api) || seen[api]) return;
+    seen[api] = true;
+    if (api.indexOf("{url}") >= 0) targets.push(api.replace(/\{url\}/g, encodeURIComponent(origin)));
+    else targets.push(api + encodeURIComponent(origin));
+  });
+  return targets.slice(0, 3);
+}
+function dsPlayData(object) {
+  if (Array.isArray(object)) {
+    for (var i = 0; i < object.length; i++) { var entry = dsPlayData(object[i]); if (entry) return entry; }
+    return null;
+  }
+  if (typeof object === "string") return dsValidURL(object) ? { url: object, type: "", headers: {} } : null;
+  if (!object || typeof object !== "object") return null;
+  if (object.code != null && [1, 200].indexOf(Number(object.code)) < 0) return null;
+  if (typeof object.url === "string" && dsValidURL(object.url)) return { url: object.url, type: dsText(object.type), headers: dsHeaders(object.headers || object.header) };
+  return object.data && object.data !== object ? dsPlayData(object.data) : null;
+}
+async function dsLine(source, episode, title, deadline) {
+  var start = Date.now(), headers = dsHeaders(source.headers), targetList = dsParseTargets(source, episode.origin);
+  // 來源放 name（官方頻道直接顯示頻道名 / 其餘顯示官方線路·線路X）；description 只留劇名·集數，保持 REX 顯示乾淨。
+  // 索引原名若含「獨家」字樣洗成中性「線路」；官方頻道不加前綴、不加編號。
+  function dsCleanLineName(value) {
+    var name = dsText(value) || "未知線路";
+    name = name.replace(/獨家|独家|獨播|独播|專享|专享|專屬|专属|獨享|独享/g, "線路");
+    return name || "未知線路";
+  }
+  // 官方平臺歸屬（只判有實證的，其餘留空不硬猜；僅用於 name 前綴）。
+  function dsPlatformShort(source, token, mediaUrl) {
+    var code = dsText(source.code).toLowerCase();
+    var parseApi = dsText(source.parse_api).toLowerCase();
+    var media = dsText(mediaUrl), tok = dsText(token);
+    if (/ixigua\.com|douyin|douyinvod|bytitop|bytetos|byteimg|pstatp\.com/i.test(media)) return "西瓜視頻";
+    if (code === "bytedance" || code === "bba" || /mtbytedance|\/bt2?\.php/.test(parseApi)) return "西瓜視頻";
+    if (/v\.qq\.com/i.test(tok) || code === "qq" || /\/qq_301\//.test(media)) return "騰訊視頻";
+    return "";
+  }
+  async function probeAndReturn(play) {
+    var mediaHeaders = dsMerge(headers, play.headers), result = await dsProbeFast(play.url, mediaHeaders, play.type, deadline);
+    var plat = dsPlatformShort(source, episode.origin, play.url);
+    var lineName, suffix = result.quality ? "·" + result.quality : "";
+    if (plat) {
+      // 官方頻道 → 直接顯示頻道名，不加「官方線路·」前綴、不加編號（如 西瓜視頻、騰訊視頻）。
+      lineName = plat + suffix;
+    } else {
+      lineName = "官方線路·" + dsCleanLineName(source.name || source.code) + suffix;
+    }
+    var platRank = !plat ? 10 : (plat === "騰訊視頻" ? 0 : (plat === "西瓜視頻" ? 1 : 2));
+    return { name: lineName, description: title + " · " + episode.title, url: result.url, headers: mediaHeaders, customHeaders: mediaHeaders, _latency: Date.now() - start, _platRank: platRank };
+  }
+  if (source.parse_secret) {
+    try {
+      var secret = await dsAPI("secret_parse_api_url", { url: episode.origin, player_code: dsText(source.code) });
+      var secretPlay = dsPlayData(secret.data);
+      if (secretPlay) return await probeAndReturn(secretPlay);
+    } catch (error) {}
+  } else if (targetList.length) {
+    // 無損加深：每條解析目標「解析+探測」一條龍並行跑，首個可用即回；
+    // 之前是等全部解析完再逐個探測，快目標會被慢目標拖住。單目標 5.5 秒超時，死線不等。
+    var raceDone = false;
+    var racers = targetList.map(function (target) {
+      return (async function () {
+        if (Date.now() >= deadline || raceDone) return null;
+        var play = null;
+        try {
+          var response = await dsWithTimeout(Widget.http.get(target, { headers: { "User-Agent": "Dart/3.13 (dart:io)" } }), 5500);
+          if (!dsOK(response)) return null;
+          play = dsPlayData(dsReply(response.data));
+        } catch (error) { return null; }
+        if (!play || Date.now() >= deadline || raceDone) return null;
+        try {
+          var probed = await dsWithTimeout(probeAndReturn(play), Math.max(1000, Math.min(6000, deadline - Date.now())));
+          if (probed) raceDone = true;
+          return probed;
+        } catch (error) { return null; }
+      })();
+    });
+    var first = null;
+    // 首個成功即回，不等最慢目標；全部失敗才繼續往下走（直鏈兜底）。
+    await new Promise(function (resolve) {
+      var pending = racers.length;
+      if (!pending) resolve();
+      racers.forEach(function (p) {
+        p.then(function (r) {
+          if (r && !first) { first = r; resolve(); }
+          else if (--pending === 0) resolve();
+        }, function () { if (--pending === 0) resolve(); });
+      });
+    });
+    if (first) return first;
+  }
+  if (!source.parse_secret && /\.(?:m3u8|mp4|mkv|mov)(?:[?#]|$)/i.test(episode.origin) && Date.now() < deadline) {
+    try { return await probeAndReturn({ url: episode.origin, headers: {}, type: /\.m3u8(?:[?#]|$)/i.test(episode.origin) ? "hls" : "mp4" }); }
+    catch (error) {}
+  }
+  return null;
+}
+async function dsPool(items, limit, task) {
+  var next = 0, output = new Array(items.length), workers = [];
+  async function run() {
+    while (next < items.length) { var index = next++; try { output[index] = await task(items[index], index); } catch (error) { output[index] = null; } }
+  }
+  for (var i = 0; i < Math.min(limit, items.length); i++) workers.push(run());
+  await Promise.all(workers);
+  return output;
+}
+
+// ============================================================
+// 實際鏈路說明（只走官方線路）
+// ------------------------------------------------------------
+// 本腳本不擁有任何片源，所有媒體都來自第三方：
+//
+//  A. 主路徑 — 索引：官方索引服務
+//     search / video_detail 僅返回「劇名 + 線路名 + 每集 token + 該線路的
+//     parse_api / secret 解析地址」。索引主機 ≠ 媒體主機。
+//  B. 主路徑 — 解析：索引下發的第三方 parse_api / secret_parse_api_url
+//     token → 真實 m3u8/mp4 由這些第三方解析服務返回（地址由索引動態下發，
+//     本腳本不硬編碼解析 IP）。本腳本只做探測過濾。
+//  C. 主路徑 — 媒體：解析返回的 CDN m3u8/mp4（HLS/直鏈），經探測才返回。
+//  D. 備援 — 本地快照重放：之前成功時存下的 (B) 線路+token，用同樣的
+//     第三方解析重放。只在索引掛掉時用，name 追加「·快照」。
+//  不含任何公開 MacCMS 資源站。
+//
+// 命名規則（REX 顯示用：來源放 name，description 只留劇名·集數）：
+//   主路徑  → name「西瓜視頻 / 騰訊視頻 / 官方線路·線路X[·清晰度]」，description「劇名 · 集」
+//   快照    → 同上，name 追加「·快照」
+// ============================================================
+// ---------- 本地快照 ----------
+//
+// 主索引只來自官方索引服務，不可達時搜不到片；因此每次主路徑成功時，
+// 把「線路清單 + 每集 token + 第三方 parse_api 地址」存到本機 storage。
+// 快照存的是索引下發的 token 與第三方解析地址，不是最終網址；
+// 重放時仍走原第三方解析服務（與索引主機不同），索引掛了仍可能出片。
+// 快照 14 天過期、只留最近 40 片（LRU），避免 storage 膨脹。
+var dsSnapshotPrefix = "dsx_snap_";
+var dsSnapshotMax = 40;
+var dsSnapshotTTL = 14 * 24 * 60 * 60 * 1000;
+
+function dsSnapshotKey(title) {
+  return dsSnapshotPrefix + dsText(title).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "_");
+}
+function dsStorageGet(key) {
+  try {
+    var v = Widget.storage && Widget.storage.get(key);
+    return v && typeof v.then === "function" ? v : Promise.resolve(v);
+  } catch (error) { return Promise.resolve(null); }
+}
+function dsStorageSet(key, value) {
+  try {
+    var v = Widget.storage && Widget.storage.set(key, value);
+    return v && typeof v.then === "function" ? v : Promise.resolve(v);
+  } catch (error) { return Promise.resolve(); }
+}
+function dsStorageKeys() {
+  try {
+    var v = Widget.storage && Widget.storage.keys();
+    return v && typeof v.then === "function" ? v : Promise.resolve(v);
+  } catch (error) { return Promise.resolve([]); }
+}
+async function dsSnapshotSave(title, payload) {
+  var key = dsSnapshotKey(title);
+  if (!key || key === dsSnapshotPrefix) return;
+  await dsStorageSet(key, JSON.stringify({ savedAt: Date.now(), payload: payload }));
+  // LRU 修剪：只保留最近 dsSnapshotMax 片
+  try {
+    var keys = await dsStorageKeys();
+    var mine = (Array.isArray(keys) ? keys : []).filter(function (k) { return dsText(k).indexOf(dsSnapshotPrefix) === 0; });
+    if (mine.length > dsSnapshotMax) {
+      var stamped = [];
+      for (var i = 0; i < mine.length; i++) {
+        var raw = await dsStorageGet(mine[i]);
+        var at = 0;
+        try { at = JSON.parse(raw).savedAt || 0; } catch (e) {}
+        stamped.push({ key: mine[i], at: at });
+      }
+      stamped.sort(function (a, b) { return a.at - b.at; });
+      for (var j = 0; j < stamped.length - dsSnapshotMax; j++) {
+        try { await Widget.storage.remove(stamped[j].key); } catch (e) {}
+      }
+    }
+  } catch (error) {}
+}
+async function dsSnapshotLoad(title) {
+  try {
+    var raw = await dsStorageGet(dsSnapshotKey(title));
+    if (!raw) return null;
+    var parsed = JSON.parse(raw);
+    if (!parsed || !parsed.payload) return null;
+    if (Date.now() - (parsed.savedAt || 0) > dsSnapshotTTL) return null;
+    return parsed.payload;
+  } catch (error) { return null; }
+}
+
+// ============================================================
+// ---------- 快照重放：用本地快照走原第三方解析 ----------
+//
+// 用快照裡的 parse_api + token 重新解析（與索引主機不同的解析服務），
+// 所以索引不可達時仍可能出片。
+async function dsReplaySnapshot(snapshot, wanted, requested, deadline) {
+  var results = [];
+  if (!snapshot || !Array.isArray(snapshot.sources)) return results;
+  var movie = Number(snapshot.type_id) === 1;
+  var candidates = [];
+  snapshot.sources.forEach(function (source) {
+    var episodes = Array.isArray(source.episodes) ? source.episodes : [];
+    var episode = null;
+    if (movie) episode = episodes[0];
+    else {
+      for (var i = 0; i < episodes.length; i++) if (episodes[i].number === requested) { episode = episodes[i]; break; }
+      if (!episode) episode = episodes[requested - 1] || null;
+    }
+    if (!episode || !episode.origin) return;
+    candidates.push({ source: source, episode: episode });
+  });
+  var all = await dsPool(candidates.slice(0, 20), 12, function (entry) {
+    if (Date.now() >= deadline) return null;
+    return dsLine(entry.source, entry.episode, dsText(snapshot.vod_name || wanted), deadline);
+  });
+  all.sort(function (a, b) { if (!a) return 1; if (!b) return -1; return ((a._platRank == null ? 10 : a._platRank) - (b._platRank == null ? 10 : b._platRank)) || (a._latency - b._latency); });
+  all.forEach(function (entry) {
+    if (!entry) return;
+    // 快照重放走同一第三方解析；name 追加「·快照」以區分時效，description 保持乾淨。
+    entry.name = dsText(entry.name) + "·快照";
+    delete entry._latency; delete entry._platRank;
+    results.push(entry);
+  });
+  return results;
+}
+
+// 把官方索引的 video_detail 轉成快照格式
+function dsMakeSnapshot(detail, title) {
+  var sources = Array.isArray(detail.vod_url_with_player) ? detail.vod_url_with_player : [];
+  return {
+    vod_name: dsText(detail.vod_name), type_id: Number(detail.type_id),
+    vod_year: dsText(detail.vod_year),
+    sources: sources.map(function (source) {
+      var episodes = [];
+      dsText(source.url).split("#").forEach(function (part) {
+        var at = part.indexOf("$");
+        if (at < 1) return;
+        var label = part.slice(0, at).trim(), url = part.slice(at + 1).trim();
+        if (!url) return;
+        var m = label.match(/(\d{1,4})/);
+        episodes.push({ title: label, origin: url, number: m ? Number(m[1]) : null });
+      });
+      return {
+        code: dsText(source.code), name: dsText(source.name),
+        parse_api: dsText(source.parse_api), extra_parse_api: dsText(source.extra_parse_api),
+        headers: source.headers || null, parse_secret: !!source.parse_secret,
+        episodes: episodes
+      };
+    }).filter(function (s) { return s.episodes.length; })
+  };
+}
+
+// ---------- 備援路徑：只有本地快照重放（同一批官方線路） ----------
+//
+// 不依賴主索引，與主路徑平行跑：主路徑成功用主路徑，
+// 主路徑失敗/超時則交付已在跑的快照重放結果。
+async function dsSnapshotFallback(wanted, requested) {
+  var deadline = Date.now() + 16000;
+  var snapshot = await dsSnapshotLoad(wanted);
+  if (!snapshot) return [];
+  var replayed = await dsReplaySnapshot(snapshot, wanted, requested, deadline);
+  var usedSnap = {}, results = [];
+  replayed.forEach(function (entry) {
+    if (!entry || usedSnap[entry.url]) return;
+    usedSnap[entry.url] = true;
+    results.push(entry);
+  });
+  return results;
+}
+
+async function dsOfficialLoadResource(params) {
+  params = params || {};
+  var wanted = dsText(params.seriesName || params.title), requested = params.episode == null ? 1 : Number(params.episode);
+  if (!wanted || !isFinite(requested) || requested < 1 || requested !== Math.floor(requested)) return [];
+  var wantedVariants = dsSearchVariants(wanted);
+  var deadline = Date.now() + 18000;
+  // 快照懶啟動：主路徑 4 秒內成功就不啟動快照（省頻寬、省並行開銷）；
+  // 主路徑慢或失敗才啟動，交付時序不變。
+  var snapshotStarted = false, snapshotPromise = null;
+  function dsEnsureSnapshot() {
+    if (!snapshotStarted) {
+      snapshotStarted = true;
+      snapshotPromise = dsSnapshotFallback(wanted, requested).catch(function () { return []; });
+    }
+    return snapshotPromise;
+  }
+  var snapshotTimer = (typeof setTimeout === "function") ? setTimeout(function () { dsEnsureSnapshot(); }, 4000) : null;
+  if (!snapshotTimer) dsEnsureSnapshot();
+  // ---------- 主路徑：官方索引（繁簡雙查：原字 + 簡體各查一次，合併去重） ----------
+  var found = null, indexError = null, pagecount = 1;
+  var items = [], seenIds = {};
+  for (var vi = 0; vi < wantedVariants.length && Date.now() < deadline; vi++) {
+    try {
+      var fres = await dsAPI("search", { text: wantedVariants[vi], pg: 1 });
+      if (vi === 0) found = fres;
+      if (fres && Number(fres.pagecount) > pagecount) pagecount = Number(fres.pagecount);
+      (fres && Array.isArray(fres.data) ? fres.data : []).forEach(function (it) {
+        var k = dsText(it.vod_id);
+        if (k && !seenIds[k]) { seenIds[k] = true; items.push(it); }
+      });
+      if (items.length) break;
+    } catch (error) { indexError = error; }
+  }
+  if (!found) found = { data: items, pagecount: pagecount };
+  function rank() { return items.map(function (item) { return { item: item, score: dsMatch(item, wanted, params) }; }).filter(function (x) { return x.score >= 95; }).sort(function (a, b) { return b.score - a.score; }); }
+  var ranked = rank();
+  if (!ranked.length) dsEnsureSnapshot();
+  if (!ranked.length && Number(pagecount) > 1 && Date.now() < deadline) {
+    for (var pi = 0; pi < wantedVariants.length && Date.now() < deadline; pi++) {
+      try { var page = await dsAPI("search", { text: wantedVariants[pi], pg: 2 }); (Array.isArray(page.data) ? page.data : []).forEach(function (it) { var k = dsText(it.vod_id); if (k && !seenIds[k]) { seenIds[k] = true; items.push(it); } }); ranked = rank(); if (ranked.length) break; } catch (error) {}
+    }
+  }
+  if (!ranked.length && dsSeason(wanted) > 0 && Date.now() < deadline) {
+    var baseQueries = dsSearchVariants(dsBaseTitle(wanted));
+    for (var bi = 0; bi < baseQueries.length && Date.now() < deadline; bi++) {
+      try { var base = await dsAPI("search", { text: baseQueries[bi], pg: 1 }); (Array.isArray(base.data) ? base.data : []).forEach(function (it) { var k = dsText(it.vod_id); if (k && !seenIds[k]) { seenIds[k] = true; items.push(it); } }); ranked = rank(); if (ranked.length) break; } catch (error) {}
+    }
+  }
+  if (ranked.length) {
+    try {
+      var info = await dsAPI("video_detail", { id: ranked[0].item.vod_id, sign_md5: "", apk_path: "", apk_length: 0 });
+      var detail = info.data && info.data.vod_info;
+      if (detail && Number(detail.vod_id) === Number(ranked[0].item.vod_id) && !dsExclude(detail, wanted)) {
+        var movie = Number(detail.type_id) === 1, sources = Array.isArray(detail.vod_url_with_player) ? detail.vod_url_with_player : [], candidates = [], seen = {};
+        sources.forEach(function (source) {
+          var episode = dsEpisode(source, requested, movie), identity = dsText(source.code || source.name) + ":" + (episode && episode.origin || "");
+          if (!episode || !episode.origin || seen[identity]) return;
+          seen[identity] = true;
+          candidates.push({ source: source, episode: episode });
+        });
+        var all = await dsPool(candidates.slice(0, 20), 12, function (entry) {
+          return Date.now() >= deadline ? null : dsLine(entry.source, entry.episode, dsText(detail.vod_name), deadline);
+        });
+        var used = {}, output = all.filter(function (entry) { if (!entry || used[entry.url]) return false; used[entry.url] = true; return true; }).sort(function (a, b) { return (a._platRank - b._platRank) || (a._latency - b._latency); }).map(function (entry) { delete entry._latency; delete entry._platRank; return entry; });
+        // 主路徑成功時順手存快照，供索引不可達時重放。
+        if (output.length) { try { await dsSnapshotSave(wanted, dsMakeSnapshot(detail, wanted)); } catch (error) {} }
+        if (output.length) return output;
+      }
+    } catch (error) { indexError = error; dsEnsureSnapshot(); }
+  }
+  if (!ranked.length) dsEnsureSnapshot();
+  // ---------- 主路徑失敗 → 交付已在平行跑的快照重放結果 ----------
+  if (snapshotTimer !== null) { try { clearTimeout(snapshotTimer); } catch (e) {} }
+  var snapFallback = await dsEnsureSnapshot();
+  if (snapFallback.length) return snapFallback;
+  if (indexError) throw indexError;
+  return [];
+}
+
+// ==================== 官方線路併入主檔的轉接層 ====================
+//
+// 插件（zen.cheyong）自帶的 dsOfficialLoadResource 已是完整鏈路：
+//   官方索引 search/video_detail → 第三方 parse_api 解析 → dsProbeFast 探測
+//   → 本地快照重放。直接複用，不拆解。
+//
+// 本轉接層只做三件事：開關、超時保護、形狀轉換（→主檔 resource）。
+
+function _officialIsEnabled(params) {
+  if (CONFIG.OFFICIALS && CONFIG.OFFICIALS.ENABLED === false) return false;
+  try {
+    const p = params && params.officialEnabled;
+    if (p != null && String(p).trim() !== '') return String(p).trim() === 'enabled';
+    const hit = (WidgetMetadata && WidgetMetadata.globalParams || []).find(x => x && x.name === 'officialEnabled');
+    const v = hit && hit.value != null ? String(hit.value).trim() : '';
+    return (v || 'enabled') === 'enabled';
+  } catch (e) { return true; }
+}
+
+function _officialWithTimeout(promise, ms) {
+  var timeoutMs = Number(ms) || 9000;
+  if (typeof Promise === 'undefined') return promise;
+  if (typeof setTimeout !== 'function') return promise;
+  var timer = null;
+  var timeout = new Promise(function (resolve) {
+    timer = setTimeout(function () { resolve({ __officialTimedOut: true }); }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).then(function (r) {
+    if (timer !== null) { try { clearTimeout(timer); } catch (e2) {} }
+    if (r && r.__officialTimedOut) return Promise.reject(new Error('官方線路超時'));
+    return r;
+  }, function (err) {
+    if (timer !== null) { try { clearTimeout(timer); } catch (e2) {} }
+    throw err;
+  });
+}
+
+// 把插件結果轉成主檔 resource 形狀。
+// 插件欄位：{ name, description, url, headers/customHeaders }
+// 主檔下游需要的關鍵欄位：episode（頂層，給 filterByEpisode）、
+// season（頂層，給 loadDetail 分組）、_rawName（給去重/比對）。
+function _officialToResource(entry, wanted, targetEpisode, targetSeason, type) {
+  if (!entry || !entry.url) return null;
+  var url = String(entry.url).trim();
+  if (!isPlayableUrl(url)) return null;
+  var epLabel = '';
+  try {
+    var m = String(entry.description || '').match(/第\s*\d+\s*[集期話回]/);
+    if (m) epLabel = m[0];
+    else if (Number.isFinite(targetEpisode) && targetEpisode > 0) epLabel = '第' + targetEpisode + '集';
+  } catch (e) {}
+  var hintName = '';
+  try { hintName = toDisplayText(wanted || ''); } catch (e2) { hintName = String(wanted || ''); }
+  var wrapped = url;
+  try {
+    wrapped = wrapM3U8WithFilter(url, {
+      site: '官方線路', name: hintName, episode: epLabel,
+      adapter: true,
+    });
+  } catch (e3) {}
+  return {
+    name: String(entry.name || '官方線路'),
+    description: String(entry.description || (wanted || '')),
+    url: wrapped,
+    playerType: 'app',
+    customHeaders: entry.customHeaders || entry.headers || { 'X-Forward-Skip-Redirect-Probe': '1' },
+    resolution: '未知',
+    isHttps: wrapped.indexOf('https') === 0,
+    episode: (type === 'movie') ? 1 : (Number.isFinite(targetEpisode) ? targetEpisode : null),
+    season: (type === 'tv') ? (Number.isFinite(targetSeason) ? targetSeason : 1) : undefined,
+    _officialSite: 'official',
+    // ★ 同時標 _adapterSite='official'：複用「adapter 綁定單集」語義——
+    //   官方線路換出來的是當集直連 URL，不能進 macCacheKey（全季共用），
+    //   必須跟 adapter 一樣走 adCacheKey（_e${ep} 綁定），且 wrap 時走
+    //   adapter 路徑（純淨 CDN，可跳過廣告過濾）。
+    _adapterSite: 'official',
+    _matchType: 'exact',
+    _matchScore: 1,
+    _confidence: 1,
+    _isMainSource: true,
+    _hasEpInfo: true,
+    _rawName: wanted || '',
+    _ep: (type === 'movie') ? 1 : (Number.isFinite(targetEpisode) ? targetEpisode : null),
+    _epActualEp: (type === 'movie') ? 1 : (Number.isFinite(targetEpisode) ? targetEpisode : null),
+    _year: null,
+    _area: null,
+    _areaMismatch: false,
+    _areaMatch: false,
+  };
+}
+
+// 官方線路主入口：回傳主檔 resource 陣列，失敗回 []（絕不拋）。
+async function _officialFetch(params, targetInfo, type, targetEpisode, targetSeason) {
+  try {
+    if (!_officialIsEnabled(params)) return [];
+    var wanted = (targetInfo && (targetInfo.searchQuery || targetInfo.baseName)) || (params && (params.seriesName || params.title)) || '';
+    wanted = String(wanted).trim();
+    if (!wanted) return [];
+    var ep = Number.isFinite(targetEpisode) ? targetEpisode : 1;
+    var callParams = {
+      seriesName: wanted,
+      title: wanted,
+      episode: ep,
+      season: Number.isFinite(targetSeason) ? targetSeason : undefined,
+      type: (type === 'movie') ? 'movie' : 'tv',
+    };
+    if (targetInfo && targetInfo.year) callParams.year = targetInfo.year;
+    var hard = (CONFIG.OFFICIALS && CONFIG.OFFICIALS.HARD_TIMEOUT) || 9000;
+    var list = await _officialWithTimeout(dsOfficialLoadResource(callParams), hard);
+    if (!Array.isArray(list) || !list.length) return [];
+    var maxLines = (CONFIG.OFFICIALS && CONFIG.OFFICIALS.MAX_LINES) || 8;
+    var out = [];
+    var seen = {};
+    for (var i = 0; i < list.length && out.length < maxLines; i++) {
+      var r = _officialToResource(list[i], wanted, targetEpisode, targetSeason, type);
+      if (!r || !r.url || seen[r.url]) continue;
+      seen[r.url] = true;
+      out.push(r);
+    }
+    if (CONFIG.OFFICIALS && CONFIG.OFFICIALS.DEBUG) {
+      try { console.log('[official] ' + wanted + ' E' + ep + ' 回傳 ' + out.length + ' 條'); } catch (e4) {}
+    }
+    return out;
+  } catch (err) {
+    try { console.warn('[official] 失敗: ' + ((err && err.message) || err)); } catch (e5) {}
+    return [];
+  }
+}
+
 // ---------- 併入既有管線的轉換層 ----------
 
 /**
@@ -5488,66 +6066,6 @@ function _adapterIsEnabled(params) {
   return setting === 'enabled';
 }
 
-// ---------- 每站開關（等同多選） ----------
-//
-// Rex/Forward 設定頁沒有多選元件，這裡用「每站一個啟用/停用」拼出同等效果。
-// 讀值三層思路與 _adapterIsEnabled 一致：params 顯式 > globalParams > 預設啟用。
-// 自訂源（VodData 手填、站名不在下表）一律啟用，不受開關影響，仍用 # 註解停用。
-const MAC_SITE_SWITCH = {
-  '電影天堂': 'siteDytt',
-  '非凡資源': 'siteFfzy',
-  '如意資源': 'siteRycj',
-  '樂子': 'siteLzi',
-  '暴風資源': 'siteBfzy',
-  '優質資源': 'siteYzzy',
-};
-const ADAPTER_SITE_SWITCH = { jpyy: 'siteJpyy', agedm: 'siteAgedm' };
-function _siteSwitch(name, params, fallback = 'enabled') {
-  try {
-    const p = params?.[name];
-    if (p != null && String(p).trim() !== '') {
-      return String(p).trim() === 'disabled' ? 'disabled' : 'enabled';
-    }
-  } catch {}
-  return _adapterGp(name, fallback) === 'disabled' ? 'disabled' : 'enabled';
-}
-/** MacCMS 站是否啟用：內建四站看開關，自訂源一律啟用。 */
-function _isMacSiteEnabled(title, params) {
-  const sw = MAC_SITE_SWITCH[title];
-  if (!sw) return true;
-  return _siteSwitch(sw, params) === 'enabled';
-}
-/** 過濾 MacCMS 站清單：關掉的站不發請求、不佔併發、不進結果。 */
-function _filterMacSites(sites, params) {
-  if (!Array.isArray(sites)) return sites;
-  return sites.filter(s => _isMacSiteEnabled(s?.title, params));
-}
-/** 站點選擇簽名：進 cache key 用。開關變了就換 key，不會讀回含已關站的舊結果。 */
-function _siteSelectionTag(params) {
-  try {
-    return ['siteDytt', 'siteFfzy', 'siteRycj', 'siteLzi', 'siteBfzy', 'siteYzzy', 'siteJpyy', 'siteAgedm']
-      .map(k => _siteSwitch(k, params) === 'enabled' ? '1' : '0').join('');
-  } catch { return '11111111'; }
-}
-/** 按當前站點開關過濾已拿到的結果（擋 legacy/舊 key 混入已關站）。 */
-function _filterResultsBySiteSelection(arr, params) {
-  if (!Array.isArray(arr) || arr.length === 0) return arr;
-  return arr.filter(r => {
-    try {
-      if (r && r._adapterSite) {
-        const sw = ADAPTER_SITE_SWITCH[r._adapterSite];
-        if (!sw) return true;
-        return _siteSwitch(sw, params) === 'enabled';
-      }
-      const base = String((r && (r._site || r.name)) || '').replace(/\s+S\d+.*$/i, '').trim();
-      if (base && MAC_SITE_SWITCH[base]) {
-        return _siteSwitch(MAC_SITE_SWITCH[base], params) === 'enabled';
-      }
-    } catch {}
-    return true;
-  });
-}
-
 /**
  * 選取本次要查詢的簽名型站。
  *
@@ -5561,14 +6079,11 @@ function _filterResultsBySiteSelection(arr, params) {
  * 是誤刪 AGE，使用者會看到動漫查不到。
  */
 function _adapterActiveSites(params) {
-  const raw = (params?.adapterSiteLimit != null && String(params.adapterSiteLimit).trim() !== '')
-    ? String(params.adapterSiteLimit).trim() : _adapterGp('adapterSiteLimit', '2');
+  const raw = _adapterGp('adapterSiteLimit', '2');
   const n = (raw === '1' || raw === '2') ? parseInt(raw, 10) : 2;
   const debug = _adapterGp('adapterDebug', 'disabled') === 'enabled';
   if (debug) CONFIG.ADAPTERS.DEBUG = true;
-  // 先按每站開關過濾，再套站數上限：關掉金牌只留 AGE 時 limit=1 仍能查到 AGE。
-  const enabled = ADAPTER_SITES.filter(s => _siteSwitch(ADAPTER_SITE_SWITCH[s.id], params) === 'enabled');
-  return enabled.slice(0, n);
+  return ADAPTER_SITES.slice(0, n);
 }
 
 const WIDGET_VERSION_KEY = 'vod_widget_version';
@@ -5839,7 +6354,6 @@ function stripLanguageParen(rawName, stripHint = null) {
   //   場景：部分站把語言字眼直接黏在片名尾端，沒括號。
   //     「九五至尊粤语」→ 樂子 MacCMS 站方原標題就這樣
   //     「庆余年2 国语」  → 某些站方直接空格接
-  //     「公主嫁到粵語版」→ 優質資源(1080zyku)站方原標題就這樣，尾端多一個「版」
   //   只刪「**抽到的 itemLang 本身**」對應的字眼（含繁簡變體），
   //   **不貪心刪 LANGUAGE_TAGS 內其他字眼**。
   //
@@ -5848,10 +6362,8 @@ function stripLanguageParen(rawName, stripHint = null) {
   //   不該把「中字」（中文字幕標記）也一起剝掉。
   //   若用「所有 LANGUAGE_TAGS 字眼去 try」，會把「中字」誤刪成
   //   「破地獄 國語」—— 反而把字幕標記殘留進去。
-  //   （「中字」緊跟在語言後時如「國語中字」不刪，留給 description 顯示；
-  //   只有語言在最尾、或語言後只跟「版/話/篇」這類版本後綴時才刪。）
   //
-  // 規則：
+  //   規則：
   //     1. 只刪「最末段」是「itemLang 對應字眼」的情況。
   //     2. 前面可有可無空白或「．·・」分隔符。
   //     3. 刪完用 trim 清掉殘留的句點 / 空白。
@@ -5872,10 +6384,7 @@ function stripLanguageParen(rawName, stripHint = null) {
     // 由長到短（避免「粵語」被「語」先吃掉）
     const sorted = [...variants].sort((a, b) => b.length - a.length);
     for (const lang of sorted) {
-      // ★ 尾端允許跟一個「版/話/篇」版本後綴：「粵語版」「国语版」。
-      //   沒這層，「公主嫁到粵語版」刪不掉，description 變
-      //   「公主嫁到粵語版．第32集」+ 第二行「🌐︎ 粵語」重複三次。
-      const tailRe = new RegExp(`[\\s．·・]?${lang.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:版|話|话|篇|本)?$`);
+      const tailRe = new RegExp(`[\\s．·・]?${lang.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`);
       if (tailRe.test(out)) {
         out = out.replace(tailRe, '').replace(/[．·・\s]+$/, '').trim();
         break;
@@ -5963,53 +6472,9 @@ function resolveTargetArea(params, targetInfo) {
   return normalizeArea(targetInfo?.region);
 }
 
-// ★ 固定排序 tier（使用者要求）：粵語 > 站序（金牌影視 > 電影天堂 > 如意資源）。
-//   只看欄位不做網路，sort comparator 用（分數加成另在 calculateResourceScore，
-//   去重/串流同向；comparator 的硬性 tier 保證同分也不亂序）。
-function _langRankOf(r) {
-  try {
-    const hay = [r?.language, r?._rawName, r?._versionLabel, r?.description]
-      .filter(Boolean).join(' ');
-    const t = extractLanguageTag(hay);
-    if (t === '粵語') return 0;
-    if (t === '國粵雙語') return 1;
-  } catch {}
-  return 2;
-}
-function _siteRankOf(r) {
-  try {
-    const hay = `${r?._adapterSite || ''} ${r?.name || ''} ${r?._site || ''}`;
-    if (/jpyy|金牌/.test(hay)) return 0;
-    if (/dytt|電影天堂|电影天堂/.test(hay)) return 1;
-    if (/rycj|如意/.test(hay)) return 2;
-  } catch {}
-  return 3;
-}
-
 function calculateResourceScore(resource, preferResolution = 'auto') {
   let score = resource._matchScore || 0;
   const weights = CONFIG.SORT_WEIGHTS;
-
-  // ★ 粵語優先（使用者要求）：有粵語的片源排前面。
-  //   語言線索散在 _rawName / _versionLabel / description / language 四處
-  //   （金牌把語言放片名尾、樂子把語言放 description），四路都看才不漏。
-  try {
-    const langHay = [
-      resource.language, resource._rawName,
-      resource._versionLabel, resource.description,
-    ].filter(Boolean).join(' ');
-    const _langTag = extractLanguageTag(langHay);
-    if (_langTag === '粵語') score += weights.CANTONESE_BONUS ?? 80;
-    else if (_langTag === '國粵雙語') score += weights.BILINGUAL_BONUS ?? 40;
-  } catch {}
-  // ★ 固定站序加成（使用者要求）：金牌影視 > 電影天堂 > 如意資源。
-  //   comparator 另有硬性 tier，這裡加分讓去重保留 / 串流排序同向。
-  try {
-    const siteHay = `${resource._adapterSite || ''} ${resource.name || ''} ${resource._site || ''}`;
-    if (/jpyy|金牌/.test(siteHay)) score += weights.SITE_RANK_JPYY ?? 60;
-    else if (/dytt|電影天堂|电影天堂/.test(siteHay)) score += weights.SITE_RANK_DYTT ?? 40;
-    else if (/rycj|如意/.test(siteHay)) score += weights.SITE_RANK_RYCJ ?? 20;
-  } catch {}
   
   if (resource._matchType === 'exact') score += weights.EXACT_MATCH;
   else if (resource._matchType === 'fuzzy') score += weights.FUZZY_MATCH;
@@ -6190,7 +6655,7 @@ class SiteManager {
 
 // ==================== 智能搜索执行模块 ====================
 class SmartSearchExecutor {
-  constructor(siteManager, targetInfo, type, matchStrictness, targetEpisode = null, adapterSites = []) {
+  constructor(siteManager, targetInfo, type, matchStrictness, targetEpisode = null, adapterSites = [], officialEnabled = true) {
     this.siteManager = siteManager;
     this.targetInfo = targetInfo;
     this.type = type;
@@ -6199,7 +6664,10 @@ class SmartSearchExecutor {
     // 簽名型 adapter 站（金牌影視等）。空陣列 = 本次不跑 adapter。
     // 由 performSmartSearch 依 _adapterIsEnabled 決定要不要傳進來。
     this.adapterSites = adapterSites || [];
-    
+    // 官方線路（zen.cheyong 官方索引＋第三方解析）。由 performSmartSearch
+    // 依 _officialIsEnabled 決定；executor 內與 MacCMS 並行跑。
+    this.officialEnabled = officialEnabled !== false;
+
     this.allResults = [];
     this.seenUrls = new Set();
     this.seenContent = new Map();
@@ -6317,6 +6785,39 @@ class SmartSearchExecutor {
       this._adapterPromise = runAdapters;
     }
 
+    // ===== 官方線路（串流模式；與 MacCMS / adapter 並行）=====
+    //
+    // 只走官方索引＋索引下發的第三方解析（西瓜視頻/騰訊視頻等官方 CDN）。
+    // 插件實測：無廣告片頭、列表＋點播兩級探測、索引掛掉走快照重放。
+    // 獨立一條 task，失敗靜默回 []，超時由 _officialFetch 內部硬上限保護。
+    if (this.officialEnabled && typeof _officialFetch === 'function') {
+      const runOfficial = (async () => {
+        try {
+          const off = await _officialFetch(
+            {},
+            this.targetInfo,
+            this.type,
+            this.targetEpisode,
+            this.targetInfo ? this.targetInfo.seasonNumber : 1
+          );
+          return Array.isArray(off) ? off : [];
+        } catch (e) {
+          try { console.warn('[official] 串流模式失敗: ' + ((e && e.message) || e)); } catch (e2) {}
+          return [];
+        }
+      })();
+      runOfficial.then(res => {
+        if (res && res.length > 0) {
+          for (const r of res) this.collected.push(r);
+          this.stats.successfulSites++;
+          if (onResultCallback) {
+            try { onResultCallback(this.smartDeduplicate(this.collected.slice())); } catch (e3) {}
+          }
+        }
+      }).catch(() => {});
+      this._officialPromise = runOfficial;
+    }
+
     // 整批搜尋的時限。慢站若被無限等待，complete 事件會晚到前端等待上限之後，
     // 使用者只會看到「暫無可用資源」——即使其他站早已回傳結果。
     // 到點就帶著已完成的結果收尾。
@@ -6399,6 +6900,18 @@ class SmartSearchExecutor {
     //
     //   而且要在 enough() 判定「之後」才併入：enough() 是看 MacCMS 站
     //   數，adapter 算進去會讓它提早收尾，反而害 MacCMS 站少查幾個。
+    // 官方線路結果在這裡併入（enough() 判定之後，避免影響 MacCMS 早收）。
+    let officialResults = [];
+    if (this._officialPromise) {
+      try {
+        officialResults = await this._officialPromise.catch(() => []);
+      } catch (e) { officialResults = []; }
+    }
+    if (officialResults.length > 0) {
+      allResults.push(...officialResults);
+      allResults = this.smartDeduplicate(allResults);
+    }
+
     let adapterResults = [];
     if (this._adapterPromise) {
       // 給 adapter 一個硬上限：它內部已有 per-request timeout，但整條鏈
@@ -6872,68 +7385,6 @@ class SmartSearchExecutor {
 //
 // 用法：呼叫端從 targetInfo.seasonNumber（或 buildDetailLink 的 season 參數）
 //   拿 playlist 級別季別傳進 context.seasonNumber；type 仍依本資源的型別。
-//
-// ★ 穩定身份（給 REX「繼續播放」回找上次來源用）。
-//
-// 背景：REX 的繼續播放會記住上次選的那路來源（按 id / url 回找），
-// 下次進來重新搜尋後拿新結果逐筆比對。舊 id 直接拿完整 m3u8 拼出
-// （`forward-vod-${rawUrl}`），而站方 URL 幾乎都帶短效簽名
-// （jpyy 的 `?t=..&sign=..`、每次 _adapterResolvePlay 現換現簽；
-// MacCMS 站的 CDN host 也會輪換）—— 兩次搜尋同一路來源的 url
-// 字面完全不同 → id 跟著漂 → REX 比對不上 → 偶發「找不回上次選的源」。
-//
-// 修法：id 只用「去簽名的規範路徑 + 穩定維度」（站名/季/集/語言/
-// CDN 分組/清晰度）組成。同一路來源換了簽名仍是同一個 id；
-// 不同站、不同語言、不同 CDN 分組、不同清晰度仍是不同 id。
-// 顯示欄位（name / description / url / title / link）一律不動。
-function _unwrapFilterInnerUrl(url) {
-  let cur = String(url || '');
-  for (let i = 0; i < 3; i++) {
-    const m = cur.match(/[?&]url=([^&#]*)/);
-    if (!m || !m[1]) break;
-    try {
-      const inner = decodeURIComponent(m[1]);
-      if (!inner || inner === cur) break;
-      cur = inner;
-    } catch { break; }
-  }
-  return cur;
-}
-
-// 去掉簽名與 fragment，只留 scheme://host/path。
-// 同一路來源換了 ?t/sign 仍回同一個字串；裸 token / 非 http 字串原樣返回。
-function _stablePlaybackPath(url) {
-  const inner = _unwrapFilterInnerUrl(url);
-  if (!inner) return '';
-  const cut = inner.split(/[?#]/)[0].trim();
-  return cut;
-}
-
-function _stableSourceId(resource, clean) {
-  const siteBase = String(clean.name || resource.name || '')
-    .replace(/\s+S\d+.*$/i, '').trim() || 'src';
-  const seasonPart = Number.isFinite(clean.season) && clean.season > 0
-    ? `s${clean.season}` : 'sx';
-  const epPart = Number.isFinite(clean.episode) && clean.episode > 0
-    ? `e${clean.episode}` : 'ex';
-  let langPart = 'x';
-  try {
-    langPart = clean.language
-      || extractLanguageTag(resource._rawName || resource._versionLabel) || 'x';
-  } catch { langPart = 'x'; }
-  const groupPart = clean.group || resource._groupLabel || 'x';
-  // ★ id 不含清晰度：applyActualResolutions 會按實測升級 resolution，
-  //   若 id 含 resPart，「無實測/有實測」兩次搜尋 id 漂移，
-  //   REX「繼續播放」對不上。清晰度只影響篩選與排序，不參與身份。
-  const pathPart = _stablePlaybackPath(
-    typeof resource.url === 'string' ? resource.url : '');
-  if (pathPart) {
-    return `forward-vod-${siteBase}|${seasonPart}${epPart}|${langPart}|${groupPart}|${pathPart}`;
-  }
-  const epOnly = clean.episode != null ? String(clean.episode) : '';
-  return `forward-vod-${resource._rawName || clean.name || 'item'}|${epOnly}`;
-}
-
 function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   const clean = { ...resource };
   // playlist 級別已識別的季別。null/0/負數一律視為無效。
@@ -7305,35 +7756,6 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     }
   }
 
-  // ★ 📺 清晰度行（使用者要求：播放列表一定顯示實際清晰度）。
-  //   根因：舊邏輯只靠背景 probe（fire-and-forget）回來才加 📺 行，
-  //   第一輪搜尋 return 時 probe 還沒跑完 → 永遠沒行；單檔 TS 無
-  //   RESOLUTION 更永遠探不到 → 永遠空白。
-  //   修法：clean 時就寫一行 —— 有 actualResolution 用實測，
-  //   沒有就用站方 resolution（extractResolutionInfo 已從片名/quality 抽出，
-  //   總比空白好；probe 回來後 applyActualResolutions 會覆蓋升級）。
-  //   冪等：已有 📺 行就不重複加；有實測時把站方行升級為實測行。
-  try {
-    const _resLabel = String(resource.actualResolution || clean.actualResolution || '').trim()
-      || String(clean.resolution || '').trim();
-    if (_resLabel && _resLabel !== '未知') {
-      const _resLine = `📺 ${_resLabel}`;
-      const _d = String(clean.description || '');
-      if (/📺[^\n]*/.test(_d)) {
-        // 已有行：有實測就升級，無實測不動（避免把實測降級回站方標註）。
-        const _ar = String(resource.actualResolution || clean.actualResolution || '').trim();
-        if (_ar && _ar !== '未知') {
-          clean.description = _d.replace(/📺[^\n]*/g, `📺 ${_ar}`);
-        }
-      } else {
-        clean.description = _d ? `${_d}\n${_resLine}` : _resLine;
-      }
-      if (!clean.actualResolution && resource.actualResolution) {
-        clean.actualResolution = resource.actualResolution;
-      }
-    }
-  } catch {}
-
   // m3u8 過濾 wrap。customHeaders 保留在物件上(REX 客戶端會用),過濾廣告伺服器端
   // 收到 m3u8 子請求時自動從 Referer 解析或回退到 customHeaders(伺服器端邏輯,
   // 見 m3u8-ad-filter-worker.js)。
@@ -7365,16 +7787,13 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     if (field in clean) delete clean[field];
   });
   
-  // ★ 缺欄位兜底：新邏輯下 extractResolutionInfo 永遠有值（最低預設 720P），
-  //   這裡只處理「舊 cache 回放、欄位根本缺失」的情況，同樣給預設 720P
-  //   而不是「未知」—— 未知會被 REX 篩選丟進「其他」。
-  if (!clean.resolution || clean.resolution === '未知') {
-    clean.resolution = '720P';
-    clean.resolutionLevel = 3;
-    clean.isHD = true;
+  if (!clean.resolution) {
+    clean.resolution = '未知';
+    clean.resolutionLevel = 0;
+    clean.isHD = false;
     clean.is4K = false;
     clean.qualityTags = [];
-    clean.qualityScore = 15;
+    clean.qualityScore = 0;
     clean.isHttps = clean.url.startsWith('https');
   }
   
@@ -7405,10 +7824,10 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   // 這裡採「最小補充」策略：只補欄位，不動現有的 name/description/url，
   // 避免影響已驗證過的 UI 顯示。
   {
-    // 用「穩定身份」當 id，供 REX「繼續播放」回找上次來源。
-    // 舊寫法拿完整 m3u8 拼 id，站方短效簽名（?t/sign）一換就漂成另一筆。
-    // 新寫法只用去簽名路徑 + 站名/季/集/語言/分組/清晰度（見 _stableSourceId），
-    // 同一路來源換簽名仍是同一個 id；顯示欄位（name/url/title/link）一律不動。
+    // 用「原始(未 wrap)url + 集數」當 id。因為 wrapM3U8WithFilter 會改寫
+    // clean.url，而過濾伺服器每次呼叫產生的 t/sign 參數都不同 —— 若拿
+    // wrap 後的 url 當 id，同一條資源在 cache 命中前後會拿到不同 id，
+    // 客戶端會當成兩筆。
     //
     // ★ 冪等性：loadResource 會把 cleaned 的欄位寫回原 res 物件
     //   （Object.assign(res, cleaned)），因此同一筆資源可能「清兩次」。
@@ -7418,7 +7837,10 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     if (typeof resource.id === 'string' && resource.id) {
       clean.id = resource.id;
     } else {
-      clean.id = _stableSourceId(resource, clean);
+      const rawUrl = typeof resource.url === 'string' ? resource.url : '';
+      const epPart = clean.episode != null ? String(clean.episode) : '';
+      const idBase = rawUrl || `${resource._rawName || clean.name || 'item'}|${epPart}`;
+      clean.id = `forward-vod-${idBase}`;
     }
     // 這批資源都是可直接播放的直連 m3u8/mp4，對應契約裡的 "url" 型別。
     clean.type = 'url';
@@ -7802,8 +8224,12 @@ async function loadResource(params, onStreamResult = null) {
     type = _resolvedType,
     season,
     episode,
+    multiSource,
     VodData,
     matchStrictness = 'standard',
+    preferResolution = 'auto',
+    searchMode = 'batch',
+    m3u8FilterEnabled = 'enabled',
     m3u8FilterWorkerUrl,
     m3u8FilterMode = 'filter',
     m3u8FilterAdminUser,
@@ -7812,11 +8238,6 @@ async function loadResource(params, onStreamResult = null) {
     // 簽名型 adapter 站是否跳過過濾廣告伺服器（'skip' | 'filter'）
     m3u8FilterAdapterMode
   } = params;
-
-  // 設定頁已精簡：搜尋模式 / 清晰度偏好 / 繁簡轉換 / m3u8 廣告過濾開關
-  // 全部移除 UI，一律走預設（批次搜尋 / 最清晰 / 轉換開啟 / 過濾開啟）。
-  const searchMode = 'batch';
-  const preferResolution = 'auto';
 
   // Forward 傳入片名的欄位名並非只有一種：詳細頁通常給 seriesName，
   // 但由相關作品卡片切換進場時可能走別的欄位。任何一個欄位帶著
@@ -7857,8 +8278,11 @@ async function loadResource(params, onStreamResult = null) {
     }
   }
 
-  // 聚合搜尋已鎖死開啟（設定頁開關已移除）。
-  if (!seriesName) {
+  // ★ Rex 直調時 params 裡沒有 multiSource（它不是 BaseParams 欄位，
+  //   只是自家 globalParams 設定項），用 !== "enabled" 會把 Rex 切季/切集
+  //   的呼叫全部擋掉（undefined !== "enabled" → return []）。
+  //   改成「顯式關掉才擋」，沒帶就當啟用。Zen 支無此守門，故不受影響。
+  if (multiSource === "disabled" || !seriesName) {
     return [];
   }
 
@@ -7872,9 +8296,11 @@ async function loadResource(params, onStreamResult = null) {
   //
   // 優先級：params 顯式傳入 > globalParams 設定項 > 模組預設值。
   //
-  // m3u8 廣告過濾已鎖死開啟（設定頁開關已移除），其餘項仍走三層 fallback：
-  // REX 客戶端在詳細頁切換集數時只帶 link / seriesName 等，
-  // 沒有 m3u8FilterWorkerUrl，所以仍需 fallback 到 globalParams。
+  // 為什麼一定要 fallback 到 globalParams：REX 客戶端在詳細頁切換集數時會
+  // 直接呼叫 loadResource(params)，params 裡只有 link / seriesName 等，
+  // 沒有 m3u8FilterWorkerUrl。原本的寫法 `m3u8FilterEnabled = 'enabled'`
+  // 在解構時就給了 default，掩盖了「參數根本沒來」這件事；
+  // 一旦使用者把設定改成 disabled 再呼叫，就會意外開啟過濾。
   // 反過來 m3u8FilterWorkerUrl 沒 default，undefined 時 if 不成立，
   // CONFIG 會停在「上一次有人寫進去的值」—— 可能是上一輪的雲端網址，
   // 這正是「設定改了卻沒生效、看播放紀錄沒東西」的原因。
@@ -7888,9 +8314,12 @@ async function loadResource(params, onStreamResult = null) {
     }
   };
 
-  // 設定頁已移除 m3u8 廣告過濾開關：一律開啟過濾（預設行為鎖死）。
-  // params / globalParams 即使殘留舊值也不再讀取，避免舊設定把過濾關掉。
-  CONFIG.M3U8_FILTER.ENABLED = true;
+  // ENABLED 預設 'enabled'：使用者沒設定時維持過濾開啟（原本行為），
+  // 但 explicit 的 'disabled' 一定會被尊重。
+  const enabledParam = (m3u8FilterEnabled != null && m3u8FilterEnabled !== '')
+    ? m3u8FilterEnabled
+    : gpValue('m3u8FilterEnabled', 'enabled');
+  CONFIG.M3U8_FILTER.ENABLED = (enabledParam === 'enabled');
 
   // WORKER_URL 三層 fallback。
   const workerParam = (typeof m3u8FilterWorkerUrl === 'string' && m3u8FilterWorkerUrl.trim())
@@ -7998,6 +8427,7 @@ async function loadResource(params, onStreamResult = null) {
       fromParams: !!m3u8FilterWorkerUrl,
       // globalParams 層的原始值（'' 代表 Forward 沒存到設定）
       gpWorkerUrl: gpValue('m3u8FilterWorkerUrl', '(空)'),
+      gpEnabled: gpValue('m3u8FilterEnabled', '(空)'),
       gpTsMode: gpValue('m3u8FilterTsMode', '(空)'),
       gpAdapterMode: gpValue('m3u8FilterAdapterMode', '(空)'),
       gpCount: allGp.length,
@@ -8048,7 +8478,7 @@ async function loadResource(params, onStreamResult = null) {
   
   const startTime = Date.now();
   
-  const resourceSites = _filterMacSites(parseResourceSites(VodData), params);
+  const resourceSites = parseResourceSites(VodData);
   if (resourceSites.length === 0) {
     onStreamResult && onStreamResult([], { type: 'error', message: '無可用資源站' });
     return [];
@@ -8154,17 +8584,13 @@ targetInfo.searchQuery = aliasQ;
   // 片名只有在使用者自己輸入年份時才是權威來源。
   const versionTag = targetInfo.year ?? extractVersionMarker(targetInfo.rawName) ?? 'x';
   const areaTag = targetInfo.region ?? 'x';
-  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_y${versionTag}_a${areaTag}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}_sites${_siteSelectionTag(params)}`;
+  const cacheKey = `vod_smart_${normalizeTitleForMatch(targetInfo.baseName)}_sq${sequelTag ?? 'x'}_y${versionTag}_a${areaTag}_s${targetSeason}_${type}_${matchStrictness}_e${targetEpisode || 'all'}`;
   let cachedResults = [];
   
   if (CONFIG.CACHE_TTL > 0) {
     try {
       const raw = await Widget.storage?.get?.(cacheKey);
       cachedResults = parseCacheValue(raw);
-      if (cachedResults.length > 0) {
-        // 站點開關：舊 key 混入已關站時先剔除，避免關掉仍顯示。
-        cachedResults = _filterResultsBySiteSelection(cachedResults, params);
-      }
       if (cachedResults.length > 0) {
         // 快取是整部劇的結果，指定集數時仍需過濾，否則會把其他集數的連結
         // 當成這一集回傳。
@@ -8248,10 +8674,6 @@ targetInfo.searchQuery = aliasQ;
             console.log(`🩹 smart cache 兜底 wrap: ${rewrapped}/${usable.length} 條裸 CDN 已修復`);
           }
 
-          // ★ 實測清晰度：把背景已探到的 master RESOLUTION 套上（純 in-memory，
-          //   無網路，不阻塞回傳）。還沒探到的這次不顯示，下次 cache 命中時會有。
-          try { applyActualResolutions(usable); } catch {}
-
           if (onStreamResult) {
             const batchSize = 5;
             for (let i = 0; i < usable.length; i += batchSize) {
@@ -8313,15 +8735,16 @@ targetInfo.searchQuery = aliasQ;
     ...params,
     seriesName,
     _preSearchQuery: targetInfo.searchQuery,
-    // 設定頁已移除搜尋模式 / 清晰度偏好：鎖死批次搜尋 + 最清晰排序，
-    // 覆寫任何殘留的舊 params，避免舊客戶端傳入 smart_stream。
-    searchMode: 'batch',
-    preferResolution: 'auto',
   };
 
-  // 設定頁已移除搜尋模式開關：一律批次搜尋（預設最快組合）。
-  console.log('🔍 使用批量搜索模式');
-  finalResults = await performBatchSearch(_searchParams);
+  if (searchMode === 'smart_stream' || searchMode === 'auto') {
+    console.log('🎯 使用智能流式搜索模式');
+    finalResults = await performSmartSearch(_searchParams, onStreamResult);
+  } else {
+    // 'batch' 為預設,涵蓋未來任何未知值(寬鬆驗證一致)
+    console.log('🔍 使用批量搜索模式');
+    finalResults = await performBatchSearch(_searchParams);
+  }
   
   if (type === 'tv' && targetEpisode) {
     const beforeFilter = finalResults.length;
@@ -8345,9 +8768,12 @@ targetInfo.searchQuery = aliasQ;
   // 至少使用者會看到候選項目（會包含第一季內容，但比「空白」好）。
 // 續集季別過濾（共用 helper，cache 命中路徑與 batch 路徑都會經過）。
 //
-// performBatchSearch 內部（file 結尾的 batch 路徑）已套用 filterBySequel
-// 並把結果回傳，loadResource 收到時 _rawName / _year 都已被
-// cleanResourceForOutput 剝掉，不在此重跑（無謂二次處理、浪費效能）。
+// 為什麼 batch 模式跳過：performBatchSearch 內部（file 結尾的 batch 路徑）
+// 已套用 filterBySequel 並把結果回傳，loadResource 收到時 _rawName / _year
+// 都已被 cleanResourceForOutput 剝掉，再跑一次 filter 會全部 fall back 到
+// description 解析，雖然「碰巧」能正確判斷（description 還含「第三季」字
+// 樣），但屬於無謂的二次處理、浪費效能、也容易因 log 顯示「_rawName=undefined」
+// 誤導除錯。stream / auto 模式仍需在此 filter（performSmartSearch 內部不跑）。
   // ★ 電影續集過濾（movie 分支）：篩掉「第一部／第二部」等無關續集。
 //
 // 場景：REX 詳細頁搜「疾速追殺」season=4（John Wick Chapter 4, 2023），
@@ -8367,8 +8793,67 @@ targetInfo.searchQuery = aliasQ;
 //   - filterBySequel 開頭就檢查 `targetSeason <= 1` 直接原樣返回，
 //     所以單部電影（REX 傳 season=1 或空）完全不受影響。
 //   - movie 不套用下面的 S4 fallback（那是「愛丽丝篇异界战争」tv 專屬）。
-// 設定頁已移除搜尋模式開關：一律批次搜尋，batch 路徑內部已跑過
-// filterBySequel，這裡不再重跑（見上方註解）。
+if (type === 'movie' && searchMode !== 'batch') {
+  const r = filterBySequel(finalResults, targetInfo);
+  if (r.kept && r.before !== undefined && r.kept.length < r.before) {
+    console.log(`🎬 電影續集過濾(第${targetInfo.seasonNumber}部): ${r.before} -> ${r.kept.length}（pooledYearMin=${r.pooledYearMin ?? 'null'}）`);
+    finalResults = r.kept;
+  } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
+    // 一部都殺不掉（站方沒寫序號）→ 保留全部，不要讓使用者看到空清單。
+    console.log(`⚠️ 電影續集過濾無命中(${r.before}筆)，保留全部候選`);
+  }
+}
+
+if (type === 'tv' && searchMode !== 'batch') {
+    const r = filterBySequel(finalResults, targetInfo);
+    let s4FallbackUsed = false;
+    if (r.kept && r.kept.length > 0 && r.before !== undefined && r.kept.length < r.before) {
+      finalResults = r.kept;
+      console.log(`🎯 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin}）`);
+      // 進入此分支表示 filterBySequel 確實有做 drop（kept < before），
+      // 若同時也有 s4FallbackCandidates 表示 r.kept 不包含 S3 後半候選，
+      // 需要把 fallback 候選塞回去並排在最前。
+      if (r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
+        s4FallbackUsed = true;
+      }
+    } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
+      console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾無命中(${r.before}筆)，保留全部候選`);
+    } else if (r.kept && r.kept.length === r.before && r.before > 0) {
+      // 全部通過即「沒 S4 命中」+ 「全部候選都是 S1 沒人可殺」 —— 退回保留全部。
+      // log 寫明這是 fallback，不要讓人誤會成「filter 確認這就是答案」。
+      const poolYr = r.pooledYearMin ?? 'null';
+      console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾: ${r.before} -> ${r.before}（無 targetSeason 命中群，pooledYearMin=${poolYr}，已是最終候選）`);
+      // 退化情境 (最常見：user 查 season>=4 但站方全名以季名命名)：把這些候選放到最前並加註。
+      if (r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
+        s4FallbackUsed = true;
+      }
+    } else if (r.kept && r.kept.length < r.before && r.before > 0 && r.s4FallbackCandidates && r.s4FallbackCandidates.length > 0) {
+      // S4 fallback 把候選抽出後 kept < before 的補接分支。
+      finalResults = r.kept;
+      s4FallbackUsed = true;
+    }
+    if (s4FallbackUsed) {
+      // 給 fallback 候選一個「最大 score」標記，確保後續 sort 不會被同分
+      // exact-match 的 S1 資源擠回中間位置（同一個 match 群分數相同）。
+      // 設在 description 改寫之後，避免誤觸 _finalScore 計算。
+      for (const cand of r.s4FallbackCandidates) {
+        cand._s4FallbackBoost = true;
+        if (cand.description && !cand.description.includes('⚠️')) {
+          cand.description = `⚠️ 站方無「第${targetInfo.seasonNumber}季」資料，這是依片名推算的 S3 後半候選\n${cand.description}`;
+        }
+      }
+      // 純化：使用者搜第4季，要看到的每一條都跟 S3 後半相關，
+      // 不要混入 S1/S2 等無關季內容。S4 站方沒資料，S3 後半 (2020) 是
+      // 已知最接近的內容，列為唯一切分才不會讓使用者誤點。
+      //
+      // 僅在 s4FallbackCandidates.length > 0 時才純化，避免空清單。
+      if (r.s4FallbackCandidates.length > 0) {
+        finalResults = [...r.s4FallbackCandidates];
+      } else {
+        finalResults = [...r.s4FallbackCandidates, ...finalResults];
+      }
+    }
+  }
 
   finalResults.forEach(res => {
     res._finalScore = calculateResourceScore(res, preferResolution);
@@ -8384,23 +8869,10 @@ targetInfo.searchQuery = aliasQ;
     const aMedia = isDirectMediaUrl(a.url) ? 0 : 1;
     const bMedia = isDirectMediaUrl(b.url) ? 0 : 1;
     if (aMedia !== bMedia) return aMedia - bMedia;
-    // ★ 硬性 tier（使用者要求）：粵語置頂，其次金牌影視 > 電影天堂 > 如意資源。
-    //   分數加成在 calculateResourceScore（管去重/串流），這裡保證同分也不亂序。
-    const aLang = _langRankOf(a), bLang = _langRankOf(b);
-    if (aLang !== bLang) return aLang - bLang;
-    const aSite = _siteRankOf(a), bSite = _siteRankOf(b);
-    if (aSite !== bSite) return aSite - bSite;
     if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
     if (b.resolutionLevel !== a.resolutionLevel) return b.resolutionLevel - a.resolutionLevel;
     if (b.qualityScore !== a.qualityScore) return b.qualityScore - a.qualityScore;
     if (b.isHttps !== a.isHttps) return b.isHttps ? 1 : -1;
-    // ★ 穩定排序：同分時按站名 + URL 兜底，避免 V8 非穩定排序
-    //   在同分段內隨機換序 → REX「繼續播放」按位置/名稱回找時偶發對不上。
-    //   純排序行為，不改變任何內容與分數。
-    const an = String(a.name || ''), bn = String(b.name || '');
-    if (an !== bn) return an < bn ? -1 : 1;
-    const au = String(a.url || ''), bu = String(b.url || '');
-    if (au !== bu) return au < bu ? -1 : 1;
     return 0;
   });
   
@@ -8475,18 +8947,7 @@ targetInfo.searchQuery = aliasQ;
         // 沒探測到的 URL 仍寫入 cache（保守策略，下次重搜時它們會被探測）。
         // 探測為 dead 的 URL 不寫 cache。
         const deadUrls = new Set(probeUrls.filter((_, i) => !alive[i]));
-        // ★ 實測清晰度（master m3u8 RESOLUTION）：只對活著的 URL 探，
-        //   與 HEAD 存活探測同一個背景 IIFE，不阻塞回傳。只讀 playlist 文字，
-        //   不下載任何 .ts 分片；單檔 TS 無 STREAM-INF 會回 null（預期內，
-        //   保留站方標註）。結果寫進 in-memory + 隨 cache 持久化，
-        //   下次 cache 命中時直接顯示「📺 實測…」行。
-        try {
-          const aliveList = probeUrls.filter((_, i) => alive[i]);
-          const resLimit = Math.min(CONFIG.ACTUAL_RES_PROBE_LIMIT ?? 20, aliveList.length);
-          if (resLimit > 0) await probeActualResolutions(aliveList.slice(0, resLimit));
-        } catch {}
         const cacheable = finalResults.filter(r => !r.url || !deadUrls.has(r.url));
-        try { applyActualResolutions(cacheable); } catch {}
         if (cacheable.length > 0) {
           Widget.storage?.set?.(cacheKey, JSON.stringify(cacheable), CONFIG.CACHE_TTL);
           console.log(`💾 已缓存 ${cacheable.length} 个结果`);
@@ -8803,31 +9264,6 @@ function filterBySequel(results, targetInfo) {
   const yearsOfMatched = sequelMatched.map(yearOf).filter(Boolean);
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
-  // ★ 規則 1 前置：目標主片名（去副標題/去尾數/去虛詞）。
-  //   實測海王2（targetSeason=2）：「上海王2」sequel 也是 2，舊規則 1
-  //   「sequel===targetSeason → 無條件 kept」直接放行，同序號不同片混入。
-  //   回到未來3 同理（「挑戰未來3：殘酷獵殺」sequel=3）。
-  //   isSmartSeriesMatch 雖已擋（none 不 match），但 batch 路徑的
-  //   filterBySequel 是獨立第二道門，必須同樣認主片名。
-  //   與 isSmartSeriesMatch 的 coreMatches 同義（相等/去虛詞相等/去尾數相等）。
-  const _stripFillerFS = (s) => String(s || '').replace(/的|之/g, '');
-  let _tCore = '', _tCoreNoDigit = '';
-  try {
-    const _tBase = String(targetInfo?.baseName || targetInfo?.rawName || '');
-    _tCore = normalizeTitleForMatch(stripSubtitle(_tBase).replace(/完结篇|完結篇/g, ''));
-    _tCoreNoDigit = _stripFillerFS(_tCore).replace(/\d+$/, '');
-  } catch {}
-  const _coreMatchesFS = (rawName) => {
-    if (!_tCore) return true;
-    try {
-      let cCore = normalizeTitleForMatch(stripSubtitle(String(rawName || '')).replace(/完结篇|完結篇/g, ''));
-      if (!cCore) return false;
-      if (cCore === _tCore || _stripFillerFS(cCore) === _stripFillerFS(_tCore)) return true;
-      const cNoDigit = _stripFillerFS(cCore).replace(/\d+$/, '');
-      return Boolean(_tCoreNoDigit && cNoDigit && _tCoreNoDigit === cNoDigit);
-    } catch { return true; }
-  };
-
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
   const unversionedBases = new Map();
@@ -8871,13 +9307,7 @@ function filterBySequel(results, targetInfo) {
       dropped.push(res); continue;
     }
 
-    if (sequel === targetSeason) {
-      // ★ 規則 1 收斂：同序號還必須主片名一致，不同片（上海王2 vs 海王2、
-      //   挑戰未來3 vs 回到未來3）即使序號相同也 drop。
-      //   安全網：主片名抽不到（_tCore 空）時維持舊行為全放行，避免誤殺。
-      if (!_coreMatchesFS(rawName)) { dropped.push(res); continue; }
-      kept.push(res); continue;
-    }
+    if (sequel === targetSeason) { kept.push(res); continue; }
 
   // 規則 X：candidate 的 sequel 明確標示為其他季，無條件 drop。
   //
@@ -9105,16 +9535,6 @@ function filterBySequel(results, targetInfo) {
 function filterByTargetVersion(results, targetInfo) {
   // 目標帶年份：只留同年份與無年份的候選。
   if (targetInfo.year) {
-    // ★ 電影不做年份硬過濾（TV 維持原行為）。
-    //   原因：REX 詳細頁的 premiereDate 是「全片首映年」（如大話西遊 1995），
-    //   但 MacCMS 站的 vod_year 常是「重映/上架年」（如意回 2014）或缺欄位，
-    //   硬比會把同部片的不同語言版整批殺掉（大話西遊只剩樂子正是如此）。
-    //   電影續集靠 filterBySequel（序號+年份群）區分，慢版/重映版都該留給
-    //   使用者用版本標籤自己挑 —— 與下方「目標沒帶年份：兩個版本都留」的
-    //   策略一致。TV 不受影響（仁医日/韓版仍靠此處分開）。
-    if (targetInfo?.type === 'movie') {
-      return results;
-    }
     const want = String(targetInfo.year);
     const before = results.length;
     const filtered = results.filter(res => {
@@ -9162,7 +9582,7 @@ async function performSmartSearch(params, onStreamResult) {
   const startTime = Date.now();
 
   const siteManager = new SiteManager();
-  const resourceSites = _filterMacSites(parseResourceSites(VodData), params);
+  const resourceSites = parseResourceSites(VodData);
   const sortedSites = siteManager.initializeSites(resourceSites);
 
   const targetInfo = extractEnhancedInfo(seriesName);
@@ -9258,7 +9678,9 @@ targetInfo.searchQuery = aliasQ;
   const smartAdapterSites = _adapterIsEnabled(params)
     ? _adapterActiveSites(params)
     : [];
-  const executor = new SmartSearchExecutor(siteManager, targetInfo, type, matchStrictness, targetEpisode, smartAdapterSites);
+  // 官方線路開關（globalParams.officialEnabled / params.officialEnabled）。
+  const smartOfficialEnabled = (typeof _officialIsEnabled === 'function') ? _officialIsEnabled(params) : true;
+  const executor = new SmartSearchExecutor(siteManager, targetInfo, type, matchStrictness, targetEpisode, smartAdapterSites, smartOfficialEnabled);
   
   const allResults = await executor.search(onStreamResult);
   
@@ -9293,7 +9715,7 @@ async function performBatchSearch(params) {
   console.log(`🔍 启动批量搜索: ${seriesName}`);
   const startTime = Date.now();
   
-  const resourceSites = _filterMacSites(parseResourceSites(VodData), params);
+  const resourceSites = parseResourceSites(VodData);
   if (resourceSites.length === 0) {
     return [];
   }
@@ -9395,7 +9817,7 @@ targetInfo.searchQuery = aliasQ;
   //   兼容：舊 key（vod_batch_..._e${ep} 含全部類型）保留讀取。命中時
   //   legacy 結果會跟 mac / ad 結果合併（用 url 去重），讓使用者無感升級；
   //   30 分鐘後舊 key 自然過期，不再佔用 storage。
-  const baseCacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}_sites${_siteSelectionTag(params)}`;
+  const baseCacheKey = `vod_batch_${normalizeTitleForMatch(targetInfo.baseName)}_sq${batchSequel ?? 'x'}_y${batchVersion}_a${targetInfo.region ?? 'x'}_s${targetSeason}_${type}`;
   const macCacheKey = baseCacheKey + '_mac';
   const adCacheKey  = baseCacheKey + `_adapter_e${targetEpisode || 'all'}`;
   // 舊格式 key（向後相容：v 之前的版本存進去的整批結果）
@@ -9457,14 +9879,10 @@ targetInfo.searchQuery = aliasQ;
         const isInAd  = adCached.some(a => a.url === r.url);
         return !isInMac && !isInAd;
       });
-      const merged = _filterResultsBySiteSelection([...macCached, ...adCached, ...fromLegacy], params);
+      const merged = [...macCached, ...adCached, ...fromLegacy];
       if (merged.length > 0) {
         console.log(`💾 batch cache 命中: mac=${macCached.length} adapter=${adCached.length} legacy=${fromLegacy.length}（合併 ${merged.length}）`);
         allResults = merged;
-        // ★ 實測清晰度：純 in-memory 套用（無網路，不阻塞）。背景已探到的
-        //   master RESOLUTION 會在這裡顯示出「📺 實測…」行；還沒探到的
-        //   這次不顯示，下次命中時會有。
-        try { applyActualResolutions(allResults); } catch {}
         // ★ 記住「哪邊 cache 命中」：決定要不要重抓補上 miss 的部分。
         //
         //   修正前：合併後 non-empty 就直接跳過搜尋 → adapter miss 時
@@ -9516,6 +9934,11 @@ targetInfo.searchQuery = aliasQ;
     allResults.length === 0
     || (!_adapterCacheHit && _adapterIsEnabled(params))
     || (!_macCacheHit && allResults.length > 0)
+    // ★ 官方線路缺失時也要進搜尋區段：升級後舊 cache 只有 MacCMS/adapter，
+    //   沒有 _officialSite 條目；若不加這條，_needRefetch=false 會直接跳過
+    //   搜尋，官方線路永遠跑不到。
+    || ((typeof _officialIsEnabled === 'function' ? _officialIsEnabled(params) : true)
+        && !allResults.some(r => r && r._officialSite))
   );
   if (_needRefetch) {
     const stats = { total: resourceSites.length, success: 0, failed: 0 };
@@ -9667,6 +10090,21 @@ targetInfo.searchQuery = aliasQ;
         );
         for (const r of perSiteSettled) if (r && r.length) adapterResults.push(...r);
         return adapterResults;
+      });
+    }
+
+    // ===== 官方線路（zen.cheyong 官方索引＋第三方解析，與 MacCMS/adapter 並行）=====
+    //
+    // 純直連 CDN、無廣告，速度最快。失敗回 []（內部已保護），不影響主流程。
+    // 已有官方結果（cache 命中）時跳過，避免每次切集都重打官方索引。
+    if ((typeof _officialIsEnabled === 'function' ? _officialIsEnabled(params) : true)
+        && !allResults.some(r => r && r._officialSite)) {
+      requestTasks.push(async () => {
+        try {
+          return await _officialFetch(params, targetInfo, type, targetEpisode, targetSeason);
+        } catch (e) {
+          return [];
+        }
       });
     }
 
@@ -10287,18 +10725,7 @@ targetInfo.searchQuery = aliasQ;
     const aMedia = isDirectMediaUrl(a.url) ? 0 : 1;
     const bMedia = isDirectMediaUrl(b.url) ? 0 : 1;
     if (aMedia !== bMedia) return aMedia - bMedia;
-    // ★ 硬性 tier（使用者要求）：粵語置頂，其次金牌影視 > 電影天堂 > 如意資源。
-    const aLang = _langRankOf(a), bLang = _langRankOf(b);
-    if (aLang !== bLang) return aLang - bLang;
-    const aSite = _siteRankOf(a), bSite = _siteRankOf(b);
-    if (aSite !== bSite) return aSite - bSite;
-    if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
-    // ★ 穩定排序：同分時按站名 + URL 兜底（理由見 smart 路徑同名註解）。
-    const an = String(a.name || ''), bn = String(b.name || '');
-    if (an !== bn) return an < bn ? -1 : 1;
-    const au = String(a.url || ''), bu = String(b.url || '');
-    if (au !== bu) return au < bu ? -1 : 1;
-    return 0;
+    return b._finalScore - a._finalScore;
   });
 
   const fieldsToDelete = ['_finalScore', '_matchType', '_matchScore', '_seasonMatch',
@@ -10335,32 +10762,13 @@ targetInfo.searchQuery = aliasQ;
   //   • MacCMS（無 _adapterSite）→ macCacheKey，與舊內容按 url 去重合併
   //     （跨集累積，避免從 E5 開始搜時把 E1~E4 洗掉）
   //   • Adapter（有 _adapterSite）→ adCacheKey，直接覆蓋（綁定單集）
-  // ★ 實測清晰度先套 in-memory 已探到的（無網路，不阻塞回傳）。
-  try { applyActualResolutions(finalResults); } catch {}
   if (finalResults.length > 0 && CONFIG.CACHE_TTL > 0) {
-    // ★ 背景補探 master RESOLUTION + 分流寫 cache（同一個 IIFE，保證順序）。
-    //   只讀 playlist 文字、不下 .ts；探完把「📺 實測…」寫進結果再持久化，
-    //   下次命中直接顯示。不阻塞 return（fire-and-forget，與 smart 路徑同策略）。
-    //   必須同一個 IIFE：分開兩個 IIFE 會有競速 —— 寫 cache 的 IIFE 可能搶在
-    //   探測完成前把「無實測」的結果先寫進去，實測永遠存不進 cache。
-    (async () => {
-      try {
-        const seen = new Set();
-        const urls = [];
-        for (const r of finalResults) {
-          if (!r || typeof r.url !== 'string' || seen.has(r.url)) continue;
-          seen.add(r.url);
-          urls.push(r.url);
-          if (urls.length >= (CONFIG.ACTUAL_RES_PROBE_LIMIT ?? 20)) break;
-        }
-        if (urls.length > 0) await probeActualResolutions(urls);
-        try { applyActualResolutions(finalResults); } catch {}
-      } catch {}
-      try {
+    try {
       const macResults = finalResults.filter(r => !r._adapterSite);
       const adResults  = finalResults.filter(r => !!r._adapterSite);
 
       if (macResults.length > 0) {
+        (async () => {
           let toWrite = macResults;
           try {
             const oldMac = parseCacheValue(await Widget.storage?.get?.(macCacheKey));
@@ -10398,6 +10806,7 @@ targetInfo.searchQuery = aliasQ;
             }
           } catch (e) { /* 合併失敗時直接寫 macResults */ }
           try { Widget.storage?.set?.(macCacheKey, JSON.stringify(toWrite), CONFIG.CACHE_TTL); } catch {}
+        })();
       }
 
       if (adResults.length > 0) {
@@ -10406,8 +10815,7 @@ targetInfo.searchQuery = aliasQ;
           console.log(`💾 adapter cache 寫入(過濾後): ${adResults.length} 條（key=..._adapter_e${targetEpisode || 'all'}）`);
         } catch (e) {}
       }
-      } catch (e) {}
-    })();
+    } catch (e) {}
   }
 
   return finalResults.slice(0, 100);
@@ -10600,23 +11008,11 @@ async function loadDetail(link) {
     //
     //   各季 cache key 獨立（loadResource 內部 _s${season}），切回舊季
     //   命中快取，不重打站台。
-    //
-    //   ★ 電影快速路徑（0 影響優化）：type === 'movie' 時只抓當前這一部。
-    //   原因：下方回傳對 movie 既不帶 episodeItems 也不帶 childItems，
-    //   多季合併的結果對 movie 完全用不上（僅影響「完全沒命中時的 fallback
-    //   季」這種極端分支）。舊寫法讓每部電影詳情頁都觸發 3 次全站 batch
-    //   搜尋（S1+S2+S3），切換系列（回到未來 1→2→3）時每次都要等最慢的
-    //   那季，體感就是「轉換系列要重新加載很慢」。
-    //   改後 movie 只跑 1 次 loadResource（cache 命中時 < 200ms），TV 路徑
-    //   原封不動。若單部 0 結果，再補抓其餘季做 fallback，語意與舊版一致。
     const explicitSeason = meta.season ?? null;
 
-    const isMovieDetail = type === 'movie';
-    const seasonsToFetch = isMovieDetail
-      ? [season]
-      : (explicitSeason != null
-        ? [...new Set([explicitSeason, 1, 2])]
-        : [1, 2, 3]);
+    const seasonsToFetch = explicitSeason != null
+      ? [...new Set([explicitSeason, 1, 2])]
+      : [1, 2, 3];
     const seenKey = new Set();
     let allResults = [];
     // ★ 併發抓多季：三個 loadResource 各自走獨立 cache key（_s${s}），
@@ -10633,7 +11029,9 @@ async function loadDetail(link) {
         searchMode: 'batch',
         matchStrictness: 'standard',
         preferResolution: 'auto',
+        multiSource: (WidgetMetadata.globalParams.find(p => p.name === 'multiSource') || {}).value || 'enabled',
         VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
+        m3u8FilterEnabled: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterEnabled') || {}).value || 'enabled',
         m3u8FilterWorkerUrl: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterWorkerUrl') || {}).value || '',
         m3u8FilterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterMode') || {}).value || 'filter',
         // 簽名型 adapter 站是否繞開過濾廣告伺服器。漏了這行會讓「相關作品」
@@ -10662,49 +11060,6 @@ async function loadDetail(link) {
         allResults.push(r);
       }
       console.log(`📡 [loadDetail] 季 S${s}: ${batchResults.length} 條（去重後累計 ${allResults.length}）`);
-    }
-    // ★ 電影 fallback：單部 0 結果時補抓其餘季，語意與舊版三季合併一致。
-    //   只在「首抓完全沒東西」時觸發一次；正常命中時零額外成本。
-    //   TV 路徑不受影響（isMovieDetail 為 false 直接跳過）。
-    if (isMovieDetail && allResults.length === 0) {
-      const fallbackSeasons = [1, 2, 3].filter((s) => !seasonsToFetch.includes(s));
-      if (fallbackSeasons.length > 0) {
-        try {
-          const fallbackArrays = await Promise.all(
-            fallbackSeasons.map((s) => loadResource({
-              seriesName: title,
-              title,
-              type,
-              season: s,
-              episode,
-              id,
-              link,
-              searchMode: 'batch',
-              matchStrictness: 'standard',
-              preferResolution: 'auto',
-              VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
-              m3u8FilterWorkerUrl: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterWorkerUrl') || {}).value || '',
-              m3u8FilterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterMode') || {}).value || 'filter',
-              m3u8FilterAdapterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterAdapterMode') || {}).value || 'skip',
-            }))
-          );
-          for (let fi = 0; fi < fallbackSeasons.length; fi++) {
-            const s = fallbackSeasons[fi];
-            const batchResults = fallbackArrays[fi] || [];
-            for (const r of batchResults) {
-              if (!r.url) continue;
-              if (r.season == null) r.season = s;
-              const dkey = `s${r.season}||${r.url}`;
-              if (seenKey.has(dkey)) continue;
-              seenKey.add(dkey);
-              allResults.push(r);
-            }
-            console.log(`📡 [loadDetail] 電影 fallback 季 S${s}: ${batchResults.length} 條（去重後累計 ${allResults.length}）`);
-          }
-        } catch (e) {
-          console.warn('[loadDetail] 電影 fallback 失敗:', e?.message || e);
-        }
-      }
     }
     const results = allResults;
 
