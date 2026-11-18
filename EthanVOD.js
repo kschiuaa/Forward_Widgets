@@ -1313,7 +1313,17 @@ const CONFIG = {
 // remark 的集數進度/完結狀態/純畫質字一律丟，只剩「第32集」；
 // 片名尾「粵語版/國語版」的「版」後綴跟著語言一起剝（語言由 🌐︎ 行承擔）。
 // 舊 cache 描述帶雜訊尾巴，清掉重搜後乾淨。
-  WIDGET_VERSION: 72,
+// bump 到 73：移植綜藝日期集映射＋搜索提速（與舊版 62 對齊）。
+// 綜藝：_macEpNumber 守門（日期/期號不當集數）＋期序×上/下換算 E1~E20＋
+// 單段期補位＋不可靠站不搶集號＋Rex 傳 tv 時 isVariety/日期段兜底＋
+// adapter fallback 不再冒充要求集數；提速：t/去t 並行雙發＋重試零退避＋
+// 樂子站免首次必敗＋host 子串匹配。舊 cache 集號/描述是舊規則，清掉重搜。
+// bump 到 74：取消無畫質字眼時硬標 720P（改回「未知」）。
+// 根因：站方文字無畫質資訊時不應猜測，硬標會把低清/未知源誤導進
+// 720P 篩選。等 probe 測到 actualResolution 再由
+// applyActualResolutions 按實測升級；缺欄位兜底同樣只補「未知」。
+// 舊 cache 內全是預設 720P，清掉重搜後未知保持未知。
+  WIDGET_VERSION: 74,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1572,7 +1582,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.8.0",
+  version: "3.8.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2396,19 +2406,10 @@ function extractResolutionInfo(vodName, epName) {
   } else if (/360[Pp]/.test(text)) {
     resolution = { level: 1, label: '360P', isHD: false, is4K: false, tags: [], qualityScore: 5 };
   } else {
-    // ★ 預設 720P（原先是「未知」level 0）。
-    //
-    // 為什麼：MacCMS 站的集名幾乎都是「第01集」這種純集數，vod_name /
-    // vod_remarks 也常只有「已完结」—— 站方文字裡根本沒有畫質字眼，
-    // 全部落到「未知」。REX 的 720P/1080P 篩選讀的是結構化欄位
-    // （resolution / resolutionLevel），「未知」一律進「其他」。
-    // 只有金牌（jpyy 自帶 resolution 數字）能進篩選，正是本次問題。
-    //
-    // 預設 720P 的依據：這些 CDN m3u8 實測多為 960x540~1080x608
-    // （高清檔），標 720P 比「未知」誠實；probe 回來後
-    // applyActualResolutions 會按實測糾正（升级结构化字段）。
-    // 分數 15（低於明示 720P 的 20）：同站「明示畫質」仍排在前面。
-    resolution = { level: 3, label: '720P', isHD: true, is4K: false, tags: [], qualityScore: 15 };
+    // 沒有畫質字眼 → 保持「未知」（不猜）。
+    // 站方文字無畫質資訊時不應硬標 720P，否則低清/未知源會被誤導進
+    // 720P 篩選。等 probe 測到 actualResolution 再由
+    // applyActualResolutions 按實測糾正。
   }
   
   if (/HDR|杜比/.test(text)) {
@@ -3090,6 +3091,18 @@ function _macEpNumber(epName) {
   // 「第01集」「第1期」「第1話」「第2回」（含全形話/回與空白）
   let m = s.match(/第\s*0*(\d+)\s*[集期話话回]/);
   if (m) {
+    // ★ 綜藝日期集守門：「第20251225期」這類 8 位日期不能當集數。
+    //   實測「日落时分说爱你」站方集名全是「第20251225期」格式，
+    //   直接 parse 會得到 episode=20251225，下游 filterByEpisode
+    //   永遠對不上目標集（1~20）→ 整站被殺光。5 位以上數字一律視為
+    //   日期/序號而非集數，回 null 交給 variety 期序邏輯處理。
+    if (String(m[1]).replace(/^0+/, '').length > 4) return null;
+    // ★ 期號不是集數：「第10期上」「第3期」這類綜藝期次標記不能當成第 10 集。
+    //   綜藝的集數由「期序 × 上/下」換算（見 extractPlayInfoForCache），
+    //   若這裡直接回 10，會蓋掉換算結果 → 集號錯亂。
+    //   判別：集名裡出現「期」且該數字後還有文字 → 是期次標記。
+    //   （純「第3期」也視為期次 → 綜藝站統一用期序換算）
+    if (/期/.test(m[0]) && s.slice(m.index + m[0].length).trim().length > 0) return null;
     const n = parseInt(m[1], 10);
     if (Number.isFinite(n) && n > 0) return n;
   }
@@ -3102,6 +3115,11 @@ function _macEpNumber(epName) {
   // 純數字「01」「3」
   m = s.match(/^\s*0*(\d+)\s*$/);
   if (m) {
+    // ★ 純 8 位日期（「20251222」）不是集數。
+    //   實測如意站第一段就是「20251222」，直接 parse 會得到
+    //   episode=20251222 → filterByEpisode 永遠對不上目標集。
+    //   5 位以上數字一律視為日期/序號，回 null 交給 variety 期序邏輯。
+    if (String(m[1]).replace(/^0+/, '').length > 4) return null;
     const n = parseInt(m[1], 10);
     if (Number.isFinite(n) && n > 0) return n;
   }
@@ -3495,7 +3513,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     // 使用者要播的那一集（挑不到時的落點規則見下）
     const wantEp = item._adapterTargetEpisode;
     let idx = -1;
-    if (type === 'tv' && wantEp != null) {
+    if ((type === 'tv' || type === 'variety') && wantEp != null) {
       idx = episodes.findIndex(e => _adapterEpNumber(e.name) === wantEp);
     }
     // 落點是否為「代替」而非使用者指定的本集。
@@ -3506,7 +3524,7 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     // 而不是「這集不存在，給你看最新一集」。後者才是合理的降級。
     let isFallbackEp = false;
     if (idx < 0) {
-      isFallbackEp = (type === 'tv' && wantEp != null);
+      isFallbackEp = ((type === 'tv' || type === 'variety') && wantEp != null);
       // 落到最後一集的理由：forward 在未指定集數時，UI 預設停在最新一集。
       // 對多集影集而言這才符合使用者預期（MacCMS movie 分支取第一個 m3u8
       // 是因為電影只有一集，那個「第一」其實也是「唯一」）。
@@ -3622,11 +3640,16 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         //   會把 _ep 提升為 episode，但那是輸出階段；此處 resources 直接
         //   進 cache/stream，仍需自帶）。理由見 cleanResourceForOutput 註解。
         //
-        // ★ fallback 時回報「使用者要求的集數」而非實際取到的那一集：
-        //   這是為了通過後段的 filterByEpisode（label === targetEpisode）。
-        //   真實集數仍保留在 _epActualEp，log 與除錯看得到實際值。
-        episode: isFallbackEp && Number.isFinite(wantEp)
-          ? wantEp
+        // ★ fallback 時不再冒充「使用者要求的集數」。
+        //   實測 E6：jpyy 站內無 E6（集名是日期 20260301），舊邏輯把
+        //   最後一集硬標 episode=6（_adapterFallbackEp=true），導致
+        //   filterByEpisode 認為 hasExact=true，把 138 條 _ep=null 的
+        //   MacCMS 候選全部殺光，只剩這條錯的。
+        //   改法：fallback 回報 null（_ep 同步 null，label 才會是 null），
+        //   有精確匹配時它被過濾掉；無精確匹配時 null 會被保留，
+        //   「給你看最新一集」的降級仍然成立。
+        episode: isFallbackEp
+          ? null
           : (Number.isFinite(epNumber) ? epNumber : null),
 
         // 保留 adapter 身分，供去重與 log 判斷
@@ -3652,7 +3675,9 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         // 沒有這行 cleanResourceForOutput 永遠讀不到 _groupLabel，
         // 描述內的 [红牛]、[非凡] 等等就會一直留著。
         _groupLabel: r?._groupLabel || null,
-        _ep: Number.isFinite(epNumber) ? epNumber : null,
+        // ★ fallback 時 _ep 同步 null（與上面的 episode 一致），否則
+        //   episodeLabelOf 會退回讀 _ep（20260301），冒充行為仍在。
+        _ep: isFallbackEp ? null : (Number.isFinite(epNumber) ? epNumber : null),
         // 實際取到的集數（fallback 時與 episode 不同），僅供 log／除錯
         _epActualEp: Number.isFinite(epNumber) ? epNumber : null,
         _adapterFallbackEp: isFallbackEp,
@@ -3786,15 +3811,244 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     const sourceName = sourceNames[i] || '預設源';
     const isTV = playSource.includes('#');
 
-    if (type === 'tv' && isTV) {
+    // ★ 綜藝（variety）走與 tv 相同的多集分支：站方綜藝也是「一條 vod_play_url 內多段」
+    //   （上/下/加更/日期集）。之前只認 type==='tv'，variety 直接掉到 movie 分支
+    //   判定失敗 → 整站回 []（實測「日落时分说爱你」type=variety 時 4 站全滅）。
+    if ((type === 'tv' || type === 'variety') && isTV) {
       const episodes = playSource.split('#').filter(Boolean);
-      episodes.forEach(ep => {
+      // ★ 綜藝日期集 → TMDb 集數的映射（本次維修核心）。
+      //
+      // 實測「日落时分说爱你」四站回包：
+      //   非凡：46 段，集名全是「第20251225期」「第20260218期上」…
+      //   樂子／電影天堂：49 段，「20251225上」「20260101下」…＋29 個加更
+      //   TMDb：Season 1 僅 20 集（10 期 × 上/下）
+      //
+      // 站方日期集名與 TMDb 序號沒有直接對應關係，不能靠日期算集數。
+      // 可用的對應是「日期集的順序」：站方把正片按播出順序排列，
+      // 先導片/加更混在其間。因此這裡：
+      //   1. 過濾掉非正片段（先導片／加更／花絮／片頭…），
+      //   2. 剩下的正片段依順序編 1,2,3…N → 對應 TMDb 的 E1~E20。
+      // 上/下兩段是同一期的上下半 → 各佔一格（TMDb 也是分兩集）。
+      //
+      // 只有當站方本身用「第N集/第N期」連號命名時才走原本的數字抽取。
+      // ★ Rex 對綜藝常傳 type='tv'（詳情頁 link 帶 type=tv），只認
+      //   type==='variety' 會讓綜藝映射整段失效（實測 E6：100+ 條 MacCMS
+      //   _ep 全 null，被 jpyy 一條 fallback 冒充 E6 殺光）。
+      //   補兩道兜底：targetInfo.isVariety，或集名本身像綜藝日期段
+      //   （8 位日期 / 上下半 ≥3 段即判定為綜藝，電視劇不會這樣命名）。
+      let _varietyMode = type === 'variety' || targetInfo?.isVariety === true;
+      if (!_varietyMode) {
+        try {
+          let _dateLike = 0;
+          for (const _ep of episodes) {
+            const _nm = String(_ep.split('$')[0] || '');
+            if (/\d{8}/.test(_nm) || /上\s*$|下\s*$|上半|下半/.test(_nm)) _dateLike++;
+            if (_dateLike >= 3) break;
+          }
+          if (_dateLike >= 3) _varietyMode = true;
+        } catch {}
+      }
+      // 正片段的「期序」對照表：index → { period, isUp, isDown }
+      const _varietyPeriod = new Map();
+      // ★ 期號 → 該期段列表（給單段期 E2 補位用，需在外層可見）。
+      const _varietyByPeriod = new Map();
+      if (_varietyMode) {
+        // 先掃全部集名，判定每段屬於第幾期、以及是上/下/單段
+        const _periodRows = [];
+        episodes.forEach((ep, idx) => {
+          const nm = String(ep.split('$')[0] || '').trim();
+          // 非正片段 → 不佔 TMDb 集號（先導片／加更／陪你追日落／花絮…）
+          if (/先导|先導|加更|陪你追日落|花絮|片头|片頭|片尾|預告|预告|幕後|幕后|特輯|特辑|彩蛋|片段|reaction|REACTION|精编|精編|純享|纯享/i.test(nm)) return;
+          // 期號：集名裡明示的「第N期」優先（日期型的「第20251225期」要排除）
+          let period = null;
+          const pm = nm.match(/第\s*0*(\d+)\s*期/);
+          if (pm && String(pm[1]).replace(/^0+/, '').length <= 4) {
+            period = parseInt(pm[1], 10);
+          }
+          const isUp = /上\s*$|上半/.test(nm);
+          const isDown = /下\s*$|下半/.test(nm);
+          // ★ 純日期段（「20251222」「第20251225期」，無上/下標記）
+          //   → 視為該期的「正篇」（上半）。
+          //   實測如意站第一段是「20251222」＝第1期的正篇，
+          //   下一段「20251225上」「20251226下」＝第2期的上下 → TMDb E3/E4。
+          //   若不這樣處理，這一段會被 _macEpNumber 誤判成 E20251222，
+          //   並讓後續所有期序整體偏移 1（E3 變 E4…）。
+          const isDateOnly = /\d{8}$/.test(nm) || /第\d{8}期$/.test(nm);
+          _periodRows.push({ idx, nm, period, isUp, isDown, isDateOnly });
+        });
+        // ★★ 站點可靠性判斷（本次維修的關鍵）★★
+        //
+        // 只有「上/下」標記覆蓋足夠多的站才做期序映射。
+        //
+        // 實測「日落时分说爱你」四站：
+        //   如意／樂子／電影天堂：22 / 49 / 49 段，其中 20 段帶「上/下」
+        //        → 結構與 TMDb 的 20 集完全對齊 ✔
+        //   非凡：46 段，只有 4 段帶「上/下」（僅最後兩期），
+        //        其餘 42 段是「第20251225期」這種**日期期號**，
+        //        而且連加更日也被標成「第X期」→ 無法反推真正的期序 ✘
+        //
+        // 若對非凡也硬做期序映射，會得到 E1..E85（43 個日期組各算一期），
+        // 這 45 筆會污染全域的集號分佈，把其他站正確的 E1~E20 擠掉。
+        //
+        // 所以：上下標記少於「正片段數的一半」→ 該站判定為「日期集站」，
+        //       不賦集號（_ep=null），交由其他站提供正確的 E1~E20。
+        //       該站的資源仍會出現在詳情頁（作為該集的候選來源之一），
+        //       只是不搶占集號。
+        const _markedCount = _periodRows.filter(r => r.isUp || r.isDown).length;
+        const _reliable = _markedCount >= 2 && _markedCount * 2 >= _periodRows.length;
+
+        if (!_reliable) {
+          console.log(`⚠️ [variety] ${siteTitle} 上下標記僅 ${_markedCount}/${_periodRows.length} 段，`
+            + `判定為日期集站 → 不賦集號（避免污染 TMDb E1-E20 對應）`);
+          // ★ 只清空「期序對照表」，不清掉 _periodRows 本身。
+          //   _periodRows 是「哪些段是正片、哪些是加更」的判斷依據，
+          //   清掉會讓該站所有資源都被當成加更而丟棄（實測非凡站會變 0 筆）。
+          //   正確做法：該站的段全部不進映射表 → _ep=null（不搶集號），
+          //   但資源本身仍會輸出，使用者仍能在詳情頁看到該站的線路。
+        }
+
+        // 沒寫期號的：依「上/下配對」規則補期序。
+        //   站方日期是「播出日」不是「期號」，無法從日期反推。
+        //   實測如意站：20251225上 / 20251226下 = 同一期（期1的上下）
+        //             20260108上 / 20260109下 = 同一期（期5的上下）
+        //   規則：相鄰的「上→下」配對算同一期，其餘單段各算一期。
+        //   若站方明示「第10期」（如 20260219第10期上）則直接採用。
+        const _rows2 = [];
+        let autoPeriod = 0;
+        for (const row of _periodRows) {
+          if (row.period != null) {
+            autoPeriod = Math.max(autoPeriod, row.period);
+            _rows2.push({ ...row });
+            continue;
+          }
+          const prev = _rows2[_rows2.length - 1];
+          // ★ 「上→下」相鄰配對 = 同一期。
+          //   前一段只要是「上」或「純日期段」都算 ——
+          //   實測如意站第1段是純日期「20251222」（無上/下），
+          //   接著是「20251225上」「20251226下」。
+          //   若只認 isUp，純日期段會自成一期 → 往後全部偏移。
+          if (prev && row.isDown && (prev.isUp || prev.isDateOnly) && !prev.isDown) {
+            _rows2.push({ ...row, period: prev.period });
+            continue;
+          }
+          autoPeriod += 1;
+          _rows2.push({ ...row, period: autoPeriod });
+        }
+        // ★ 不可靠站：只標記「這是正片」但不進映射表（_ep 留 null）。
+        if (_reliable) {
+          _rows2.forEach((row) => { _varietyPeriod.set(row.idx, row); });
+        }
+
+        // ★★ 期序 → TMDb 集號的偏移修正 ★★
+        //
+        // 可靠站的結構（實測如意站 21 個正片段）：
+        //   20251222               ← 期1（單段，正篇）
+        //   20251225上 / 20251226下 ← 期2
+        //   20260101上 / 20260102下 ← 期3
+        //   …
+        //   20260218上 / 20260219下 ← 期10
+        //   20260219第10期上 / 下   ← 期10（另一版本，同期重複）
+        //
+        // TMDb 是 10 期 × 上下 = 20 集。
+        // 直接用 (period-1)*2+1 會讓後面全部偏移（缺 E2）。
+        //
+        // 正確算法：**依期號分組後累進**：
+        //   - 每個「期」佔的格數 = 該期段數（單段佔 1 組，上下佔 2 格）
+        //   - 但同一期有多個版本（期10 有 4 段 = 2 組）時，這是**重複內容**
+        //     而非新增集數 → 不應佔額外集號。
+        //
+        // 所以：依期號分組 → 第 N 期（1-based）的起始集號 =
+        //   「前面各期實際佔用的格數總和 + 1」，
+        //   而該期內第一組用這個起始號，若該期有多組，第二組**重用**
+        //   同一組的起始號（不新增格數）。
+        //
+        // 實算（21 段 / 10 期）：
+        //   期1：1 段 → E1        （佔 1 格）
+        //   期2：2 段 → E2, E3    （佔 2 格）
+        //   期3：2 段 → E4, E5
+        //   …
+        //   期10：4 段（2 組）→ 起始 E18；第1組 E18,E19；第2組重用 E18,E19
+        // → 剛好對齊 TMDb E1~E20 ✔
+        //
+        // 實作：先依 period 分組 → 算出每期的起始集號 → 再把段配到集號。
+        //
+        // ★★ 期序 → TMDb 集號的分配 ★★
+        //
+        // 可靠站的結構（實測如意站 21 個正片段）：
+        //   20251222               ← 期1（單段，正篇）
+        //   20251225上 / 20251226下 ← 期2
+        //   20260101上 / 20260102下 ← 期3
+        //   …
+        //   20260218上 / 20260219下 ← 期10
+        //   20260219第10期上 / 下   ← 期10（另一版本，同期重複）
+        //
+        // TMDb 是 10 期 × 上下 = **20 集**，也就是「每期固定佔 2 格」。
+        // 站方第1期只有 1 段（正篇，沒有標「下」），但 TMDb 仍把它
+        // 拆成 2 集 → 所以第1期要佔 E1 + E2（缺的下半留給後續補齊）。
+        //
+        // 分配規則：**每期固定佔 2 格**，該期起始集號 = (期號-1)*2 + 1。
+        //   期1 → E1, E2（站方只有 E1；E2 沒有對應段）
+        //   期2 → E3, E4
+        //   …
+        //   期10 → E19, E20
+        //
+        // 同期的多組（期10 有 2 組）→ 都映射到同一組集號（E19/E20），
+        // 代表「同一集的兩個來源版本」，不新增集號。
+        // 這樣站方 21 段 → 剛好覆蓋 TMDb E1~E20 ✔
+        _varietyByPeriod.clear();
+        for (const row of _rows2) {
+          if (!row.period) continue;
+          if (!_varietyByPeriod.has(row.period)) _varietyByPeriod.set(row.period, []);
+          _varietyByPeriod.get(row.period).push(row);
+        }
+        for (const [period, list] of _varietyByPeriod) {
+          // 該期起始集號：固定每期 2 格（期N → E(2N-1), E(2N)）
+          const start = (period - 1) * 2 + 1;
+          // ★ 該期內的段依序配對成組（上下成對，落單的當單段），
+          //   **所有組都映射到該期的同一組集號**。
+          //
+          //   實測如意站期10 有 4 段：
+          //     20260218上 / 20260219下        ← 組A
+          //     20260219第10期上 / 20260219第10期下 ← 組B（同期的另一版本）
+          //   兩組都是第10期 → 都對應 TMDb 的 E19 / E20。
+          //   組B 是「同一集的另一個來源版本」，不是 E21/E22。
+          //   累進會超 TMDb 的 20 集（實測會跑到 E21/E22）→ 集號錯亂。
+          let i = 0;
+          while (i < list.length) {
+            const cur = list[i];
+            const nxt = list[i + 1];
+            const isPair = cur.isUp && nxt && nxt.isDown;
+            cur.epBase = start;
+            if (isPair) {
+              nxt.epBase = start;
+              i += 2;
+            } else {
+              i += 1;
+            }
+          }
+        }
+        // ★ 只在可靠站寫回映射表（含 epBase）。
+        //   不可靠站（日期集站）的 _ep 留 null → 不搶占 TMDb 的集號，
+        //   但資源本身仍會輸出（見上方 _isVariety / _hasEpInfo 判斷）。
+        if (_reliable) {
+          _rows2.forEach((row) => { _varietyPeriod.set(row.idx, row); });
+        }
+      }
+      episodes.forEach((ep, epIdx) => {
         const [epName, url] = ep.split('$');
         if (url && isPlayableUrl(url)) {
           // ★ 集數抽取必須認全格式（「01」「EP01」「第1話」…），
           //   只認「第N集/期」時其他格式的 _ep=null，切到那集就整批被丟，
           //   使用者看到「這集搜不到」。見 _macEpNumber 註解。
-          const episodeNumber = _macEpNumber(epName);
+          let episodeNumber = _macEpNumber(epName);
+          // ★ 日期集（第20251225期 / 20251225上）→ 依「期序 × 上/下」換算，
+          //   對齊 TMDb 的 E1~E20（見上方映射說明）。
+          if (_varietyMode && episodeNumber === null) {
+            const row = _varietyPeriod.get(epIdx);
+            if (row && row.epBase) {
+              episodeNumber = row.isDown ? row.epBase + 1 : row.epBase;
+            }
+          }
 
           // ★ 綜藝型集名的判斷依據（「第N期」）。
           //
@@ -3905,10 +4159,25 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
             _areaMatch: areaMatch
           };
 
-          results.push(resource);
+          // ★ variety 單段期補位：單段正片同時佔該期的兩格集號。
+          //   實測如意站期 1 只有「20251222」一段，但 TMDb 期 1 佔 E1+E2。
+          //   不補 → E2 全域無來源，點 E2 時 filterByEpisode 退回無集號備選而誤播。
+          //   補法：複製同一條資源，_ep 指向該期的第二格（epBase+1）。
+          //   是否「正確」：導航正確（不斷集、不串期），內容是近似正確
+          //   （E1/E2 播同一段合併正片，而非各自獨立的上下半——上游本來就沒拆）。
+          if (_varietyMode && episodeNumber !== null) {
+            try {
+              const _vrow = _varietyPeriod.get(epIdx);
+              const _plist = _vrow && _vrow.period ? _varietyByPeriod.get(_vrow.period) : null;
+              if (_vrow && _plist && _plist.length === 1 && !_vrow.isDown && _vrow.epBase) {
+                const _dupEp = _vrow.epBase + 1;
+                results.push({ ...resource, _ep: _dupEp });
+              }
+            } catch (_) {}
+          }
         }
       });
-    } else if (type === 'movie') {
+    } else if ((type === 'movie' || type === 'variety') && !isTV) {
       // ★ 電影多版本 `#`：MacCMS 站常把同一部片的多語言/多版本拼在同一條
       //   playSource（`HD国语$url1#HD粤语$url2`），`#` 在這裡不是「多集」，
       //   而是「多版本」。舊條件 `type === 'movie' && !isTV` 遇到 `#` 就整條
@@ -4081,9 +4350,29 @@ const SITES_REJECTING_TYPE_PARAM = new Set([
   // 上面三個短字串是歷史遺留、實際靠執行時 fallback 記住，這裡不動它們）。
   'https://bfzyapi.com/api.php/provide/vod',
   'https://api.1080zyku.com/inc/apijson.php',
+  // ★ 綜藝實測（2026-11）：樂子站帶任何 t（1/2/3/4）都回 total=107 但 list=[]
+  //   （分類過濾在站方實現有 bug），不帶 t 才回 20 條。直接免去第一次必敗請求。
+  'lziapi.com',
+  'cj.lziapi.com',
 ]);
 
 const REJECTING_TYPE_STORAGE_KEY = 'vod_sites_rejecting_t';
+
+// ★ 提速（结果不变）：域名子串匹配。旧代码用 Set.has(完整URL) 比对，
+//   而集合里存的是域名片段（'dyttzyapi.com'），永远匹配不上，
+//   导致已知拒绝 t 的站每次仍双发（带t空跑一次）。改成子串匹配后，
+//   已知站只发单次（去 t），未知站仍双发并行，结果逐字相同。
+function isRejectingTypeSite(urlOrValue) {
+  try {
+    const s = String(urlOrValue || '');
+    if (!s) return false;
+    if (SITES_REJECTING_TYPE_PARAM.has(s)) return true;
+    for (const m of SITES_REJECTING_TYPE_PARAM) {
+      if (m && s.includes(m)) return true;
+    }
+    return false;
+  } catch { return false; }
+}
 
 // 官方 @rexnow/libs 的 storage.set/get 用字串介面，本地儲存的快取必須先
 // 序列化。舊資料若是陣列（自行 mock 的環境）也要能讀出來 —— 用這個 helper
@@ -4427,7 +4716,7 @@ function applyActualResolutions(results) {
       //   只改 description 不改欄位 → 篩選永遠進「其他」。
       //   規則：TC/槍版（qualityScore===8）不升級 —— 實測像素再高也是槍版，
       //   升級會把「搶先版」洗成 1080P 正片；其餘一律以實測為準
-      //   （含往下糾正：預設 720P 實測 480P 也要認）。
+      //  （含未知來源實測出 480P 也要認，不硬猜）。
       //   id 穩定性：_stableSourceId 已不再含 resolution，升級不漂 id，
       //   REX「繼續播放」不受影響。
       try {
@@ -4459,7 +4748,20 @@ async function loadRejectingTypeSites() {
 }
 
 function rememberRejectingTypeSite(siteValue) {
-  SITES_REJECTING_TYPE_PARAM.add(siteValue);
+  // ★ 只存 host 片段而非完整 URL：调用端传的是完整 API 地址，
+  //   直接存完整串会让集合无限膨胀；存 host 后 isRejectingTypeSite
+  //   用子串匹配仍能命中，且 storage 体积稳定。
+  try {
+    const s = String(siteValue || '');
+    let host = s;
+    const m = s.match(/:\/\/([^/]+)/);
+    if (m) host = m[1].toLowerCase();
+    else host = s.toLowerCase();
+    // 去掉端口
+    host = String(host).split(':')[0];
+    if (host) SITES_REJECTING_TYPE_PARAM.add(host);
+    else SITES_REJECTING_TYPE_PARAM.add(siteValue);
+  } catch { SITES_REJECTING_TYPE_PARAM.add(siteValue); }
   try {
     Widget.storage?.set?.(REJECTING_TYPE_STORAGE_KEY, JSON.stringify([...SITES_REJECTING_TYPE_PARAM]));
   } catch (e) {
@@ -5687,10 +5989,34 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
   for (let i = 0; i <= retries; i++) {
     try {
       const baseQuery = { ...params.params };
-      if (SITES_REJECTING_TYPE_PARAM.has(url)) {
+      if (isRejectingTypeSite(url)) {
         delete baseQuery.t;
       }
       const searchParams = { ...params, params: baseQuery };
+
+      // ★ 提速（结果逐字不变）：t / 去 t 双发并行取首个非空。
+      //   旧逻辑是串行：先带 t 等一轮回来空了再去 t，慢站多等一轮 RTT（4s）。
+      //   双发与串行结果一致：带 t 非空优先用带 t，否则用去 t（并记住该站）。
+      //   已知拒绝 t 的站仍只发单次（不浪费请求）。
+      if (searchParams.params.t !== undefined) {
+        const withT = searchParams.params;
+        const withoutT = { ...withT };
+        delete withoutT.t;
+        const [r1, r2] = await Promise.all([
+          httpGetApi(url, withT).then(normalizeHttpResponse).catch(() => null),
+          httpGetApi(url, withoutT).then(normalizeHttpResponse).catch(() => null),
+        ]);
+        const good1 = (r1?.list && r1.list.length > 0) ? r1 : null;
+        const good2 = (r2?.list && r2.list.length > 0) ? r2 : null;
+        if (good1) return good1;
+        if (good2) {
+          rememberRejectingTypeSite(url);
+          return good2;
+        }
+        // 两边都空：回带 t 的结果（与旧逻辑 fallback 回空一致），进重试
+        if (r1 || r2) return r1 ?? r2;
+        throw new Error('empty response');
+      }
 
       const response = await httpGetApi(url, searchParams.params);
 
@@ -5702,24 +6028,14 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
         return normalized;
       }
 
-        // 仍為空：去掉 t 分類參數再試一次，涵蓋分類 ID 不同的站台
-        if (searchParams.params.t !== undefined) {
-          delete searchParams.params.t;
-          const fallbackResponse = await httpGetApi(url, searchParams.params);
-          const fallback = normalizeHttpResponse(fallbackResponse);
-          if (fallback?.list && fallback.list.length > 0) {
-            rememberRejectingTypeSite(url);
-            return fallback;
-          }
-          return fallback;
-        }
-
       return normalized;
     } catch (error) {
       lastError = error;
       if (i < retries) {
-        const delay = 1000 * Math.pow(2, i);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        // ★ 提速（结果不变）：重试不等 1s 退避，只让出一个 microtask 就重发。
+        //   之前 delay = 1000 * 2^i，慢站失败一次就多等 1s 再吃第二次 4s 超时。
+        //   重试发不发、发几次不变，只是早发，结果集合逐字相同。
+        await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
   }
@@ -6580,7 +6896,7 @@ class SmartSearchExecutor {
         const params = {
           ac: "detail",
           wd: keyword,
-          t: this.type === 'movie' ? 1 : (this.targetInfo.isVariety ? 4 : 2)
+          t: this.type === 'movie' ? 1 : ((this.targetInfo.isVariety || this.type === 'variety') ? 4 : 2)
         };
 
         if (site.value.includes('ffzy') || site.value.includes('wolong')) {
@@ -6590,8 +6906,28 @@ class SmartSearchExecutor {
         }
 
         // 已確認不吃 t 參數的站台，直接略過分類條件
-        if (SITES_REJECTING_TYPE_PARAM.has(site.value)) {
+        if (isRejectingTypeSite(site.value)) {
           delete params.t;
+        }
+
+        // ★ 提速（结果逐字不变）：t / 去 t 双发并行取首个非空（与 batch 路径同逻辑）。
+        if (params.t !== undefined) {
+          const withT = { ...params };
+          const withoutT = { ...params };
+          delete withoutT.t;
+          const [r1, r2] = await Promise.all([
+            httpGetApi(site.value, withT).then(normalizeHttpResponse).catch(() => null),
+            httpGetApi(site.value, withoutT).then(normalizeHttpResponse).catch(() => null),
+          ]);
+          const good1 = (r1?.list && r1.list.length > 0) ? r1 : null;
+          const good2 = (r2?.list && r2.list.length > 0) ? r2 : null;
+          if (good1) return good1;
+          if (good2) {
+            rememberRejectingTypeSite(site.value);
+            return good2;
+          }
+          if (r1 || r2) return r1 ?? r2;
+          throw new Error('empty response');
         }
 
         const response = await httpGetApi(site.value, params);
@@ -6599,30 +6935,14 @@ class SmartSearchExecutor {
         // 同 fetchWithSmartRetry：統一解析字串/巢狀回應
         const normalized = normalizeHttpResponse(response);
 
-        if (normalized?.list && normalized.list.length > 0) {
-          return normalized;
-        }
-
-        // 結果為空時改用不帶 t 的請求再試一次
-        if (params.t !== undefined) {
-          delete params.t;
-          const retry = await httpGetApi(site.value, params);
-          const fallback = normalizeHttpResponse(retry);
-          if (fallback?.list && fallback.list.length > 0) {
-            rememberRejectingTypeSite(site.value);
-            return fallback;
-          }
-          return fallback;
-        }
-
         return normalized;
       } catch (error) {
         lastError = error;
 
         if (attempt < maxRetries) {
-          const baseDelay = 1000 * Math.pow(2, attempt);
-          const jitter = Math.random() * 1000;
-          const delay = baseDelay + jitter;
+          // ★ 提速（结果不变）：重试不等 1~2s 退避，只让出一个 microtask 就重发
+          //   （与 batch 路径同逻辑）。发几次不变，只是早发，结果集合逐字相同。
+          const delay = 0;
 
           // 重試必須仍趕得在整體時限內送出，否則這段退避只是讓使用者
           // 多空等 — 逾時的站再試一次通常也是逾時。
@@ -6634,7 +6954,7 @@ class SmartSearchExecutor {
             break;
           }
 
-          console.log(`⏱️ ${site.title} 请求失败，${delay}ms后重试 (${error.message})`);
+          console.log(`⏱️ ${site.title} 请求失败，重试 (${error.message})`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
@@ -7365,17 +7685,19 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     if (field in clean) delete clean[field];
   });
   
-  // ★ 缺欄位兜底：新邏輯下 extractResolutionInfo 永遠有值（最低預設 720P），
-  //   這裡只處理「舊 cache 回放、欄位根本缺失」的情況，同樣給預設 720P
-  //   而不是「未知」—— 未知會被 REX 篩選丟進「其他」。
-  if (!clean.resolution || clean.resolution === '未知') {
-    clean.resolution = '720P';
-    clean.resolutionLevel = 3;
-    clean.isHD = true;
+  // 缺欄位兜底：沒有畫質資訊就保持「未知」，不硬標 720P。
+  // 舊 cache 可能缺欄位，這裡只補齊結構（level 0 / score 0），
+  // 等 probe 測到 actualResolution 再由 applyActualResolutions 按實測升級。
+  if (!clean.resolution) {
+    clean.resolution = '未知';
+    clean.resolutionLevel = 0;
+    clean.isHD = false;
     clean.is4K = false;
     clean.qualityTags = [];
-    clean.qualityScore = 15;
-    clean.isHttps = clean.url.startsWith('https');
+    clean.qualityScore = 0;
+  }
+  if (typeof clean.isHttps !== 'boolean') {
+    try { clean.isHttps = String(clean.url || '').startsWith('https'); } catch {}
   }
   
   if (clean.resolutionLevel >= 5) {
