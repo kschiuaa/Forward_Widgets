@@ -1538,7 +1538,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.6.2",
+  version: "3.8.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
