@@ -980,6 +980,19 @@ const CHINESE_NUM_MAP = {
 const DEFAULT_WORKER_URL = 'https://m3u8-adfliter.kschiuaa.com';
 
 const CONFIG = {
+  // ★ 批次管線診斷開關（預設關閉）。
+  //
+  // 開啟後會在 console 印出每個階段的筆數：
+  //   [batch:mac] 每站 list/eligible/out
+  //   [batch] 站回原始 / 去重後 / 過濾前 / 集數過濾後 / 版本過濾後 / 季別過濾後
+  //
+  // 為什麼需要：實測《慶餘年》S1E15 時 log 有 100+ 條 wrap m3u8
+  // （detail 明明抓到了大量 m3u8），但最終只剩 1 條結果。
+  // 沒有逐階段計數就只能靠猜殺手是哪一層。
+  //
+  // 預設關閉是為了不打擾正常使用者 log —— 批次搜尋每季都會跑，
+  // 開著會多出十幾行噪音。
+  DEBUG_BATCH_TRACE: false,
   // 性能配置
   MAX_CONCURRENT_REQUESTS: 8,
   MIN_CONCURRENT_REQUESTS: 3,
@@ -1582,7 +1595,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.8.5",
+  version: "3.9.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2279,13 +2292,43 @@ const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆�
       // 實測「仁醫完結篇 - 第02集 - [ffm3u8]」會抓出 3（從 ffm3u8），
       // 「仁医2 - 第01集 - [wjm3u8]」會抓出 8，整個比對規則全面錯亂。
       const sNoBrackets = s.replace(/\[[^\]]*\]/g, '');
-      const digits = [...sNoBrackets.matchAll(/(\d+)/g)]
+      // ★★ 畫質／集數／進度字眼必須先排除（本次修的重點）★★
+      //
+      // 背景：《慶餘年》S1E15 實測只回 1 條（金牌影視），MacCMS 站
+      // 全部被 filterBySequel 的 S1 分支殺光。殺手是這裡：站方片名裡
+      // 的畫質字樣與集數資訊被當成「續集序號」，於是 sequel>1 → drop。
+      //
+      // 實測被誤判的片名（extractSequelNumber 回值全錯）：
+      //   「慶餘年 4K」        → 4   （4K 畫質字，不是第四部）
+      //   「慶餘年 全26集」    → 26  （全26集是集數總數，不是第26部）
+      //   「慶餘年 更新至15集」 → 15 （更新進度，不是第15部）
+      //
+      // 這三種在 MacCMS 站極常見（畫質標記是站方預設欄位、remarks 會
+      // 併進檔名），一旦命中就讓整條資源被當成「後續季」丟掉。
+      //
+      // 修法：把這些字眼的「數字片段」整段挖掉再抽序號，語意不變但
+      // 不會誤判。逐條挖（而非整個片名丟棄）是因為「慶餘年4K」這種
+      // 真的帶序號+畫質的片名仍要能抽出序號。
+      const sForSeq = sNoBrackets
+        // 畫質字眼（數字在字眼內或字眼前）：4K/8K/2K、1080P/720P/480P、
+        //   4KHDR、2160P…（K 後面可接 HDR/DV 等後綴）
+        //   一條式：數字 + 可選空白 + K，後面不接中文字即可
+        //   （「4K」結尾 /「4KHDR」開頭都要吃掉，所以不對後面做限制）
+        .replace(/\d+\s*[kK](?=[a-zA-Z\u4e00-\u9fff]|$|\s)/g, ' ')
+        .replace(/\d{3,4}\s*[pP]/g, ' ')
+        // 集數總數：「全26集」「共30集」「26集」「更新至15集」「更新到20集」
+        .replace(/(?:全|共|总|總)\s*\d+\s*[集話话回期]/g, ' ')
+        .replace(/(?:更新至|更新到|更新)\s*\d+\s*[集話话回期]/g, ' ')
+        .replace(/\d+\s*[集話话回](?![\s\S]{0,4}(?:部|季))/g, ' ')
+        // 「4K」「1080P」等純畫質標籤可能沒有單位字母黏在一起的情形
+        .replace(/[kK]\s*\d+/g, ' ');
+      const digits = [...sForSeq.matchAll(/(\d+)/g)]
         .map(m => ({ raw: m[1], at: m.index }))
         .filter(d => {
           const n = parseInt(d.raw, 10);
           if (!(n > 0 && n < 100)) return false;      // 排除 0 與 100 以上（含年份）
           // 序號前面是中文／英文文字才算續集；「红海行动2018」整個是年份。
-          const before = sNoBrackets.slice(0, d.at);
+          const before = sForSeq.slice(0, d.at);
           // 舊條件：數字前方是「文字」或「字串開頭」才算。
           // 問題：對「Back to the Future 3」（空白分隔），before = "Back to the Future "
           // 結尾是空白，不匹配 [^\d\s]，所以 3 被錯誤排除。
@@ -10264,10 +10307,26 @@ targetInfo.searchQuery = aliasQ;
         if (siteResults.length > 0) {
           stats.success++;
         }
+        // ★ 診斷（分站計數）：把「搜尋→比對→抓 detail→產出」各階段的數量印出來。
+        //   為什麼需要：實測《慶餘年》S1E15 時 log 有 100+ 條 wrap m3u8
+        //   （代表 detail 抓到了大量 m3u8），但最終只剩 1 條結果。
+        //   沒有這行就只能靠猜；有了它一眼就能看出是「比對殺光」還是
+        //   「去重殺光」還是「集數/季別過濾殺光」。
+        //   需開啟 CONFIG.DEBUG_BATCH_TRACE 才會輸出（避免正常使用時的 log 噪音）。
+        if (CONFIG.DEBUG_BATCH_TRACE) {
+          try {
+            console.log(`🩺 [batch:mac] ${site.title} list=${response.list.length} eligible=${eligible.length} out=${siteResults.length}`);
+          } catch {}
+        }
 
         return siteResults;
       } catch (error) {
         stats.failed++;
+        if (CONFIG.DEBUG_BATCH_TRACE) {
+          try {
+            console.log(`🩺 [batch:mac] ${site.title} 例外: ${error?.message || error}`);
+          } catch {}
+        }
         return [];
       }
     });
@@ -10279,6 +10338,14 @@ targetInfo.searchQuery = aliasQ;
       .filter(r => r.status === 'fulfilled')
       .flatMap(r => r.value);
 
+    // ★ 診斷：搜站回來的原始筆數 → 去重後筆數。
+    //   這兩個數差很大 = 去重把結果殺光了（鍵撞在一起）。
+    if (CONFIG.DEBUG_BATCH_TRACE) {
+      try {
+        console.log(`🩺 [batch] 站回原始 ${fulfilledResults.length} 條`);
+      } catch {}
+    }
+
     const executor = new SmartSearchExecutor(new SiteManager(), targetInfo, type, matchStrictness);
     // ★ 部分 cache 命中時，搜出來的新結果要與 cache 合併而非覆蓋。
     //
@@ -10286,6 +10353,11 @@ targetInfo.searchQuery = aliasQ;
     //     cache 內的 MacCMS 結果。
     //   修正後：cache 已有結果（_macCacheHit）時，與新結果合併去重。
     const newSearched = executor.smartDeduplicate(fulfilledResults);
+    if (CONFIG.DEBUG_BATCH_TRACE) {
+      try {
+        console.log(`🩺 [batch] 去重後 ${newSearched.length} 條`);
+      } catch {}
+    }
     if (allResults.length > 0) {
       // 合併：cache 內的 MacCMS + 新搜的 adapter（或部分 MacCMS）
       // ★ 去重鍵必須帶季別（與 loadDetail 的 s${season}||url 一致）。
@@ -10501,6 +10573,13 @@ targetInfo.searchQuery = aliasQ;
   }
 
   let finalResults = allResults;
+  // ★ 診斷：逐階段計數。用來定位「100+ 條 wrap m3u8 最後只剩 1 條」
+  //   的殺手是哪一層（集數 / 版本 / 季別 / 去重）。
+  if (CONFIG.DEBUG_BATCH_TRACE) {
+    try {
+      console.log(`🩺 [batch] 過濾前 ${allResults.length} 條（target=${targetInfo.baseName} S${targetInfo.seasonNumber} E${targetEpisode ?? 'all'}）`);
+    } catch {}
+  }
   // ★ 集數過濾短路（純加速，輸出逐字不變）。
   // 原邏輯是寬鬆版（保留未知集數 label===null，下游 loadResource 會再跑
   // 嚴格版 filterByEpisode 收斂），且寫 cache 發生在這裡之後 —— 改成
@@ -10518,9 +10597,19 @@ targetInfo.searchQuery = aliasQ;
       });
     }
   }
+  if (CONFIG.DEBUG_BATCH_TRACE) {
+    try {
+      console.log(`🩺 [batch] 集數過濾後 ${finalResults.length} 條`);
+    } catch {}
+  }
 
   // 版本過濾，理由與串流模式相同。
   finalResults = filterByTargetVersion(finalResults, targetInfo);
+  if (CONFIG.DEBUG_BATCH_TRACE) {
+    try {
+      console.log(`🩺 [batch] 版本過濾後 ${finalResults.length} 條`);
+    } catch {}
+  }
 
   // 第 2 季過濾：smart_stream 與 batch 兩個路徑都必須套用，
   // 否則批次搜「仁醫」+ season=2 會把第一季的「仁医」也一起推上來。
@@ -10594,6 +10683,11 @@ targetInfo.searchQuery = aliasQ;
       } else {
         finalResults = [...r.s4FallbackCandidates, ...finalResults];
       }
+    }
+    if (CONFIG.DEBUG_BATCH_TRACE) {
+      try {
+        console.log(`🩺 [batch] 季別過濾後 ${finalResults.length} 條`);
+      } catch {}
     }
   }
 
