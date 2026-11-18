@@ -1378,6 +1378,12 @@ const CONFIG = {
     // 整鏈硬上限（搜尋＋詳情＋解析＋探測）。逾時即放棄本輪官方結果，
     // MacCMS / adapter 結果不受影響。
     HARD_TIMEOUT: 9000,
+    // 尾端等待上限：串流/批量主流程收尾時最多再等官方幾毫秒。
+    // 為什麼要跟 HARD_TIMEOUT 分開：HARD_TIMEOUT 是官方鏈路內部的
+    // 「給足機會」上限（索引慢時仍可等到 9s）；TAIL_TIMEOUT 是主流程
+    // 的「不被拖住」上限 —— MacCMS 早收後，官方最多再等這麼久，
+    // 超時只丟掉本輪官方結果，不影響已拿到的 MacCMS/adapter。
+    TAIL_TIMEOUT: 4500,
   },
 
   // 流式搜尋配置
@@ -1538,7 +1544,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.8.1",
+  version: "3.8.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7165,8 +7171,15 @@ class SmartSearchExecutor {
     // 官方線路結果在這裡併入（enough() 判定之後，避免影響 MacCMS 早收）。
     let officialResults = [];
     if (this._officialPromise) {
+      // ★ 尾延保護：官方鏈路內部 HARD_TIMEOUT=9s 是「給足機會」，
+      //   但主流程收尾最多再等 TAIL_TIMEOUT（預設 4.5s）—— 超時只丟本輪官方，
+      //   不拖住已拿到的 MacCMS/adapter 结果。與下方 adapter 的 4500 race 同理。
+      const tail = (CONFIG.OFFICIALS && CONFIG.OFFICIALS.TAIL_TIMEOUT) || 4500;
       try {
-        officialResults = await this._officialPromise.catch(() => []);
+        officialResults = await Promise.race([
+          this._officialPromise.catch(() => []),
+          new Promise(r => setTimeout(() => r([]), tail)),
+        ]);
       } catch (e) { officialResults = []; }
     }
     if (officialResults.length > 0) {
@@ -10367,11 +10380,17 @@ targetInfo.searchQuery = aliasQ;
     //
     // 純直連 CDN、無廣告，速度最快。失敗回 []（內部已保護），不影響主流程。
     // 已有官方結果（cache 命中）時跳過，避免每次切集都重打官方索引。
+    // ★ 尾延保護：allSettled 會等最慢的 task，官方內部 HARD_TIMEOUT=9s
+    //   過長 —— 這裡再包一層 TAIL_TIMEOUT race，超時只丟本輪官方。
     if ((typeof _officialIsEnabled === 'function' ? _officialIsEnabled(params) : true)
         && !allResults.some(r => r && r._officialSite)) {
       requestTasks.push(async () => {
         try {
-          return await _officialFetch(params, targetInfo, type, targetEpisode, targetSeason);
+          const tail = (CONFIG.OFFICIALS && CONFIG.OFFICIALS.TAIL_TIMEOUT) || 4500;
+          return await Promise.race([
+            _officialFetch(params, targetInfo, type, targetEpisode, targetSeason),
+            new Promise(r => setTimeout(() => r([]), tail)),
+          ]);
         } catch (e) {
           return [];
         }
