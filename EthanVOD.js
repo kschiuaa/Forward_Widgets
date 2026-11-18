@@ -1265,7 +1265,9 @@ const CONFIG = {
   // bump 到 58 見上。 bump 到 59：clean 通用 wrap 補 site/name/episode，
   // 舊 cache 內的已包裝連結無名（凍結），清掉重搜後新連結才帶名。
   // bump 到 60：併入官方線路（zen.cheyong 官方索引＋第三方解析），舊 cache 無官方來源，清掉重搜。
-  WIDGET_VERSION: 60,
+  // bump 到 61：綜藝映射失效＋fallback 冒充修復（E6 只剩 jpyy 一條錯的），
+  // 舊 cache 內的 _ep=null＋fallback episode=6 是髒數據，清掉重搜。
+  WIDGET_VERSION: 61,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1544,7 +1546,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.8.2",
+  version: "3.8.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3568,11 +3570,16 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         //   會把 _ep 提升為 episode，但那是輸出階段；此處 resources 直接
         //   進 cache/stream，仍需自帶）。理由見 cleanResourceForOutput 註解。
         //
-        // ★ fallback 時回報「使用者要求的集數」而非實際取到的那一集：
-        //   這是為了通過後段的 filterByEpisode（label === targetEpisode）。
-        //   真實集數仍保留在 _epActualEp，log 與除錯看得到實際值。
-        episode: isFallbackEp && Number.isFinite(wantEp)
-          ? wantEp
+        // ★ fallback 時不再冒充「使用者要求的集數」。
+        //   實測 E6：jpyy 站內無 E6（集名是日期 20260301），舊邏輯把
+        //   最後一集硬標 episode=6（_adapterFallbackEp=true），導致
+        //   filterByEpisode 認為 hasExact=true，把 138 條 _ep=null 的
+        //   MacCMS 候選全部殺光，只剩這條錯的。
+        //   改法：fallback 回報 null（_ep 同步 null，label 才會是 null），
+        //   有精確匹配時它被過濾掉；無精確匹配時 null 會被保留，
+        //   「給你看最新一集」的降級仍然成立。
+        episode: isFallbackEp
+          ? null
           : (Number.isFinite(epNumber) ? epNumber : null),
 
         // 保留 adapter 身分，供去重與 log 判斷
@@ -3598,7 +3605,9 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         // 沒有這行 cleanResourceForOutput 永遠讀不到 _groupLabel，
         // 描述內的 [红牛]、[非凡] 等等就會一直留著。
         _groupLabel: r?._groupLabel || null,
-        _ep: Number.isFinite(epNumber) ? epNumber : null,
+        // ★ fallback 時 _ep 同步 null（與上面的 episode 一致），否則
+        //   episodeLabelOf 會退回讀 _ep（20260301），冒充行為仍在。
+        _ep: isFallbackEp ? null : (Number.isFinite(epNumber) ? epNumber : null),
         // 實際取到的集數（fallback 時與 episode 不同），僅供 log／除錯
         _epActualEp: Number.isFinite(epNumber) ? epNumber : null,
         _adapterFallbackEp: isFallbackEp,
@@ -3752,7 +3761,23 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       // 上/下兩段是同一期的上下半 → 各佔一格（TMDb 也是分兩集）。
       //
       // 只有當站方本身用「第N集/第N期」連號命名時才走原本的數字抽取。
-      const _varietyMode = type === 'variety';
+      // ★ Rex 對綜藝常傳 type='tv'（詳情頁 link 帶 type=tv），只認
+      //   type==='variety' 會讓綜藝映射整段失效（實測 E6：100+ 條 MacCMS
+      //   _ep 全 null，被 jpyy 一條 fallback 冒充 E6 殺光）。
+      //   補兩道兜底：targetInfo.isVariety，或集名本身像綜藝日期段
+      //   （8 位日期 / 上下半 ≥3 段即判定為綜藝，電視劇不會這樣命名）。
+      let _varietyMode = type === 'variety' || targetInfo?.isVariety === true;
+      if (!_varietyMode) {
+        try {
+          let _dateLike = 0;
+          for (const _ep of episodes) {
+            const _nm = String(_ep.split('$')[0] || '');
+            if (/\d{8}/.test(_nm) || /上\s*$|下\s*$|上半|下半/.test(_nm)) _dateLike++;
+            if (_dateLike >= 3) break;
+          }
+          if (_dateLike >= 3) _varietyMode = true;
+        } catch {}
+      }
       // 正片段的「期序」對照表：index → { period, isUp, isDown }
       const _varietyPeriod = new Map();
       // ★ 期號 → 該期段列表（給單段期 E2 補位用，需在外層可見）。
@@ -4211,6 +4236,22 @@ const SITES_REJECTING_TYPE_PARAM = new Set([
 
 const REJECTING_TYPE_STORAGE_KEY = 'vod_sites_rejecting_t';
 
+// ★ 提速（结果不变）：域名子串匹配。旧代码用 Set.has(完整URL) 比对，
+//   而集合里存的是域名片段（'dyttzyapi.com'），永远匹配不上，
+//   导致已知拒绝 t 的站每次仍双发（带t空跑一次）。改成子串匹配后，
+//   已知站只发单次（去 t），未知站仍双发并行，结果逐字相同。
+function isRejectingTypeSite(urlOrValue) {
+  try {
+    const s = String(urlOrValue || '');
+    if (!s) return false;
+    if (SITES_REJECTING_TYPE_PARAM.has(s)) return true;
+    for (const m of SITES_REJECTING_TYPE_PARAM) {
+      if (m && s.includes(m)) return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
 // 官方 @rexnow/libs 的 storage.set/get 用字串介面，本地儲存的快取必須先
 // 序列化。舊資料若是陣列（自行 mock 的環境）也要能讀出來 —— 用這個 helper
 // 統一處理，比每個呼叫端各自 try/catch 安全。
@@ -4345,7 +4386,20 @@ async function loadRejectingTypeSites() {
 }
 
 function rememberRejectingTypeSite(siteValue) {
-  SITES_REJECTING_TYPE_PARAM.add(siteValue);
+  // ★ 只存 host 片段而非完整 URL：调用端传的是完整 API 地址，
+  //   直接存完整串会让集合无限膨胀；存 host 后 isRejectingTypeSite
+  //   用子串匹配仍能命中，且 storage 体积稳定。
+  try {
+    const s = String(siteValue || '');
+    let host = s;
+    const m = s.match(/:\/\/([^/]+)/);
+    if (m) host = m[1].toLowerCase();
+    else host = s.toLowerCase();
+    // 去掉端口
+    host = String(host).split(':')[0];
+    if (host) SITES_REJECTING_TYPE_PARAM.add(host);
+    else SITES_REJECTING_TYPE_PARAM.add(siteValue);
+  } catch { SITES_REJECTING_TYPE_PARAM.add(siteValue); }
   try {
     Widget.storage?.set?.(REJECTING_TYPE_STORAGE_KEY, JSON.stringify([...SITES_REJECTING_TYPE_PARAM]));
   } catch (e) {
@@ -6470,10 +6524,34 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
   for (let i = 0; i <= retries; i++) {
     try {
       const baseQuery = { ...params.params };
-      if (SITES_REJECTING_TYPE_PARAM.has(url)) {
+      if (isRejectingTypeSite(url)) {
         delete baseQuery.t;
       }
       const searchParams = { ...params, params: baseQuery };
+
+      // ★ 提速（结果逐字不变）：t / 去 t 双发并行取首个非空。
+      //   旧逻辑是串行：先带 t 等一轮回来空了再去 t，慢站多等一轮 RTT（4s）。
+      //   双发与串行结果一致：带 t 非空优先用带 t，否则用去 t（并记住该站）。
+      //   已知拒绝 t 的站仍只发单次（不浪费请求）。
+      if (searchParams.params.t !== undefined) {
+        const withT = searchParams.params;
+        const withoutT = { ...withT };
+        delete withoutT.t;
+        const [r1, r2] = await Promise.all([
+          httpGetApi(url, withT).then(normalizeHttpResponse).catch(() => null),
+          httpGetApi(url, withoutT).then(normalizeHttpResponse).catch(() => null),
+        ]);
+        const good1 = (r1?.list && r1.list.length > 0) ? r1 : null;
+        const good2 = (r2?.list && r2.list.length > 0) ? r2 : null;
+        if (good1) return good1;
+        if (good2) {
+          rememberRejectingTypeSite(url);
+          return good2;
+        }
+        // 两边都空：回带 t 的结果（与旧逻辑 fallback 回空一致），进重试
+        if (r1 || r2) return r1 ?? r2;
+        throw new Error('empty response');
+      }
 
       const response = await httpGetApi(url, searchParams.params);
 
@@ -6481,28 +6559,14 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
       // 未正規化時 .data.list 永遠取不到，導致整個搜尋靜默回傳 0 筆。
       const normalized = normalizeHttpResponse(response);
 
-      if (normalized?.list && normalized.list.length > 0) {
-        return normalized;
-      }
-
-        // 仍為空：去掉 t 分類參數再試一次，涵蓋分類 ID 不同的站台
-        if (searchParams.params.t !== undefined) {
-          delete searchParams.params.t;
-          const fallbackResponse = await httpGetApi(url, searchParams.params);
-          const fallback = normalizeHttpResponse(fallbackResponse);
-          if (fallback?.list && fallback.list.length > 0) {
-            rememberRejectingTypeSite(url);
-            return fallback;
-          }
-          return fallback;
-        }
-
       return normalized;
     } catch (error) {
       lastError = error;
       if (i < retries) {
-        const delay = 1000 * Math.pow(2, i);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        // ★ 提速（结果不变）：重试不等 1s 退避，只让出一个 microtask 就重发。
+        //   之前 delay = 1000 * 2^i，慢站失败一次就多等 1s 再吃第二次 4s 超时。
+        //   重试发不发、发几次不变，只是早发，结果集合逐字相同。
+        await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
   }
@@ -7378,8 +7442,28 @@ class SmartSearchExecutor {
         }
 
         // 已確認不吃 t 參數的站台，直接略過分類條件
-        if (SITES_REJECTING_TYPE_PARAM.has(site.value)) {
+        if (isRejectingTypeSite(site.value)) {
           delete params.t;
+        }
+
+        // ★ 提速（结果逐字不变）：t / 去 t 双发并行取首个非空（与 batch 路径同逻辑）。
+        if (params.t !== undefined) {
+          const withT = { ...params };
+          const withoutT = { ...params };
+          delete withoutT.t;
+          const [r1, r2] = await Promise.all([
+            httpGetApi(site.value, withT).then(normalizeHttpResponse).catch(() => null),
+            httpGetApi(site.value, withoutT).then(normalizeHttpResponse).catch(() => null),
+          ]);
+          const good1 = (r1?.list && r1.list.length > 0) ? r1 : null;
+          const good2 = (r2?.list && r2.list.length > 0) ? r2 : null;
+          if (good1) return good1;
+          if (good2) {
+            rememberRejectingTypeSite(site.value);
+            return good2;
+          }
+          if (r1 || r2) return r1 ?? r2;
+          throw new Error('empty response');
         }
 
         const response = await httpGetApi(site.value, params);
@@ -7387,30 +7471,14 @@ class SmartSearchExecutor {
         // 同 fetchWithSmartRetry：統一解析字串/巢狀回應
         const normalized = normalizeHttpResponse(response);
 
-        if (normalized?.list && normalized.list.length > 0) {
-          return normalized;
-        }
-
-        // 結果為空時改用不帶 t 的請求再試一次
-        if (params.t !== undefined) {
-          delete params.t;
-          const retry = await httpGetApi(site.value, params);
-          const fallback = normalizeHttpResponse(retry);
-          if (fallback?.list && fallback.list.length > 0) {
-            rememberRejectingTypeSite(site.value);
-            return fallback;
-          }
-          return fallback;
-        }
-
         return normalized;
       } catch (error) {
         lastError = error;
 
         if (attempt < maxRetries) {
-          const baseDelay = 1000 * Math.pow(2, attempt);
-          const jitter = Math.random() * 1000;
-          const delay = baseDelay + jitter;
+          // ★ 提速（结果不变）：重试不等 1~2s 退避，只让出一个 microtask 就重发
+          //   （与 batch 路径同逻辑）。发几次不变，只是早发，结果集合逐字相同。
+          const delay = 0;
 
           // 重試必須仍趕得在整體時限內送出，否則這段退避只是讓使用者
           // 多空等 — 逾時的站再試一次通常也是逾時。
@@ -7422,7 +7490,7 @@ class SmartSearchExecutor {
             break;
           }
 
-          console.log(`⏱️ ${site.title} 请求失败，${delay}ms后重试 (${error.message})`);
+          console.log(`⏱️ ${site.title} 请求失败，重试 (${error.message})`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
