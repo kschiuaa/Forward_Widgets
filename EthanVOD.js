@@ -204,6 +204,11 @@ const _tmdbAliasInFlight = new Set();
 const _tmdbInFlightPromise = new Map();  // key -> Promise<void>
 // 短期內重複查同一片名直接復用結果（即使 cache miss）。
 const _tmdbAliasRecent = new Map();  // key -> { aliases, ts }
+// ★ TMDb 單集播出日期 cache：key=`${base}|${season}|${ep}|${type}` → YYYYMMDD 整數或 null。
+//   用途見 getTMDBEpisodeAirDateBlocking：綜藝日期集名（20260115）只能靠
+//   TMDb E4 的 air_date 反查站方日期，位置硬對（第 N 個播出日 = E N）是錯的。
+const _tmdbEpAirCache = new Map();  // key -> { airDate, ts }
+const _tmdbEpAirInFlight = new Map();  // key -> Promise
 
 async function _loadTmdbAliasCacheFromStorage() {
   if (!Widget?.storage?.get) return;
@@ -1305,7 +1310,11 @@ const CONFIG = {
 // bump 到 71：停用綜藝日期位置映射 + 日期 fallback 不再謊報 E4。
 //   只認顯式期號（「20260115(第4期上)」→ E4）；純日期抽不出集數就回 null，
 //   寧可不過濾出那條，也不要播最新集卻顯示 E4。舊 cache 是髒結果，清掉重搜。
-  WIDGET_VERSION: 71,
+// bump 到 72：改用 TMDb air_date 精準對齊綜藝日期集。
+//   TMDb S1E4 的 air_date（例如 20260115）反查站方同日期的集 → 自動命中，
+//   其餘播出日（20251222 / 20260301…）判定為不相干並丟掉。
+//   使用者不再需要在一堆日期裡手動挑。舊 cache 是髒結果，清掉重搜。
+  WIDGET_VERSION: 72,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1564,7 +1573,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.0.1",
+  version: "4.0.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3106,6 +3115,123 @@ function _parseEpDate(name) {
 }
 
 /**
+ * 把 TMDb air_date（"2026-01-15"）正規化成 YYYYMMDD 整數，失敗回 null。
+ *
+ * 為什麼需要：站方日期集名經 _parseEpDate 得到 20260115 整數，
+ * TMDb 的 air_date 是 "2026-01-15" 字串，兩邊必須是同一種表示才能比對。
+ */
+function _normalizeAirDateToInt(s) {
+  const t = String(s ?? '').trim();
+  if (!t) return null;
+  let m = t.match(/((?:19|20)\d{2})[.\-\/年]\s*(\d{1,2})[.\-\/月]\s*(\d{1,2})/);
+  if (m) {
+    const y = parseInt(m[1], 10), mo = parseInt(m[2], 10), d = parseInt(m[3], 10);
+    if (Number.isFinite(y) && Number.isFinite(mo) && Number.isFinite(d)) return y * 10000 + mo * 100 + d;
+  }
+  m = t.match(/((?:19|20)\d{6})/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/**
+ * 取 TMDb S/E 的首播日期（air_date → YYYYMMDD 整數），拿不到回 null。
+ *
+ * 為什麼需要這一層：綜藝站用播出日期當集名（20251222 / 20260115），
+ * _macEpNumber / _adapterEpNumber 對純日期一律回 null（未知）。
+ * 第 N 個播出日 ≠ TMDb 第 N 集（站方會拆上/下集、補特別篇），位置硬對
+ * 只會播錯集（實測 E4 硬對到 20251227，但 TMDb E4 並不是那一天）。
+ * 唯一正確的對齊方式是拿 TMDb E4 的 air_date 反查站方同日期的集：
+ * TMDb S1E4 air_date=2026-01-15 → 站方 20260115(第4期上)/20260115 就是 E4。
+ *
+ * 行為：
+ *   - TMDB 未啟用 / 沒 API key / 缺 season-ep → 回 null（呼叫端走原顯式期號邏輯）
+ *   - in-memory cache 命中 → 同步回傳（第二次切集 0 成本）
+ *   - 否則打 search 找 tmdb id，再打 /tv/{id}/season/{s}/episode/{e} 拿 air_date
+ *   - 任何錯誤 → 靜默回 null，不影響原搜尋流程
+ *   - variety 在 TMDb 側一律按 tv 查（TMDb 沒有 variety 類型）
+ */
+async function getTMDBEpisodeAirDateBlocking(baseName, type, season, episode, maxWaitMs = 2500) {
+  if (!CONFIG.TMDB?.ENABLED || !CONFIG.TMDB.API_KEY) return null;
+  const base = String(baseName || '').trim();
+  const sNum = Number(season), eNum = Number(episode);
+  if (!base || base.length < 2) return null;
+  if (!Number.isFinite(sNum) || sNum < 1 || !Number.isFinite(eNum) || eNum < 1) return null;
+  const tmdbType = 'tv';
+  const cacheKey = `${base}|${sNum}|${eNum}|${tmdbType}`;
+  const cached = _tmdbEpAirCache.get(cacheKey);
+  if (cached && (cached.airDate !== undefined)) return cached.airDate;
+  let inflight = _tmdbEpAirInFlight.get(cacheKey);
+  if (!inflight) {
+    inflight = (async () => {
+      try {
+        const apiKey = CONFIG.TMDB.API_KEY;
+        const searchUrlBase = (lang) =>
+          `https://api.themoviedb.org/3/search/${tmdbType}` +
+          `?api_key=${encodeURIComponent(apiKey)}` +
+          `&query=${encodeURIComponent(base)}` +
+          `&language=${encodeURIComponent(lang)}`;
+        let tmdbId = null;
+        try {
+          const cnResp = await Widget.http.get(searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE_CN || 'zh-CN'), {
+            timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+            headers: { 'Accept': 'application/json' }
+          }).then(_unwrapHttpResponse).catch(() => null);
+          if (cnResp?.results?.length) tmdbId = cnResp.results[0]?.id || null;
+          if (!tmdbId) {
+            const twResp = await Widget.http.get(searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE || 'zh-TW'), {
+              timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+              headers: { 'Accept': 'application/json' }
+            }).then(_unwrapHttpResponse).catch(() => null);
+            if (twResp?.results?.length) tmdbId = twResp.results[0]?.id || null;
+          }
+        } catch {}
+        if (!tmdbId) {
+          _tmdbEpAirCache.set(cacheKey, { airDate: null, ts: Date.now() });
+          return null;
+        }
+        const epUrl = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${sNum}/episode/${eNum}` +
+          `?api_key=${encodeURIComponent(apiKey)}&language=${encodeURIComponent(CONFIG.TMDB.SEARCH_LANGUAGE_CN || 'zh-CN')}`;
+        let epData = null;
+        try {
+          const epResp = await Widget.http.get(epUrl, {
+            timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+            headers: { 'Accept': 'application/json' }
+          });
+          epData = _unwrapHttpResponse(epResp);
+        } catch {}
+        const airInt = _normalizeAirDateToInt(epData?.air_date);
+        _tmdbEpAirCache.set(cacheKey, { airDate: airInt, ts: Date.now() });
+        if (airInt) console.log(`[TMDB-diag] S${sNum}E${eNum} air_date=${epData?.air_date} → ${airInt}`);
+        else console.log(`[TMDB-diag] S${sNum}E${eNum} 無 air_date（${JSON.stringify(epData?.air_date)})`);
+        return airInt;
+      } catch (e) {
+        return null;
+      } finally {
+        _tmdbEpAirInFlight.delete(cacheKey);
+      }
+    })();
+    _tmdbEpAirInFlight.set(cacheKey, inflight);
+  }
+  try {
+    if (typeof setTimeout === 'function') {
+      const timeoutP = new Promise((resolve) => {
+        try { setTimeout(() => resolve('__timeout__'), maxWaitMs); } catch { resolve('__timeout__'); }
+      });
+      const r = await Promise.race([inflight, timeoutP]);
+      if (r === '__timeout__') {
+        try { const c = _tmdbEpAirCache.get(cacheKey); if (c) return c.airDate; } catch {}
+        return null;
+      }
+      return r;
+    }
+    return await inflight;
+  } catch { return null; }
+}
+
+/**
  * 已停用：綜藝日期列表的位置映射（第 N 個播出日 ≠ TMDb 第 N 集）。
  *
  * 保留函式僅供除錯/單測引用，正式路徑不再呼叫。原因：
@@ -3168,12 +3294,39 @@ function _toEpisodeNumber(v) {
  * 一律保留會在點第3集時混進第1集的連結，比少給更糟：使用者不會自己分辨。
  * 但若某站完全沒有本集來源，寧可給一個可能可播的選項，也不要讓該站整個消失。
  */
-function filterByEpisode(results, targetEpisode) {
-  if (!targetEpisode) return results;
-  const hasExact = results.some(res => episodeLabelOf(res) === targetEpisode);
+function filterByEpisode(results, targetEpisode, targetAirDate = null) {
+  if (!targetEpisode && !targetAirDate) return results;
+  const _targetDateInt = (() => {
+    if (targetAirDate == null) return null;
+    if (typeof targetAirDate === 'number' && Number.isFinite(targetAirDate)) return targetAirDate;
+    try { const v = _normalizeAirDateToInt(targetAirDate); return v; } catch { return null; }
+  })();
+  const _resDateInt = (res) => {
+    try {
+      if (res?._episodeDate != null) {
+        const v = typeof res._episodeDate === 'number' ? res._episodeDate : _parseEpDate(res._episodeDate);
+        if (Number.isFinite(v)) return v;
+      }
+      // adapter 日期資源：episode 為 null 時從 description / epLabel 反查日期
+      const d = _parseEpDate(res?.description ?? '');
+      if (Number.isFinite(d)) return d;
+      return null;
+    } catch { return null; }
+  };
+  const _isDateHit = (res) => _targetDateInt != null && _resDateInt(res) === _targetDateInt;
+  const hasExact = results.some(res => episodeLabelOf(res) === targetEpisode || _isDateHit(res));
   const filtered = results.filter(res => {
     const label = episodeLabelOf(res);
-    if (label === targetEpisode) return true;
+    if (targetEpisode != null && label === targetEpisode) return true;
+    if (_isDateHit(res)) return true;
+    // ★ TMDb 日期對齊：一旦目標日期已知，站方「其它播出日」的集就是
+    //   不相干的集（20251222 / 20260301 對 E4 的 20260115）。
+    //   舊邏輯走 `label === null → 保留` 會把它們全放行 → 使用者看到
+    //   一堆日期要手動挑。這裡改成：日期已知且不命中 → 丟掉。
+    if (_targetDateInt != null) {
+      const d = _resDateInt(res);
+      if (d != null) return false;
+    }
     if (label !== null) return false;
     return !hasExact;
   });
@@ -3546,6 +3699,15 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
 
     // 使用者要播的那一集（挑不到時的落點規則見下）
     const wantEp = item._adapterTargetEpisode;
+    // ★ TMDb 播出日期對齊：純日期集名（20260115）抽不出集數，第 N 個播出日
+    //   ≠ TMDb 第 N 集。唯一正確的對齊是拿 TMDb E{wantEp} 的 air_date
+    //   反查同日期的站方集（見 getTMDBEpisodeAirDateBlocking）。
+    const _targetAirRaw = item._adapterTargetAirDate ?? targetInfo?._targetAirDate ?? null;
+    let _targetAirInt = null;
+    try {
+      if (typeof _targetAirRaw === 'number' && Number.isFinite(_targetAirRaw)) _targetAirInt = _targetAirRaw;
+      else if (_targetAirRaw != null) _targetAirInt = _normalizeAirDateToInt(_targetAirRaw);
+    } catch { _targetAirInt = null; }
     // ★ 綜藝日期列表不用位置映射：已停用 _varietyPositionalIndex 的呼叫。
     //   第 N 個播出日 ≠ TMDb 第 N 集（站方會拆上/下集、補特別篇，
     //   順序硬對只會播錯集；實測 E4 硬對到 20251227，但 TMDb E4 並不是那一天）。
@@ -3554,6 +3716,14 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     let idx = -1;
     if (type === 'tv' && wantEp != null) {
       idx = episodes.findIndex(e => _adapterEpNumber(e.name) === wantEp);
+    }
+    // ★ 日期命中優先於 fallback：顯式期號沒命中時，若 TMDb air_date 已知，
+    //   用播出日期反查站方同日期的集。這才是 E4 該播的那一個，
+    //   不是「最後一集」也不是「第 N 個播出日」。
+    let _isDateHit = false;
+    if (idx < 0 && _targetAirInt != null) {
+      const di = episodes.findIndex(e => _parseEpDate(e?.name) === _targetAirInt);
+      if (di >= 0) { idx = di; _isDateHit = true; }
     }
     // ★ 日期列表判定：過半集名是播出日期（「20260301」這類）即視為日期列表。
     //   用途見下方 episode 回報分支：日期 fallback 不得謊報 wantEp。
@@ -3692,9 +3862,17 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   filterByEpisode 誤以為「這就是 E4」，實播卻是最新集 20260301。
       //   日期 fallback 一律回 null（未知），寧可被 hasExact 過濾掉，
       //   也不要播錯集。戲劇（非日期列表）維持原謊報降級。
-      episode: (isFallbackEp && Number.isFinite(wantEp) && !_isDateList)
+      //
+      // ★ 但 TMDb 日期命中例外：上面的日期反查已用 TMDb E{wantEp} 的
+      //   air_date 驗證過同日期（_isDateHit），這不是謊報，是正確對齊。
+      //   此時必須回報 episode=wantEp，否則後段 filterByEpisode（即使帶
+      //   targetAirDate）在 cache 回放（_episodeDate 已被 clean 刪掉、
+      //   只剩 description 反查）時仍可能因描述格式差異而丟失。
+      episode: (_isDateHit && Number.isFinite(wantEp))
         ? wantEp
-        : (Number.isFinite(epNumber) ? epNumber : null),
+        : ((isFallbackEp && Number.isFinite(wantEp) && !_isDateList)
+          ? wantEp
+          : (Number.isFinite(epNumber) ? epNumber : null)),
 
         // 保留 adapter 身分，供去重與 log 判斷
         _adapterSite: item._adapterSite,
@@ -3859,13 +4037,29 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   ≠ TMDb 第 N 集（站方會拆上/下集、補特別篇，順序硬對只會播錯集）。
       //   只認顯式集數（_macEpNumber）；抽不出就保持 null，交給
       //   filterByEpisode 的未知集邏輯決定去留，不謊報集數。
+      //
+      // ★ 但 TMDb 日期對齊例外：targetInfo._targetAirDate 是 TMDb E{target}
+      //   的 air_date（YYYYMMDD 整數）。站方同日期的集就是 TMDb 那一集，
+      //   此時把 _ep 綁成 targetEpisode，讓下游直接命中，不用手動挑。
+      const _macTargetAirInt = (() => {
+        try {
+          const raw = targetInfo?._targetAirDate;
+          if (raw == null) return null;
+          if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+          return _normalizeAirDateToInt(raw);
+        } catch { return null; }
+      })();
+      const _macWantEp = (() => {
+        const v = targetInfo?._targetEpisode;
+        return Number.isFinite(v) && v > 0 ? v : null;
+      })();
       episodes.forEach(ep => {
         const [epName, url] = ep.split('$');
         if (url && isPlayableUrl(url)) {
           // ★ 集數抽取必須認全格式（「01」「EP01」「第1話」…），
           //   只認「第N集/期」時其他格式的 _ep=null，切到那集就整批被丟，
           //   使用者看到「這集搜不到」。見 _macEpNumber 註解。
-          const episodeNumber = _macEpNumber(epName);
+          let episodeNumber = _macEpNumber(epName);
 
           // ★ 綜藝型集名的判斷依據（「第N期」）。
           //
@@ -3882,6 +4076,14 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           const resolutionInfo = extractResolutionInfo(vod_name, epName);
 
           const dateMatch = epName.match(/(\d{4}年\d{1,2}月\d{1,2}日|\d{4}\.\d{1,2}\.\d{1,2}|\d{4}\d{2}\d{2})/);
+          // ★ TMDb 日期對齊：顯式期號沒抽出、但站方日期 == TMDb E{target} 的
+          //   air_date 時，這一集就是 TMDb 那一集，直接綁成 targetEpisode。
+          if (episodeNumber == null && _macTargetAirInt != null && _macWantEp != null) {
+            try {
+              const d = _parseEpDate(epName);
+              if (d === _macTargetAirInt) episodeNumber = _macWantEp;
+            } catch {}
+          }
 
           // 資源站回傳簡體，統一轉繁體後再顯示
           // ★ 走 _adapterSeasonLabel 而非 toDisplayText：站方把季別寫進
@@ -5280,7 +5482,7 @@ const ADAPTER_FILTERS = {
  * 播放連結採「延遲換取」：vod_play_url 先填 episode 元件，待使用者
  * 實際要播哪一集時才呼叫 playUrls 換真實 m3u8。理由見 _adapterSearch。
  */
-function _adapterBuildPlayUrl(site, vodId, episodes, targetEpisode) {
+function _adapterBuildPlayUrl(site, vodId, episodes, targetEpisode, targetAirDate = null) {
   if (!episodes || episodes.length === 0) return '';
 
   // 單集電影：站方 episodeList 只有一筆
@@ -5298,6 +5500,15 @@ function _adapterBuildPlayUrl(site, vodId, episodes, targetEpisode) {
     //   使用者要第 2 集卻拿到第 80 集，之後又被當成單集（第 1 集）
     //   送出，下游 filterByEpisode 直接把這條來源丟掉。
     ep = episodes.find(e => _adapterEpNumber(e.name) === targetEpisode) || null;
+  }
+  // ★ TMDb 日期對齊：顯式期號沒命中時，用 TMDb E{target} 的 air_date
+  //   反查同日期的站方集（綜藝日期集名只能靠日期對齊，位置硬對是錯的）。
+  if (!ep && targetAirDate != null) {
+    try {
+      const tInt = (typeof targetAirDate === 'number' && Number.isFinite(targetAirDate))
+        ? targetAirDate : _normalizeAirDateToInt(targetAirDate);
+      if (tInt != null) ep = episodes.find(e => _parseEpDate(e?.name) === tInt) || null;
+    } catch {}
   }
   if (!ep) ep = episodes[episodes.length - 1];
 
@@ -5377,7 +5588,7 @@ async function _adapterPool(tasks, limit = 4) {
  *   降到 0.31 秒，輸出內容完全不變。
  *   ★ 併發上限必須有：一次全打會觸發站方 429。
  */
-async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode) {
+async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode, targetAirDate = null) {
   const t0 = Date.now();
   let items;
   // ★ 跨季共用：同 keyword 同站只打一次 search（loadDetail S1~S6 同字）。
@@ -5427,7 +5638,7 @@ async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode
           eps = await (site.episodes || _adapterDefaultEpisodes)(site, item.vod_id);
           _adapterCacheSet(_ADAPTER_EPS_CACHE, _epsKey, eps || [], _ADAPTER_SEARCH_TTL);
         }
-        playUrl = _adapterBuildPlayUrl(site, item.vod_id, eps, targetEpisode);
+        playUrl = _adapterBuildPlayUrl(site, item.vod_id, eps, targetEpisode, targetAirDate);
       } catch (e) {
         // 詳情頁失敗 = 這筆沒有可播資源，跳過而非送出空播放項
         if (CONFIG.ADAPTERS?.DEBUG) console.warn(`[adapter:${site.id}] episodes 失敗 id=${item.vod_id}: ${e?.message || e}`);
@@ -6273,12 +6484,16 @@ class SmartSearchExecutor {
               this.targetInfo.searchQuery || this.targetInfo.baseName,
               this.targetInfo,
               this.type,
-              this.targetEpisode
+              this.targetEpisode,
+              this.targetInfo?._targetAirDate ?? null
             );
             if (!items || items.length === 0) return [];
 
             // 標記目標集，讓 extractPlayInfoForCache 只換那一集的 URL
-            for (const it of items) it._adapterTargetEpisode = this.targetEpisode;
+            for (const it of items) {
+              it._adapterTargetEpisode = this.targetEpisode;
+              it._adapterTargetAirDate = this.targetInfo?._targetAirDate ?? null;
+            }
 
             // ★ 這裡必須併發，不能循序。
             //   extractPlayInfoForCache 對 adapter 項會呼叫
@@ -6684,7 +6899,7 @@ class SmartSearchExecutor {
     // 指定集數時只推送該集，否則 UI 會先收到第1、2集的來源，
     // 使用者選第34集卻看到不相干的連結。逐站判斷，理由見 filterByEpisode。
     let candidates = (this.type === 'tv' && this.targetEpisode !== null)
-      ? filterByEpisode(resources, this.targetEpisode)
+      ? filterByEpisode(resources, this.targetEpisode, this.targetInfo?._targetAirDate ?? null)
       : resources;
 
     // 版本過濾必須在推播之前，否則使用者會先看到別的版本。
@@ -8161,6 +8376,21 @@ targetInfo.searchQuery = aliasQ;
   // 另需帶上續集序號：清理片名時年份與序號都會被移除，
   // 「追龙2017」與「追龙2」清理後都是「追龙」，共用同一鍵會讓後者
   // 讀到前者的來源 —— 使用者點開同系列的另一部電影時看到舊片。
+  // ★ TMDb 播出日期對齊：綜藝日期集名（20260115）只能靠 TMDb E{target} 的
+  //   air_date 反查站方同日期的集。位置硬對（第 N 個播出日 = E N）是錯的。
+  //   取到後掛在 targetInfo 供 extractPlayInfoForCache / filterByEpisode 用。
+  //   Forward 的 params.airDate（若有）優先，拿不到才打 TMDb。
+  targetInfo._targetEpisode = targetEpisode;
+  try {
+    let _ad = null;
+    try { _ad = _normalizeAirDateToInt(params?.airDate); } catch {}
+    if (_ad == null && (type === 'tv' || type === 'variety') && Number.isFinite(targetEpisode) && targetEpisode > 0) {
+      _ad = await getTMDBEpisodeAirDateBlocking(targetInfo.baseName, type, targetSeason, targetEpisode, 2500);
+    }
+    targetInfo._targetAirDate = _ad;
+    if (_ad) console.log(`📅 TMDb air_date 對齊: S${targetSeason}E${targetEpisode} → ${_ad}`);
+  } catch { targetInfo._targetAirDate = null; }
+
   const sequelTag = extractSequelNumber(targetInfo.rawName);
   // 年份也要納入：clean 後「仁醫2009」與「仁醫2012」都變成「仁醫」，
   // 共用同一鍵會讓指定韓版的請求讀到日版的來源，指定年份形同失效。
@@ -8185,7 +8415,7 @@ targetInfo.searchQuery = aliasQ;
         let usable = cachedResults;
         if (type === 'tv' && targetEpisode) {
           const before = usable.length;
-          usable = filterByEpisode(usable, targetEpisode);
+          usable = filterByEpisode(usable, targetEpisode, targetInfo?._targetAirDate ?? null);
           console.log(`🎯 集数过滤(缓存): ${before} -> ${usable.length}`);
         }
 
@@ -8327,6 +8557,8 @@ targetInfo.searchQuery = aliasQ;
     ...params,
     seriesName,
     _preSearchQuery: targetInfo.searchQuery,
+    _targetAirDate: targetInfo._targetAirDate ?? null,
+    _targetEpisode: targetEpisode ?? null,
     // 設定頁已移除搜尋模式 / 清晰度偏好：鎖死批次搜尋 + 最清晰排序，
     // 覆寫任何殘留的舊 params，避免舊客戶端傳入 smart_stream。
     searchMode: 'batch',
@@ -8339,7 +8571,7 @@ targetInfo.searchQuery = aliasQ;
   
   if (type === 'tv' && targetEpisode) {
     const beforeFilter = finalResults.length;
-    finalResults = filterByEpisode(finalResults, targetEpisode);
+    finalResults = filterByEpisode(finalResults, targetEpisode, targetInfo?._targetAirDate ?? null);
     console.log(`🎯 集数过滤: ${beforeFilter} -> ${finalResults.length}`);
   }
 
@@ -9232,6 +9464,25 @@ targetInfo.searchQuery = aliasQ;
   }
 }
 
+  // ★ TMDb 播出日期對齊（綜藝）。
+  //
+  //   串流路徑不會經過 loadResource，因此不會有人先幫它解析 air_date。
+  //   這裡自己解析一次：優先用上游帶來的 params._targetAirDate，
+  //   否則打 TMDb 拿 E{targetEpisode} 的 air_date。
+  //
+  //   為什麼需要：綜藝站用播出日期當集名（「20260115」），抽不出集數。
+  //   沒有 air_date 就無法判斷哪一集才是 TMDb 的 E4 → 使用者只能手動挑。
+  targetInfo._targetEpisode = targetEpisode;
+  try {
+    let _ad = null;
+    try { _ad = _normalizeAirDateToInt(params?._targetAirDate); } catch {}
+    if (_ad == null && (type === 'tv' || type === 'variety') && Number.isFinite(targetEpisode) && targetEpisode > 0) {
+      _ad = await getTMDBEpisodeAirDateBlocking(targetInfo.baseName, type, targetSeason, targetEpisode, 2500);
+    }
+    targetInfo._targetAirDate = _ad;
+    if (_ad) console.log(`📅 TMDb air_date 對齊(stream): S${targetSeason}E${targetEpisode} → ${_ad}`);
+  } catch { targetInfo._targetAirDate = null; }
+
   // 原本這裡會先對 10 個站做健康檢查再開始搜尋。該檢查只是 GET 站點首頁、
   // 結果不影響搜尋行為，等於每個站先被多打一次請求再打正式的搜尋請求，
   // 慢的站還要等滿 1500ms 超時。串流的價值就是快，實測因此多花掉數秒，
@@ -9354,6 +9605,26 @@ targetInfo.searchQuery = aliasQ;
   applyAliasNameToTarget(targetInfo, aliasQ);
   }
 }
+
+  // ★ TMDb 播出日期對齊（綜藝）。理由與 performSmartSearch 的同名區塊相同。
+  //
+  //   批次路徑若獨立被呼叫（不經 loadResource），就沒有上游幫忙解析 air_date。
+  //   這裡自己解析：優先用 params._targetAirDate（loadResource 已解析好的），
+  //   否則打 TMDb 拿 E{targetEpisode} 的 air_date。
+  //
+  //   拿到後掛在 targetInfo，給下游 extractPlayInfoForCache / filterByEpisode
+  //   / _adapterSearch 用：站方的日期集名（20260115）要靠它反查才認得出
+  //   哪一集是 TMDb 的 E4。
+  targetInfo._targetEpisode = targetEpisode;
+  try {
+    let _ad = null;
+    try { _ad = _normalizeAirDateToInt(params?._targetAirDate); } catch {}
+    if (_ad == null && (type === 'tv' || type === 'variety') && Number.isFinite(targetEpisode) && targetEpisode > 0) {
+      _ad = await getTMDBEpisodeAirDateBlocking(targetInfo.baseName, type, targetSeason, targetEpisode, 2500);
+    }
+    targetInfo._targetAirDate = _ad;
+    if (_ad) console.log(`📅 TMDb air_date 對齊(batch): S${targetSeason}E${targetEpisode} → ${_ad}`);
+  } catch { targetInfo._targetAirDate = null; }
 
   // 與串流模式同樣帶上續集序號，理由見 loadResource 的 cacheKey 說明。
   const batchSequel = extractSequelNumber(targetInfo.rawName);
@@ -9489,7 +9760,29 @@ targetInfo.searchQuery = aliasQ;
   //   修法：merged 裡沒有 targetEpisode 時，強制 MacCMS 重抓一次
   //   （_macCacheHit=false，且全程不寫髒 cache）。
   if (type === 'tv' && targetEpisode && allResults.length > 0) {
-    const hasTargetEp = allResults.some(r => episodeLabelOf(r) === targetEpisode);
+    // ★ 日期對齊也要算命中：綜藝站的日期集（20260115）抽不出集數，
+    //   label 永遠是 null → 只看 label 會誤判成「缺 E4」而強制重抓，
+    //   每次切集都白跑一輪全站搜尋。
+    const _airInt = (() => {
+      try {
+        const raw = targetInfo._targetAirDate;
+        if (raw == null) return null;
+        if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+        return _normalizeAirDateToInt(raw);
+      } catch { return null; }
+    })();
+    const _dateHit = (r) => {
+      if (_airInt == null) return false;
+      try {
+        if (r?._episodeDate != null) {
+          const v = typeof r._episodeDate === 'number' ? r._episodeDate : _parseEpDate(r._episodeDate);
+          if (Number.isFinite(v)) return v === _airInt;
+        }
+        const d = _parseEpDate(r?.description ?? '');
+        return Number.isFinite(d) && d === _airInt;
+      } catch { return false; }
+    };
+    const hasTargetEp = allResults.some(r => episodeLabelOf(r) === targetEpisode || _dateHit(r));
     if (!hasTargetEp) {
       console.log(`🔄 切集補抓: cache 有 ${allResults.length} 條但缺 E${targetEpisode}，MacCMS 重抓`);
       _macCacheHit = false;
@@ -9535,7 +9828,8 @@ targetInfo.searchQuery = aliasQ;
               targetInfo.searchQuery || targetInfo.baseName,
               targetInfo,
               type,
-              targetEpisode
+              targetEpisode,
+              targetInfo._targetAirDate ?? null
             );
             if (!items || items.length === 0) return [];
 
@@ -9617,7 +9911,10 @@ targetInfo.searchQuery = aliasQ;
             }
 
             // 標記目標集，讓 extractPlayInfoForCache 只換那一集的URL
-            for (const it of items) it._adapterTargetEpisode = targetEpisode;
+            for (const it of items) {
+              it._adapterTargetEpisode = targetEpisode;
+              it._adapterTargetAirDate = targetInfo._targetAirDate ?? null;
+            }
 
             // ★ 同上：extractPlayInfoForCache 對 adapter 項會走
             //   _adapterResolvePlay 的多跳網路鏈，循序會把首屏拖到
@@ -10167,15 +10464,60 @@ targetInfo.searchQuery = aliasQ;
   // 嚴格版 filterByEpisode 收斂），且寫 cache 發生在這裡之後 —— 改成
   // 嚴格版會改變 cache 內容，不可取。這裡只跳過「註定無操作」的那次：
   // 當所有條目的 label 已是目標集或未知時，filter 結果與輸入逐字相同。
+  //
+  // ★ TMDb 日期對齊：綜藝站的日期集（20260115）抽不出集數 → label 恒為
+  //   null → 寬鬆版會把它們全部放行，使用者看到的就是「一堆日期」要手動挑。
+  //   這裡把「日期 == TMDb E{target} 的 air_date」視為命中並綁成目標集，
+  //   其他日期項則視為不相干而丟掉 —— 這才是「自動對上 TMDb 那一集」。
   if (type === 'tv' && targetEpisode) {
+    const _airInt = (() => {
+      try {
+        const raw = targetInfo._targetAirDate;
+        if (raw == null) return null;
+        if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+        return _normalizeAirDateToInt(raw);
+      } catch { return null; }
+    })();
+    // 從資源抽出它的日期（_episodeDate 是站方原始日期字串）。
+    const _resDate = (res) => {
+      try {
+        if (res?._episodeDate != null) {
+          const v = typeof res._episodeDate === 'number' ? res._episodeDate : _parseEpDate(res._episodeDate);
+          if (Number.isFinite(v)) return v;
+        }
+        const d = _parseEpDate(res?.description ?? '');
+        if (Number.isFinite(d)) return d;
+        return null;
+      } catch { return null; }
+    };
+    const _isDateHit = (res) => _airInt != null && _resDate(res) === _airInt;
+    // ★ 有日期命中時，日期集要能表達「它就是 E{target}」——
+    //   否則下游 filterByEpisode（label===null 的未知集邏輯）會把
+    //   「已知是本集」和「其它日期集」混為一談。
+    if (_airInt != null) {
+      for (const res of allResults) {
+        if (_isDateHit(res)) res._ep = targetEpisode;
+      }
+    }
     const needFilter = allResults.some(res => {
       const label = episodeLabelOf(res);
-      return label !== null && label !== targetEpisode;
+      if (label === targetEpisode) return false;
+      if (_airInt != null) {
+        // 日期集：有命中就留，沒命中就丟（這就是收斂那堆日期的關鍵）。
+        const d = _resDate(res);
+        if (d != null) return d !== _airInt;
+      }
+      return label !== null;
     });
     if (needFilter) {
       finalResults = allResults.filter(res => {
         const label = episodeLabelOf(res);
-        return label === null || label === targetEpisode;
+        if (label === targetEpisode) return true;
+        if (_airInt != null) {
+          const d = _resDate(res);
+          if (d != null) return d === _airInt;
+        }
+        return label === null;
       });
     }
   }
