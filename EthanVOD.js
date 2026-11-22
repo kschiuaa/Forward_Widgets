@@ -1300,11 +1300,12 @@ const CONFIG = {
 // 舊 cache 內無 📺 行且排序是舊規則，清掉重搜後才會看到新行與新順序。
 // bump 到 69：新增暴風資源 + 優質資源（MacCMS，標準 ac=detail+wd，開關 siteBfzy/siteYzzy）。
 // 量子資源不加（與樂子同一後端 cj.lziapi.com，加了只會重複）。舊 cache 無新站結果，清掉重搜。
-// bump 到 70：綜藝日期列表按播出順序映射（TMDb E4 → 第 4 個播出日）。
-//   修「要 E4 卻播 20260301 最新集」：日期型集名（_isDateLikeEpName）
-//   不再 parse 成幾千萬集號，adapter/MacCMS/BuildPlayUrl 三處統一用
-//   _varietyPositionalIndex 取第 N 個播出日。舊 cache 內是謊報 E4 的髒結果，清掉重搜。
-  WIDGET_VERSION: 70,
+// bump 到 70：綜藝日期不再 parse 成幾千萬集號（_isDateLikeEpName 守門），
+//   顯示不再包「第20260301集」。位置映射已停用：第 N 個播出日 ≠ TMDb 第 N 集。
+// bump 到 71：停用綜藝日期位置映射 + 日期 fallback 不再謊報 E4。
+//   只認顯式期號（「20260115(第4期上)」→ E4）；純日期抽不出集數就回 null，
+//   寧可不過濾出那條，也不要播最新集卻顯示 E4。舊 cache 是髒結果，清掉重搜。
+  WIDGET_VERSION: 71,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1563,7 +1564,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.0.0",
+  version: "4.0.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3105,22 +3106,12 @@ function _parseEpDate(name) {
 }
 
 /**
- * 綜藝日期列表的位置映射：把「TMDb 第 N 集」對到「站方第 N 個播出日」。
+ * 已停用：綜藝日期列表的位置映射（第 N 個播出日 ≠ TMDb 第 N 集）。
  *
- * 為什麼需要：綜藝站常用播出日期當集名（「20251222」「20260301」），
- * _macEpNumber / _adapterEpNumber 對這類名字一律回 null（未知），
- * 直接拿 null 跟 wantEp 比對永遠找不到 → 呼叫端 fallback 到最後一集
- * 卻謊報 episode=wantEp（實測：要 E4 卻播 20260301 最新集）。
- *
- * 規則（只影響綜藝日期列表，多集劇不受影響）：
- *   - wantEp 非正整數 → 回 -1（交給呼叫端原 fallback）。
- *   - 列表內任一集能抽出顯式集數（_adapterEpNumber/_macEpNumber 非 null）
- *     且等於 wantEp → 呼叫端已用顯式命中，本函式不應被呼叫。
- *   - 僅當列表「看起來像日期列表」（至少一集是日期型，或至少一集能
- *     parse 出日期）才做位置映射；純「正片/預告」這類非日期列表回 -1。
- *   - 按日期升冪排（_parseEpDate），取第 N 個；排不到日期的集名
- *     （無日期字樣）按原序綴在最後。wantEp 超出範圍回 -1。
- *   - 回傳的是原陣列下標（不是排序後下標），呼叫端直接取用。
+ * 保留函式僅供除錯/單測引用，正式路徑不再呼叫。原因：
+ * 站方會拆上/下集、補特別篇，順序硬對只會播錯集
+ *（實測 E4 硬對到 20251227，但該日期並不是 TMDb E4）。
+ * 現在只認顯式期號（「20260115(第4期上)」→ 4）。
  */
 function _varietyPositionalIndex(episodes, wantEp, numFn) {
   if (!Array.isArray(episodes) || episodes.length === 0) return -1;
@@ -3555,22 +3546,20 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
 
     // 使用者要播的那一集（挑不到時的落點規則見下）
     const wantEp = item._adapterTargetEpisode;
-    // ★ 是否用「位置映射」命中（綜藝日期列表，見 _varietyPositionalIndex）。
-    //   與 fallback 不同：位置映射是有效命中（第 N 個播出日即 TMDb 第 N 集），
-    //   回報 episode=wantEp 且不標 fallback；fallback 才是「拿最新集頂替」。
-    let isPositionalEp = false;
+    // ★ 綜藝日期列表不用位置映射：已停用 _varietyPositionalIndex 的呼叫。
+    //   第 N 個播出日 ≠ TMDb 第 N 集（站方會拆上/下集、補特別篇，
+    //   順序硬對只會播錯集；實測 E4 硬對到 20251227，但 TMDb E4 並不是那一天）。
+    //   只認顯式期號（「20260115(第4期上)」→ 4）；純日期抽不出集數就走
+    //   下方 fallback，但不再謊報 episode=wantEp（見下方 isDateList 分支）。
     let idx = -1;
     if (type === 'tv' && wantEp != null) {
       idx = episodes.findIndex(e => _adapterEpNumber(e.name) === wantEp);
-      if (idx < 0) {
-        const pos = _varietyPositionalIndex(episodes, wantEp, _adapterEpNumber);
-        if (pos >= 0) {
-          idx = pos;
-          isPositionalEp = true;
-          console.log(`📅 [adapter] 日期位置映射: E${wantEp} → 第 ${pos + 1} 個播出日「${episodes[pos].name}」`);
-        }
-      }
     }
+    // ★ 日期列表判定：過半集名是播出日期（「20260301」這類）即視為日期列表。
+    //   用途見下方 episode 回報分支：日期 fallback 不得謊報 wantEp。
+    const _dateCount = episodes.filter(e => _isDateLikeEpName(e?.name)).length;
+    const _isDateList = episodes.length > 1 && _dateCount > 0
+      && (_dateCount / episodes.length >= 0.5 || _dateCount >= 3);
     // 落點是否為「代替」而非使用者指定的本集。
     // 為什麼需要這個旗標：目標集不存在時（例如使用者跳到第 9999 集，
     // 而站方只有 46 集），我們會 fallback 到最後一集。此時若照實回報
@@ -3699,10 +3688,11 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   這是為了通過後段的 filterByEpisode（label === targetEpisode）。
       //   真實集數仍保留在 _epActualEp，log 與除錯看得到實際值。
       //
-      // ★ 位置映射命中（綜藝日期列表）時，epNumber 是 null（日期不是集數），
-      //   必須回報 wantEp —— 否則 episode=null 會被下游 filterByEpisode
-      //   當成「未知集」：hasExact=true 時整批被丟，使用者選哪一集都空白。
-      episode: (isFallbackEp || isPositionalEp) && Number.isFinite(wantEp)
+      // ★ 但日期列表例外：純日期抽不出集數，謊報 episode=wantEp 會讓
+      //   filterByEpisode 誤以為「這就是 E4」，實播卻是最新集 20260301。
+      //   日期 fallback 一律回 null（未知），寧可被 hasExact 過濾掉，
+      //   也不要播錯集。戲劇（非日期列表）維持原謊報降級。
+      episode: (isFallbackEp && Number.isFinite(wantEp) && !_isDateList)
         ? wantEp
         : (Number.isFinite(epNumber) ? epNumber : null),
 
@@ -3865,43 +3855,17 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
 
     if (type === 'tv' && isTV) {
       const episodes = playSource.split('#').filter(Boolean);
-      // ★ 綜藝日期列表的位置映射（與 adapter 側 _varietyPositionalIndex 同規則）。
-      //   純日期列表（無顯式集數、至少一集可 parse 出日期）按播出先後賦
-      //   _ep=1..N，讓 TMDb E4 對到第 4 個播出日；否則全部 _ep=null，
-      //   下游 filterByEpisode 在 hasExact=true 時整批丟光（點哪集都空白）。
-      //   多集劇不受影響：有顯式集數的列表（「01」「第N集」…）走原路徑。
-      const _macParsed = episodes.map(ep => {
-        const nm = String(ep.split('$')[0] ?? '');
-        let n = null;
-        try { n = _macEpNumber(nm); } catch { n = null; }
-        return { ep, name: nm, num: n, d: _parseEpDate(nm), isDate: _isDateLikeEpName(nm) };
-      });
-      let _macPosOf = null;
-      if (!_macParsed.some(x => x.num != null) && _macParsed.some(x => x.d != null || x.isDate)) {
-        const _ordered = [
-          ..._macParsed.filter(x => x.d != null).sort((a, b) => a.d - b.d),
-          ..._macParsed.filter(x => x.d == null),
-        ];
-        _macPosOf = new Map();
-        _ordered.forEach((x, k) => {
-          // 只給日期型集名賦位；「預告/花絮」這類不賦，保持 null。
-          if (x.d != null || x.isDate) _macPosOf.set(x.ep, k + 1);
-        });
-        if (_macPosOf.size > 0) {
-          console.log(`📅 [mac] 日期位置映射: ${siteTitle}「${toDisplayText(vod_name)}」${_macPosOf.size} 個播出日按時間排序賦 E1..E${_macPosOf.size}`);
-        }
-      }
+      // ★ 綜藝純日期集名（「20251222」這類）不賦位置集數：第 N 個播出日
+      //   ≠ TMDb 第 N 集（站方會拆上/下集、補特別篇，順序硬對只會播錯集）。
+      //   只認顯式集數（_macEpNumber）；抽不出就保持 null，交給
+      //   filterByEpisode 的未知集邏輯決定去留，不謊報集數。
       episodes.forEach(ep => {
         const [epName, url] = ep.split('$');
         if (url && isPlayableUrl(url)) {
           // ★ 集數抽取必須認全格式（「01」「EP01」「第1話」…），
           //   只認「第N集/期」時其他格式的 _ep=null，切到那集就整批被丟，
           //   使用者看到「這集搜不到」。見 _macEpNumber 註解。
-          let episodeNumber = _macEpNumber(epName);
-          // ★ 日期列表按位置賦集數（上方 _macPosOf），見上方註解。
-          if (episodeNumber == null && _macPosOf && _macPosOf.has(ep)) {
-            episodeNumber = _macPosOf.get(ep);
-          }
+          const episodeNumber = _macEpNumber(epName);
 
           // ★ 綜藝型集名的判斷依據（「第N期」）。
           //
@@ -5334,12 +5298,6 @@ function _adapterBuildPlayUrl(site, vodId, episodes, targetEpisode) {
     //   使用者要第 2 集卻拿到第 80 集，之後又被當成單集（第 1 集）
     //   送出，下游 filterByEpisode 直接把這條來源丟掉。
     ep = episodes.find(e => _adapterEpNumber(e.name) === targetEpisode) || null;
-    // ★ 綜藝日期列表：顯式命中失敗時按播出順序取第 N 個（與
-    //   extractPlayInfoForCache 內 _varietyPositionalIndex 同規則）。
-    if (!ep) {
-      const pos = _varietyPositionalIndex(episodes, targetEpisode, _adapterEpNumber);
-      if (pos >= 0) ep = episodes[pos];
-    }
   }
   if (!ep) ep = episodes[episodes.length - 1];
 
