@@ -1649,7 +1649,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.2.0",
+  version: "4.2.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3192,7 +3192,9 @@ function episodeLabelOf(resource) {
   if (resource?._ep !== null && resource?._ep !== undefined) {
     return resource._ep;
   }
-  const fromText = String(resource?.description || '').match(/第(\d+)集/);
+  // ★ fallback 也用站方原文（_rawEpName）：description 是顯示用的乾淨版，
+  //   可能已被剝掉「第N集」以外的資訊。見 _resEpIdentityText 註解。
+  const fromText = String(_resEpIdentityText(resource) || resource?.description || '').match(/第(\d+)集/);
   return fromText ? parseInt(fromText[1], 10) : null;
 }
 
@@ -3332,6 +3334,38 @@ function _isVarietyExtraSeg(name) {
   //   見 _VARIETY_ALIAS_SEG_RE 註解。
   if (_VARIETY_ALIAS_SEG_RE.test(s)) return false;
   return _VARIETY_DERIV_SEG_RE.test(s);
+}
+
+/**
+ * 取出資源的「集名識別文字」——供衍生段判定 / 期號解析 / 日期解析使用。
+ *
+ * ★★★ 為什麼需要這個函式（重要）★★★
+ *
+ * 選源列表的顯示文字（resource.description）已經被正規化成乾淨形式
+ * （剝掉「美食競技純享版」「更新至…」「先導片」等站方雜訊），但那些
+ * 字樣**是下游判定的依據**：
+ *   - 「先導片」「精編回顧」「走心局」→ 衍生段 → 該剪掉
+ *   - 「美食競技純享版」→ 別名（同一集）→ 該保留
+ *   - 「更新至20260301(陪你追日落第10期下)」→ 該先剝再判
+ *
+ * 若讓判定直接吃「已乾淨化的 description」，這些判斷全部失效：
+ *   實測《一飯封神》S2 E18 的過濾輸入從 60 筆暴增到 100 筆
+ *   （衍生段預篩失效），而樂子 / 非凡資源的正確來源整組消失。
+ *
+ * → 顯示層用乾淨文字，判定層用站方原文。兩者分開存：
+ *   description（顯示） + _rawEpName（判定）。
+ */
+function _resEpIdentityText(r) {
+  try {
+    const raw = r?._rawEpName;
+    if (raw != null && String(raw).trim()) return String(raw);
+  } catch {}
+  try { return String(r?.description ?? ''); } catch { return ''; }
+}
+
+/** _resEpIdentityText 的「是衍生段」快捷判定。 */
+function _resIsVarietyExtra(r) {
+  try { return _isVarietyExtraSeg(_resEpIdentityText(r)); } catch { return false; }
 }
 
 function _macEpNumber(epName) {
@@ -3558,6 +3592,116 @@ function _varietyDateTitle(resource) {
     const segM = desc.match(/(?:19|20)\d{2}[.\-\/年]?\s*\d{2}[.\-\/月]?\s*\d{2}(?:日)?\s*(上|中|下)/);
     return segM ? `${ymd} ${segM[1]}` : ymd;
   } catch { return null; }
+}
+
+/**
+ * 把「選源列表」用的綜藝集名正規化成「集號」形式。
+ *
+ * ★ 為什麼需要這一層（與 _playlistEpisodeTitle 的分工）：
+ *   _playlistEpisodeTitle 負責「播放清單」那一層 —— 每集的標題
+ *     （一集一列）。但使用者在詳情頁看到的「選源列表」是**另一個
+ *     介面**：同一集的所有站源各佔一列，那一列的標題是 resource.description，
+ *     走的是 MacCMS 路徑的 `displayName．epText．remark` 組裝
+ *     （見 Ethan VOD.js:6506）—— **完全不經過 _playlistEpisodeTitle**。
+ *   → 所以只改 _playlistEpisodeTitle，使用者看到的選源列表仍然是亂的。
+ *
+ * ★ 實測亂掉的樣子（搜《一飯封神》S2 第 18 集，9 個站源）：
+ *     「第2季 一飯封神．20260923上」                      ← 純日期沒轉期名
+ *     「第2季 一飯封神．20260923上美食競技純享版」        ← 別名沒收斂
+ *     「一飯封神 第2季（加更版）．20260923上…」           ← 「（加更版）」沒剝
+ *     「一飯封神 第2季．20260923上．更新至20261011期」     ← 「更新至」沒剝
+ *     「一飯封神 第2季．第20260923期」                     ← 日期套期號殼沒轉
+ *
+ * ★ 本函式處理三件事：
+ *   1. 剝掉「更新至…」後綴（站方標註「本節目已更新到第X期」的聲明，
+ *      跟「這一集是哪一集」無關 —— 20 段正片全都帶著同一個後綴）。
+ *   2. 剝掉「純享版 / 美食競技純享版」等**同集別名**後綴
+ *      （是同一集的剪輯版，不是另一集）。
+ *   3. 把「20260923上」「第20260923期」轉成可辨識的集名形式。
+ *
+ * ★ 回傳格式：{ ok:boolean, text:string|null, period:number|null, seg:string|null }
+ *   ok=true  → text 是正規化後的集名（可直接取代 description 的集數段）
+ *   ok=false → 不是綜藝型集名，呼叫端維持原行為
+ */
+function _normalizeVarietySegLabel(epName) {
+  try {
+    const raw = String(epName ?? '').trim();
+    if (!raw) return { ok: false, text: null, period: null, seg: null };
+
+    // ── 步驟 1：剝「更新至…」後綴 ──
+    //   「20260923上．更新至20261011期」→「20260923上．」
+    let s = _episodeNameOnly(raw);
+    s = s.replace(/[．.、,，;；]?\s*$/, '').trim();
+    if (!s) return { ok: false, text: null, period: null, seg: null };
+
+    // ── 步驟 2：剝「同集別名」後綴（純享版 / 加長版 / 搶先看…）──
+    //   「20260923上美食競技純享版」→「20260923上」
+    //   ★ 只剝**尾巴**的別名關鍵字，不剝中間的
+    //     （「20260116(第4期下)」的「下」是段序，不能動）。
+    const beforeAlias = s;
+    s = s.replace(/[（(]?\s*(?:美食競技|美食竞技)?\s*(?:純享版|纯享版|純享|纯享|加長版|加长版|完整版|搶先看|抢先看)\s*[）)]?/g, '')
+         .replace(/\s+/g, ' ')
+         .trim();
+    // 若剝完整段不見了（例如站方集名只有「純享版」而沒有主體）→ 不動。
+    if (!s) s = beforeAlias;
+
+    // ── 步驟 3：判斷這是不是「綜藝型集名」──
+    //   有「第N期」 → 用期號 + 段序（「第10期 上」）
+    //   有日期     → 用日期 + 段序（「20260923 上」）
+    //   ★ 日期套期號殼（「第20260923期」）先剝成日期再走日期分支。
+    const periodM = s.match(/第\s*0*(\d+)\s*期/);
+    if (periodM && !_isDateNumberStr(periodM[1])) {
+      const p = _parseVarietyPeriod(s);
+      if (p) {
+        return { ok: true, text: p.seg ? `第${p.period}期 ${p.seg}` : `第${p.period}期`,
+                 period: p.period, seg: p.seg };
+      }
+    }
+
+    // 日期型：日期殼 → 純日期 → 日期＋段序
+    //   ★ 用**嚴格 8 位連寫** YYYYMMDD 抓日期，不要用寬鬆的
+    //     「YYYY[./-年]MM[./-月]DD」—— 那個會把「20260923上」誤切
+    //     成「2026」+「09」+「23」（因為 [./-年] 是選填，\d{2} 會從
+    //     「2026」的「09」開始抓）→ 段序變成「2026」。
+    //
+    // ★★ 日期套期號殼「第20260923期」→ 顯示成裸日期「20260923」★★
+    //   站方（非凡資源）寫的就是「第20260923期」「第20260923期纯享」，
+    //   剝掉別名後剩下日期殼。顯示層要與其它站一致（裸日期 + 段序），
+    //   否則同一集在不同站長得完全不同：
+    //     非凡資源「第20260923期」vs 樂子「20260923 上」
+    //
+    // ★★ 下游判定不受影響：原始站方集名存在 resource._rawEpName，
+    //   _resEpIdentityText / _resDateIntOf / _resSuffixOf / episodeLabelOf
+    //   都優先讀那一份（見 _resEpIdentityText 註解）。
+    //   早期版本曾把日期殼直接改成裸日期，結果 _macEpNumber 讀不到
+    //   「日期殼」語意 → 非凡資源整組在過濾裡消失（實測 9 筆掉到 5 筆）。
+    //   → 顯示可改，判定原文不可改。
+    const dateShellM = s.match(/第\s*((?:19|20)\d{6})\s*期/);
+    if (dateShellM && _isDateNumberStr(dateShellM[1])) {
+      const ymd = dateShellM[1];
+      // 日期殼裡沒有段序（「第20260923期」沒有上/中/下）→ 只輸出日期。
+      return { ok: true, text: ymd, period: null, seg: null };
+    }
+
+    const dateOnly = s;
+    const dm = dateOnly.match(/(?:^|[^\d])((?:19|20)\d{6})(?!\d)/);
+    if (dm) {
+      const ymd = dm[1];
+      if (_isDateNumberStr(ymd)) {
+        // 段序：日期**直後緊接**的 上/中/下（別名殘留的中文已在步驟 2 剝掉）。
+        //   ★ 群組索引：segM[1]=日期、segM[2]=段序
+        //   ★ 不用 lookbehind（(?<!\d)）：Rex 的 JavaScriptCore 與
+        //     Android WebView 在舊版本不支援 lookbehind，改用
+        //     「(?:^|[^\d])」+「(?!\d)」的等價寫法。
+        const segM = dateOnly.match(/(?:^|[^\d])((?:19|20)\d{6})(?!\d)\s*(上|中|下)/);
+        return { ok: true, text: segM ? `${ymd} ${segM[2]}` : ymd, period: null, seg: segM ? segM[2] : null };
+      }
+    }
+
+    return { ok: false, text: null, period: null, seg: null };
+  } catch {
+    return { ok: false, text: null, period: null, seg: null };
+  }
 }
 
 /**
@@ -4963,8 +5107,13 @@ function _resDateIntOf(r) {
       const v = typeof r._episodeDate === 'number' ? r._episodeDate : _parseEpDate(r._episodeDate);
       if (Number.isFinite(v)) return v;
     }
-    const d = _parseEpDate(r?.description ?? '');
+    // ★ 優先用站方原文（_rawEpName）反查：description 是顯示用的乾淨版，
+    //   剝掉雜訊後仍可解析，但原文更可靠（例如「第20260923期」）。
+    const raw = _resEpIdentityText(r);
+    const d = _parseEpDate(raw);
     if (Number.isFinite(d)) return d;
+    const d2 = _parseEpDate(r?.description ?? '');
+    if (Number.isFinite(d2)) return d2;
   } catch {}
   return null;
 }
@@ -4982,7 +5131,9 @@ function _resDateIntOf(r) {
  */
 function _resSuffixOf(r) {
   try {
-    const s = String(r?.description ?? '');
+    // ★ 優先用站方原文（_rawEpName）：description 是顯示用的乾淨版，
+    //   段序字（上/中/下）在乾淨版裡仍保留，但原文更可靠。
+    const s = _resEpIdentityText(r);
     // ★ 「日期…上/下」，中間允許「期」「第」「N」等字。
     //   實測 bfzy 的「20260116(第4期下)」中間是「第4期」—— 裡面有數字 4，
     //   舊正則 `[^上下一二三四五六七八九十0-9]*?` 把數字也排除了 → 抓不到
@@ -4998,6 +5149,14 @@ function _resSuffixOf(r) {
     if (/上\s*$/.test(t)) return '上';
     if (/中\s*$/.test(t)) return '中';
     if (/下\s*$/.test(t)) return '下';
+    // 退回用乾淨描述再試一次（display 版仍可能保留段序）。
+    const s2 = String(r?.description ?? '');
+    if (s2 && s2 !== s) {
+      const m2 = s2.match(/(?:19|20)\d{6}[^上下中]{0,12}?(上|中|下)/);
+      if (m2) return m2[1];
+      const m3 = s2.match(/(上|中|下)\s*(?:[\)）\]．.・\s]|$)/);
+      if (m3) return m3[1];
+    }
   } catch {}
   return null;
 }
@@ -5294,7 +5453,7 @@ function _inferVarietyEpByDateOrder(results, targetEpisode) {
     try {
       for (const r of results) {
         if (episodeLabelOf(r) == null) continue;
-        if (_isVarietyExtraSeg(String(r?.description ?? ''))) continue;
+        if (_resIsVarietyExtra(r)) continue;
         _hasInternalExplicit = true;
         break;
       }
@@ -5504,7 +5663,7 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null, targetAir
   try {
     if (Array.isArray(results) && results.length > 1) {
       const _isExtraR = (r) => {
-        try { return _isVarietyExtraSeg(String(r?.description ?? '')); } catch { return false; }
+        try { return _resIsVarietyExtra(r); } catch { return false; }
       };
       const _kept = results.filter((r) => !_isExtraR(r));
       if (_kept.length > 0 && _kept.length < results.length) results = _kept;
@@ -5572,7 +5731,7 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null, targetAir
     try {
       _sameDatePeers = results.filter(r => {
         try {
-          if (_isVarietyExtraSeg(String(r?.description ?? ''))) return false;
+          if (_resIsVarietyExtra(r)) return false;
           return _resDateInt(r) === _targetDateInt;
         } catch { return false; }
       });
@@ -5777,6 +5936,22 @@ function _adapterSeasonLabel(rawName, type = 'tv') {
   //   安全網：剝後空字串 → 退回原 s0（絕不刪過頭）。
   const s = stripSeasonMarker(s0).trim() || s0;
 
+  // ★★ 剝掉站方片名尾端的「版本別名」括弧：「（加更版）」「（純享版）」★★
+  //
+  // 實測如意資源把《一飯封神》第 2 季存成兩筆條目：
+  //   vod_name = "一饭封神2"            → 顯示「一飯封神 第2季」
+  //   vod_name = "一饭封神2（加更版）"   → 顯示「一飯封神 第2季（加更版）」
+  // 「（加更版）」是**站方的版本別名**（同一季的另一個剪輯版本），
+  // 跟「純享版」同性質 —— 使用者在選源列表看到它會以為是另一個節目。
+  // → 顯示層剝掉，只留片名本身。
+  //
+  // ★ 只剝「已知的版本別名」括弧，不動語言括弧（粵語/國語等由
+  //   stripLanguageParen 處理）與其它有意義的註記。
+  const versionAliased = s.replace(/[（(]\s*(?:加更版|加更|纯享版|純享版|纯享|純享|加长版|加長版|完整版|抢先版|搶先版|抢先看|搶先看)\s*[）)]/g, ' ')
+                           .replace(/\s+/g, ' ')
+                           .trim();
+  const sForLabel = versionAliased || s;
+
   // ★ 先剝掉片名尾端的「(語言)」括弧：「轻功(粤语)」「轻功（国语）」
   //   → 拆成「轻功」，語言由頂層 language 欄位承擔（見 stripLanguageParen 註解）。
   //   抽不到語言的片名（無括弧或括弧內非語言）保持原樣，不破壞既有資料。
@@ -5784,9 +5959,9 @@ function _adapterSeasonLabel(rawName, type = 'tv') {
   //   stripHint 用「這條字串自己抽到的語言」：讓階段二精準刪「對應的語言
   //   變體」，避免誤刪「中字」之類的字幕標記。
   //   此時還沒進 cleanResourceForOutput，**自己抽一次**（代價小，邏輯一致）。
-  const selfLang = extractLanguageTag(s);
-  const stripped = stripLanguageParen(s, selfLang);
-  if (stripped === s) {
+  const selfLang = extractLanguageTag(sForLabel);
+  const stripped = stripLanguageParen(sForLabel, selfLang);
+  if (stripped === sForLabel) {
     // 沒拆到語言 → 走原本邏輯
     return _adapterSeasonLabelInner(stripped, type);
   }
@@ -5861,8 +6036,8 @@ function _adapterSeasonLabelInner(s, type = 'tv') {
             restWithSemantic = m[0] + (rest ? ' ' + rest : '');
           }
           const display = restWithSemantic
-            ? `${head} ${seasonText} ${restWithSemantic}`.replace(/\s+/g, ' ').trim()
-            : `${head} ${seasonText}`.replace(/\s+/g, ' ').trim();
+            ? `${head}．${seasonText}．${restWithSemantic}`.replace(/\s+/g, ' ').trim()
+            : `${head}．${seasonText}`.replace(/\s+/g, ' ').trim();
           return toDisplayText(display);
         }
       }
@@ -5898,9 +6073,12 @@ function _adapterSeasonLabelInner(s, type = 'tv') {
   const seasonText = `第${seq}季`;
   // 後綴存在（「：青木時代」）時季別插在後綴之前，否則讀起來像片名被拆開：
   //   「小时代：青木時代 第2季」✗  →  「小时代 第2季：青木時代」✓
+  //
+  // ★ 分隔符用「．」而非空白：與選源列表的統一格式一致
+  //   （劇集名稱．第幾季．第幾期．上/中/下）。
   const converted = rest.trim()
-    ? `${head.trim()} ${seasonText}${rest}`
-    : `${head.trim()} ${seasonText}`;
+    ? `${head.trim()}．${seasonText}${rest}`
+    : `${head.trim()}．${seasonText}`;
   return toDisplayText(converted);
 }
 
@@ -6501,9 +6679,59 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           const stripFinished = (s) => String(s || '').replace(/已完結|已完结/g, '').replace(/\s+/g, ' ').trim();
           const epText = stripFinished(displayEp);
           const remarkText = stripFinished(displayRemarks);
+          //
+          // ★★ 綜藝集名正規化（選源列表用）★★
+          //
+          // 問題（實測《一飯封神》S2 第 18 集，9 個站源）：
+          //   MacCMS 站的 description 直接組「displayName．epText．remark」，
+          //   而 epText 就是**站方原始集名**、remark 是**站方的更新進度**
+          //   → 使用者看到的是：
+          //     「第2季 一飯封神．20260923上」
+          //     「第2季 一飯封神．20260923上美食競技純享版」
+          //     「一飯封神 第2季（加更版）．20260923上美食競技純享版」
+          //     「一飯封神 第2季．20260923上．更新至20261011期」
+          //     「一飯封神 第2季．第20260923期」
+          //   → 同一集的 9 個站源長得完全不一樣，使用者分不出哪個是
+          //     正片、哪個是別名、哪個才是真正的那一集。
+          //
+          // 修法：把站方集名正規化成「集號」形式，並且
+          //   **所有站都換成同一個文字**（正片與純享版別名都變成
+          //   「20260923 上」）→ 同一集的不同站源終於對得上。
+          //
+          // ★ 為什麼剝「更新至…」：
+          //   那是站方標註「本節目已更新到第X期」的聲明，**跟這一集
+          //   是哪一集完全無關** —— 同一季每一段正片都帶著同一個後綴。
+          //   （見 _episodeNameOnly 註解）
+          //
+          // ★ 為什麼剝「純享版 / 美食競技純享版」：
+          //   那是**同一集的剪輯版**（別名），不是另一集 → 剝掉後
+          //   與正片顯示完全一致。
+          //
+          // ★ 為什麼要保留日期而不是全換成期號：
+          //   純日期站（如意/樂子）沒有期號，只能顯示日期；
+          //   有期號的站顯示「第N期 X」。兩者都無法跨站統一，
+          //   但至少**同一集在同一站的不同版本**會一致。
+          const _vLabel = (() => {
+            try { return _normalizeVarietySegLabel(epName); }
+            catch { return { ok: false, text: null }; }
+          })();
+          const epTextFinal = _vLabel && _vLabel.ok && _vLabel.text ? _vLabel.text : epText;
+          //
+          // ★ 「（加更版）」這類站方版本標記也要剝 —— 它是**站方的版本
+          //   別名**（同一集的加更剪輯版），跟「純享版」同性質。
+          //   實測如意資源回「一飯封神 第2季（加更版）．20260923上…」。
+          const epTextFinal2 = epTextFinal
+            .replace(/[（(]\s*加更版\s*[）)]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          //
+          // ★ remark 只在「不是綜藝集名」時才保留。
+          //   綜藝站方的 remark（「更新至20261011期」）是更新進度聲明，
+          //   與這集無關 → 綜合藝集名時直接丟掉，避免多餘噪音。
+          const remarkFinal = (_vLabel && _vLabel.ok) ? '' : remarkText;
           // epName / remark 中常含多段空白分隔，保留全部並用「．」串接
           // （user 範例：「进击的巨人 最终季．完结篇」），再追加 remark 段。
-          const tail = [epText, remarkText].filter(Boolean).join('．').replace(/\s+/g, ' ').trim();
+          const tail = [epTextFinal2, remarkFinal].filter(Boolean).join('．').replace(/\s+/g, ' ').trim();
           const resource = {
             name: siteTitle,
             description: tail ? `${displayName}．${tail}` : displayName,
@@ -6538,6 +6766,12 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
 
             _ep: episodeNumber,
             _episodeDate: dateMatch ? dateMatch[0] : null,
+            // ★★ 站方原始集名（未正規化的原文）★★
+            //   顯示用的 description 已經剝掉「美食競技純享版」「更新至…」
+            //   等雜訊，讓選源列表乾淨；但那些字樣是**下游判定依據**
+            //   （衍生段 / 別名 / 期號 / 日期），必須保留原文另存。
+            //   見 _resEpIdentityText 註解。
+            _rawEpName: epName,
             _isVariety: dateMatch !== null || epMatch?.[2] === '期',
             _matchType: matchInfo.type,
             _matchScore: matchInfo.score,
@@ -9695,21 +9929,29 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
       || /Season\s*[0-9]+/i.test(firstLine)
       || /\bS\s*[0-9]+\b/i.test(firstLine);
     if (!alreadyHasSeason) {
-      // 在第一個「.」「．」或「 」（夾「第N集/話/回」前）插入季別標籤。
-      // 範例：
-      //   "白粉飛．第10集"   → "白粉飛 第2季．第10集"
-      //   "進擊的巨人．第1集 [2024年 - 日本]" → "進擊的巨人 第2季．第1集 [2024年 - 日本]"
-      //   "白粉飛 第10集"   → "白粉飛 第2季 第10集"  (沒分隔點但在「第」前插)
-      //   "白粉飛"          → "第2季 白粉飛"           (完全沒集數，前置插入)
-      const sepMatch = firstLine.match(/[．.]\s*第|[ \t]+第/);
-      if (sepMatch && sepMatch.index > 0) {
-        const before = firstLine.slice(0, sepMatch.index).replace(/\s+$/, '');
-        // 保留原分隔符（． / . / 空白）做視覺一致
-        const afterRaw = firstLine.slice(sepMatch.index);
-        // 取出分隔符
-        const sepChar = (afterRaw.match(/^[．.\s]+/) || [' '])[0].replace(/\s+/, ' ');
-        const after = afterRaw.replace(/^[．.\s]+/, '').replace(/^\s+/, '');
-        lines[0] = `${before} ${seasonTag}${sepChar}${after}`;
+      // ★★ 插入位置：片名之後、集數之前，一律用「．」分隔 ★★
+      //
+      // 使用者要求的顯示格式是「劇集名稱．第幾季．第幾期．上/中/下」，
+      // 季別必須**夾在片名與集數之間**：
+      //   "一飯封神．20260923 上"  →  "一飯封神．第2季．20260923 上"
+      //   "白粉飛．第10集"          →  "白粉飛．第2季．第10集"
+      //
+      // ★ 舊邏輯只在「．」後面緊接「第」時才插（sepMatch = /[．.]\s*第/），
+      //   綜藝的「．20260923 上」不符合 → 落到 else 分支**前置**插入，
+      //   變成「第2季 一飯封神．20260923 上」—— 季別跑到片名前面，
+      //   跟其它站（片名內嵌季別）的寫法不一致，同一集看起來像兩個節目。
+      //   （實測《一飯封神》S2 E18：電影天堂「第2季 一飯封神．…」vs
+      //     如意／優質／樂子「一飯封神 第2季．…」）
+      //
+      // 修法：只要第一行有「．」分隔點，就插在**第一個分隔點之前**
+      //       （= 片名與集數之間）；沒有分隔點才前置插入。
+      const sepIdx = firstLine.search(/[．.]/);
+      if (sepIdx > 0) {
+        const before = firstLine.slice(0, sepIdx).replace(/\s+$/, '');
+        const after = firstLine.slice(sepIdx).replace(/^[．.\s]+/, '');
+        lines[0] = after
+          ? `${before}．${seasonTag}．${after}`
+          : `${before}．${seasonTag}`;
       } else {
         // 沒分隔點（純片名、或只有「第N集」無前文）→ 前置插入
         lines[0] = `${seasonTag} ${firstLine}`;
@@ -13183,7 +13425,7 @@ targetInfo.searchQuery = aliasQ;
     try {
       if (allResults.length > 1) {
         const _kept0 = allResults.filter(res => {
-          try { return !_isVarietyExtraSeg(String(res?.description ?? '')); } catch { return true; }
+          try { return !_resIsVarietyExtra(res); } catch { return true; }
         });
         if (_kept0.length > 0 && _kept0.length < allResults.length) allResults = _kept0;
       }
