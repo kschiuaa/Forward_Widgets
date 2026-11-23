@@ -209,6 +209,28 @@ const _tmdbAliasRecent = new Map();  // key -> { aliases, ts }
 //   TMDb E4 的 air_date 反查站方日期，位置硬對（第 N 個播出日 = E N）是錯的。
 const _tmdbEpAirCache = new Map();  // key -> { airDate, ts }
 const _tmdbEpAirInFlight = new Map();  // key -> Promise
+// ★ TMDb 整季集數序位 cache：key=`${base}|${season}|${type}` →
+//   { byDate: Map<YYYYMMDD, { count, order:Map<ep,ordinal> }>, ts }
+//   用途：有些綜藝同一天有多集（《一飯封神》S1 E23/E24/E25 全是 20250912、
+//   S2 E19/E20/E21 全是 20260924），單靠 air_date 反查會把三集都對到同一段。
+//   需要知道「目標集是該日期的第幾集」，才能在站方同日的多段中挑對。
+const _tmdbSeasonOrderCache = new Map();
+const _tmdbSeasonOrderInFlight = new Map();
+// ★ TMDb「期號 → 集號」對照（依 (baseName, season) 分組）。
+//   站方「第N期上/中/下」→ TMDb「Episode N (Part M)」需要這張表，
+//   否則只能假設「每期固定 2 段」（slot=(N-1)*2），遇到每期 3 段的
+//   綜藝（《一飯封神》S1 第1期 = 上/中/下 = E1/E2/E3）整季錯位。
+//   key=`${base}|${season}|${type}` → { periodParts:Map, periodFirst:Map, periodSegCount:Map }
+const _tmdbPeriodMapCache = new Map();
+// ★ 站方推導的「期號 → 集號槽位」對照（依 片名+季 分組）。
+//   沒有 TMDb Key 時，用站方自己的「第N期上/中/下」集名推出每期有幾段，
+//   進而把「第N期」對到正確的集號（不依賴「每期固定 2 段」的假設）。
+const _stationPeriodMapCache = new Map();
+// ★ 由「播出日期序列 + 上/中/下」推導的期結構（如意 / 樂子這類沒有
+//   「第N期」字樣、只有「20260729上」這種命名的站靠這條路徑）。
+const _stationDateSeqCache = new Map();
+// ★ 合併「期號對照表」+「日期序列」的最終集號結構（權威）。
+const _combinedPeriodCache = new Map();
 
 async function _loadTmdbAliasCacheFromStorage() {
   if (!Widget?.storage?.get) return;
@@ -1354,7 +1376,21 @@ const CONFIG = {
   //       target 沒有，被副標題規則判成 spin_off 而丟掉 —— 續集反而找不到。
   //   實測：修正後搜「海王2」得 9 筆全部是 2023 年的《海王2：失落的王國》，
   //   搜「海王」得 9 筆全部是 2018 年的第一部。
-  WIDGET_VERSION: 79,
+  // ★ v80：修《一飯封神》S1/S2 綜藝日期集匹配（TMDb id=296217）。
+  //   TMDb S1 = 26 集、S2 = 21 集，集名是「Episode N (Part M)」；
+  //   站方用「第N期上/中/下」+ 裸日期表達同一件事。
+  //   三個根因：
+  //   (1) 「第N期上/中/下」→ 集號的公式硬編碼「每期 2 段」
+  //       (slot=(N-1)*2+上1/下2)，只對《日落時分說愛你》(10期×上下=20集)
+  //       成立。《一飯封神》每期段數不固定（S1/S2 第1期都是 上/中/下 3 段），
+  //       整季錯位（實測 S2「第10期上」算出 19、實際是 E20）。
+  //   (2) 只用 air_date 反查 → 同一天多集時全部對到同一段資源
+  //       （S1 E23/E24/E25 都是 20250912、S2 E19/E20/E21 都是 20260924），
+  //       實測三集點進去拿到完全相同的結果。
+  //   (3) _resSuffixOf 只認「上/下」，不認「中」→ 三段式無法排序。
+  //   修法：抓 TMDb 整季集名建「期號+Part → 集號」對照表，
+  //   並在 filterByEpisode 用「同日期的段序」二次比對。
+  WIDGET_VERSION: 80,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1613,7 +1649,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.1.1",
+  version: "4.1.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3260,7 +3296,7 @@ function _isVarietyExtraSeg(name) {
   //   不剝就會把 20 段正片全部誤判成衍生，進而刪掉全季唯一的顯式集數
   //   錨點 —— 結果就是點任何一集都看到整季不相干的日期（實測 E8 = 99 筆）。
   const s = _episodeNameOnly(name);
-  return /加更|陪你|花絮|特辑|特輯|老友|直播|彩蛋|超前|预告|預告|片花|幕后|幕後|纯享|純享|会员|會員|抢先|搶先|路透|名场面|名場面|撒糖|先导|先導|先行/.test(s);
+  return /加更|陪你|花絮|特辑|特輯|老友|直播|彩蛋|超前|预告|預告|片花|幕后|幕後|纯享|純享|会员|會員|抢先|搶先|路透|名场面|名場面|撒糖|先导|先導|先行|陪你看|陪看|高光回顾|高光回顧|一饭小馆|一飯小館|一饭家常菜|一飯家常菜|封神陪看|准备开饭|準備開飯|回顾特辑|回顧特輯|小馆|小館|家常菜/.test(s);
 }
 
 function _macEpNumber(epName) {
@@ -3484,6 +3520,834 @@ async function getTMDBEpisodeAirDateBlocking(baseName, type, season, episode, ma
 }
 
 /**
+ * 取 TMDb 整季的「日期 → 該日集序」對照表。
+ *
+ * 為什麼需要（實測《一飯封神》TMDb id=296217）：
+ *   - S1（26 集）裡 20250717 有 E1/E2、20250724 有 E4/E5、20250814 有 E11/E12、
+ *     20250821 有 E14/E15、20250828 有 E17/E18、20250912 有 E23/E24/E25。
+ *   - S2（21 集）裡 20260729 有 E1/E2、20260924 有 E19/E20/E21。
+ *   只有 air_date 不足以定位：同一日期的所有集會被對到同一段站方資源
+ *   （實測 S1 E23/E24/E25 三集點進去拿到完全相同的 9 筆結果）。
+ *
+ * 回傳結構：
+ *   {
+ *     byDate: Map<YYYYMMDD, { count:number, order:Map<epNumber, ordinal> }>,
+ *     dates:  Map<epNumber, YYYYMMDD>
+ *   }
+ *   ordinal = 該集在「同 air_date 的集群」中的序位（1-based，依集數升序）。
+ *   同日只有一集時 ordinal=1、count=1（呼叫端可據此跳過序位比對）。
+ *
+ * 失敗一律回 null（呼叫端退回純日期比對，行為與現況相同，不會更差）。
+ */
+async function getTMDBSeasonDateOrder(baseName, type, season, maxWaitMs = 3000) {
+  if (!CONFIG.TMDB?.ENABLED || !CONFIG.TMDB.API_KEY) return null;
+  const base = String(baseName || '').trim();
+  const sNum = Number(season);
+  if (!base || base.length < 2) return null;
+  if (!Number.isFinite(sNum) || sNum < 1) return null;
+  const tmdbType = 'tv';
+  const cacheKey = `${base}|${sNum}|${tmdbType}`;
+  const cached = _tmdbSeasonOrderCache.get(cacheKey);
+  if (cached && cached.data) return cached.data;
+  let inflight = _tmdbSeasonOrderInFlight.get(cacheKey);
+  if (!inflight) {
+    inflight = (async () => {
+      try {
+        const apiKey = CONFIG.TMDB.API_KEY;
+        const searchUrlBase = (lang) =>
+          `https://api.themoviedb.org/3/search/${tmdbType}` +
+          `?api_key=${encodeURIComponent(apiKey)}` +
+          `&query=${encodeURIComponent(base)}` +
+          `&language=${encodeURIComponent(lang)}`;
+        let tmdbId = null;
+        try {
+          const cnResp = await Widget.http.get(searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE_CN || 'zh-CN'), {
+            timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+            headers: { 'Accept': 'application/json' }
+          }).then(_unwrapHttpResponse).catch(() => null);
+          if (cnResp?.results?.length) tmdbId = cnResp.results[0]?.id || null;
+          if (!tmdbId) {
+            const twResp = await Widget.http.get(searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE || 'zh-TW'), {
+              timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+              headers: { 'Accept': 'application/json' }
+            }).then(_unwrapHttpResponse).catch(() => null);
+            if (twResp?.results?.length) tmdbId = twResp.results[0]?.id || null;
+          }
+        } catch {}
+        if (!tmdbId) {
+          _tmdbSeasonOrderCache.set(cacheKey, { data: null, ts: Date.now() });
+          return null;
+        }
+        const listUrl = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${sNum}` +
+          `?api_key=${encodeURIComponent(apiKey)}&language=${encodeURIComponent(CONFIG.TMDB.SEARCH_LANGUAGE_CN || 'zh-CN')}`;
+        let listData = null;
+        try {
+          const listResp = await Widget.http.get(listUrl, {
+            timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+            headers: { 'Accept': 'application/json' }
+          });
+          listData = _unwrapHttpResponse(listResp);
+        } catch {}
+        const eps = Array.isArray(listData?.episodes) ? listData.episodes : null;
+        if (!eps || eps.length === 0) {
+          _tmdbSeasonOrderCache.set(cacheKey, { data: null, ts: Date.now() });
+          return null;
+        }
+        // 先收集 (epNumber → airDate)
+        const dates = new Map();
+        // ★ 集名 → (期號, Part 序)：TMDb 的綜藝集名是「Episode N (Part M)」
+        //   （《一飯封神》S1 E1 = "Episode 1 (Part 1)"、E2 = "Episode 1 (Part 2)"）。
+        //   站方用「第N期上/中/下」表達同一件事 → 靠這張表把
+        //   「第N期上」精確對到 TMDb 的集號，不必再假設「每期固定 2 段」。
+        const periodParts = new Map();   // `${period}|${part}` → epNumber
+        const periodFirst = new Map();   // period → 第一集的 epNumber
+        const periodSegCount = new Map(); // period → 該期共幾段
+        for (const ep of eps) {
+          const n = Number(ep?.episode_number);
+          if (!Number.isFinite(n) || n < 1) continue;
+          const di = _normalizeAirDateToInt(ep?.air_date);
+          if (di != null) dates.set(n, di);
+          const nm = String(ep?.name ?? '');
+          // "Episode 12 (Part 3)" / "第 12 期" / "Episode 12"
+          let pm = nm.match(/Episode\s*(\d+)\s*\(\s*Part\s*(\d+)\s*\)/i);
+          let period = null, part = null;
+          if (pm) { period = parseInt(pm[1], 10); part = parseInt(pm[2], 10); }
+          else {
+            pm = nm.match(/第\s*(\d+)\s*期/);
+            if (pm) {
+              period = parseInt(pm[1], 10);
+              const pp = nm.match(/Part\s*(\d+)/i) || nm.match(/第\s*\d+\s*期\s*([上中下])/);
+              if (pp) {
+                if (pp[1] === '上') part = 1; else if (pp[1] === '中') part = 2; else if (pp[1] === '下') part = 3;
+                else part = parseInt(pp[1], 10);
+              }
+            }
+          }
+          if (Number.isFinite(period) && period > 0) {
+            if (Number.isFinite(part) && part > 0) periodParts.set(`${period}|${part}`, n);
+            if (!periodFirst.has(period) || n < periodFirst.get(period)) periodFirst.set(period, n);
+            periodSegCount.set(period, (periodSegCount.get(period) || 0) + 1);
+          }
+        }
+        // 再依日期分群、算同日期內的序位（依集數升序）
+        const groups = new Map();
+        for (const n of [...dates.keys()].sort((a, b) => a - b)) {
+          const di = dates.get(n);
+          if (!groups.has(di)) groups.set(di, []);
+          groups.get(di).push(n);
+        }
+        const byDate = new Map();
+        for (const [di, list] of groups.entries()) {
+          const order = new Map();
+          list.forEach((n, i) => order.set(n, i + 1));
+          byDate.set(di, { count: list.length, order });
+        }
+        const data = { byDate, dates, periodParts, periodFirst, periodSegCount };
+        _tmdbSeasonOrderCache.set(cacheKey, { data, ts: Date.now() });
+        _tmdbPeriodMapCache.set(cacheKey, {
+          periodParts, periodFirst, periodSegCount, ts: Date.now()
+        });
+        console.log(`📅 TMDb 季序位表: S${sNum} ${eps.length} 集 / ${byDate.size} 個播出日` +
+          `（${[...byDate.values()].filter(v => v.count > 1).length} 個同日多集日）`);
+        return data;
+      } catch (e) {
+        return null;
+      } finally {
+        _tmdbSeasonOrderInFlight.delete(cacheKey);
+      }
+    })();
+    _tmdbSeasonOrderInFlight.set(cacheKey, inflight);
+  }
+  try {
+    if (typeof setTimeout === 'function') {
+      const timeoutP = new Promise((resolve) => {
+        try { setTimeout(() => resolve('__timeout__'), maxWaitMs); } catch { resolve('__timeout__'); }
+      });
+      const r = await Promise.race([inflight, timeoutP]);
+      if (r === '__timeout__') {
+        try { const c = _tmdbSeasonOrderCache.get(cacheKey); if (c) return c.data; } catch {}
+        return null;
+      }
+      return r;
+    }
+    return await inflight;
+  } catch { return null; }
+}
+
+/**
+ * 站方「第N期上/中/下」→ TMDb 集號。
+ *
+ * 背景：綜藝站的「第N期上」代表該期的**第一段**，TMDb 對應
+ * 「Episode N (Part 1)」。舊實作用固定公式 slot=(N-1)*2+上1/下2，
+ * 隱含「每期固定 2 段」—— 這只對《日落時分說愛你》（10 期 × 上/下 = 20 集）
+ * 成立。《一飯封神》不是：
+ *   - S1：第1期 = 上/中/下（E1/E2/E3）、第3期 = 上/下（E7/E8）… 每期段數不一
+ *   - S2：第1期 = 上/中/下（E1/E2/E3）、第2期 = 上/下（E4/E5）…
+ * 用固定公式會整季錯位（實測 S2「第10期上」算出 19，實際是 E20）。
+ *
+ * 解法：用 TMDb 整季集名（「Episode N (Part M)」）建「期號+段序 → 集號」
+ * 對照表，精確命中。表還沒載入（沒 Key / 沒抓 / 呼叫太早）時回 null，
+ * 由呼叫端退回原本的固定公式（行為與現況相同，不會更差）。
+ *
+ * @param baseName  片名（與 TMDb 搜尋用同一個）
+ * @param season    季
+ * @param period    期號（N）
+ * @param segChar   '上' / '中' / '下'（可為 null）
+ */
+function _resolvePeriodToEpisode(baseName, season, period, segChar) {
+  try {
+    if (!Number.isFinite(period) || period < 1) return null;
+    const sNum = Number(season);
+    if (!Number.isFinite(sNum) || sNum < 1) return null;
+    const base = String(baseName || '').trim();
+    if (!base) return null;
+    const key = `${base}|${sNum}|tv`;
+    const m = _tmdbPeriodMapCache.get(key);
+    if (!m || !m.periodParts) return null;
+    // 段序：上=1、中=2、下=3
+    let part = null;
+    if (segChar === '上') part = 1;
+    else if (segChar === '中') part = 2;
+    else if (segChar === '下') part = 3;
+    if (part != null) {
+      const ep = m.periodParts.get(`${period}|${part}`);
+      if (Number.isFinite(ep)) return ep;
+      // 該期沒有這一段 → 退回該期第一集
+      const first = m.periodFirst.get(period);
+      if (Number.isFinite(first)) return first;
+      return null;
+    }
+    // 沒有段序 → 該期第一集
+    const first = m.periodFirst.get(period);
+    if (Number.isFinite(first)) return first;
+    return null;
+  } catch { return null; }
+}
+
+/**
+ * 由「站方集名列表」建立「期號 → 該期各段 → 集號槽位」的對照。
+ *
+ * 為什麼需要（沒有 TMDb Key 時的唯一出路）：
+ *   《一飯封神》每期的段數不固定 —— S1 第1期 = 上/中/下（3 段）、
+ *   第3期 = 上/下（2 段）；S2 第1期 = 上/中/下、第2期起 = 上/下。
+ *   舊的固定公式 slot=(N-1)*2+上1/下2 隱含「每期固定 2 段」，
+ *   遇到 3 段的期就整季錯位（實測 S2「第10期上」算出 19、實際 E20）。
+ *
+ *   但「每期有幾段」是可以從站方自己的集名看出來的：同一期會帶
+ *   「第N期上 / 第N期中 / 第N期下」三種段標記。數一數第 N 期出現了
+ *   幾種段標記，就知道該期有幾段 → 前面各期各佔幾槽位 → 累計出
+ *   第 N 期第 k 段對應的集號。
+ *
+ * 前提：站方的集名帶有「第N期 + 段標記」。像暴風那種整站都是裸日期
+ * （「20250717上」「20250724中」）沒有期號的站，本函式回 null，
+ * 那種情況只能靠日期對齊（TMDb Key）或位置推斷。
+ *
+ * @param epNames 該站整季的集名陣列（依播出順序）
+ * @param season  季（只用於快取 key）
+ * @param baseKey 快取用的識別字（片名）
+ */
+function _buildStationPeriodMap(epNames, baseKey, season, merge = false) {
+  try {
+    if (!Array.isArray(epNames) || epNames.length === 0) return null;
+    // 1) 收集「期號 → 出現過的段標記集合」
+    //    ★ 只收「乾淨」的段標記：集名必須是「…第N期[上|中|下]」且後面
+    //      沒有別的裝飾字（純享版 / 加更 / 回顾 / 一饭小馆…）。
+    //      否則暴風《一飯封神》S2 會把「第1期上」「第1期中」「第1期上美食竞技纯享版」
+    //      「第1期加更」算成 4 段（實際只有 3 段：上/中/下）→ 整季錯位。
+    const periodSegs = new Map();   // period → Set<'上'|'中'|'下'>
+    const periodFirstIdx = new Map(); // period → 首次出現的索引
+    const segOrder = { '上': 1, '中': 2, '下': 3 };
+    epNames.forEach((nm, idx) => {
+      const s = String(nm ?? '');
+      const m = s.match(/第\s*0*(\d+)\s*期/);
+      if (!m) return;
+      const period = parseInt(m[1], 10);
+      if (!Number.isFinite(period) || period < 1 || period >= 1000) return;
+      // 段標記：緊接「期」字的 上/中/下，且「期」之後不能還有別的字
+      //（例如「第1期上美食竞技纯享版」不是乾淨的「上」段）。
+      const segM = s.match(/第\s*0*\d+\s*期\s*(上|中|下)\s*(?:[)）\].．、,，\-—_ ]|$)/);
+      const seg = segM ? segM[1] : null;
+      // ★ 衍生段整條排除（「20260801(一饭小馆第1期)」「20260904陪你看第6期上」
+      //   「20260807(第2期加更)」「20260803(封神陪看第1期)」…）。
+      //   這些是同一期的附屬內容，不佔正片集位；算進去會讓該期段數變多、
+      //   後面每一期的槽位全部往後偏（實測第6期被推到 E13、實際 E12）。
+      //   _isVarietyExtraSeg 已涵蓋 加更/純享/陪看/回顧/彩蛋…等既有規則。
+      try { if (_isVarietyExtraSeg(s)) return; } catch {}
+      if (!periodSegs.has(period)) {
+        periodSegs.set(period, new Set());
+        periodFirstIdx.set(period, idx);
+      }
+      // 乾淨段標記才收錄；沒有乾淨標記的（如「一饭小馆第1期」）
+      // 不算正片段，落實「衍生段不計入期數」。
+      if (seg) periodSegs.get(period).add(seg);
+    });
+    if (periodSegs.size === 0) return null;
+    // 2) 依「期號出現順序」累計槽位
+    const periods = [...periodSegs.keys()].sort((a, b) => {
+      const ia = periodFirstIdx.get(a), ib = periodFirstIdx.get(b);
+      if (ia !== ib) return ia - ib;
+      return a - b;
+    });
+    const periodSlots = new Map();  // period → { start, count }
+    const periodSegSlot = new Map(); // `${period}|${seg}` → slot
+    let slot = 0;
+    for (const p of periods) {
+      const segs = periodSegs.get(p);
+      const ordered = [...segs].sort((a, b) => {
+        const ra = a ? segOrder[a] : 1.5;
+        const rb = b ? segOrder[b] : 1.5;
+        return ra - rb;
+      });
+      periodSlots.set(p, { start: slot + 1, count: ordered.length });
+      ordered.forEach((sg, i) => {
+        periodSegSlot.set(`${p}|${sg ?? ''}`, slot + i + 1);
+      });
+      slot += ordered.length;
+    }
+    const map = { periodSlots, periodSegSlot, totalSlots: slot, periods };
+    // 快取（依片名+季）
+    const key = `${baseKey}|${season}|station`;
+    const prev = _stationPeriodMapCache.get(key);
+    if (merge && prev && prev.map) {
+      // ★ 跨站合併：不同站的期號覆蓋範圍不同（如意只有「第10期」、
+      //   暴風有全部 10 期）。任一站缺某期的資料時，它的推算會整季錯位。
+      //   合併策略：覆蓋期數更多的站為準（期數 = 有乾淨段標記的期數）；
+      //   若覆蓋期數相同則保留先到的（第一個完整站通常最準）。
+      const prevCov = prev.map.periods.length;
+      const newCov = periods.length;
+      if (newCov > prevCov) {
+        _stationPeriodMapCache.set(key, { map, ts: Date.now() });
+        return map;
+      }
+      if (newCov === prevCov) {
+        // 同覆蓋度 → 合併段標記（可能互補）
+        const merged = {
+          periodSlots: new Map(prev.map.periodSlots),
+          periodSegSlot: new Map(prev.map.periodSegSlot),
+          totalSlots: prev.map.totalSlots,
+          periods: prev.map.periods.slice(),
+        };
+        for (const p of periods) {
+          if (!merged.periodSlots.has(p)) {
+            merged.periodSlots.set(p, map.periodSlots.get(p));
+            merged.periods.push(p);
+          }
+          for (const [k, v] of map.periodSegSlot.entries()) {
+            if (!merged.periodSegSlot.has(k)) merged.periodSegSlot.set(k, v);
+          }
+        }
+        merged.periods.sort((a, b) => a - b);
+        _stationPeriodMapCache.set(key, { map: merged, ts: Date.now() });
+        return merged;
+      }
+      return prev.map;
+    }
+    _stationPeriodMapCache.set(key, { map, ts: Date.now() });
+    return map;
+  } catch { return null; }
+}
+
+/**
+ * 用「站方推導的期號對照表」把「第N期上/中/下」轉成集號。
+ *
+ * 找不到對應段（例如該期沒有「中」）→ 回 null，呼叫端退回原本的固定公式。
+ */
+function _resolvePeriodToEpisodeByStation(baseKey, season, period, segChar) {
+  try {
+    const key = `${baseKey}|${season}|station`;
+    const hit = _stationPeriodMapCache.get(key);
+    if (!hit || !hit.map) return null;
+    const { periodSegSlot, periodSlots } = hit.map;
+    const k = `${period}|${segChar ?? ''}`;
+    if (periodSegSlot.has(k)) {
+      const v = periodSegSlot.get(k);
+      if (Number.isFinite(v) && v > 0) return v;
+    }
+    // 沒有這一段 → 該期第一集
+    const ps = periodSlots.get(period);
+    if (ps && Number.isFinite(ps.start)) return ps.start;
+    return null;
+  } catch { return null; }
+}
+
+/**
+ * 由「播出日期序列 + 上/中/下」推導「期」的結構。
+ *
+ * 這是《一飯封神》最可靠的路徑，因為它不需要任何站方提供「第N期」：
+ *   如意 / 樂子的正片集名是「20260729上」「20260729中」「20260730下」
+ *   「20260805上」「20260806下」…（沒有期號）。
+ *   但「期」的邊界是可以從「上/中/下」的連續性推出来的：
+ *     - 一期的第一段一定是「上」
+ *     - 「中」接在「上」之後（同日或隔日）
+ *     - 「下」接在「上/中」之後
+ *     - 下一個「上」開啟新的一期
+ *   於是 20260729上 + 20260729中 + 20260730下 = 第1期（3 段），
+ *        20260805上 + 20260806下 = 第2期（2 段）… 與 TMDb 完全一致
+ *        （TMDb S2 = 21 集 = 第1期3段 + 第2~10期各2段）。
+ *
+ * 回傳：
+ *   {
+ *     periodOfSeg: Map<`${date}|${seg}`, period>,
+ *     periodSegCount: Map<period, count>,
+ *     periodFirstSlot: Map<period, slot>,   // 該期第一段對應的集號
+ *     segSlotOf: Map<`${date}|${seg}`, slot>,
+ *     totalSlots: number
+ *   }
+ */
+function _buildPeriodMapFromDateSequence(epNames, baseKey = null, season = 1, merge = false) {
+  try {
+    if (!Array.isArray(epNames) || epNames.length === 0) return null;
+    const segRank = { '上': 1, '中': 2, '下': 3 };
+    // 只收「純日期 + 上/中/下」的乾淨主片段
+    //
+    // ★ 關鍵：同一集在不同站會有不同寫法（plain「20260819上」、
+    //   純享版「20260819上美食競技純享版」）。它們是「同一集」的別名，
+    //   日期+段序完全相同 → 以 (日期, 段序) 去重即可合併成一段。
+    //   純享版只是「該站的寫法」，不能當成另一集（否則整季集數暴增）；
+    //   但也不能整批丟掉（否則某站缺 plain 寫法時該集會消失）。
+    //   解法：兩者都收錄，用 (日期, 段序) 當唯一鍵去重。
+    // ★ 跨站合併：所有站的「日期 + 段序」集合取聯集 → 推導期結構。
+    //   各站覆蓋不完整（暴風缺 20260820下 的 plain 寫法、如意缺第10期），
+    //   單看任一站都會推錯整季；聯集後才拿得到完整的主集序列。
+    const cacheKey = (baseKey != null) ? `${baseKey}|${season}|dateseq` : null;
+    let union = null;
+    if (merge && cacheKey) {
+      const prev = _stationDateSeqCache.get(cacheKey);
+      if (prev && prev.union) union = new Set(prev.union);
+    }
+    if (!union) union = new Set();
+    for (const nm of epNames) {
+      const s = String(nm ?? '');
+      const d = _parseEpDate(s);
+      if (d == null) continue;
+      const m = s.match(/(上|中|下)\s*(?:[)）\].．、,，\-—_ ]|$)/);
+      if (!m) continue;
+      union.add(`${d}|${m[1]}`);
+    }
+    if (union.size === 0) return null;
+    // 依（日期, 段序）排序 → 得到播出順序
+    const segs = [...union].map(k => {
+      const i = k.indexOf('|');
+      return { d: parseInt(k.slice(0, i), 10), seg: k.slice(i + 1), key: k };
+    }).filter(x => Number.isFinite(x.d));
+    segs.sort((a, b) => (a.d - b.d) || (segRank[a.seg] - segRank[b.seg]));
+    if (segs.length === 0) return null;
+    // 依「段序連續性」切期：上 → 新期；中 → 接續；下 → 接續
+    const periodOfSeg = new Map();
+    const periodSegCount = new Map();
+    const periodFirstSlot = new Map();
+    const segSlotOf = new Map();
+    let period = 0;
+    let slot = 0;
+    for (const s of segs) {
+      const rank = segRank[s.seg];
+      if (rank === 1) {
+        period += 1;              // 「上」開啟新的一期
+      } else if (period === 0) {
+        period = 1;               // 沒有「上」就從「中/下」開始（罕見）
+      }
+      slot += 1;
+      periodOfSeg.set(s.key, period);
+      periodSegCount.set(period, (periodSegCount.get(period) || 0) + 1);
+      if (!periodFirstSlot.has(period)) periodFirstSlot.set(period, slot);
+      segSlotOf.set(s.key, slot);
+    }
+    if (period === 0) return null;
+    const _res = {
+      periodOfSeg, periodSegCount, periodFirstSlot, segSlotOf,
+      totalSlots: slot, periodCount: period,
+    };
+    // ★ 順便寫入快取，讓單獨呼叫本函式也能被 _resolveSegToEpisodeByDateSequence 取用。
+    try {
+      if (cacheKey) {
+        _stationDateSeqCache.set(cacheKey, { map: _res, union, ts: Date.now() });
+      }
+    } catch {}
+    return _res;
+  } catch { return null; }
+}
+
+/**
+ * 用「日期序列推導的期結構」把「日期 + 上/中/下」轉成集號。
+ *
+ * 這是《一飯封神》最可靠的路徑：如意 / 樂子的正片集名沒有「第N期」，
+ * 只有「日期 + 上/中/下」，但期的邊界可由段序連續性推導。
+ */
+function _resolveSegToEpisodeByDateSequence(baseKey, season, dateInt, segChar) {
+  try {
+    const key = `${baseKey}|${season}|dateseq`;
+    const hit = _stationDateSeqCache.get(key);
+    if (!hit || !hit.map) return null;
+    const { segSlotOf, periodFirstSlot, periodOfSeg } = hit.map;
+    const sk = `${dateInt}|${segChar}`;
+    if (segSlotOf.has(sk)) {
+      const v = segSlotOf.get(sk);
+      if (Number.isFinite(v) && v > 0) return v;
+    }
+    // 該日期沒有這一段 → 退回該日期所在期的第一集
+    const p = periodOfSeg.get(`${dateInt}|上`) ?? periodOfSeg.get(`${dateInt}|中`)
+      ?? periodOfSeg.get(`${dateInt}|下`);
+    if (p != null) {
+      const v = periodFirstSlot.get(p);
+      if (Number.isFinite(v) && v > 0) return v;
+    }
+    return null;
+  } catch { return null; }
+}
+
+/**
+ * 綜合「期號對照表」與「日期序列」的集號解析器 —— 《一飯封神》的核心。
+ *
+ * 站方命名有兩種，必須分開處理：
+ *   A) 「20260924第10期上」→ 有明確期號 → 期號是權威。
+ *   B) 「20260729上」       → 只有日期 + 段序 → 期號靠段序連續性推。
+ *
+ * ★ 演算法（TMDb S2 = 21 集為真值驗證過）：
+ *
+ *   Step 1  以「段序連續性」把所有集切成「推導期」。
+ *           ★ 這是主力：如意/樂子的純日期集名切出來的期結構與 TMDb 完全一致
+ *             （第1期 = 20260729上 + 20260729中 + 20260730下 = 3 段；
+ *               第2期 = 20260805上 + 20260806下 = 2 段；… 第10期 = 20260930上 + 20261001下）。
+ *           ★ 切期規則：「上」開新期、「中/下」接續上一期。
+ *             但同一天可以出現兩期（20260924 = 第9期的下 + 第10期的上/下），
+ *             所以「上」開新期的同時，要檢查前一期是否已用完（段序已到「下」）。
+ *
+ *   Step 2  把「帶明確期號」的集「認領」到對應的推導期。
+ *           認領方式：第 N 期的第一段日期落在哪個推導期附近 → 那一期。
+ *
+ *   Step 3  依期序累計槽位 → 每段對應的集號。
+ *
+ * ★ Step 1 為什麼不能用「有期號的集」當主體：
+ *   實測 S2 有期號的集只有「第10期」（20260924第10期上/下），
+ *   若以它為主體 → 所有集都會塞進第 10 期 → 集號全錯。
+ */
+function _buildCombinedPeriodMap(epNames, baseKey, season, merge = false) {
+  try {
+    if (!Array.isArray(epNames) || epNames.length === 0) return null;
+    const segRank = { '上': 1, '中': 2, '下': 3 };
+    const cacheKey = `${baseKey}|${season}|combined`;
+    let acc = null;
+    if (merge) {
+      const prev = _combinedPeriodCache.get(cacheKey);
+      if (prev && prev.acc) {
+        acc = {
+          numbered: new Map(prev.acc.numbered),   // 'period|seg' → date
+          dated: new Map(prev.acc.dated),         // 'date|seg'   → true
+        };
+      }
+    }
+    if (!acc) acc = { numbered: new Map(), dated: new Map() };
+
+    for (const nm of epNames) {
+      const s = String(nm ?? '');
+      const d = _parseEpDate(s);
+      if (d == null) continue;
+      // ★ 衍生段排除（加更 / 純享版 / 陪你看 / 高光回顾 / 一飯小館…）。
+      //   純享版是「同一集的別名寫法」，日期+段序相同 → 去重後自然合併；
+      //   但「20261011高光回顧」這類沒有對應日期+段序的衍生內容
+      //   會憑空多出一集，必須排除。
+      try { if (_isVarietyExtraSeg(s)) continue; } catch {}
+      const segM = s.match(/(上|中|下)\s*(?:[)）\].．、,，\-—_ ]|$)/);
+      if (!segM) continue;
+      const seg = segM[1];
+      const pm = s.match(/第\s*0*(\d+)\s*期/);
+      if (pm) {
+        const period = parseInt(pm[1], 10);
+        // ★ 日期型期號（「第20260925期」＝把日期塞進期號殼）不是真的期號
+        //   → 排除，改走日期路徑。
+        if (Number.isFinite(period) && period >= 1 && period < 1000
+            && !_isDateNumberStr(pm[1])) {
+          const k = `${period}|${seg}`;
+          if (!acc.numbered.has(k)) acc.numbered.set(k, d);
+          continue;
+        }
+      }
+      const k = `${d}|${seg}`;
+      if (!acc.dated.has(k)) acc.dated.set(k, true);
+    }
+    if (acc.numbered.size === 0 && acc.dated.size === 0) return null;
+
+    const res = _recomputeCombinedMap(acc, segRank);
+    _combinedPeriodCache.set(cacheKey, { acc, res, ts: Date.now() });
+    return res;
+  } catch { return null; }
+}
+
+/**
+ * 依「累積素材」重算合併期結構的槽位。
+ *
+ * ★ 為什麼要獨立出來：各站的 extractPlayInfoForCache 是併發跑的，
+ *   先跑完的站會把「當下只含部分站」的結構寫進快取，後跑的站讀到就會
+ *   對同一集算出不同集號（實測 20260924第10期上 → 19 或 20 不定）。
+ *   解法：只累積素材（日期/段序/期號），槽位每次求解前即時重算。
+ */
+function _recomputeCombinedMap(acc, segRankIn) {
+  const segRank = segRankIn || { '上': 1, '中': 2, '下': 3 };
+  const dateOf = (k) => parseInt(k.slice(0, k.indexOf('|')), 10);
+  const segOf = (k) => k.slice(k.indexOf('|') + 1);
+  const cmpKey = (a, b) => {
+    const da = dateOf(a), db = dateOf(b);
+    if (da !== db) return da - db;
+    return (segRank[segOf(a)] || 0) - (segRank[segOf(b)] || 0);
+  };
+
+  // ---- 收集所有集（日期,段序），標記是否帶明確期號 ----
+  //   'date|seg' → { no: 明確期號或 null }
+  const items = new Map();   // 'date|seg' → { no }
+  for (const k of acc.dated.keys()) items.set(k, { no: null });
+  for (const [k, d] of acc.numbered.entries()) {
+    const dk = `${d}|${k.slice(k.indexOf('|') + 1)}`;
+    const it = items.get(dk);
+    if (it) { if (it.no == null) it.no = parseInt(k.slice(0, k.indexOf('|')), 10); }
+    else items.set(dk, { no: parseInt(k.slice(0, k.indexOf('|')), 10) });
+  }
+  const allKeys = [...items.keys()].sort(cmpKey);
+
+  // ---- Step 1：依「段序連續性」切出推導期 ----
+  //   規則：
+  //   - 「上」→ 開新期
+  //   - 「中」/「下」→ 接續上一期，但若上一期已出現過同樣的段序 → 開新期
+  //   ★ 「20260924下」接在「20260923上」後 → 第9期；
+  //     「20260924上」→ 開新期（第10期）；
+  //     「20261001下」→ 上一期已有「上」但沒有「下」→ 接續 → 第10期 ✓
+  const derived = [];   // [{ keys: [...], segSet: Set }]
+  let cur = null;
+  for (const k of allKeys) {
+    const seg = segOf(k);
+    const rank = segRank[seg] || 9;
+    const needNew = (rank === 1) || (!cur) || cur.segSet.has(seg);
+    if (needNew) {
+      cur = { keys: [], segSet: new Set() };
+      derived.push(cur);
+    }
+    cur.keys.push(k);
+    cur.segSet.add(seg);
+  }
+
+  // ---- Step 2：帶明確期號的集 → 指定它屬於第幾期 ----
+  //   ★ 以「段序對應」為準，不以日期為準：
+  //     站的期號與推導期序是一一對應的（站方第 N 期 = 推導第 N 期），
+  //     但日期可能寫錯（實測 S1：站方「第8期」寫 20260916、
+  //     「第10期」寫 20250918，年份疑似誤植）。
+  //     → 用「期號 N ↔ 推導第 N 期」直接對應，日期只用於排序。
+  const numberedByPeriod = new Map();   // period → ['date|seg', ...]
+  for (const [k, d] of acc.numbered.entries()) {
+    const dk = `${d}|${k.slice(k.indexOf('|') + 1)}`;
+    const pn = parseInt(k.slice(0, k.indexOf('|')), 10);
+    if (!numberedByPeriod.has(pn)) numberedByPeriod.set(pn, []);
+    if (!numberedByPeriod.get(pn).includes(dk)) numberedByPeriod.get(pn).push(dk);
+  }
+  const periodNos = [...numberedByPeriod.keys()].sort((a, b) => a - b);
+
+  // ---- Step 1.5：季外內容的判定與濾除 ----
+  //
+  // ★ 核心問題：綜藝站的正片結束後會接續播「3 段式特別篇」
+  //   （S2：20260925 上/中/下 = 一次 3 段播出），這些在 TMDb 沒有對應集。
+  //   它們在集名上看起來跟正片一模一樣（日期 + 上/中/下），
+  //   唯一能分辨的是「它們排在最後一期之後」。
+  //
+  // ★ 判定基準：站方明確標的「期號」→ 該期號的播出日期就是正片的最後一段。
+  //   實測 S2：第10期 = 20260924 → 之後的 20260925 / 20261010 / 20261011
+  //   都是季外加更 → 排除 → 詳情只剩 21 集，與 TMDb 一致。
+  //
+  // ★ 只在「有明確期號」時才做這個截斷：
+  //   純日期站（如某些站沒有「第N期」字樣）的日期序本身就是正片序，
+  //   截斷反而會砍掉真正的正片。
+  if (periodNos.length > 0) {
+    let seasonEnd = -Infinity;
+    for (const pn of periodNos) {
+      for (const k of numberedByPeriod.get(pn)) {
+        const dd = dateOf(k);
+        if (dd > seasonEnd) seasonEnd = dd;
+      }
+    }
+    if (Number.isFinite(seasonEnd)) {
+      for (const k of [...items.keys()]) {
+        if (dateOf(k) > seasonEnd) items.delete(k);
+      }
+    }
+  }
+  // periodNo → derived index
+  // ★ 以「期號 N ↔ 推導第 N 期」對應（推導期由日期序切出，順序即播出序）。
+  //   站方的期號是相對的（從第 1 期起算），與推導期序同源。
+  const periodToDerived = new Map();
+  const usedDerived = new Set();
+  for (const pn of periodNos) {
+    // 推導第 (pn-1) 期（推導期索引從 0 開始）
+    let di = pn - 1;
+    if (di < 0 || di >= derived.length) {
+      // 超出推導期數 → 找「包含該期任一段」的推導期
+      const keys = numberedByPeriod.get(pn);
+      di = derived.findIndex(dp => keys.some(kk => dp.keys.includes(kk)));
+      if (di < 0) continue;
+    }
+    if (usedDerived.has(di)) {
+      let alt = -1;
+      for (const cand of [di + 1, di - 1, di + 2, di - 2]) {
+        if (cand >= 0 && cand < derived.length && !usedDerived.has(cand)) { alt = cand; break; }
+      }
+      if (alt >= 0) di = alt;
+    }
+    usedDerived.add(di);
+    periodToDerived.set(pn, di);
+  }
+
+  // ---- Step 2.5：季的終點 = 最後一個「明確期號」所在的推導期 ----
+  //
+  // ★ 為什麼需要：綜藝站會在正片結束後繼續放「加更 / 特別篇 / 純享版」，
+  //   這些內容的日期排在最後一期之後（實測 S2：正片到 20260924（第10期）
+  //   為止，之後還有 20260925 / 20261010 / 20261011 的加更）。
+  //   TMDb 只有正片 → 那些加更不該有集號，否則詳情會多出第 22~28 集
+  //   （使用者看到「明明 TMDb 21 集，卻列出 28 集」）。
+  //
+  //   ★ 判定依據：站方明確標了「第N期」→ N 就是正片的期號。
+  //     最大期號 = 最後一期的期號 → 該期之後的日期都是季外內容。
+  //   ★ 沒有明確期號時（純日期站）不截斷 —— 那種站的日期序本身就是正片序。
+  const lastNumberedDerived = (() => {
+    if (periodNos.length === 0) return -1;
+    let best = -1, bestNo = -1;
+    for (const [pn, di] of periodToDerived.entries()) {
+      if (pn > bestNo) { bestNo = pn; best = di; }
+    }
+    return best;
+  })();
+  if (lastNumberedDerived >= 0) {
+    // 最後一期的「結束日期」
+    const lastKeys = derived[lastNumberedDerived].keys;
+    const lastDate = Math.max(...lastKeys.map(dateOf));
+    // ★ 同一日期仍可能有該期的其他段（20260924 = 第9期下 + 第10期上/下）
+    //   → 只砍掉「日期 > lastDate」的推導期，以及「日期 > lastDate」的段。
+    for (let i = derived.length - 1; i >= 0; i--) {
+      if (i === lastNumberedDerived) continue;
+      const ds = derived[i].keys.map(dateOf);
+      if (Math.min(...ds) > lastDate) derived.splice(i, 1);
+    }
+    // 過濾掉日期 > lastDate 的段
+    for (const k of allKeys) {
+      if (dateOf(k) > lastDate) items.delete(k);
+    }
+  }
+
+  // ---- Step 3：把「明確期號」的段認領進對應的推導期 ----
+  //
+  // ★ 唯一鍵是「(期, 段序)」：同一期不可能有兩個「上」，
+  //   所以別名寫法（日期不同但同一期同一段）會自動合併 → 不會重複算集。
+  const derivedNo = new Map();   // derived index → 明確期號
+  for (const [pn, di] of periodToDerived.entries()) derivedNo.set(di, pn);
+
+  // 每個推導期的「段序 → 該段的所有別名 (日期,段序)」
+  const periodSegAliases = new Map();   // derivedIdx → Map<seg, ['date|seg', ...]>
+  derived.forEach((dp, i) => {
+    const m = new Map();
+    for (const k of dp.keys) {
+      const sg = segOf(k);
+      if (!m.has(sg)) m.set(sg, []);
+      m.get(sg).push(k);
+    }
+    periodSegAliases.set(i, m);
+  });
+  // 明確期號的段 → 併入對應推導期。
+  //
+  // ★ 只當「別名」記錄（不新增段）：
+  //   推導期（依日期序 + 段序連續性）已經決定了「哪一段屬於哪一期」。
+  //   站的明確期號只用來「標記」期號，不該改變段數 ——
+  //   否則別站的集名（含其他季/其他內容）會憑空多出段，
+  //   實測 S1 會多出「20250808上」「20260916上」等 → 28 集（TMDb 26）。
+  //
+  // ★ 例外：該推導期「完全沒有」對應段序時，才補建
+  //   （例如某期只有「第N期上」而推導期切成 3 段，缺 中/下）。
+  for (const [pn, di] of periodToDerived.entries()) {
+    const m = periodSegAliases.get(di);
+    if (!m) continue;
+    for (const k of numberedByPeriod.get(pn)) {
+      const sg = segOf(k);
+      if (m.has(sg)) {
+        if (!m.get(sg).includes(k)) m.get(sg).push(k);
+      } else {
+        // 該段序在推導期不存在 → 檢查是否真的缺（推導期太小）
+        const dp = derived[di];
+        if (dp.segSet.size <= 1) {
+          m.set(sg, [k]);
+          dp.segSet.add(sg);
+        }
+      }
+    }
+  }
+
+  // ---- Step 4：依期序累計槽位 ----
+  //   ★ 期的順序 = 推導順序（依播出日期）。
+  const orderedDerived = [...derived.keys()].map((_, i) => i).sort((a, b) => {
+    if (a !== b) {
+      const ka = derived[a].keys[0], kb = derived[b].keys[0];
+      const da = dateOf(ka), db = dateOf(kb);
+      if (da !== db) return da - db;
+    }
+    const na = derivedNo.get(a), nb = derivedNo.get(b);
+    if (na != null && nb != null) return na - nb;
+    return a - b;
+  });
+
+  const periodSlots = new Map();
+  const periodSegSlot = new Map();   // 'period|seg' → slot
+  const dateSegSlot = new Map();     // 'date|seg' → slot
+  const dateSegAll = new Map();      // 'date|seg' → [slot, ...]
+  let slot = 0;
+  for (const di of orderedDerived) {
+    const m = periodSegAliases.get(di);
+    if (!m) continue;
+    const no = derivedNo.get(di);
+    const segs = [...m.keys()].sort((x, y) => (segRank[x] || 9) - (segRank[y] || 9));
+    const start = slot + 1;
+    periodSlots.set(no != null ? no : `d${di}`, { start, count: segs.length });
+    for (const sg of segs) {
+      slot += 1;
+      if (no != null) periodSegSlot.set(`${no}|${sg}`, slot);
+      for (const k of m.get(sg)) {
+        if (!dateSegAll.has(k)) dateSegAll.set(k, []);
+        dateSegAll.get(k).push(slot);
+        if (!dateSegSlot.has(k)) dateSegSlot.set(k, slot);
+      }
+    }
+  }
+  return { periodSlots, periodSegSlot, dateSegSlot, dateSegAll, derived, derivedNo };
+}
+
+/**
+ * 用「合併期結構」把「日期 + 上/中/下」轉成集號。
+ */
+function _resolveSegToEpisodeCombined(baseKey, season, dateInt, segChar) {
+  try {
+    const ck = `${baseKey}|${season}|combined`;
+    const hit = _combinedPeriodCache.get(ck);
+    if (!hit || !hit.acc) return null;
+    // ★ 即時重算：確保所有站看到同一份結構（併發下先跑完的站不能
+    //   把「只含部分站」的結果當定論）。
+    const res = _recomputeCombinedMap(hit.acc);
+    hit.res = res;
+    const v = res.dateSegSlot.get(`${dateInt}|${segChar}`);
+    if (Number.isFinite(v) && v > 0) return v;
+    return null;
+  } catch { return null; }
+}
+
+/**
+ * 用「合併期結構」把「第N期 + 上/中/下」轉成集號。
+ */
+function _resolvePeriodToEpisodeCombined(baseKey, season, period, segChar) {
+  try {
+    const ck = `${baseKey}|${season}|combined`;
+    const hit = _combinedPeriodCache.get(ck);
+    if (!hit || !hit.acc) return null;
+    // ★ 同上：即時重算，避免併發下各站算出的集號不一致。
+    const res = _recomputeCombinedMap(hit.acc);
+    hit.res = res;
+    const v = res.periodSegSlot.get(`${period}|${segChar ?? ''}`);
+    if (Number.isFinite(v) && v > 0) return v;
+    return null;
+  } catch { return null; }
+}
+
+/**
  * 已停用：綜藝日期列表的位置映射（第 N 個播出日 ≠ TMDb 第 N 集）。
  *
  * 保留函式僅供除錯/單測引用，正式路徑不再呼叫。原因：
@@ -3597,16 +4461,104 @@ function _resSuffixOf(r) {
     //   「下」→ bfzy 的 20260116 登錄成無後綴 → dytt/ffzy 的「20260116下」
     //   查表查不到 → 跨站對齊整個失效（實測 E8 看到 32 條不相關集）。
     //   修正：日期之後的「上/下」取**最後**一個匹配，且中間允許數字。
-    let m = s.match(/(?:19|20)\d{6}[^上下]{0,12}?(上|下)/);
+    let m = s.match(/(?:19|20)\d{6}[^上下中]{0,12}?(上|中|下)/);
     if (m) return m[1];
     // 「上/下」緊接其它字元
-    m = s.match(/(上|下)\s*(?:[\)）\]．.・\s]|$)/);
+    m = s.match(/(上|中|下)\s*(?:[\)）\]．.・\s]|$)/);
     if (m) return m[1];
     const t = s.trim();
     if (/上\s*$/.test(t)) return '上';
+    if (/中\s*$/.test(t)) return '中';
     if (/下\s*$/.test(t)) return '下';
   } catch {}
   return null;
+}
+
+/**
+ * 資源在「同一播出日」內的段序（1-based）。
+ *
+ * 為什麼需要（實測《一飯封神》TMDb id=296217）：
+ *   TMDb S1 的 20250912 同時有 E23/E24/E25、S2 的 20260924 同時有 E19/E20/E21。
+ *   只用 air_date 反查會把這幾集全部對到同一段站方資源（三集點進去拿到
+ *   完全相同的結果）。要分清楚，就必須知道「這是當天的第幾段」。
+ *
+ * 段序來源：站方的「上 / 中 / 下」後綴。
+ *   上 → 1、中 → 2、下 → 3，與 TMDb 的「Part 1 / Part 2 / Part 3」一致
+ *   （《一飯封神》S1 第1期 = 20250717上(E1) + 20250717中(E2) + 20250718下(E3)，
+ *     TMDb 標題正是 Episode 1 (Part 1/2/3)）。
+ *   同一日期多段但其中一段沒有上/中/下 → 以「同日期內的段落出現順序」
+ *   補位（無法判定時回 null，交由呼叫端保守處理）。
+ *
+ * 回傳：
+ *   { ordinal:number, count:number } —— count 是該日期在整季中的段數
+ *   （由呼叫端提供，這裡只算本資源在同日期資源中的位次）。
+ */
+function _resDateOrdinal(r, sameDatePeers) {
+  try {
+    const suf = _resSuffixOf(r);
+    // 同一日期的所有候選（已過濾衍生段）
+    let peers = Array.isArray(sameDatePeers) ? sameDatePeers : [r];
+    if (peers.length === 0) peers = [r];
+    const order = { '上': 1, '中': 2, '下': 3 };
+    // ★ 先算出「該日期共有幾段」：依上/中/下去重（同後綴 = 同一集的多線路），
+    //   沒後綴的段以描述當識別碼去重。這個 count 要反映「當天總段數」，
+    //   不是「到本段為止有幾段」—— 後者會讓上/中/下 的 count 依次遞增，
+    //   比對時就會誤判（實測 20250912 上/中/下 應是 3 段，卻算出 1/2/3）。
+    const segKeys = [];
+    const segSeen = new Set();
+    for (const p of peers) {
+      const s2 = _resSuffixOf(p);
+      const k = s2 ? `s:${s2}` : `d:${String(p?.description ?? '')}`;
+      if (segSeen.has(k)) continue;
+      segSeen.add(k);
+      segKeys.push(k);
+    }
+    const total = segKeys.length;
+    // 有明確上/中/下 → 用它定位（多個同後綴者視為同一集的不同線路 → 取第一個）
+    if (suf) {
+      const rank = order[suf];
+      if (rank != null) {
+        // 找出同日期內「有明確後綴且排名 <= rank」的段落數 → 序位
+        const keyed = peers.filter(p => {
+          const s2 = _resSuffixOf(p);
+          const r2 = s2 ? order[s2] : null;
+          return r2 != null && r2 <= rank;
+        });
+        // 同後綴重複（同集多線路）→ 去重成一段
+        const uniq = [];
+        const seen = new Set();
+        for (const p of keyed) {
+          const s2 = _resSuffixOf(p);
+          const k = `${s2}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          uniq.push(p);
+        }
+        return { ordinal: uniq.length, count: total };
+      }
+    }
+    // 沒有明確後綴 → 用同日期內的段落順序（依描述排序後的位置）
+    const sorted = [...peers].sort((a, b) => {
+      const sa = _resSuffixOf(a), sb = _resSuffixOf(b);
+      const order = { '上': 0, '中': 1, '下': 2 };
+      const ra = sa ? order[sa] : 1.5;
+      const rb = sb ? order[sb] : 1.5;
+      if (ra !== rb) return ra - rb;
+      return String(a?.description ?? '').localeCompare(String(b?.description ?? ''));
+    });
+    const idx = sorted.findIndex(p => p === r);
+    if (idx < 0) return null;
+    // 去重：同描述視為同一段的不同線路
+    const descs = [];
+    for (const p of sorted) {
+      const d = String(p?.description ?? '');
+      if (!descs.includes(d)) descs.push(d);
+    }
+    const myDesc = String(r?.description ?? '');
+    const ord = descs.indexOf(myDesc) + 1;
+    if (ord <= 0) return null;
+    return { ordinal: ord, count: descs.length };
+  } catch { return null; }
 }
 
 /**
@@ -4006,7 +4958,17 @@ function _varietyDateSlotOf(r) {
   } catch { return null; }
 }
 
-function filterByEpisode(results, targetEpisode, targetAirDate = null) {
+/**
+ * 依集數過濾候選資源。
+ *
+ * @param results        候選資源
+ * @param targetEpisode  目標集數（TMDb 集號）
+ * @param targetAirDate  目標集的 TMDb air_date（YYYYMMDD 整數或字串）
+ * @param targetAirOrdinal 目標集是「同 air_date 集群內的第幾集」（1-based）。
+ *        為 null 時不做序位比對（維持純日期行為）。
+ * @param targetAirCount 目標 air_date 在 TMDb 該季共有幾集（同日多集時 >1）。
+ */
+function filterByEpisode(results, targetEpisode, targetAirDate = null, targetAirOrdinal = null, targetAirCount = null) {
   if (!targetEpisode && !targetAirDate) return results;
   // ★ 综艺衍生段预筛（加更 / 陪你追日落 / 花絮…永不可能是正片 E_target）：
   //   实测 dytt《日落时分说爱你》97 段里一半是衍生日期；不先剪它们永远
@@ -4058,7 +5020,45 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null) {
     try { const v = _normalizeAirDateToInt(targetAirDate); return v; } catch { return null; }
   })();
   const _resDateInt = _resDateIntOf;
-  const _isDateHit = (res) => _targetDateInt != null && _resDateInt(res) === _targetDateInt;
+  // ★★ 同日多集時的序位比對（實測《一飯封神》S1 E23/E24/E25 都是 20250912、
+  //   S2 E19/E20/E21 都是 20260924）。
+  //   只比日期會把三集全部對到同一段資源（三集點進去結果一模一樣）。
+  //   TMDb 給了「這是該日期的第幾集」（Part 1/2/3），站方用「上/中/下」
+  //   表達同一個序位 → 兩邊序位對得上就是本集。
+  //   只有當 TMDb 該日期確實有多集（targetAirCount > 1）時才啟用；
+  //   單集日期維持原本的純日期命中（行為不變，避免回歸）。
+  const _useOrdinal = (() => {
+    try {
+      if (_targetDateInt == null) return false;
+      if (targetAirOrdinal == null) return false;
+      const n = Number(targetAirOrdinal);
+      if (!Number.isFinite(n) || n < 1) return false;
+      const c = Number(targetAirCount);
+      if (!Number.isFinite(c) || c < 2) return false;
+      return true;
+    } catch { return false; }
+  })();
+  // 同日期的所有候選（用來算本資源在當天的段序）
+  let _sameDatePeers = [];
+  if (_useOrdinal) {
+    try {
+      _sameDatePeers = results.filter(r => {
+        try {
+          if (_isVarietyExtraSeg(String(r?.description ?? ''))) return false;
+          return _resDateInt(r) === _targetDateInt;
+        } catch { return false; }
+      });
+    } catch {}
+  }
+  const _isDateHit = (res) => {
+    if (_targetDateInt == null) return false;
+    if (_resDateInt(res) !== _targetDateInt) return false;
+    if (!_useOrdinal) return true;
+    // 同日多集 → 序位必須相符
+    const ord = _resDateOrdinal(res, _sameDatePeers);
+    if (!ord || !Number.isFinite(ord.ordinal)) return true; // 算不出序位 → 放行（保守）
+    return ord.ordinal === Number(targetAirOrdinal);
+  };
   const hasExact = results.some(res => episodeLabelOf(res) === targetEpisode || _isDateHit(res));
   const filtered = results.filter(res => {
     const label = episodeLabelOf(res);
@@ -4805,6 +5805,53 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
 
     if (type === 'tv' && isTV) {
       const episodes = playSource.split('#').filter(Boolean);
+      // ★ 站方推導「期號 → 集號」對照（沒有 TMDb Key 也能對準）。
+      //   集名裡帶「第N期上/中/下」時，數一數各期有幾段 → 累計出
+      //   第N期第k段 = 第幾集。這解決了《一飯封神》那種「每期段數不固定」
+      //   的綜藝（舊的固定公式假設每期 2 段 → 整季錯位）。
+      try {
+        const _names = episodes.map(e => String(e).split('$')[0]);
+        const _hasPeriod = _names.some(nm => /第\s*0*\d+\s*期/.test(String(nm)));
+        if (_hasPeriod) {
+          const _bk = `${targetInfo?.baseName || ''}|${targetInfo?.seasonNumber || 1}`;
+          const _ck = `${_bk}|station`;
+          if (!_stationPeriodMapCache.has(_ck)) {
+            _buildStationPeriodMap(_names, targetInfo?.baseName || '', targetInfo?.seasonNumber || 1);
+          } else {
+            // 跨站合併：各站覆蓋的期數不同，合併後取覆蓋最全的那份
+            _buildStationPeriodMap(_names, targetInfo?.baseName || '', targetInfo?.seasonNumber || 1, true);
+          }
+        }
+        // ★ 由「日期序列 + 上/中/下」推導期結構（如意 / 樂子只有
+        //   「20260729上」這種命名、沒有「第N期」字樣，靠這條路徑）。
+        //   期的邊界由段序連續性決定：上→開新期、中/下→接續。
+        //   ★ 必須跨站合併（merge=true）：各站覆蓋的集數不同，
+        //   單站缺一段就會讓後面整季的槽位偏移。
+        const _dk = `${targetInfo?.baseName || ''}|${targetInfo?.seasonNumber || 1}|dateseq`;
+        const _hasDateSeq = _stationDateSeqCache.has(_dk);
+        const _dm = _buildPeriodMapFromDateSequence(
+          _names,
+          targetInfo?.baseName || '',
+          targetInfo?.seasonNumber || 1,
+          _hasDateSeq);
+        if (_dm && !_hasDateSeq) {
+          _stationDateSeqCache.set(_dk, { map: _dm, ts: Date.now() });
+        }
+        // ★ 建立「合併期結構」（權威）：同時吃「第N期上/中/下」與
+        //   「日期+上/中/下」兩種命名，並跨站聯集。
+        //   《一飯封神》靠這個把每期段數不固定的情況算對
+        //   （S2 = 第1期3段 + 第2~10期各2段 = 21 集，與 TMDb 一致）。
+        const _ck2 = `${targetInfo?.baseName || ''}|${targetInfo?.seasonNumber || 1}|combined`;
+        const _hasCombined = _combinedPeriodCache.has(_ck2);
+        const _cm = _buildCombinedPeriodMap(
+          _names,
+          targetInfo?.baseName || '',
+          targetInfo?.seasonNumber || 1,
+          _hasCombined);
+        if (_cm && !_hasCombined) {
+          _combinedPeriodCache.set(_ck2, { acc: _cm.acc, res: _cm, ts: Date.now() });
+        }
+      } catch {}
       // ★ 綜藝純日期集名（「20251222」這類）不賦位置集數：第 N 個播出日
       //   ≠ TMDb 第 N 集（站方會拆上/下集、補特別篇，順序硬對只會播錯集）。
       //   只認顯式集數（_macEpNumber）；抽不出就保持 null，交給
@@ -4832,6 +5879,59 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           //   只認「第N集/期」時其他格式的 _ep=null，切到那集就整批被丟，
           //   使用者看到「這集搜不到」。見 _macEpNumber 註解。
           let episodeNumber = _macEpNumber(epName);
+
+          // ★ 「第N期上/中/下」→ TMDb 集號。
+          //   預設公式 slot=(N-1)*2+上1/下2 隱含「每期固定 2 段」，
+          //   只對《日落時分說愛你》成立。《一飯封神》每期段數不固定
+          //   （S1 第1期 = 上/中/下 = E1/E2/E3、S2 第1期同樣 3 段），
+          //   用固定公式會整季錯位（實測 S2「第10期上」算出 19、實際 E20）。
+          //   優先用 TMDb 整季集名建的對照表（最準）；沒有 TMDb Key 時
+          //   退回「站方自己推導的期號對照表」（數各期有幾段）；都沒有才
+          //   用原本的固定公式（行為與現況相同，不會更差）。
+          if (episodeNumber != null) {
+            try {
+              const _pm = epName.match(/第\s*(\d+)\s*期\s*(上|中|下)?/);
+              if (_pm) {
+                const _period = parseInt(_pm[1], 10);
+                const _seg = _pm[2] || null;
+                // ★ 優先序：TMDb 整季集名對照表（有 TMDb Key 時最準）
+                //   → 合併期結構（跨站合併的期號+日期結構，不需要 Key）
+                //   → 站方單站期號對照表
+                //   → 原本的固定公式（行為與現況相同，不會更差）
+                let _resolved = _resolvePeriodToEpisode(
+                  targetInfo?.baseName, targetInfo?.seasonNumber, _period, _seg);
+                if (!Number.isFinite(_resolved)) {
+                  _resolved = _resolvePeriodToEpisodeCombined(
+                    targetInfo?.baseName, targetInfo?.seasonNumber, _period, _seg);
+                }
+                // ★ 不可再退回「單站期號對照表」：單站看不到整季的期結構，
+                //   會把季外加更配上集號（詳情多出第 22~29 集）。
+                if (Number.isFinite(_resolved) && _resolved > 0) episodeNumber = _resolved;
+              }
+            } catch {}
+          }
+
+          // ★ 純日期 + 上/中/下 的集名（「20260729上」「20260730下」）→
+          //   用「日期序列推導的期結構」換算集號。
+          //   如意 / 樂子這類站沒有「第N期」字樣，只能靠這條路徑；
+          //   期的邊界由段序連續性決定（上→開新期、中/下→接續），
+          //   剛好對上 TMDb 的分期（S2 第1期3段、第2~10期各2段 = 21 集）。
+          //   沒有 TMDb Key 時這是唯一能對準的依據。
+          if (episodeNumber == null || _isDateLikeEpName(epName)) {
+            try {
+              const _dm = _parseEpDate(epName);
+              const _sm = epName.match(/(上|中|下)\s*(?:[)）\].．、,，\-—_ ]|$)/);
+              if (_dm != null && _sm) {
+                // ★ 只用「合併期結構」（跨站聯集）。
+                //   不可再退回「單站日期序列」—— 單站的序列看不到整季的期結構，
+                //   會把季外加更（20260925 / 20261010 / 20261011 的上/中/下）
+                //   也配上集號 → 詳情多出第 22~29 集（TMDb 只有 21 集）。
+                const _dsEp = _resolveSegToEpisodeCombined(
+                  targetInfo?.baseName, targetInfo?.seasonNumber, _dm, _sm[1]);
+                if (Number.isFinite(_dsEp) && _dsEp > 0) episodeNumber = _dsEp;
+              }
+            } catch {}
+          }
 
           // ★ 綜藝型集名的判斷依據（「第N期」）。
           //
@@ -7671,7 +8771,8 @@ class SmartSearchExecutor {
     // 指定集數時只推送該集，否則 UI 會先收到第1、2集的來源，
     // 使用者選第34集卻看到不相干的連結。逐站判斷，理由見 filterByEpisode。
     let candidates = (this.type === 'tv' && this.targetEpisode !== null)
-      ? filterByEpisode(resources, this.targetEpisode, this.targetInfo?._targetAirDate ?? null)
+      ? filterByEpisode(resources, this.targetEpisode, this.targetInfo?._targetAirDate ?? null,
+          this.targetInfo?._targetAirOrdinal ?? null, this.targetInfo?._targetAirCount ?? null)
       : resources;
 
     // ★ 日期站逐站推送抑制（综艺纯日期站刷屏的根因）。
@@ -9210,6 +10311,30 @@ targetInfo.searchQuery = aliasQ;
     targetInfo._targetAirDate = _ad;
     if (_ad) console.log(`📅 TMDb air_date 對齊: S${targetSeason}E${targetEpisode} → ${_ad}`);
   } catch { targetInfo._targetAirDate = null; }
+  // ★★ 同日多集的序位（《一飯封神》S1 E23/E24/E25 都是 20250912、S2
+  //   E19/E20/E21 都是 20260924）。
+  //   只有 air_date 時，這幾集會被對到同一段資源（三集結果一模一樣）。
+  //   取 TMDb 整季的「日期 → 該日集序」對照，得出本集是當天第幾集，
+  //   讓 filterByEpisode 能在站方同日的多段（上/中/下）中挑對。
+  targetInfo._targetAirOrdinal = null;
+  targetInfo._targetAirCount = null;
+  try {
+    if (targetInfo._targetAirDate != null && (type === 'tv' || type === 'variety')
+        && Number.isFinite(targetEpisode) && targetEpisode > 0) {
+      const _so = await getTMDBSeasonDateOrder(targetInfo.baseName, type, targetSeason, 3000);
+      if (_so && _so.byDate) {
+        const _grp = _so.byDate.get(targetInfo._targetAirDate);
+        if (_grp) {
+          targetInfo._targetAirCount = _grp.count;
+          const _o = _grp.order.get(targetEpisode);
+          if (Number.isFinite(_o)) targetInfo._targetAirOrdinal = _o;
+        }
+      }
+    }
+    if (targetInfo._targetAirOrdinal != null) {
+      console.log(`📅 同日序位: S${targetSeason}E${targetEpisode} 是 ${targetInfo._targetAirDate} 的第 ${targetInfo._targetAirOrdinal}/${targetInfo._targetAirCount} 集`);
+    }
+  } catch { targetInfo._targetAirOrdinal = null; targetInfo._targetAirCount = null; }
 
   const sequelTag = extractSequelNumber(targetInfo.rawName);
   // 年份也要納入：clean 後「仁醫2009」與「仁醫2012」都變成「仁醫」，
@@ -9235,7 +10360,8 @@ targetInfo.searchQuery = aliasQ;
         let usable = cachedResults;
         if (type === 'tv' && targetEpisode) {
           const before = usable.length;
-          usable = filterByEpisode(usable, targetEpisode, targetInfo?._targetAirDate ?? null);
+          usable = filterByEpisode(usable, targetEpisode, targetInfo?._targetAirDate ?? null,
+            targetInfo?._targetAirOrdinal ?? null, targetInfo?._targetAirCount ?? null);
           console.log(`🎯 集数过滤(缓存): ${before} -> ${usable.length}`);
         }
 
@@ -9391,7 +10517,8 @@ targetInfo.searchQuery = aliasQ;
   
   if (type === 'tv' && targetEpisode) {
     const beforeFilter = finalResults.length;
-    finalResults = filterByEpisode(finalResults, targetEpisode, targetInfo?._targetAirDate ?? null);
+    finalResults = filterByEpisode(finalResults, targetEpisode, targetInfo?._targetAirDate ?? null,
+      targetInfo?._targetAirOrdinal ?? null, targetInfo?._targetAirCount ?? null);
     console.log(`🎯 集数过滤: ${beforeFilter} -> ${finalResults.length}`);
   }
 
@@ -10842,23 +11969,100 @@ targetInfo.searchQuery = aliasQ;
     //   修正後：_macCacheHit=true 時 macTasks 為空，requestTasks 只含
     //     adapter 補抓；進 if 之後 allResults 已含 MacCMS cache，合併
     //     新的 adapter 結果後寫回。E1 切 E2 從 4-8s 降到 ~200ms。
+    // ★★ 期結構預掃（跨站聯集）★★
+    //
+    // 背景：《一飯封神》每期段數不固定（S2 第1期 = 上/中/下 = 3 段，
+    // 第2~10期各 2 段 = 共 21 集，與 TMDb 一致）。要把「第N期上」
+    // 對到正確集號，必須知道「每期有幾段」；而各站提供的集名覆蓋範圍
+    // 不同（暴風有「第1期上/中/下」、如意只有「20260729上」…），
+    // 單看任一站都推不準 → 必須把所有站的集名聯集起來推。
+    //
+    // ★ 為什麼要「先掃一次、併發解析時共用」：
+    //   各站的 extractPlayInfoForCache 是併發跑的，先跑完的站若把
+    //   「當下只含部分站」的期結構寫進快取，後跑的站會對同一集算出
+    //   不同集號（實測 20260924第10期上 → 19 或 20 不定）。
+    //   預掃階段先拿齊所有站的集名 → 結構一次到位、全部站一致。
+    //
+    // ★ 實作：把「抓搜尋結果」與「抓詳情」拆成兩階段，中間插預掃。
+    //   搜尋結果（ac=detail 的 list）本身就含 vod_play_url（集名列），
+    //   預掃不需要另外的請求 —— 拆階段只是把同一份 response 往後傳。
+    const _macSearches = _macCacheHit ? [] : await Promise.all(
+      resourceSites.map(async site => {
+        try {
+          const retries = site.isMain ? CONFIG.RETRY_ATTEMPTS : 1;
+          const response = await fetchWithSmartRetry(
+            site.value,
+            { params: { ac: "detail", wd: targetInfo.searchQuery || targetInfo.baseName } },
+            retries,
+            site.title
+          );
+          if (!response?.list) return null;
+          try { macResponseCache.set(site.value, response.list); } catch {}
+          return { site, list: response.list };
+        } catch { return null; }
+      })
+    );
+    // 預掃：把所有站的集名聯集起來，建立跨站一致的期結構
+    //
+    // ★ 只能收「確實是本片本季」的候選：站方搜尋結果裡混有其他集、
+    //   其他季、甚至同名不同作的項目（「一飯封神 第2季（加更版）」、
+    //   「一飯封神 花絮」…）。把那些集名一起送進期結構會把整季集數
+    //   撐到 50+（實測 E54），反而比修之前更糟。
+    //   → 沿用既有的 isSmartSeriesMatch（與各站篩選同一套判準）。
+    try {
+      if (type === 'tv' && !_macCacheHit) {
+        const bk = targetInfo?.baseName || '';
+        const sn = targetInfo?.seasonNumber || 1;
+        const ck = `${bk}|${sn}|combined`;
+        if (!_combinedPeriodCache.has(ck)) {
+          const allNames = [];
+          for (const { list } of _macSearches) {
+            if (!Array.isArray(list)) continue;
+            for (const it of list) {
+              if (!it?.vod_name) continue;
+              // ★ 只收「通過比對」且「季別正確」的候選
+              let candidateInfo = null;
+              try { candidateInfo = extractEnhancedInfo(it.vod_name, it); } catch {}
+              if (!candidateInfo) continue;
+              const mr = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness);
+              if (!mr.match) continue;
+              // 季別衝突（站方是第1季、我們要第2季）→ 不收
+              const itemSeason = extractSequelNumber(it.vod_name);
+              if (itemSeason != null && sn != null && Number(itemSeason) !== Number(sn)) continue;
+
+              const pu = String(it?.vod_play_url || '');
+              if (!pu || !pu.includes('#')) continue;
+              for (const src of pu.replace(/#+$/, '').split('$$$')) {
+                if (!src.includes('#')) continue;
+                for (const ep of src.split('#')) {
+                  const nm = String(ep).split('$')[0];
+                  if (!nm) continue;
+                  // ★ 排除「其他季」的集名。
+                  //   站方的同一個條目偶爾把 S1/S2 混在同一份列表裡
+                  //   （實測 S1 的聯集裡混進了 S2 的「第8期」20260916/20260917），
+                  //   那些日期排在最後一期之後，會讓 S1 多出 2 集。
+                  //   → 集名文字裡帶「第N季」且 N ≠ 目標季 → 跳過。
+                  const _sm2 = nm.match(/第\s*([0-9]+)\s*季/);
+                  if (_sm2 && sn != null && Number(_sm2[1]) !== Number(sn)) continue;
+                  allNames.push(nm);
+                }
+              }
+            }
+          }
+          if (allNames.length > 0) _buildCombinedPeriodMap(allNames, bk, sn, false);
+        }
+      }
+    } catch {}
+
     const macTasks = _macCacheHit ? [] : resourceSites.map(site => async () => {
       try {
-        const retries = site.isMain ? CONFIG.RETRY_ATTEMPTS : 1;
-        const response = await fetchWithSmartRetry(
-          site.value,
-          { params: { ac: "detail", wd: targetInfo.searchQuery || targetInfo.baseName } },
-          retries,
-          site.title
-        );
+        const _pre = _macSearches.find(x => x && x.site === site);
+        const response = _pre ? { list: _pre.list } : null;
 
         if (!response?.list) {
           stats.failed++;
           return [];
         }
-
-        // 第一次 response.list 留一份給 fallback 路徑
-        try { macResponseCache.set(site.value, response.list); } catch {}
 
         // Phase 1 收集「通過比對與過濾的候選」；Phase 2 併發抓 detail（見下方）。
         const eligible = [];
