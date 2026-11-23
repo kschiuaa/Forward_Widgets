@@ -1340,7 +1340,21 @@ const CONFIG = {
   //   修法：_isVarietyExtraSeg 先剝掉「更新至…」後綴再判斷。
   //   同時 _lookupGlobalDateEp 補「同日單一上/下錨定」規則，讓
   //   ffzy「第20260116期」（無上/下）對到 E8 而不是位置推斷出的錯日期。
-  WIDGET_VERSION: 78,
+  //
+  // ★ v79：修電影續集匹配 —— 搜「海王2」會回第一部《海王》(2018)。
+  //   四個根因全在 isSmartSeriesMatch / filterBySequel：
+  //   (1) sequelConflict 只擋「target 無序號 ↔ candidate 有序號」，
+  //       漏了反向的「target 有序號(≥2) ↔ candidate 無序號」，
+  //       所以「海王2」對「海王」不衝突 → 以 fallback(50) 放行。
+  //   (2) fallback 分支的 finaleMatches 逃逸門把 sequelCompatible 架空，
+  //       序號明明衝突照樣放行。
+  //   (3) 「上海王2」(2020，另一部電影) 序號也是 2，相似度 0.75 過 LOOSE 門檻
+  //       → 誤放行；需要「去序號後主片名一致」的守門員。
+  //   (4) 真正的續集「海王2：失落的王国」(2023) 因為候選有副標題、
+  //       target 沒有，被副標題規則判成 spin_off 而丟掉 —— 續集反而找不到。
+  //   實測：修正後搜「海王2」得 9 筆全部是 2023 年的《海王2：失落的王國》，
+  //   搜「海王」得 9 筆全部是 2018 年的第一部。
+  WIDGET_VERSION: 79,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1599,7 +1613,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.1.0",
+  version: "4.1.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2834,8 +2848,29 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   if (candidateSequel === 1) candidateSequel = null;
   // target 端同理：使用者輸入「庆余年1」時不應被當成有續集序號。
   const targetSequelNorm = targetSequel === 1 ? null : targetSequel;
+
+  // ★★ v78.1：補上「反向」的序號形狀衝突。
+  //
+  //   原先只擋「target 無序號 ↔ candidate 有序號」（shapeMismatch），
+  //   但「target 有序號 ≥2 ↔ candidate 無序號」這一組完全沒被擋，
+  //   結果是：搜「海王2」時，2018 年的《海王》（檔名沒有數字序號）
+  //   以 fallback(score 50) 混進結果，使用者看到第一部的片源。
+  //
+  //   語意：target 明確是某系列的第 2 部以後，candidate 卻是沒有序號的
+  //   原版（序號 1 或無標示）→ 兩者是不同作品，必須擋。
+  //   這正是註解裡點名的「战狼2 對 战狼」那一組。
+  //
+  //   例外：「完结篇/完結篇」是 S2 的常見替身命名（「仁医完结篇」），
+  //   檔名本身沒有數字序號，但它確實是續集。上面 candidateSequel 的
+  //   補值只在 target 有 _expectedSequel 時才生效；這裡再放行一次，
+  //   讓「target 有數字序號 + candidate 完结篇」也不被誤殺
+  //   （例：target「仁医2」對 candidate「仁医完结篇」）。
+  const candidateIsFinaleMark = /完结篇|完結篇/.test(candidateInfo.rawName || '');
+  const targetHasSequel = targetSequelNorm !== null && targetSequelNorm >= 2;
+  const reverseShapeMismatch = targetHasSequel &&
+    (candidateSequel === null) && !candidateIsFinaleMark;
   const sequelShapeMismatch = (targetSequelNorm === null) && (candidateSequel !== null);
-  const sequelConflict = sequelShapeMismatch ||
+  const sequelConflict = sequelShapeMismatch || reverseShapeMismatch ||
     (targetSequelNorm !== null && candidateSequel !== null && targetSequelNorm !== candidateSequel);
 
   // 季度衝突：使用者選第一季，候選卻是第二季，就不是他要的內容。
@@ -2884,6 +2919,34 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       similarity, sequelTarget: targetSequelNorm, sequelCandidate: candidateSequel,
       seasonMatch: false, confidence: 0
     };
+  }
+
+  // ★★ v78.1：序號相同但主片名不同 → 不同作品，必須擋。
+  //
+  //   實測搜「海王2」時，站方回傳「上海王2」(2020，另一部電影)，
+  //   兩者續集序號都是 2 → 序號不衝突，相似度 0.75 也過了 LOOSE 門檻
+  //   → 以 loose(score 70) 放行，使用者看到完全不相干的電影。
+  //
+  //   判準：把雙方的片名去掉「續集序號數字」後必須一致。
+  //   「海王2」→ 主片名「海王」；「上海王2」→ 主片名「上海王」→ 不一致 → 擋。
+  //   同一部片的正常寫法（序號位置或副標題不同）都會落在主片名一致上。
+  //
+  //   只在「雙方序號相同且非 null」時啟用，避免誤殺：
+  //   target 無序號的情況（使用者只打「海王」）不受影響。
+  if (targetSequelNorm !== null && candidateSequel !== null &&
+      targetSequelNorm === candidateSequel) {
+    const coreOf = (s) => stripFiller(
+      normalizeTitleForMatch(stripSubtitle(s)).replace(/完结篇|完結篇/g, '')
+    ).replace(/\d+$/, '');
+    const targetCoreSeq = coreOf(targetInfo.baseName);
+    const candidateCoreSeq = coreOf(candidateInfo.baseName);
+    if (targetCoreSeq && candidateCoreSeq && targetCoreSeq !== candidateCoreSeq) {
+      return {
+        match: false, type: 'sequel_conflict', score: 0,
+        similarity, sequelTarget: targetSequelNorm, sequelCandidate: candidateSequel,
+        seasonMatch: false, confidence: 0
+      };
+    }
   }
   
   let thresholds = CONFIG.MATCH_THRESHOLDS;
@@ -2982,7 +3045,22 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
               ((candidateIsFinale && candidateSequel === null) ||
                (targetIsFinale && targetSequel === null)));
 
-    if (coreMatches && (sequelCompatible || (finaleMatches && targetIsFinale === false))) {
+    // ★★ v78.1：修掉「無序號逃逸門」讓序號衝突的候選混進來。
+    //
+    //   原式：`coreMatches && (sequelCompatible || (finaleMatches && targetIsFinale === false))`
+    //   後半段的 finaleMatches 在「兩者都沒有完结篇字樣」時恆為 true，
+    //   等於把 sequelCompatible 整個架空 —— 於是序號明明衝突
+    //   （target sequel=2「海王2」vs candidate sequel=null「海王」）
+    //   仍舊以 fallback(score 50) 放行，使用者搜「海王2」會看到第一部。
+    //
+    //   修正：逃逸門只允許在「序號不衝突」時使用。
+    //   finaleMatches 的原意是「一方標示完結篇、另一方沒標」時容許互補
+    //   （target「仁医」對 candidate「仁医完结篇」），那種情況序號本來
+    //   就相容（candidateSequel 已被補成 target 的期望序號），
+    //   所以加上 !sequelConflict 不會影響它。
+    const canUseFinaleEscape = finaleMatches && targetIsFinale === false && !sequelConflict;
+
+    if (coreMatches && (sequelCompatible || canUseFinaleEscape)) {
       // v2.9.5：擋掉「衍生作 / 兄弟作」（spin-off）。
       //
       // 實測「行尸走肉」（target, S11）比對站方結果時，下列都通過 coreMatches
@@ -2996,21 +3074,65 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       const targetSub = String(targetInfo.baseName || '').split(/[：:]/).slice(1).join('').trim();
       const candidateSub = String(candidateInfo.baseName || '').split(/[：:]/).slice(1).join('').trim();
       if (!targetSub && candidateSub) {
-        return {
-          match: false, type: 'spin_off', score: 0,
-          similarity: similarity, seasonMatch: false,
-          targetSub: '', candidateSub: candidateSub,
-          confidence: 0
-        };
+        // ★★ v78.1：續集本片常帶副標題，不能一律當成衍生作。
+        //
+        //   實測搜「海王2」時，站方真正的續集檔名是「海王2：失落的王国」
+        //   （2023），target「海王2」沒有副標題 → 被這條規則判成 spin_off
+        //   而丟掉，結果只剩下 2018 年的第一部《海王》和 2020 年的
+        //   《上海王2》—— 續集反而找不到。
+        //
+        //   判準：候選的「主片名（含續集序號）」與 target 的主片名相同
+        //   時，副標題只是同一部片的副標題，不是衍生作 → 放行。
+        //   「海王2：失落的王国」剝掉副標題後的主片名是「海王2」，
+        //   與 target「海王2」一致 → 放行。
+        //   反例仍維持 spin_off：「行尸走肉：存活之人」剝掉副標題後是
+        //   「行尸走肉」，跟 target「行尸走肉」主片名相同 —— 但它的副標題
+        //   「存活之人」是衍生作專屬標記，不能放行。
+        //   因此這裡額外要求「候選序號與 target 序號一致且非空」，
+        //   才視為同一部片的副標題。
+        const candidateCoreForSub = normalizeTitleForMatch(
+          stripSubtitle(candidateInfo.baseName).replace(/完结篇|完結篇/g, '')
+        );
+        const targetCoreForSub = normalizeTitleForMatch(
+          stripSubtitle(targetInfo.baseName).replace(/完结篇|完結篇/g, '')
+        );
+        const sameWorkWithSubtitle =
+          candidateCoreForSub === targetCoreForSub &&
+          targetSequelNorm !== null && candidateSequel !== null &&
+          targetSequelNorm === candidateSequel;
+
+        if (!sameWorkWithSubtitle) {
+          return {
+            match: false, type: 'spin_off', score: 0,
+            similarity: similarity, seasonMatch: false,
+            targetSub: '', candidateSub: candidateSub,
+            confidence: 0
+          };
+        }
       }
 
+      // ★★ v78.1：主片名（含續集序號）完全一致時，給高分。
+      //
+      //   「海王2」對「海王2：失落的王国」：候選多了副標題，相似度被
+      //   稀釋到 0.407 而落到 fallback(50)，排序時會被排到後段。
+      //   但兩者的主片名其實完全相同 —— 這就是使用者要找的那部片，
+      //   應該跟 exact 一樣的優先度。
+      //
+      //   判準：targetCore === candidateCore（已經去掉完结篇、保留續集序號）。
+      //   這比單純的相似度高門檻更可靠：「行尸走肉」對「行尸走肉：存活之人」
+      //   的 targetCore 也是相同，但那一路會被上面的副標題規則擋掉。
+      //
+      //   ★ 型別沿用 exact（不另創 exact_core）：排序權重表只認
+      //     exact / fuzzy / loose / fallback，且 exact 還參與
+      //     shouldStopSearch 的「高品質結果」計數。沿用 exact 免得漏接。
+      const coreIdentical = targetCore === candidateCore;
       return {
         match: true,
-        type: 'fallback',
-        score: 50,
+        type: coreIdentical ? 'exact' : 'fallback',
+        score: coreIdentical ? 95 : 50,
         similarity: similarity,
         seasonMatch: targetInfo.seasonNumber === candidateInfo.seasonNumber,
-        confidence: 0.60
+        confidence: coreIdentical ? 0.92 : 0.60
       };
     }
   }
@@ -9818,6 +9940,29 @@ function filterBySequel(results, targetInfo) {
     //   舊規則的正則漏了這個符號，是實測漏網的直接原因。
     if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇|[＊∽]/.test(rawName)) {
       dropped.push(res); continue;
+    }
+
+    // ★★ v78.1：target 有續集序號時，主片名不同的候選必須 drop。
+    //
+    //   場景：target「海王2」（續集序號 2），站方同時回傳
+    //     ・海王2：失落的王国 (2023)  ← 正確
+    //     ・上海王2            (2020)  ← 另一部電影，序號也剛好是 2
+    //   兩者的 sequel 都是 2 → 規則 1 會把「上海王2」一起 keep，
+    //   使用者就會看到完全不相干的電影。
+    //
+    //   判準：把雙方片名去掉「續集序號數字」與虛詞後必須一致。
+    //     海王2 → 海王；上海王2 → 上海王 → 不一致 → drop。
+    //   只在 target 自身帶續集序號（≥2）時啟用，避免影響一般單集作品。
+    const targetSeq = extractSequelNumber(targetInfo?.rawName || '');
+    if (Number.isFinite(targetSeq) && targetSeq >= 2 && rawName) {
+      const coreOfName = (s) => normalizeTitleForMatch(
+        stripSubtitle(String(s)).replace(/完结篇|完結篇/g, '')
+      ).replace(/的|之/g, '').replace(/\d+$/, '');
+      const tCore = coreOfName(targetInfo?.rawName || '');
+      const cCore = coreOfName(rawName);
+      if (tCore && cCore && tCore !== cCore) {
+        dropped.push(res); continue;
+      }
     }
 
     if (sequel === targetSeason) { kept.push(res); continue; }
