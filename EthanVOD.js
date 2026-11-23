@@ -1314,7 +1314,12 @@ const CONFIG = {
 //   TMDb S1E4 的 air_date（例如 20260115）反查站方同日期的集 → 自動命中，
 //   其餘播出日（20251222 / 20260301…）判定為不相干並丟掉。
 //   使用者不再需要在一堆日期裡手動挑。舊 cache 是髒結果，清掉重搜。
-  WIDGET_VERSION: 72,
+// bump 到 73：綜藝正片收斂（TMDb S1 20 集 = 10 期 × 上/下）。
+//   bfzy 51 段裡 20 段正片（第N期上/下 → slot=(N-1)*2+上1/下2）對齊 20 集，
+//   其餘加更/陪你追日落等衍生（_isVarietyExtraSeg）抽不出集數；ffzy
+//   「第20251225期」日期殼與 lzi「20251225上」同樣未知。詳情頁未知集
+//   不再單獨成組（否則 46 段變 46 個大集號、或全擠進 eX）。舊 cache 脏，重搜。
+  WIDGET_VERSION: 73,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1573,7 +1578,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.0.2",
+  version: "4.0.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3038,14 +3043,62 @@ function playSourceKeyOf(resource) {
  * 不能硬判成第 1 集，否則點第 1 集會混進預告片。null 交給
  * filterByEpisode 的 hasExact 後備邏輯決定去留。
  */
+function _isDateNumberStr(numStr) {
+  const t = String(numStr ?? '').replace(/^0+/, '');
+  if (t.length !== 8) return false;
+  if (!/^(19|20)\d{6}$/.test(t)) return false;
+  const mo = parseInt(t.slice(4, 6), 10), d = parseInt(t.slice(6, 8), 10);
+  return mo >= 1 && mo <= 12 && d >= 1 && d <= 31;
+}
+
+/**
+ * 綜藝衍生段判定（加更 / 陪你追日落 / 花絮 / 直播 / 先導片 …）。
+ *
+ * 為什麼需要：以 bfzy《日落时分说爱你》為例，51 段裡只有 20 段是正片
+ * （10 期 × 上/下，TMDb S1 20 集），其餘 31 段是衍生（加更、陪你追日落、
+ * 老友局、直播、花絮、先導片…）。衍生段常套著「第N期」殼
+ * （「20251227(第1期加更)」），不攔會被 _macEpNumber/_adapterEpNumber
+ * 抽出 N=1，跟正片 E1 撞車 → 詳情多出一堆重複集。
+ * 一律回 true → 上游抽集數時回 null（未知），loadDetail 正片收斂時丟掉。
+ */
+function _isVarietyExtraSeg(name) {
+  // ★ 先導片也算衍生：bfzy《日落时分说爱你》51 段 = 先導片 1 + 正片 20 +
+  //   衍生 30，TMDb S1 只有 20（10 期 × 上/下）。先導片抽不出集數，
+  //   留下會在詳情多出第 21 組；併入衍生後，有顯式集時隨 eX 組一起剪掉，
+  //   無顯式集（純日期單站）時因 hasExplicit=false 保留，不會空白頁。
+  return /加更|陪你|花絮|特辑|特輯|老友|直播|彩蛋|超前|预告|預告|片花|幕后|幕後|纯享|純享|会员|會員|抢先|搶先|路透|名场面|名場面|撒糖|先导|先導|先行/.test(String(name ?? ''));
+}
+
 function _macEpNumber(epName) {
   const s = String(epName ?? '').trim();
   if (!s) return null;
+  // ★ 綜藝衍生段（加更 / 陪你追日落 / 花絮…）不是正片：直接回 null，
+  //   不得抽出裡面的「第N期」跟正片撞車（「20251227(第1期加更)」≠ E1）。
+  //   先導片除外（常是 E1）。
+  if (_isVarietyExtraSeg(s)) return null;
   // 「第01集」「第1期」「第1話」「第2回」（含全形話/回與空白）
-  let m = s.match(/第\s*0*(\d+)\s*[集期話话回]/);
+  // ★ 日期型期號（「第20251225期」這類把 YYYYMMDD 包進「第…期」）不是集數：
+  //   舊正則直接抽出 20251225 當集號 → 詳情頁冒出「第20251225集」等幾十個
+  //   假集數（實測 ffzy《日落时分说爱你》46 段全變獨立大集號，遠超 TMDb S1 20 集）。
+  //   8 位日期數字一律跳過本條，交給日期邏輯（_episodeDate）處理。
+  let m = s.match(/第\s*0*(\d+)\s*([集期話话回])\s*(上|下)?/);
   if (m) {
-    const n = parseInt(m[1], 10);
-    if (Number.isFinite(n) && n > 0) return n;
+    if (_isDateNumberStr(m[1])) {
+      // 整段就是日期套期號殼，不是有編號的期 → 當未知集數處理
+    } else {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n) && n > 0) {
+        // ★ 綜藝上/下拆段（「第1期上」「20260115(第4期下)」）：同一期拆成
+        //   上下兩段播，TMDb 按播出段各記一集（S1 共 20 集 = 10 期 × 上/下）。
+        //   只回期號會把上下併成一組（詳情只剩 10 集）；編成槽位
+        //   slot=(N-1)*2+上1/下2 後，詳情自然展開成 20 集且與 TMDb 順序一致。
+        //   只對「期」做此展開（戲劇「第1集」不受影響）；N<1000 防大數字。
+        if (m[2] === '期' && (m[3] === '上' || m[3] === '下') && n < 1000) {
+          return (n - 1) * 2 + (m[3] === '上' ? 1 : 2);
+        }
+        return n;
+      }
+    }
   }
   // 「EP01」「E3」「ep 12」（前有分隔或在開頭，避免誤抓片名內的 E）
   m = s.match(/(?:^|[^A-Za-z\d])E[Pp]?\s*0*(\d+)\b/);
@@ -3085,6 +3138,11 @@ function _macEpNumber(epName) {
 function _isDateLikeEpName(s) {
   const t = String(s ?? '').trim();
   if (!t) return false;
+  // ★ 日期套期號殼（「第20251225期」這類把 YYYYMMDD 包進「第…期」）視為日期：
+  //   必須在「第N期」排除之前先判，否則這類永遠被當成顯式期號，
+  //   _macEpNumber 抽出 20251225 當集號 → 詳情頁冒出幾十個假集數
+  //   （實測 ffzy《日落时分说爱你》46 段全變獨立大集號，遠超 TMDb S1 20 集）。
+  if (/第\s*(?:19|20)\d{6}\s*[集期話话回]/.test(t)) return true;
   if (/第\s*\d+\s*[集期話话回]/.test(t)) return false;
   if (/(?:^|[^A-Za-z\d])E[Pp]?\s*\d+\b/.test(t)) return false;
   if (/(19|20)\d{2}[.\-\/年]\d{1,2}[.\-\/月]\d{1,2}/.test(t)) return true;
@@ -3392,12 +3450,27 @@ function _adapterEpisodeLabel(rawName) {
 function _adapterEpNumber(rawName) {
   const s = String(rawName ?? '').trim();
   if (!s) return 1;
+  // ★ 綜藝衍生段（加更 / 陪你追日落 / 花絮…）不是正片：回 null（未知），
+  //   不得抽出裡面的「第N期」跟正片撞車（同 _macEpNumber 修法）。
+  //   先導片除外（常是 E1）。
+  if (_isVarietyExtraSeg(s)) return null;
   // ★ 先抓「第N集/期/話」這類顯式標記（「20260115(第4期上)」真正的集號是 4，
   //   不是 20260115）。這與 _macEpNumber 的優先順序一致。
-  let m = s.match(/第\s*0*(\d+)\s*[集期話话回]/);
+  let m = s.match(/第\s*0*(\d+)\s*([集期話话回])\s*(上|下)?/);
   if (m) {
-    const n = parseInt(m[1], 10);
-    if (Number.isFinite(n) && n > 0) return n;
+    // ★ 日期套期號殼（「第20251225期」）不是集數：跳過，交給日期邏輯
+    //   （同 _macEpNumber 的修法；實測 ffzy《日落时分说爱你》46 段全是這種）。
+    if (!_isDateNumberStr(m[1])) {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n) && n > 0) {
+        // ★ 綜藝上/下拆段與 _macEpNumber 同規則：第N期上/下展開成
+        //   slot=(N-1)*2+上1/下2（TMDb S1 20 集 = 10 期 × 上/下）。
+        if (m[2] === '期' && (m[3] === '上' || m[3] === '下') && n < 1000) {
+          return (n - 1) * 2 + (m[3] === '上' ? 1 : 2);
+        }
+        return n;
+      }
+    }
   }
   // 「EP01」「E3」這類編號（同 _macEpNumber，避免誤抓片名內的 E）。
   m = s.match(/(?:^|[^A-Za-z\d])E[Pp]?\s*0*(\d+)\b/);
@@ -11065,6 +11138,29 @@ async function loadDetail(link) {
         groups.set(key, { season: resSeason, episode: epLabel, resources: [] });
       }
       groups.get(key).resources.push(r);
+    }
+    // ★ 綜藝正片收斂（TMDb S1 20 集 = 10 期 × 上/下）：
+    //   bfzy 20 段正片已有 slot 1..20；ffzy「第20251225期」日期殼、
+    //   lzi「20251225上」純日期+上/下、以及各站加更/陪你追日落等衍生
+    //   （_isVarietyExtraSeg）抽不出集數，全擠在 eX 未知組。
+    //   有顯式集數時，未知組裡的日期/衍生只是噪音（否則詳情多出
+    //   「未命名」一集，內含幾十個日期段；修前更是 46 個幾千萬大集號）。
+    //   按季剪枝：該季有顯式集 → 丟掉該季 eX 組裡的日期/衍生資源；
+    //   剪空才刪組（先導片這類無編號正片保留；戲劇無日期組不受影響；
+    //   純日期單站無顯式集時保留原樣，寧可給一個可播項也不給空白頁）。
+    for (const [key, g] of Array.from(groups.entries())) {
+      if (g.episode != null) continue;
+      const hasExplicit = Array.from(groups.values()).some(
+        (o) => o.season === g.season && o.episode != null
+      );
+      if (!hasExplicit) continue;
+      g.resources = g.resources.filter((r) => {
+        const desc = String(r?.description ?? '');
+        if (_isVarietyExtraSeg(desc)) return false;
+        if (_isDateLikeEpName(desc)) return false;
+        return true;
+      });
+      if (g.resources.length === 0) groups.delete(key);
     }
 
     // 集數排序：先按 season，再按 episode。season 排序確保 S1 在前 S2 在後，
