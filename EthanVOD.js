@@ -1330,7 +1330,17 @@ const CONFIG = {
 //   其餘加更/陪你追日落等衍生（_isVarietyExtraSeg）抽不出集數；ffzy
 //   「第20251225期」日期殼與 lzi「20251225上」同樣未知。詳情頁未知集
 //   不再單獨成組（否則 46 段變 46 個大集號、或全擠進 eX）。舊 cache 脏，重搜。
-  WIDGET_VERSION: 76,
+  // ★ v77：修「更新至…」站方後綴誤判正片為衍生段。
+  //   bfzy《日落时分说爱你》每段集名都帶著
+  //   「．更新至20260301(陪你追日落第10期下)」，內含「陪你」→
+  //   _isVarietyExtraSeg 把 20 段正片全判成衍生 → performBatchSearch
+  //   的預篩整批刪掉（292 筆刪 162 筆，含 E1–E20 唯一顯式錨點）
+  //   → 跨站日期登錄表全空 → 純日期站推不出集數 → 點任何一集都看到
+  //   整季不相干日期（實測 E8 = 99 筆）。
+  //   修法：_isVarietyExtraSeg 先剝掉「更新至…」後綴再判斷。
+  //   同時 _lookupGlobalDateEp 補「同日單一上/下錨定」規則，讓
+  //   ffzy「第20260116期」（無上/下）對到 E8 而不是位置推斷出的錯日期。
+  WIDGET_VERSION: 77,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1589,7 +1599,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.0.8",
+  version: "4.0.9",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3072,12 +3082,52 @@ function _isDateNumberStr(numStr) {
  * 抽出 N=1，跟正片 E1 撞車 → 詳情多出一堆重複集。
  * 一律回 true → 上游抽集數時回 null（未知），loadDetail 正片收斂時丟掉。
  */
+/**
+ * 取出「真正的集名」——把站方附加在集名後面的說明後綴剝掉。
+ *
+ * ★ 為什麼需要（實測 bfzy《日落时分说爱你》51 段全被誤判成衍生）：
+ *   bfzy 把每一段的集名都寫成
+ *     「20260116(第4期下)．更新至20260301(陪你追日落第10期下)」
+ *   後半段「更新至20260301(陪你追日落第10期下)」是站方標註「本節目已
+ *   更新到第 10 期下」的聲明，**跟這一集是什麼無關** —— 20 段正片全都
+ *   帶著同一個後綴。但它含有「陪你」（陪你追日落是該節目的衍生單元），
+ *   導致 _isVarietyExtraSeg 把「20260116(第4期下)」也判成衍生。
+ *
+ * 後果非常致命：
+ *   1. _macEpNumber 因為「是衍生」而回 null → 抽不出「第4期下」→ _ep 遺失；
+ *   2. performBatchSearch 的衍生段預篩把這 20 段正片整批刪掉
+ *      （實測 292 筆刪掉 162 筆，其中 20 筆正是 E1–E20 的唯一顯式錨點）；
+ *   3. 錨點沒了 → 跨站日期登錄表全空 → 純日期站（dytt/lzi/ffzy/1080zyku）
+ *      的日期推不出集數 → filterByEpisode 的 hasExact 恆為 false →
+ *      整站幾十個不相干日期全部留下（實測 E8 點進去 99 筆）。
+ *
+ * 剝的原則：只切掉「更新至」之後的內容，且保留「更新至」之前的集名。
+ * 若整段就是「更新至…」（沒有集名前綴），則不剝（避免把空字串交出去）。
+ */
+function _episodeNameOnly(name) {
+  const s = String(name ?? '');
+  if (!s) return s;
+  const i = s.search(/更新至|更新到|更新\s*[:：]/);
+  if (i <= 0) return s;
+  const head = s.slice(0, i);
+  // head 只剩空白/標點 → 整段都是更新聲明，不剝。
+  const t = head.replace(/[\s．.・、,，:：\-—_]/g, '');
+  if (!t) return s;
+  return head;
+}
+
 function _isVarietyExtraSeg(name) {
   // ★ 先導片也算衍生：bfzy《日落时分说爱你》51 段 = 先導片 1 + 正片 20 +
   //   衍生 30，TMDb S1 只有 20（10 期 × 上/下）。先導片抽不出集數，
   //   留下會在詳情多出第 21 組；併入衍生後，有顯式集時隨 eX 組一起剪掉，
   //   無顯式集（純日期單站）時因 hasExplicit=false 保留，不會空白頁。
-  return /加更|陪你|花絮|特辑|特輯|老友|直播|彩蛋|超前|预告|預告|片花|幕后|幕後|纯享|純享|会员|會員|抢先|搶先|路透|名场面|名場面|撒糖|先导|先導|先行/.test(String(name ?? ''));
+  //
+  // ★ 必須先剝掉站方的「更新至…」後綴再判斷（見 _episodeNameOnly 註解）：
+  //   bfzy 每一段正片都帶著「．更新至20260301(陪你追日落第10期下)」，
+  //   不剝就會把 20 段正片全部誤判成衍生，進而刪掉全季唯一的顯式集數
+  //   錨點 —— 結果就是點任何一集都看到整季不相干的日期（實測 E8 = 99 筆）。
+  const s = _episodeNameOnly(name);
+  return /加更|陪你|花絮|特辑|特輯|老友|直播|彩蛋|超前|预告|預告|片花|幕后|幕後|纯享|純享|会员|會員|抢先|搶先|路透|名场面|名場面|撒糖|先导|先導|先行/.test(s);
 }
 
 function _macEpNumber(epName) {
@@ -3454,6 +3504,26 @@ function _lookupGlobalDateEp(dateInt, suffix) {
     if (suffix) {
       const v = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, null));
       if (v != null) return v;
+    }
+    // ★★ 同一日期的單一上/下錨定（ffzy「第20260116期」這類無上/下段）
+    //
+    //   ffzy 整站命名是「第YYYYMMDD期」，沒有上/下 → suffix=null，查不到
+    //   「20260116上」「20260116下」兩個鍵。而 ffzy 一天只有一段（該站
+    //   只收錄其中一段），bfzy 同日有上/下兩段。
+    //
+    //   為什麼不能靠位置推斷：ffzy 一天一段、bfzy 一天兩段，兩站的
+    //   日期序位相差半集，位置推斷會整體錯位（實測 E8 被算成
+    //   「第20260104期」而不是「第20260116期」—— 前者其實是第 7 期上）。
+    //
+    //   安全做法：**同一天、且該日的上/下錨定只有一個**時直接採用。
+    //   只有一個錨定 → 不可能是「上與下同時存在卻只登錄一個」的情形，
+    //   所以該日期確實只有那一集，取它不會錯。
+    if (!suffix) {
+      const up = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, '上'));
+      const dn = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, '下'));
+      if (up != null && dn == null) return up;
+      if (dn != null && up == null) return dn;
+      // 兩者都有 → 該日有上/下兩集，本段沒有上/下 → 無法判定，放棄。
     }
     return null;
   } catch { return null; }
