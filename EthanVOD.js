@@ -1390,7 +1390,38 @@ const CONFIG = {
   //   (3) _resSuffixOf 只認「上/下」，不認「中」→ 三段式無法排序。
   //   修法：抓 TMDb 整季集名建「期號+Part → 集號」對照表，
   //   並在 filterByEpisode 用「同日期的段序」二次比對。
-  WIDGET_VERSION: 81,
+  //
+  // ★ v81：修「選源列表名稱雜亂」——同一集的 9 個站源長得完全不同。
+  //   症狀（實測《一飯封神》S2 E18 選源列表）：
+  //     「第2季 一飯封神．20260923上」
+  //     「第2季 一飯封神．20260923上美食競技純享版」
+  //     「一飯封神 第2季（加更版）．20260923上美食競技純享版」
+  //     「一飯封神 第2季．20260923上．更新至20261011期」
+  //     「一飯封神 第2季．第20260923期」
+  //   使用者分不出哪個是正片、哪個是別名、哪個才是真正的那一集。
+  //
+  //   三個根因：
+  //   (1) 描述直接用站方原始集名（別名、更新進度、版本標記全留著）。
+  //   (2) 季別位置不一致：有的「片名．季別」、有的「季別 片名」。
+  //   (3) ★★ 隱藏的更嚴重問題：若直接把雜訊從描述剝掉，
+  //       會**連帶破壞下游判定**（衍生段 / 別名 / 期號 / 日期全靠
+  //       描述裡的字樣判讀）。實測這樣做會讓《一飯封神》S2 E18 的
+  //       過濾輸入從 60 筆暴增到 100 筆（衍生段預篩失效），
+  //       樂子 / 非凡資源整組消失 → 選源只剩 5 筆。
+  //       修法：**顯示層用乾淨文字、判定層用站方原文**。
+  //       新增 resource._rawEpName 保存原始集名，
+  //       _resEpIdentityText / _resDateIntOf / _resSuffixOf /
+  //       episodeLabelOf / 衍生段預篩全部改讀原文。
+  //
+  //   顯示層的處理：
+  //   - 剝別名（純享版 / 加更版 / 搶先看…）→ 與正片一致
+  //   - 剝「更新至…」進度聲明 → 與本集無關
+  //   - 剝日期殼「第20260923期」→ 裸日期，與其它站對得上
+  //   - 剝片名裡的「（加更版）」括弧
+  //   - 季別統一用「．」夾在片名與集數之間：
+  //     「一飯封神．第2季．20260923 上」
+  //   舊 cache 的描述是髒結果，bump 版本讓 syncWidgetVersion 清掉重搜。
+  WIDGET_VERSION: 82,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1649,7 +1680,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.2.5",
+  version: "4.3.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3475,10 +3506,16 @@ function _isVarietyEpisodeName(resource) {
   try {
     const desc = String(resource?.description ?? '').trim();
     if (!desc) return false;
+    // ★ 優先用站方原文（_rawEpName）：description 是顯示用的乾淨版，
+    //   集名可能被正規化成裸日期形式；原文才是判斷依據。
+    //   見 _resEpIdentityText 註解。
+    const raw = _resEpIdentityText(resource);
     // 1) 「第N期」：綜藝的專用語意。
-    if (/第\s*0*\d+\s*期/.test(desc)) return true;
+    if (/第\s*0*\d+\s*期/.test(raw)) return true;
     // 2) 純日期型集名（連寫 8 位日期，或帶分隔符）：綜藝站普遍用播出日期當集名。
     //    注意：日期套期號殼（「第20251225期」）也算 → _isDateLikeEpName 會回 true。
+    if (_isDateLikeEpName(raw)) return true;
+    if (/第\s*0*\d+\s*期/.test(desc)) return true;
     if (_isDateLikeEpName(desc)) return true;
     return false;
   } catch { return false; }
@@ -3557,7 +3594,11 @@ function _varietyEpisodeTitle(resource) {
     // 站方集名在 description 的「集數」那一段：displayName．epText．remark
     // 例：「日落時分說愛你．20260116(第4期下)．更新至…」
     // 直接對整串做比對即可 —— 片名本身不會含「第N期」。
-    const p = _parseVarietyPeriod(desc);
+    //
+    // ★ 優先用站方原文（_rawEpName）：description 是顯示用的乾淨版，
+    //   「第N期」可能被正規化成裸日期或別名形式，原文才是權威。
+    //   見 _resEpIdentityText 註解。
+    const p = _parseVarietyPeriod(_resEpIdentityText(resource)) || _parseVarietyPeriod(desc);
     if (!p) return null;
     return p.seg ? `第${p.period}期 ${p.seg}` : `第${p.period}期`;
   } catch { return null; }
@@ -3581,15 +3622,20 @@ function _varietyDateTitle(resource) {
   try {
     const desc = String(resource?.description ?? '').trim();
     if (!desc) return null;
-    // 從 description 抽出日期型集名本體。
+    // ★ 優先用站方原文（_rawEpName）：description 是顯示用的乾淨版。
+    //   見 _resEpIdentityText 註解。
+    const raw = _resEpIdentityText(resource) || desc;
+    // 從集名抽出日期型集名本體。
     // 優先抓「8 位連寫日期」或「帶分隔符日期」；抓不到回 null。
-    const m = desc.match(/((?:19|20)\d{2})[.\-\/年]?\s*(\d{2})[.\-\/月]?\s*(\d{2})(日)?/);
+    const m = raw.match(/((?:19|20)\d{2})[.\-\/年]?\s*(\d{2})[.\-\/月]?\s*(\d{2})(日)?/)
+           || desc.match(/((?:19|20)\d{2})[.\-\/年]?\s*(\d{2})[.\-\/月]?\s*(\d{2})(日)?/);
     if (!m) return null;
     const ymd = `${m[1]}${m[2]}${m[3]}`;
     // 驗證是合法日期（否則可能是片名裡的數字巧合）。
     if (!_isDateNumberStr(ymd)) return null;
     // 段序：日期直後緊接的 上/中/下。
-    const segM = desc.match(/(?:19|20)\d{2}[.\-\/年]?\s*\d{2}[.\-\/月]?\s*\d{2}(?:日)?\s*(上|中|下)/);
+    const segM = (raw.match(/(?:19|20)\d{2}[.\-\/年]?\s*\d{2}[.\-\/月]?\s*\d{2}(?:日)?\s*(上|中|下)/)
+              || desc.match(/(?:19|20)\d{2}[.\-\/年]?\s*\d{2}[.\-\/月]?\s*\d{2}(?:日)?\s*(上|中|下)/));
     return segM ? `${ymd} ${segM[1]}` : ymd;
   } catch { return null; }
 }
@@ -9965,7 +10011,10 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
     '_confidence', '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
-    '_s4FallbackBoost', '_seasonFromItem'
+    '_s4FallbackBoost', '_seasonFromItem',
+    // ★ 站方原始集名（判定用）。顯示層已用乾淨版 description，
+    //   這份原文只供下游判定，不該送到客戶端。
+    '_rawEpName'
   ];
   
   // 版本資訊必須在欄位刪除前寫進描述。
