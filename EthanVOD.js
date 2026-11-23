@@ -1390,7 +1390,7 @@ const CONFIG = {
   //   (3) _resSuffixOf 只認「上/下」，不認「中」→ 三段式無法排序。
   //   修法：抓 TMDb 整季集名建「期號+Part → 集號」對照表，
   //   並在 filterByEpisode 用「同日期的段序」二次比對。
-  WIDGET_VERSION: 80,
+  WIDGET_VERSION: 81,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1649,7 +1649,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.1.2",
+  version: "4.2.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3285,6 +3285,30 @@ function _episodeNameOnly(name) {
   return head;
 }
 
+/**
+ * 「同集不同版本」的別名關鍵字（純享版 / 美食競技純享版 …）。
+ *
+ * ★ 為什麼要跟「衍生段」分開：
+ *   《一飯封神》S1 的「第8期」在站方只有
+ *     「20250907(第8期上美食竞技纯享版)」「20250907(第8期下美食竞技纯享版)」
+ *   兩筆帶著期號的集名；正片版的「第8期上/下」反而沒有期號
+ *   （只有「第20250904期」「第20250905期」這種日期當期號的寫法）。
+ *   → 若把「纯享」整個當衍生段丟掉，第8期就會失去期號，
+ *     變成「推導期」，標籤退化成 d20250904，集號位置還對、但對不上期號。
+ *   → 正確做法：純享版是**同一集的別名**（同一 (期號,段序)），
+ *     應該當成該集的「別名日期」，不是衍生。
+ *
+ * ★ 純享版「看起來」比正片還短，但它是同一集的剪輯版，
+ *   播出日期也跟正片不同（20250907 vs 20250904）→ 只能當別名。
+ */
+const _VARIETY_ALIAS_SEG_RE = /纯享|純享|美食竞技|美食競賽|纯享版|純享版|加长版|加長版|完整版|抢先看|搶先看/;
+
+/**
+ * 真正的「衍生段」關鍵字 —— 這些是**另一集**，不是同一集的別名。
+ * （加更 / 走心局 / 解憂局 / 陪看 / 小館 / 家常菜 / 高光回顧 / 彩蛋 …）
+ */
+const _VARIETY_DERIV_SEG_RE = /加更|陪你|花絮|特辑|特輯|老友|直播|彩蛋|超前|预告|預告|片花|幕后|幕後|会员|會員|抢先|搶先|路透|名场面|名場面|撒糖|先导|先導|先行|陪你看|陪看|高光回顾|高光回顧|一饭小馆|一飯小館|一饭家常菜|一飯家常菜|封神陪看|准备开饭|準備開飯|回顾特辑|回顧特輯|小馆|小館|家常菜|走心局|解忧局|解憂局|光头火夫|爱哭包|愛哭包|回顾|回顧|特别篇|特別篇|精编|精編|先導片|片头|片尾/;
+
 function _isVarietyExtraSeg(name) {
   // ★ 先導片也算衍生：bfzy《日落时分说爱你》51 段 = 先導片 1 + 正片 20 +
   //   衍生 30，TMDb S1 只有 20（10 期 × 上/下）。先導片抽不出集數，
@@ -3296,7 +3320,18 @@ function _isVarietyExtraSeg(name) {
   //   不剝就會把 20 段正片全部誤判成衍生，進而刪掉全季唯一的顯式集數
   //   錨點 —— 結果就是點任何一集都看到整季不相干的日期（實測 E8 = 99 筆）。
   const s = _episodeNameOnly(name);
-  return /加更|陪你|花絮|特辑|特輯|老友|直播|彩蛋|超前|预告|預告|片花|幕后|幕後|纯享|純享|会员|會員|抢先|搶先|路透|名场面|名場面|撒糖|先导|先導|先行|陪你看|陪看|高光回顾|高光回顧|一饭小馆|一飯小館|一饭家常菜|一飯家常菜|封神陪看|准备开饭|準備開飯|回顾特辑|回顧特輯|小馆|小館|家常菜/.test(s);
+  //
+  // ★ 《一飯封神》新增的衍生段（實測 S1/S2 站方集名）：
+  //   「第1期走心局」「第1期解忧局」「第6期光头火夫」「第6期爱哭包」
+  //   「第8期回顾」「第1期美食竞技纯享版」
+  //   —— 這些都套著「第N期」的殼，但**不是**正片那一期；
+  //   若不攔，「第1期走心局」會被當成「無段序的第1期」寫進 bare，
+  //   讓第1期多佔一個槽位 → 整季集號往後錯位（實測 S1 變 37 集）。
+  //
+  // ★ 別名型（純享版 / 美食競技純享版）**不算**衍生段 —— 它是同一集。
+  //   見 _VARIETY_ALIAS_SEG_RE 註解。
+  if (_VARIETY_ALIAS_SEG_RE.test(s)) return false;
+  return _VARIETY_DERIV_SEG_RE.test(s);
 }
 
 function _macEpNumber(epName) {
@@ -3378,6 +3413,151 @@ function _isDateLikeEpName(s) {
   if (/(19|20)\d{2}[.\-\/年]\d{1,2}[.\-\/月]\d{1,2}/.test(t)) return true;
   if (/(19|20)\d{6}/.test(t)) return true;
   return false;
+}
+
+/**
+ * 判定一個資源是不是「綜藝集名型」，用來決定播放清單的集數標題格式。
+ *
+ * ★ 為什麼要自動偵測而不是只看 type === 'variety'：
+ *   type 是「使用者/上游給的意圖」，但站方集名才是事實。
+ *   實測三種來源會讓 type 與實際型別不一致：
+ *     1. 沒有 TMDb Key 時，綜藝走的是 tv 路徑（type='tv'），
+ *        但集名是「20260115(第4期下)」→ 純粹的 tv 判定會漏掉。
+ *     2. 有 TMDb Key 時，綜藝走 tv 查（見「variety 在 TMDb 側一律按 tv 查」註解），
+ *        TMDb 沒有 variety 類型 → type 仍是 'tv'。
+ *     3. 使用者從 TMDb 的「綜藝」分類進來時，type 可能是 'variety'，
+ *        但站方集名其實是普通「第N集」。
+ *   → 所以以「站方集名長什麼樣」為準，才不會兩邊都漏。
+ *
+ * 判定順序（先具體、後籠統）：
+ *   1. 站方集名含「第N期」→ 一定是綜藝（期號是綜藝專用語意）。
+ *   2. 站方集名是純日期型（20251222 / 20251222上）→ 純日期綜藝。
+ *   3. 都不是 → 不是綜藝（回 false，走影集「第N集」格式）。
+ *
+ * ★ 安全網：description 拿不到 → 回 false（維持影集格式），
+ *   寧可少數用者看到「第N集」，也不要讓整季戲劇變成「第N期」。
+ */
+function _isVarietyEpisodeName(resource) {
+  try {
+    const desc = String(resource?.description ?? '').trim();
+    if (!desc) return false;
+    // 1) 「第N期」：綜藝的專用語意。
+    if (/第\s*0*\d+\s*期/.test(desc)) return true;
+    // 2) 純日期型集名（連寫 8 位日期，或帶分隔符）：綜藝站普遍用播出日期當集名。
+    //    注意：日期套期號殼（「第20251225期」）也算 → _isDateLikeEpName 會回 true。
+    if (_isDateLikeEpName(desc)) return true;
+    return false;
+  } catch { return false; }
+}
+
+/**
+ * 從站方集名抽出綜藝的「期號 + 段序」，回傳 { period, seg } 或 null。
+ *
+ * ★ 支援的站方寫法（實測站方集名）：
+ *   - 「20260115(第4期下)」      → period=4, seg='下'
+ *   - 「第1期上」                → period=1, seg='上'
+ *   - 「第1期中」                → period=1, seg='中'
+ *   - 「第10期」                 → period=10, seg=null
+ *   - 「20250907(第8期上美食竞技纯享版)」→ period=8, seg='上'（後綴不影響）
+ *
+ * ★ 段序必須「緊接」期字：第N期後面若還有別的字（「第1期美食竞技纯享版」）
+ *   就不算有段序 —— 與 _buildStationPeriodMap 的 segM 規則一致，
+ *   否則會把「上/中/下」數錯，導致整季期結構錯位。
+ *
+ * ★ 但別名型集名（「第8期上美食竞技纯享版」）的段序後面會接著中文，
+ *   嚴格規則抓不到 → 該集會退化成「無段序的期」，顯示成「第8期」
+ *   而非「第8期 上」。因為純享版是**同一集的別名**，顯示必須跟正片
+ *   一致才能對得上。
+ *   → 補第二種抓法：緊接「第N期」之後（可含右括號）的 上/中/下。
+ *     與 _buildPeriodMapFromDateSequence 的 segAfterPeriod 同款規則。
+ *
+ * ★ 日期套期號殼（「第20251225期」）不是期號 → 回 null（交給日期邏輯）。
+ */
+function _parseVarietyPeriod(name) {
+  const s = String(name ?? '').trim();
+  if (!s) return null;
+  const m = s.match(/第\s*0*(\d+)\s*期/);
+  if (!m) return null;
+  // 日期套期號殼：數字是 YYYYMMDD，不是期號。
+  if (_isDateNumberStr(m[1])) return null;
+  const period = parseInt(m[1], 10);
+  if (!Number.isFinite(period) || period < 1) return null;
+  // 段序（嚴格）：緊接「期」字，後面不得再有別的字（除非是收尾符號）。
+  const segM = s.match(/第\s*0*\d+\s*期\s*(上|中|下)\s*(?:[)）\].．、,，\-—_ ]|$)/);
+  if (segM) return { period, seg: segM[1] };
+  // 段序（別名型寬鬆）：緊接「第N期」之後（可含右括號）的 上/中/下。
+  //   處理「第8期上美食竞技纯享版」這種段序後面接中文的寫法。
+  const mIdx = s.indexOf(m[0]);
+  const after = s.slice(mIdx + m[0].length).match(/^\s*[)）]?\s*(上|中|下)/);
+  return { period, seg: after ? after[1] : null };
+}
+
+/**
+ * 產生播放清單裡綜藝節目的集數標題。
+ *
+ * ★ 為什麼需要（對照電影／電視劇的做法）：
+ *   - 電視劇：「第01集」「第02集」—— 集數就是播放順序。
+ *   - 電影：沒有集數面板。
+ *   - 綜藝：既不是「集」也不是單集。綜藝的一期常常拆成上／中／下三段播出，
+ *     站方集名寫的是「第4期下」而不是「第4集」。但我們的內部 slot 換算
+ *     （slot=(N-1)*2+上1/下2）把它壓成了「第4集」，
+ *     使用者在播放清單看到「第4集」完全對不上站方名稱 —— 不知道
+ *     自己看的是哪一期、哪一段。
+ *
+ * ★ 輸出格式：「第1期 上」「第4期 下」（有段序）/「第10期」（無段序）。
+ *   ★ 為什麼不照抄站方原名（「20260116(第4期下)」）：
+ *     括號裡的日期是**播出日期**，同一集在站方每期都帶不同日期，
+ *     照抄會讓播放清單變成日期流水帳（一長串 20260115、20260116…），
+ *     使用者要的是「第幾期」而不是「哪一天播」。日期保留在 description
+ *     裡當補充資訊即可。
+ *
+ * ★ 抽不到期號時回 null → 由呼叫端決定 fallback（純日期站顯示日期名稱）。
+ *
+ * @param {object} resource 資源物件（需含 description）
+ * @returns {string|null}
+ */
+function _varietyEpisodeTitle(resource) {
+  try {
+    const desc = String(resource?.description ?? '').trim();
+    if (!desc) return null;
+    // 站方集名在 description 的「集數」那一段：displayName．epText．remark
+    // 例：「日落時分說愛你．20260116(第4期下)．更新至…」
+    // 直接對整串做比對即可 —— 片名本身不會含「第N期」。
+    const p = _parseVarietyPeriod(desc);
+    if (!p) return null;
+    return p.seg ? `第${p.period}期 ${p.seg}` : `第${p.period}期`;
+  } catch { return null; }
+}
+
+/**
+ * 純日期型綜藝的集數標題：直接顯示站方日期名稱。
+ *
+ * ★ 為什麼不用「第N集」：
+ *   純日期站（如暴風 / 如意）的集名只有「20251222」，
+ *   我們抽不出集數 → episode 為 null → 原本播放清單會退回顯示
+ *   description（整串「片名．20251222．更新至…」），使用者看到的是
+ *   一整行片名而不是集名；或是硬寫「第N集」——但那個 N 其實是
+ *   播出順序，不是「集」。
+ *   顯示日期本身（20251222）既誠實又可辨識：使用者知道這是哪一天播出的一集。
+ *
+ * ★ 段序也一併保留（「20251222上」→ 顯示「20251222 上」），
+ *   與有期號的情形保持一致。
+ */
+function _varietyDateTitle(resource) {
+  try {
+    const desc = String(resource?.description ?? '').trim();
+    if (!desc) return null;
+    // 從 description 抽出日期型集名本體。
+    // 優先抓「8 位連寫日期」或「帶分隔符日期」；抓不到回 null。
+    const m = desc.match(/((?:19|20)\d{2})[.\-\/年]?\s*(\d{2})[.\-\/月]?\s*(\d{2})(日)?/);
+    if (!m) return null;
+    const ymd = `${m[1]}${m[2]}${m[3]}`;
+    // 驗證是合法日期（否則可能是片名裡的數字巧合）。
+    if (!_isDateNumberStr(ymd)) return null;
+    // 段序：日期直後緊接的 上/中/下。
+    const segM = desc.match(/(?:19|20)\d{2}[.\-\/年]?\s*\d{2}[.\-\/月]?\s*\d{2}(?:日)?\s*(上|中|下)/);
+    return segM ? `${ymd} ${segM[1]}` : ymd;
+  } catch { return null; }
 }
 
 /**
@@ -3998,28 +4178,33 @@ function _resolveSegToEpisodeByDateSequence(baseKey, season, dateInt, segChar) {
 /**
  * 綜合「期號對照表」與「日期序列」的集號解析器 —— 《一飯封神》的核心。
  *
- * 站方命名有兩種，必須分開處理：
- *   A) 「20260924第10期上」→ 有明確期號 → 期號是權威。
- *   B) 「20260729上」       → 只有日期 + 段序 → 期號靠段序連續性推。
+ * ══════════ TMDb 實測結構（真值，air_date 已核對）══════════
+ *   S1 = 26 集：
+ *     第1期=上/中/下(E1-3) 第2期=上/中/下(E4-6) 第3期=上/下(E7-8)
+ *     第4期=上/下(E9-10)  第5期=上/中/下(E11-13) 第6期=上/中/下(E14-16)
+ *     第7期=上/中/下(E17-19) 第8期=上/下(E20-21) 第9期=上/下(E22-23)
+ *     第10期=上/下(E24-25) 第11期=單集(E26，頒獎晚宴，無上/中/下)
+ *   S2 = 21 集：
+ *     第1期=上/中/下(E1-3) 第2~10期=各2段(E4-21)
+ *     ★ E19/E20/E21 同在 20260924（同一天 3 集）
+ * ══════════════════════════════════════════════════════════
  *
- * ★ 演算法（TMDb S2 = 21 集為真值驗證過）：
+ * ★ 核心觀念：★ 期的結構由「(期號, 段序)」決定 ★
+ *   同一集在不同站的寫法不一致（日期可能差一天、可能整年誤植）：
+ *     實測 S1：暴風「第1期下」=20250718，如意「第1期下」=20250717
+ *     實測 S2：暴風「第10期上」=20260924，如意「第10期上」=20260930（錯寫）
+ *   → (期號, 段序) 才是唯一鍵；日期只是「同一集的多種別名」。
  *
- *   Step 1  以「段序連續性」把所有集切成「推導期」。
- *           ★ 這是主力：如意/樂子的純日期集名切出來的期結構與 TMDb 完全一致
- *             （第1期 = 20260729上 + 20260729中 + 20260730下 = 3 段；
- *               第2期 = 20260805上 + 20260806下 = 2 段；… 第10期 = 20260930上 + 20261001下）。
- *           ★ 切期規則：「上」開新期、「中/下」接續上一期。
- *             但同一天可以出現兩期（20260924 = 第9期的下 + 第10期的上/下），
- *             所以「上」開新期的同時，要檢查前一期是否已用完（段序已到「下」）。
- *
- *   Step 2  把「帶明確期號」的集「認領」到對應的推導期。
- *           認領方式：第 N 期的第一段日期落在哪個推導期附近 → 那一期。
- *
- *   Step 3  依期序累計槽位 → 每段對應的集號。
- *
- * ★ Step 1 為什麼不能用「有期號的集」當主體：
- *   實測 S2 有期號的集只有「第10期」（20260924第10期上/下），
- *   若以它為主體 → 所有集都會塞進第 10 期 → 集號全錯。
+ * ★ 演算法：
+ *   Step 1  收集兩類素材：
+ *          numbered = 有明確期號的集（期號, 段序）→ 日期
+ *          dated    = 只有日期 + 段序的集
+ *          bare     = 有期號但無段序的集（第11期＝頒獎晚宴單集）
+ *   Step 2  ★ 骨幹 ★：逐期建立「期 → 段序集合」。
+ *          - 有明確期號的期 → 段序集合 = 該期號的所有段序（權威）
+ *          - 沒有期號的期 → 用「段序連續性」從 dated 推導
+ *   Step 3  dated 的集 → 掛到相符的期當別名（段序相同 + 日期最近）
+ *   Step 4  依期序累計槽位 → 集號
  */
 function _buildCombinedPeriodMap(epNames, baseKey, season, merge = false) {
   try {
@@ -4033,36 +4218,73 @@ function _buildCombinedPeriodMap(epNames, baseKey, season, merge = false) {
         acc = {
           numbered: new Map(prev.acc.numbered),   // 'period|seg' → date
           dated: new Map(prev.acc.dated),         // 'date|seg'   → true
+          bare: new Map(prev.acc.bare || []),     // period → date（無段序的單集期）
+          // ★ 別名日期：'period|seg' → [date, ...]（同一集的純享版等）
+          aliasDates: new Map(prev.acc.aliasDates || []),
         };
       }
     }
-    if (!acc) acc = { numbered: new Map(), dated: new Map() };
+    if (!acc) acc = { numbered: new Map(), dated: new Map(), bare: new Map(), aliasDates: new Map() };
 
     for (const nm of epNames) {
       const s = String(nm ?? '');
       const d = _parseEpDate(s);
       if (d == null) continue;
-      // ★ 衍生段排除（加更 / 純享版 / 陪你看 / 高光回顾 / 一飯小館…）。
-      //   純享版是「同一集的別名寫法」，日期+段序相同 → 去重後自然合併；
-      //   但「20261011高光回顧」這類沒有對應日期+段序的衍生內容
-      //   會憑空多出一集，必須排除。
+      // ★ 衍生段排除（加更 / 走心局 / 陪看 / 高光回顧 / 一飯小館…）。
+      //   這些是「另一集」，不能算進正片結構。
       try { if (_isVarietyExtraSeg(s)) continue; } catch {}
       const segM = s.match(/(上|中|下)\s*(?:[)）\].．、,，\-—_ ]|$)/);
-      if (!segM) continue;
-      const seg = segM[1];
       const pm = s.match(/第\s*0*(\d+)\s*期/);
+      // ★ 期號後面直接跟段序的寫法（「第8期上美食竞技纯享版」「第10期)上」）。
+      //   前面的 segM 要求段序後面是右括號/空白/結尾，但別名型集名的段序
+      //   後面常常接著中文（「上美食竞技纯享版」）→ segM 抓不到，
+      //   導致「第8期」整期退化成 bare（實測 S1 少 2 集）。
+      //   → 這裡補抓「第N期」緊接著的段序。
+      const segAfterPeriod = (() => {
+        if (!pm) return null;
+        const m = s.slice(pm.index + pm[0].length).match(/^\s*[)）]?\s*(上|中|下)/);
+        return m ? m[1] : null;
+      })();
+      // ★ 別名型集名（純享版 / 美食競技純享版 …）＝ 同一集的另一個版本。
+      //   它帶的日期通常跟正片不同（實測 S1 第3期下：正片 20250801、
+      //   純享版 20250803），但 (期號,段序) 相同。
+      //   → 有期號：當成該 (期號,段序) 的**別名日期**。
+      //   → 沒期號：無法對應到任何 (期號,段序) → 丟棄，
+      //     否則會憑空多出一期（實測 S1 變 35 集）。
+      const isAlias = (() => { try { return _VARIETY_ALIAS_SEG_RE.test(_episodeNameOnly(s)); } catch { return false; } })();
       if (pm) {
         const period = parseInt(pm[1], 10);
-        // ★ 日期型期號（「第20260925期」＝把日期塞進期號殼）不是真的期號
-        //   → 排除，改走日期路徑。
-        if (Number.isFinite(period) && period >= 1 && period < 1000
-            && !_isDateNumberStr(pm[1])) {
-          const k = `${period}|${seg}`;
+        const realPeriod = Number.isFinite(period) && period >= 1 && period < 1000
+            && !_isDateNumberStr(pm[1]);
+        if (realPeriod) {
+          const segCh = segM ? segM[1] : segAfterPeriod;
+          if (!segCh) {
+            // ★ 「無段序」的期號（TMDb S1 的「第11期」＝頒獎晚宴，單集）
+            //
+            // ★ 但要注意：「第1期走心局」「第1期解忧局」這類衍生段
+            //   也會命中「有期號、無段序」。若把它們當成 bare 期，
+            //   就會多出一個「第1期」槽位 → 整季集號往後錯位。
+            //   → 判別法：該期號若已有「上/中/下」任何一段序，
+            //     這個「無段序的期號」必定是衍生段 → 直接略過。
+            const _alreadyHasSeg = [...acc.numbered.keys()].some(k => k.startsWith(`${period}|`));
+            if (!_alreadyHasSeg && !acc.bare.has(period)) acc.bare.set(period, d);
+            continue;
+          }
+          const k = `${period}|${segCh}`;
           if (!acc.numbered.has(k)) acc.numbered.set(k, d);
+          if (isAlias) {
+            // ★ 別名日期：同一 (期號,段序) 的另一個播出日 → 掛在別名表
+            if (!acc.aliasDates) acc.aliasDates = new Map();
+            if (!acc.aliasDates.has(k)) acc.aliasDates.set(k, []);
+            if (!acc.aliasDates.get(k).includes(d)) acc.aliasDates.get(k).push(d);
+          }
           continue;
         }
       }
-      const k = `${d}|${seg}`;
+      if (!segM) continue;
+      // ★ 別名型但沒有期號 → 無法對應正片 → 丟棄（否則憑空多一期）
+      if (isAlias) continue;
+      const k = `${d}|${segM[1]}`;
       if (!acc.dated.has(k)) acc.dated.set(k, true);
     }
     if (acc.numbered.size === 0 && acc.dated.size === 0) return null;
@@ -4076,10 +4298,9 @@ function _buildCombinedPeriodMap(epNames, baseKey, season, merge = false) {
 /**
  * 依「累積素材」重算合併期結構的槽位。
  *
- * ★ 為什麼要獨立出來：各站的 extractPlayInfoForCache 是併發跑的，
- *   先跑完的站會把「當下只含部分站」的結構寫進快取，後跑的站讀到就會
- *   對同一集算出不同集號（實測 20260924第10期上 → 19 或 20 不定）。
- *   解法：只累積素材（日期/段序/期號），槽位每次求解前即時重算。
+ * ★ 即時重算的理由：各站的 extractPlayInfoForCache 是併發跑的，
+ *   先跑完的站若把「當下只含部分站」的結構寫進快取，後跑的站會對同一集
+ *   算出不同集號（實測 20260924第10期上 → 19 或 20 不定）。
  */
 function _recomputeCombinedMap(acc, segRankIn) {
   const segRank = segRankIn || { '上': 1, '中': 2, '下': 3 };
@@ -4088,203 +4309,492 @@ function _recomputeCombinedMap(acc, segRankIn) {
   const cmpKey = (a, b) => {
     const da = dateOf(a), db = dateOf(b);
     if (da !== db) return da - db;
-    return (segRank[segOf(a)] || 0) - (segRank[segOf(b)] || 0);
+    return (segRank[segOf(a)] || 0) - (segRank[b.slice(b.indexOf('|') + 1)] || 0);
   };
 
-  // ---- 收集所有集（日期,段序），標記是否帶明確期號 ----
-  //   'date|seg' → { no: 明確期號或 null }
-  const items = new Map();   // 'date|seg' → { no }
-  for (const k of acc.dated.keys()) items.set(k, { no: null });
+  // ---- Step 1：整理素材 ----
+  const numberedByPeriod = new Map();   // period → Map<seg, ['date|seg', ...]>
   for (const [k, d] of acc.numbered.entries()) {
-    const dk = `${d}|${k.slice(k.indexOf('|') + 1)}`;
-    const it = items.get(dk);
-    if (it) { if (it.no == null) it.no = parseInt(k.slice(0, k.indexOf('|')), 10); }
-    else items.set(dk, { no: parseInt(k.slice(0, k.indexOf('|')), 10) });
-  }
-  const allKeys = [...items.keys()].sort(cmpKey);
-
-  // ---- Step 1：依「段序連續性」切出推導期 ----
-  //   規則：
-  //   - 「上」→ 開新期
-  //   - 「中」/「下」→ 接續上一期，但若上一期已出現過同樣的段序 → 開新期
-  //   ★ 「20260924下」接在「20260923上」後 → 第9期；
-  //     「20260924上」→ 開新期（第10期）；
-  //     「20261001下」→ 上一期已有「上」但沒有「下」→ 接續 → 第10期 ✓
-  const derived = [];   // [{ keys: [...], segSet: Set }]
-  let cur = null;
-  for (const k of allKeys) {
-    const seg = segOf(k);
-    const rank = segRank[seg] || 9;
-    const needNew = (rank === 1) || (!cur) || cur.segSet.has(seg);
-    if (needNew) {
-      cur = { keys: [], segSet: new Set() };
-      derived.push(cur);
-    }
-    cur.keys.push(k);
-    cur.segSet.add(seg);
-  }
-
-  // ---- Step 2：帶明確期號的集 → 指定它屬於第幾期 ----
-  //   ★ 以「段序對應」為準，不以日期為準：
-  //     站的期號與推導期序是一一對應的（站方第 N 期 = 推導第 N 期），
-  //     但日期可能寫錯（實測 S1：站方「第8期」寫 20260916、
-  //     「第10期」寫 20250918，年份疑似誤植）。
-  //     → 用「期號 N ↔ 推導第 N 期」直接對應，日期只用於排序。
-  const numberedByPeriod = new Map();   // period → ['date|seg', ...]
-  for (const [k, d] of acc.numbered.entries()) {
-    const dk = `${d}|${k.slice(k.indexOf('|') + 1)}`;
     const pn = parseInt(k.slice(0, k.indexOf('|')), 10);
-    if (!numberedByPeriod.has(pn)) numberedByPeriod.set(pn, []);
-    if (!numberedByPeriod.get(pn).includes(dk)) numberedByPeriod.get(pn).push(dk);
+    const sg = k.slice(k.indexOf('|') + 1);
+    if (!numberedByPeriod.has(pn)) numberedByPeriod.set(pn, new Map());
+    const m = numberedByPeriod.get(pn);
+    if (!m.has(sg)) m.set(sg, []);
+    const dk = `${d}|${sg}`;
+    if (!m.get(sg).includes(dk)) m.get(sg).push(dk);
   }
   const periodNos = [...numberedByPeriod.keys()].sort((a, b) => a - b);
+  const datedKeys = [...acc.dated.keys()].sort(cmpKey);
 
-  // ---- Step 1.5：季外內容的判定與濾除 ----
-  //
-  // ★ 核心問題：綜藝站的正片結束後會接續播「3 段式特別篇」
-  //   （S2：20260925 上/中/下 = 一次 3 段播出），這些在 TMDb 沒有對應集。
-  //   它們在集名上看起來跟正片一模一樣（日期 + 上/中/下），
-  //   唯一能分辨的是「它們排在最後一期之後」。
-  //
-  // ★ 判定基準：站方明確標的「期號」→ 該期號的播出日期就是正片的最後一段。
-  //   實測 S2：第10期 = 20260924 → 之後的 20260925 / 20261010 / 20261011
-  //   都是季外加更 → 排除 → 詳情只剩 21 集，與 TMDb 一致。
-  //
-  // ★ 只在「有明確期號」時才做這個截斷：
-  //   純日期站（如某些站沒有「第N期」字樣）的日期序本身就是正片序，
-  //   截斷反而會砍掉真正的正片。
+  // ---- Step 1.5：季外內容的濾除 ----
+  //   正片結束後的「加更 / 特別篇」（S2：20260925、20261010、20261011）
+  //   在 TMDb 沒有對應集 → 以「最後一個明確期號的日期」為界排除。
   if (periodNos.length > 0) {
     let seasonEnd = -Infinity;
     for (const pn of periodNos) {
-      for (const k of numberedByPeriod.get(pn)) {
-        const dd = dateOf(k);
-        if (dd > seasonEnd) seasonEnd = dd;
-      }
-    }
-    if (Number.isFinite(seasonEnd)) {
-      for (const k of [...items.keys()]) {
-        if (dateOf(k) > seasonEnd) items.delete(k);
-      }
-    }
-  }
-  // periodNo → derived index
-  // ★ 以「期號 N ↔ 推導第 N 期」對應（推導期由日期序切出，順序即播出序）。
-  //   站方的期號是相對的（從第 1 期起算），與推導期序同源。
-  const periodToDerived = new Map();
-  const usedDerived = new Set();
-  for (const pn of periodNos) {
-    // 推導第 (pn-1) 期（推導期索引從 0 開始）
-    let di = pn - 1;
-    if (di < 0 || di >= derived.length) {
-      // 超出推導期數 → 找「包含該期任一段」的推導期
-      const keys = numberedByPeriod.get(pn);
-      di = derived.findIndex(dp => keys.some(kk => dp.keys.includes(kk)));
-      if (di < 0) continue;
-    }
-    if (usedDerived.has(di)) {
-      let alt = -1;
-      for (const cand of [di + 1, di - 1, di + 2, di - 2]) {
-        if (cand >= 0 && cand < derived.length && !usedDerived.has(cand)) { alt = cand; break; }
-      }
-      if (alt >= 0) di = alt;
-    }
-    usedDerived.add(di);
-    periodToDerived.set(pn, di);
-  }
-
-  // ---- Step 2.5：季的終點 = 最後一個「明確期號」所在的推導期 ----
-  //
-  // ★ 為什麼需要：綜藝站會在正片結束後繼續放「加更 / 特別篇 / 純享版」，
-  //   這些內容的日期排在最後一期之後（實測 S2：正片到 20260924（第10期）
-  //   為止，之後還有 20260925 / 20261010 / 20261011 的加更）。
-  //   TMDb 只有正片 → 那些加更不該有集號，否則詳情會多出第 22~28 集
-  //   （使用者看到「明明 TMDb 21 集，卻列出 28 集」）。
-  //
-  //   ★ 判定依據：站方明確標了「第N期」→ N 就是正片的期號。
-  //     最大期號 = 最後一期的期號 → 該期之後的日期都是季外內容。
-  //   ★ 沒有明確期號時（純日期站）不截斷 —— 那種站的日期序本身就是正片序。
-  const lastNumberedDerived = (() => {
-    if (periodNos.length === 0) return -1;
-    let best = -1, bestNo = -1;
-    for (const [pn, di] of periodToDerived.entries()) {
-      if (pn > bestNo) { bestNo = pn; best = di; }
-    }
-    return best;
-  })();
-  if (lastNumberedDerived >= 0) {
-    // 最後一期的「結束日期」
-    const lastKeys = derived[lastNumberedDerived].keys;
-    const lastDate = Math.max(...lastKeys.map(dateOf));
-    // ★ 同一日期仍可能有該期的其他段（20260924 = 第9期下 + 第10期上/下）
-    //   → 只砍掉「日期 > lastDate」的推導期，以及「日期 > lastDate」的段。
-    for (let i = derived.length - 1; i >= 0; i--) {
-      if (i === lastNumberedDerived) continue;
-      const ds = derived[i].keys.map(dateOf);
-      if (Math.min(...ds) > lastDate) derived.splice(i, 1);
-    }
-    // 過濾掉日期 > lastDate 的段
-    for (const k of allKeys) {
-      if (dateOf(k) > lastDate) items.delete(k);
-    }
-  }
-
-  // ---- Step 3：把「明確期號」的段認領進對應的推導期 ----
-  //
-  // ★ 唯一鍵是「(期, 段序)」：同一期不可能有兩個「上」，
-  //   所以別名寫法（日期不同但同一期同一段）會自動合併 → 不會重複算集。
-  const derivedNo = new Map();   // derived index → 明確期號
-  for (const [pn, di] of periodToDerived.entries()) derivedNo.set(di, pn);
-
-  // 每個推導期的「段序 → 該段的所有別名 (日期,段序)」
-  const periodSegAliases = new Map();   // derivedIdx → Map<seg, ['date|seg', ...]>
-  derived.forEach((dp, i) => {
-    const m = new Map();
-    for (const k of dp.keys) {
-      const sg = segOf(k);
-      if (!m.has(sg)) m.set(sg, []);
-      m.get(sg).push(k);
-    }
-    periodSegAliases.set(i, m);
-  });
-  // 明確期號的段 → 併入對應推導期。
-  //
-  // ★ 只當「別名」記錄（不新增段）：
-  //   推導期（依日期序 + 段序連續性）已經決定了「哪一段屬於哪一期」。
-  //   站的明確期號只用來「標記」期號，不該改變段數 ——
-  //   否則別站的集名（含其他季/其他內容）會憑空多出段，
-  //   實測 S1 會多出「20250808上」「20260916上」等 → 28 集（TMDb 26）。
-  //
-  // ★ 例外：該推導期「完全沒有」對應段序時，才補建
-  //   （例如某期只有「第N期上」而推導期切成 3 段，缺 中/下）。
-  for (const [pn, di] of periodToDerived.entries()) {
-    const m = periodSegAliases.get(di);
-    if (!m) continue;
-    for (const k of numberedByPeriod.get(pn)) {
-      const sg = segOf(k);
-      if (m.has(sg)) {
-        if (!m.get(sg).includes(k)) m.get(sg).push(k);
-      } else {
-        // 該段序在推導期不存在 → 檢查是否真的缺（推導期太小）
-        const dp = derived[di];
-        if (dp.segSet.size <= 1) {
-          m.set(sg, [k]);
-          dp.segSet.add(sg);
+      for (const list of numberedByPeriod.get(pn).values()) {
+        for (const k of list) {
+          const dd = dateOf(k);
+          if (dd > seasonEnd) seasonEnd = dd;
         }
       }
     }
+    if (Number.isFinite(seasonEnd)) {
+      for (const k of [...acc.dated.keys()]) {
+        if (dateOf(k) > seasonEnd) acc.dated.delete(k);
+      }
+    }
   }
 
-  // ---- Step 4：依期序累計槽位 ----
-  //   ★ 期的順序 = 推導順序（依播出日期）。
-  const orderedDerived = [...derived.keys()].map((_, i) => i).sort((a, b) => {
-    if (a !== b) {
-      const ka = derived[a].keys[0], kb = derived[b].keys[0];
-      const da = dateOf(ka), db = dateOf(kb);
-      if (da !== db) return da - db;
+  // ---- Step 2：★ 建立期的骨架 ★ ----
+  //   每一期 = { no: 期號或 null, segs: Map<seg, ['date|seg', ...]> }
+  const periods = [];      // 有明確期號的期（依期號順序）
+  const periodByNo = new Map();
+  for (const pn of periodNos) {
+    const p = { no: pn, segs: new Map() };
+    for (const [sg, list] of numberedByPeriod.get(pn)) p.segs.set(sg, list.slice());
+    periods.push(p);
+    periodByNo.set(pn, p);
+  }
+
+  // ---- Step 2b：沒有期號的期 → 用「段序連續性」從 dated 推導 ----
+  //   ★ 只處理「還沒被任何期認領」的 dated 集。
+  const claimed = new Set();   // 'date|seg' 已認領
+  for (const p of periods) {
+    for (const list of p.segs.values()) for (const k of list) claimed.add(k);
+  }
+  // ★★ 同日期同段序，但期號不同 → 兩者是**不同的集** ★★
+  //   實測 S2（真值：E19=第9期下、E20=第10期上、E21=第10期下，
+  //   三集同在 20260924）：
+  //     明確期10 認領了 20260924|上 與 20260924|下
+  //     但純日期站的 20260924下 其實是「第9期下」（E19），
+  //     跟「20260924第10期下」（E21）是不同的集，只是同一天。
+  //   舊規則把它當成已認領 → 第9期只剩「上」→ S2 少一集（實測 20 集）。
+  //   → 判別：若該 (date,seg) 在多個不同期號下都出現，
+  //     純日期的那筆就不能被任何一個期獨佔 → 交給推導期去認領。
+  const segCountByPeriod = new Map();   // 'date|seg' → 期號數
+  for (const p of periods) {
+    for (const list of p.segs.values()) {
+      for (const k of list) {
+        segCountByPeriod.set(k, (segCountByPeriod.get(k) || 0) + 1);
+      }
     }
-    const na = derivedNo.get(a), nb = derivedNo.get(b);
-    if (na != null && nb != null) return na - nb;
-    return a - b;
+  }
+  // 同日期+同段序被**不同期號**佔用 → 該 (date,seg) 有歧義 → 不獨佔
+  const ambiguousKeys = new Set();
+  {
+    const byKeySeg = new Map();   // 'date|seg' → Set<期號>
+    for (const p of periods) {
+      for (const list of p.segs.values()) {
+        for (const k of list) {
+          if (!byKeySeg.has(k)) byKeySeg.set(k, new Set());
+          byKeySeg.get(k).add(p.no);
+        }
+      }
+    }
+    for (const [k, set] of byKeySeg) {
+      if (set.size > 1) ambiguousKeys.add(k);
+    }
+  }
+  // ★ 判定哪些 dated 集「已被明確期認領、但其實是另一期」★
+  //   實測 S2（真值 E19=第9期下、E20=第10期上、E21=第10期下，三集同在 20260924）：
+  //   明確期10 認領 20260924|上、20260924|下；
+  //   而純日期站的「20260924下」其實是「第9期下」（E19）—— 不同的集，只是同一天。
+  //   → 先濾掉 → 第9期只剩「上」→ S2 少一集（實測 20 集）。
+  //
+  // ★ 反向案例（S1）：S1 有完整明確期號 1~11，dated 集幾乎全是同一期的別名。
+  //   若全部放行 → 每個明確期都會多出一個重複的推導期 → 集數暴增（實測 32 集）。
+  //
+  // ★ 判別法：當某個明確期**已經有齊它應有的段序**時，
+  //   同 (date,seg) 的 dated 集若「正好是這個期的下一段的起點」，
+  //   就不該被它認領 —— 它屬於後面那個還沒被認領的期。
+  //   實作：把 claimed 過濾放寬成「只有當該 dated 集不會自成新期時才排除」。
+  //   判斷方式：把該 dated 集單獨餵給推導器，看它是否會開啟一個「新的上」。
+  //
+  // 簡化且安全的做法：只放行「明確期『缺』段序」的那些 dated 集。
+  //   實測 S2 第9期（推導期）缺「下」→ 20260924|下 放行 → 補上 ✓
+  //   實測 S1：每個明確期都滿載 → 不放行任何 dated 集 ✓
+  const periodSegCount = new Map();   // 期號 → 段序數
+  for (const p of periods) periodSegCount.set(p.no, p.segs.size);
+  // 明確期「缺段序」的判斷：該期現有段序數 < 同時段序中最常見的段序數
+  //   （S1 的第1期=3、第3期=2… 不統一 → 用「全季最多的段序數」當基準不準）
+  //   → 改用更穩健的規則：某個 dated 集 (date,seg) 若已被某明確期認領，
+  //     卻又出現一個「日期更晚、段序是上」的 dated 集，
+  //     代表中間缺了一期 → 放行。
+  const maxExplicitPeriod = periodNos.length ? Math.max(...periodNos) : 0;
+  // ══════════════════════════════════════════════════════════════
+  //  ★★ 統一期模型：把「明確期號」與「純日期推導期」放進同一個池子 ★★
+  // ══════════════════════════════════════════════════════════════
+  //
+  //  為什麼要重寫（實測《一飯封神》S1/S2）：
+  //   舊做法是「明確期 + 推導期」兩個池子再靠日期 proximity 合併，
+  //   在下列兩種真值下都會錯：
+  //   (a) S1：11 期都有明確期號，dated 集全是同一期的別名日期
+  //       → dated 放行會讓每期多出一個重複推導期（實測 32~42 集）
+  //   (b) S2：只有第 10 期有明確期號，其餘全靠日期推導
+  //       → dated 放行時，第9期的「下」(20260924下) 跟第10期的
+  //         「下」(20260924第10期下) 同日期同段序，但**是不同集**
+  //         （真值 E19 / E21）→ 舊做法只會挑一個 → 少一集（實測 20 集）
+  //
+  //  ★ 新模型（單一池子）：
+  //    1. 收集所有觀測：{ date, seg, period? }
+  //       - 明確期號的集 → period = 期號
+  //       - 純日期的集     → period = null
+  //    2. 依 (日期, 段序) 排序
+  //    3. 用「段序連續性」切期：**只有「上」能開新期**
+  //       （中/下 只能接續當前期；重複段序 = 別名日期，日期相近就併入）
+  //    4. 每個期：優先用該期內出現最多的明確期號；
+  //       沒有明確期號的期 → 依日期順序填入「還沒被用掉的期號」
+  //
+  //  ★ 關鍵：切期是在**同一個池子**裡做的，所以 S2 的
+  //    「20260923上 / 20260924下 / 20260924第10期上 / 20260924第10期下」
+  //    會被切成兩個期：
+  //      期A = {上:20260923, 下:20260924}   （純日期，第9期）
+  //      期B = {上:20260924, 下:20260924}   （第10期）
+  //    雖然日期重疊，但因為「上」開新期、段序不重複 → 天然分開 ✓
+  const observations = [];
+  // ★ 季外界線：最後一個明確期號的日期
+  //   S2 實測：第10期 = 20260924 → 20260925 之後的
+  //   「20261010上/下」「20261011上/中/下」「20260925加更」… 都是季外，
+  //   TMDb S2 只有 21 集 → 必須排除（否則多出第 11~13 期）。
+  const _seasonEnd = (() => {
+    let mx = -Infinity;
+    for (const p of periods) {
+      for (const list of p.segs.values()) {
+        for (const k of list) mx = Math.max(mx, dateOf(k));
+      }
+    }
+    return mx;
+  })();
+  // (a) 明確期號的集
+  for (const p of periods) {
+    for (const [sg, list] of p.segs) {
+      for (const k of list) {
+        observations.push({
+          date: dateOf(k), seg: sg, period: p.no, key: k, numbered: true,
+        });
+      }
+    }
+  }
+  // (a2) ★ 「單集期」（bare，如 TMDb S1 的「第11期」＝頒獎晚宴）
+  //   沒有段序，只有一集 → 以空段序的觀測放進來，佔 1 個槽位。
+  const _bareObs = [];
+  if (acc.bare && acc.bare.size > 0) {
+    for (const [pn, d] of acc.bare.entries()) {
+      _bareObs.push({ date: d, seg: '', period: pn, key: `${d}|`, numbered: true, bare: true });
+    }
+  }
+  // (b) 純日期的集（季外的排除）
+  for (const k of datedKeys) {
+    const d = dateOf(k);
+    if (Number.isFinite(_seasonEnd) && d > _seasonEnd) continue;
+    observations.push({
+      date: d, seg: segOf(k), period: null, key: k, numbered: false,
+    });
+  }
+  for (const bo of _bareObs) observations.push(bo);
+  // ★ 排序：先依日期、再依段序；**同日期同段序時，有明確期號的排前面**。
+  //   實測 S2：「20260924第10期下」(有期號) 與「20260924下」(純日期)
+  //     同日期同段序但屬於不同期（E21 / E19）。
+  //     讓有期號的先處理 → 它會先佔住 20260924|下 這個 key，
+  //     純日期那筆之後就會因為「當前組缺這段序」而自成一期 ✓
+  observations.sort((a, b) => {
+    if (a.date !== b.date) return a.date - b.date;
+    const ra = segRank[a.seg] || 9, rb = segRank[b.seg] || 9;
+    if (ra !== rb) return ra - rb;
+    // 同日期同段序 → 有期號的先
+    const na = a.period != null ? 0 : 1, nb = b.period != null ? 0 : 1;
+    if (na !== nb) return na - nb;
+    return 0;
+  });
+
+  // ---- 切期：只有「上」開新期 ----
+  //
+  // ★★ 明確期號的觀測**錨定**它自己的期，不受日期影響 ★★
+  //   實測 S1 第8期：正片是 20250904上 / 20250905下，
+  //     但純享版是 20250907上 / 20250907下（同一集、不同日期）。
+  //   若純粹依日期切組 → 20250907|上 會自成一期 → 第8期變兩期 → 集數暴增。
+  //   → 先用期號把觀測分好組，再把「純日期觀測」依段序連續性併進去。
+  const groups = [];
+  const groupByPeriod = new Map();   // 期號 → group
+  // ★★ 'date|seg' → group：純日期觀測若跟某期的 (date,seg) 完全相同，
+  //   它就是那一集的**別名**（不同站寫法不同、但同一集）→ 直接併進那一期。
+  //   實測 S1：如意站寫「20250717上」、暴風站寫「20250717(第1期上)」，
+  //     兩者是同一集 → 若不併，會多出一個 no=null 的期 → 集數暴增。
+  const groupByKey = new Map();
+  let curG = null;
+  // ★ 上一個「純日期觀測」所在的組（用於讓純日期集自然接續成一期）
+  let lastPlainGroup = null;
+  for (const ob of observations) {
+    const rank = segRank[ob.seg] || 9;
+    let needNew = false;
+    if (ob.bare) {
+      // ★ 單集期（bare）→ 直接用該期號的組；自成一期、佔 1 槽位
+      const g = groupByPeriod.get(ob.period);
+      if (!g) {
+        needNew = true;
+      } else {
+        curG = g;
+      }
+    } else if (ob.period != null) {
+      // ★ 明確期號 → 直接用該期號的組（沒有就開一個）
+      const g = groupByPeriod.get(ob.period);
+      if (!g) {
+        needNew = true;
+      } else {
+        curG = g;
+      }
+    } else {
+      // ★ 純日期觀測 → 決定它屬於哪一組 ★
+      //
+      //   實測 S2（真值 E19=第9期下、E20=第10期上、E21=第10期下，
+      //   三集同在 20260924）：
+      //     純日期站：「20260923上」(第9期上)、「20260924下」(第9期下)
+      //     有期號站：「20260924第10期上」、「20260924第10期下」
+      //   「20260924下」跟「20260924第10期下」同日期同段序 → key 相同，
+      //   但屬於**不同的期**。
+      //   → 不能單靠 key 找組，要看「哪一組還缺這一段序」。
+      //
+      //   判別順序：
+      //     1. 有明確期號的組，且該組**缺**這一段序、日期相近 → 併入它
+      //     2. 否則找「最近的一個缺這段序的組」→ 併入
+      //     3. 否則（key 已有組）→ 併入該組當別名
+      //     4. 都沒有 → 自成新組
+      const gk = groupByKey.get(ob.key);
+      // ★ 候選：所有缺這一段序的組（且日期相近）
+      //   ★★ 只考慮「純日期組」（periodVotes 空的）★★
+      //     明確期號組的段序是既定的，不能讓純日期觀測塞進去
+      //     —— 否則會把「第9期上」併進「第10期」→ 集號錯位。
+      //   實測 S2：純日期「20260923上」若併進編號組 10，
+      //     第9期就變成只有「下」、第10期變 3 段 → 整季錯開。
+      const cands = [];
+      for (const g of groups) {
+        if (g.segs.has(ob.seg)) continue;
+        if (g.periodVotes.size > 0) continue;   // ★ 編號組不作為候選
+        const diff = Math.abs(g.date - ob.date);
+        if (diff <= 3) cands.push({ g, diff });
+      }
+      if (cands.length > 0) {
+        cands.sort((a, b) => (a.diff - b.diff) || ((a.g.no ?? 99999) - (b.g.no ?? 99999)));
+        curG = cands[0].g;
+      } else if (gk) {
+        // ★★ key 已被某個明確期號組佔用，但該組的段序「在同一個日期」→
+        //   它是一期完整的集，這筆純日期的同段序集屬於**別的期**。
+        //   實測 S2：「20260924下」(第9期下) vs「20260924第10期下」(第10期下)
+        //     第10期 的 上/下 都在 20260924 → 完整一期 → 純日期那筆自成第9期 ✓
+        //   ★ 但只有在「該期號組的段序全在同一天」時才成立；
+        //     S1 第1期跨 20250717~20250718（多天）→ 不是單日完整期 → 併進去 ✓
+        let oneDay = false;
+        if (gk.periodVotes.size > 0) {
+          const gkDates = new Set();
+          for (const list of gk.segs.values()) for (const k of list) gkDates.add(dateOf(k));
+          oneDay = gkDates.size === 1;
+        }
+        if (oneDay) {
+          needNew = true;   // 自成一組
+        } else {
+          curG = gk;
+        }
+      } else {
+        needNew = true;
+      }
+    }
+    if (!needNew && ob.period == null && curG && groupByKey.get(ob.key)) {
+      // 已併入既有組
+    } else if (!needNew && ob.period == null) {
+      if (!curG) {
+        needNew = true;
+      } else if (rank === 1) {
+        needNew = true;               // 「上」開新期
+      } else if (curG.segs.has(ob.seg)) {
+        // 段序重複 → 別名日期（日期相近）或真的隔了一期（日期遠）
+        const prev = curG.segs.get(ob.seg) || [];
+        let nearest = Infinity;
+        for (const pk of prev) nearest = Math.min(nearest, Math.abs(dateOf(pk) - ob.date));
+        needNew = !(nearest <= 3);
+      }
+    }
+    if (needNew) {
+      curG = { segs: new Map(), periodVotes: new Map(), date: ob.date };
+      groups.push(curG);
+      if (ob.period != null) groupByPeriod.set(ob.period, curG);
+    }
+    if (!curG.segs.has(ob.seg)) curG.segs.set(ob.seg, []);
+    if (!curG.segs.get(ob.seg).includes(ob.key)) curG.segs.get(ob.seg).push(ob.key);
+    if (!groupByKey.has(ob.key)) groupByKey.set(ob.key, curG);
+    if (ob.bare) curG.isBare = true;
+    // ★ 期號投票：同一期裡若有多個期號，取**最多票**的那個
+    if (ob.period != null) {
+      curG.periodVotes.set(ob.period, (curG.periodVotes.get(ob.period) || 0) + 1);
+    }
+    curG.date = Math.min(curG.date, ob.date);
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  //  ★★ 全季期數「自洽性」檢查 ★★
+  // ══════════════════════════════════════════════════════════════
+  //
+  //  ★ 為什麼需要（實測《一飯封神》S1/S2）：
+  //   S1：明確期號 1~11 齊全 → 整季就是 11 期 → 任何多出來的組
+  //       （純日期組）都必須是**別名**，必須併回某期，否則集數暴增
+  //       （實測 S1 會變 27~32 集）。
+  //   S2：明確期號只有第 10 期 → 整季 10 期 → 純日期組要**填補空缺**
+  //       （第1~9期），不能全部當別名。
+  //
+  //  ★ 判別式：候選期號的最大值 M。
+  //     若編號期數已達 M（每一期都有號）→ 純日期組全是別名 → 全部併回
+  //     若編號期數 < M → 有空缺 → 純日期組依序填補空缺
+  {
+    const numberedList = groups.filter(g => g.periodVotes.size > 0);
+    const plainList = groups.filter(g => g.periodVotes.size === 0);
+    const maxNo = numberedList.length
+      ? Math.max(...numberedList.map(g => Math.max(...g.periodVotes.keys())))
+      : 0;
+    const numberedNos = new Set();
+    for (const g of numberedList) for (const pn of g.periodVotes.keys()) numberedNos.add(pn);
+    const gaps = [];
+    for (let n = 1; n <= maxNo; n++) if (!numberedNos.has(n)) gaps.push(n);
+    // ★ 沒有空缺（期號連續且齊全）→ 純日期組都是別名 → 全部併回
+    if (gaps.length === 0) {
+      for (const pg of plainList) {
+        let best = null, bestDiff = Infinity;
+        for (const ng of numberedList) {
+          const diff = Math.abs(ng.date - pg.date);
+          if (diff <= 3 && diff < bestDiff) { bestDiff = diff; best = ng; }
+        }
+        if (!best && numberedList.length) {
+          let bd = Infinity;
+          for (const ng of numberedList) {
+            const diff = Math.abs(ng.date - pg.date);
+            if (diff < bd) { bd = diff; best = ng; }
+          }
+        }
+        if (best) {
+          for (const [sg, list] of pg.segs) {
+            if (!best.segs.has(sg)) best.segs.set(sg, []);
+            for (const k of list) {
+              if (!best.segs.get(sg).includes(k)) best.segs.get(sg).push(k);
+              if (!groupByKey.has(k)) groupByKey.set(k, best);
+            }
+          }
+          pg.mergedInto = best;
+        }
+      }
+      for (let i = groups.length - 1; i >= 0; i--) {
+        if (groups[i].mergedInto) groups.splice(i, 1);
+      }
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  //  ★★ 期號對位：明確期號是「錨點」，純日期組依錨點間的空隙分配 ★★
+  // ══════════════════════════════════════════════════════════════
+  //
+  //  實測 S1（錨點 = 第1~11期，全部有期號）：
+  //    純日期組 d20250808{上} 夾在 第4期(0807) 與 第5期(0814) 之間
+  //      → 第4、5 是**相鄰**期號 → 沒有空位 → 它只能是別名 → 併入
+  //    純日期組 d20250904{上,下} 夾在 第7期(0828) 與 第8期(0907) 之間
+  //      → 第7、8 相鄰 → 只能併 → 併入第8期（它就是第8期的正片版本）
+  //    純日期組 d20250918{上,下} 在 第10期(0912) 之後 → 併入第11期
+  //
+  //  實測 S2（錨點 = 只有第10期）：
+  //    純日期組 d20260923{上,下} 夾在 第8期(0916) 與 第10期(0924) 之間
+  //      → 第8、10 **不相鄰** → 中間有空位(第9期) → 它自成第9期 ✓
+  const usedPeriods = new Set();
+  for (const g of groups) {
+    let best = null, bestVotes = -1;
+    for (const [pn, v] of g.periodVotes) {
+      if (v > bestVotes || (v === bestVotes && (best == null || pn < best))) {
+        best = pn; bestVotes = v;
+      }
+    }
+    g.no = best;
+    if (best != null) usedPeriods.add(best);
+  }
+
+  // 依日期排序所有組
+  const byDate = groups.slice().sort((a, b) => a.date - b.date);
+  // 每個「純日期組」找左右最近的錨點
+  const anchors = byDate.filter(g => g.no != null);
+  for (const g of byDate) {
+    if (g.no != null) continue;
+    let prevA = null, nextA = null;
+    for (const a of anchors) {
+      if (a.date < g.date) prevA = a;
+      else if (nextA == null) nextA = a;
+    }
+    const pn = prevA ? prevA.no : null;
+    const nn = nextA ? nextA.no : null;
+    // ★★★ 先判斷「是不是前一期的別名」 ★★★
+    //   實測 S2 第1期：純日期組 {下:20260730} 緊接著 {上:20260729,中:20260729,下:20260729}
+    //     → 它沒有「上」→ 它不是新一期的起點 → 它是前期的**別名日期** → 併入前期
+    //     （不併 → 第1期變成 3+1 段 → 整季錯位）
+    //   ★ 判別式：**一期一定由「上」開啟**。
+    //     純日期組若沒有「上」→ 它不可能是一期 → 必是別名 → 併入前期。
+    //   ★ 反向（S2 第9期 {上:20260923, 下:20260924}）：有「上」→ 自成一期 ✓
+    const gSegsAll = [...g.segs.keys()];
+    const hasShang = gSegsAll.includes('上');
+    const isAliasOfPrev = !!(prevA && !hasShang && gSegsAll.length > 0);
+    if (isAliasOfPrev) {
+      for (const [sg, list] of g.segs) {
+        if (!prevA.segs.has(sg)) prevA.segs.set(sg, []);
+        for (const k of list) {
+          if (!prevA.segs.get(sg).includes(k)) prevA.segs.get(sg).push(k);
+          if (!groupByKey.has(k)) groupByKey.set(k, prevA);
+        }
+      }
+      g.mergedInto = prevA;
+      continue;
+    }
+    // ★ 有空位 → 自成一期（期號取 prevA+1）
+    const hasGap = (pn == null || nn == null) ? true : (nn - pn > 1);
+    if (hasGap) {
+      g.no = (pn == null) ? 1 : pn + 1;
+      usedPeriods.add(g.no);
+      anchors.push(g);
+      anchors.sort((a, b) => a.date - b.date);
+      continue;
+    }
+    // ★ 無空位（左右錨點期號相鄰）→ 這組是別名 → 併入「缺這段序」的那一期
+    const gSegs = [...g.segs.keys()];
+    const missingIn = (a) => gSegs.some(sg => !a.segs.has(sg));
+    const cands = [prevA, nextA].filter(Boolean);
+    const needFill = cands.filter(missingIn);
+    let target = null;
+    if (needFill.length === 1) {
+      target = needFill[0];
+    } else if (cands.length === 2) {
+      target = Math.abs(prevA.date - g.date) <= Math.abs(nextA.date - g.date) ? prevA : nextA;
+    } else {
+      target = cands[0] || null;
+    }
+    if (target) {
+      for (const [sg, list] of g.segs) {
+        if (!target.segs.has(sg)) target.segs.set(sg, []);
+        for (const k of list) {
+          if (!target.segs.get(sg).includes(k)) target.segs.get(sg).push(k);
+          if (!groupByKey.has(k)) groupByKey.set(k, target);
+        }
+      }
+      g.mergedInto = target;
+    }
+  }
+  // 移除已併入的組
+  for (let i = groups.length - 1; i >= 0; i--) {
+    if (groups[i].mergedInto) groups.splice(i, 1);
+  }
+  // 併入後的組要重新計算日期（取最早）
+  for (const g of groups) {
+    let mn = Infinity;
+    for (const list of g.segs.values()) for (const k of list) mn = Math.min(mn, dateOf(k));
+    if (Number.isFinite(mn)) g.date = mn;
+  }
+
+  // ---- 依期號排序，計算槽位 ----
+  const ordered = groups.slice().sort((a, b) => {
+    const an = a.no ?? 99999, bn = b.no ?? 99999;
+    if (an !== bn) return an - bn;
+    return a.date - b.date;
   });
 
   const periodSlots = new Map();
@@ -4292,24 +4802,40 @@ function _recomputeCombinedMap(acc, segRankIn) {
   const dateSegSlot = new Map();     // 'date|seg' → slot
   const dateSegAll = new Map();      // 'date|seg' → [slot, ...]
   let slot = 0;
-  for (const di of orderedDerived) {
-    const m = periodSegAliases.get(di);
-    if (!m) continue;
-    const no = derivedNo.get(di);
-    const segs = [...m.keys()].sort((x, y) => (segRank[x] || 9) - (segRank[y] || 9));
+  for (const g of ordered) {
+    const segs = [...g.segs.keys()].sort((x, y) => (segRank[x] || 9) - (segRank[y] || 9));
     const start = slot + 1;
-    periodSlots.set(no != null ? no : `d${di}`, { start, count: segs.length });
+    const label = g.no != null ? g.no : `d${g.date}`;
+    // ★ 「單集期」（bare）：沒有段序 → 算 1 集
+    //   實測 TMDb S1 第11期＝頒獎晚宴（單集），
+    //   但站方寫成「20250918上/下」→ 會被算成 2 集 → S1 多 1 集。
+    //   → 若該組被標記為 bare → 一律算 1 集，段序只當別名日期。
+    const isBare = g.isBare === true;
+    periodSlots.set(label, { start, count: isBare ? 1 : segs.length });
+    if (isBare) {
+      slot += 1;
+      if (g.no != null) periodSegSlot.set(`${g.no}|`, slot);
+      for (const k of g.segs.get('')) {
+        if (!dateSegAll.has(k)) dateSegAll.set(k, []);
+        if (!dateSegAll.get(k).includes(slot)) dateSegAll.get(k).push(slot);
+        if (!dateSegSlot.has(k)) dateSegSlot.set(k, slot);
+      }
+      continue;
+    }
     for (const sg of segs) {
       slot += 1;
-      if (no != null) periodSegSlot.set(`${no}|${sg}`, slot);
-      for (const k of m.get(sg)) {
+      if (g.no != null) periodSegSlot.set(`${g.no}|${sg}`, slot);
+      for (const k of g.segs.get(sg)) {
         if (!dateSegAll.has(k)) dateSegAll.set(k, []);
-        dateSegAll.get(k).push(slot);
+        if (!dateSegAll.get(k).includes(slot)) dateSegAll.get(k).push(slot);
         if (!dateSegSlot.has(k)) dateSegSlot.set(k, slot);
       }
     }
   }
-  return { periodSlots, periodSegSlot, dateSegSlot, dateSegAll, derived, derivedNo };
+  const finalSlots = ordered.map(g => ({
+    no: g.no, segs: g.segs, date: g.date, bare: g.segs.size === 0,
+  }));
+  return { periodSlots, periodSegSlot, dateSegSlot, dateSegAll, periods: finalSlots };
 }
 
 /**
@@ -4320,8 +4846,6 @@ function _resolveSegToEpisodeCombined(baseKey, season, dateInt, segChar) {
     const ck = `${baseKey}|${season}|combined`;
     const hit = _combinedPeriodCache.get(ck);
     if (!hit || !hit.acc) return null;
-    // ★ 即時重算：確保所有站看到同一份結構（併發下先跑完的站不能
-    //   把「只含部分站」的結果當定論）。
     const res = _recomputeCombinedMap(hit.acc);
     hit.res = res;
     const v = res.dateSegSlot.get(`${dateInt}|${segChar}`);
@@ -4338,11 +4862,15 @@ function _resolvePeriodToEpisodeCombined(baseKey, season, period, segChar) {
     const ck = `${baseKey}|${season}|combined`;
     const hit = _combinedPeriodCache.get(ck);
     if (!hit || !hit.acc) return null;
-    // ★ 同上：即時重算，避免併發下各站算出的集號不一致。
     const res = _recomputeCombinedMap(hit.acc);
     hit.res = res;
     const v = res.periodSegSlot.get(`${period}|${segChar ?? ''}`);
     if (Number.isFinite(v) && v > 0) return v;
+    // ★ 「無段序」的單集期（TMDb S1 的「第11期」＝頒獎晚宴）
+    if (segChar == null || segChar === '') {
+      const ps = res.periodSlots.get(period);
+      if (ps && Number.isFinite(ps.start) && ps.start > 0) return ps.start;
+    }
     return null;
   } catch { return null; }
 }
@@ -12016,6 +12544,26 @@ targetInfo.searchQuery = aliasQ;
         const ck = `${bk}|${sn}|combined`;
         if (!_combinedPeriodCache.has(ck)) {
           const allNames = [];
+          // ★ 預掃也要擋「續集年份」的候選。
+          //   實測《一飯封神》站內有兩個條目：
+          //     「一饭封神」(2025) = S1
+          //     「一饭封神2026」(2026) = S2  ← 片名帶年份、沒有「第2季」字樣
+          //   預掃原本只看「集名裡有沒有第N季」→ S2 的集名整包收進 S1 的
+          //   期結構 → S2 的「第8期」變成 S1 的多餘一期 → 集號多出好幾集。
+          //   → 站內若同時存在「無年份」與「帶年份」的同名條目，
+          //     帶年份的是後續季（與 findYearMarkedSequels 同一套判準）。
+          // ★ 只在「目標是第 1 季」時才依年份切季。
+          //   目標是第 2 季時，帶年份的條目（實測「一饭封神2026」）正是本體，
+          //   不能跳過（與 eligible 篩選的 sequelsToSkip 同一套判準）。
+          const _seqYears = (() => {
+            try {
+              if (sn != null && Number(sn) >= 2) return null;
+              const bm = findYearMarkedSequels(
+                _macSearches.flatMap(x => (Array.isArray(x?.list) ? x.list : [])),
+                targetInfo, matchStrictness);
+              return bm && Array.isArray(bm.sequels) ? bm.sequels.map(Number) : null;
+            } catch { return null; }
+          })();
           for (const { list } of _macSearches) {
             if (!Array.isArray(list)) continue;
             for (const it of list) {
@@ -12029,6 +12577,16 @@ targetInfo.searchQuery = aliasQ;
               // 季別衝突（站方是第1季、我們要第2季）→ 不收
               const itemSeason = extractSequelNumber(it.vod_name);
               if (itemSeason != null && sn != null && Number(itemSeason) !== Number(sn)) continue;
+              // ★ 續集年份剔除（與 eligible 篩選同一套判準）
+              //   「一饭封神2026」→ 檔名年份 2026 命中續集年份 → 整個條目跳過。
+              if (_seqYears && _seqYears.length > 0) {
+                const _ys = [];
+                if (candidateInfo.year != null) _ys.push(Number(candidateInfo.year));
+                if (it.vod_year) _ys.push(Number(it.vod_year));
+                const _userYear = targetInfo?.year != null ? Number(targetInfo.year) : null;
+                const _wantsIt = _userYear != null && _ys.includes(_userYear);
+                if (_ys.some(y => _seqYears.includes(y)) && !_wantsIt) continue;
+              }
 
               const pu = String(it?.vod_play_url || '');
               if (!pu || !pu.includes('#')) continue;
@@ -12049,7 +12607,9 @@ targetInfo.searchQuery = aliasQ;
               }
             }
           }
-          if (allNames.length > 0) _buildCombinedPeriodMap(allNames, bk, sn, false);
+          if (allNames.length > 0) {
+            _buildCombinedPeriodMap(allNames, bk, sn, false);
+          }
         }
       }
     } catch {}
@@ -13065,6 +13625,90 @@ function buildDetailLink({ title, season, episode, type, id }) {
 }
 
 /**
+ * 產生播放清單（episodeItems）裡單一集的顯示標題。
+ *
+ * ★ 顯示格式（使用者指定）：
+ *
+ *   劇集名稱．第N季．第N期．上/中/下
+ *
+ *   例：
+ *     影集 → 「慶餘年2．第2季．第03集」
+ *     綜藝 → 「一飯封神．第1季．第4期．下」
+ *     綜藝（無段序）→「一飯封神．第1季．第10期」
+ *     純日期綜藝 → 「一飯封神．第1季．20251222」
+ *
+ * ★ 為什麼要有「．」分隔（點號）而不是空格：
+ *   播放清單是長條列表，每一列的標題寬度有限。
+ *   「慶餘年2 第2季 第03集」用空格分隔時，片名長短會讓後面的
+ *   季／集資訊左右跳動（掃過一整列時很難對齊是哪一集）；
+ *   用「．」分隔則每一段的起點固定，一眼就能分出片名與集資訊。
+ *   這也與站方描述的慣例一致（「慶餘年2．第03集」）。
+ *
+ * ★ 三種型別的差異（與電影／電視劇對齊）：
+ *   - 影集：片名．第N季．第N集
+ *   - 綜藝：片名．第N季．第N期（．上/中/下）
+ *     綜藝的一期常拆成上／中／下三段播出，站方集名寫的是「第4期下」。
+ *     我們內部把期號換算成 TMDb slot（(N-1)*2+上1/下2），
+ *     若直接顯示「第4集」，使用者完全對不上站方名稱 ——
+ *     不知道看的是第幾期、第幾段。
+ *   - 電影：沒有集數面板（loadDetail 不產生 episodeItems）。
+ *
+ * ★ 為什麼用「自動偵測」而不是 type === 'variety'：
+ *   TMDb 沒有 variety 類型，綜藝在 TMDb 側一律按 tv 查；
+ *   沒有 TMDb Key 時綜藝也走 tv 路徑 → type 常常就是 'tv'。
+ *   所以以「站方集名長什麼樣」為準（見 _isVarietyEpisodeName）。
+ *
+ * ★ fallback 順序：
+ *   1. 綜藝集名型 → 期名（「第1期 上」）
+ *   2. 純日期型綜藝 → 日期名（「20251222」/「20251222 上」）
+ *   3. 有集數 → 「第N集」（影集）
+ *   4. 都沒有 → 站方 description（原本行為）
+ *
+ * @param {object} group     分組物件 { season, episode, resources }
+ * @param {object} first     該組第一筆資源
+ * @param {string} type      'tv' | 'movie' | 'variety'
+ * @param {string} showTitle 劇集名稱（片名）
+ * @returns {string}
+ */
+function _playlistEpisodeTitle(group, first, type, showTitle) {
+  // 電影不進播放清單（沒有 episodeItems），防禦性處理。
+  if (type === 'movie') return first?.description || '未命名';
+  try {
+    // ★ 段一：劇集名稱。
+    //   片名為空時不補前綴（避免開頭出現「．」）。
+    const head = String(showTitle ?? '').trim();
+    const segs = [];
+    if (head) segs.push(head);
+
+    // ★ 段二：第N季。
+    //   只在 season 有效時顯示（>= 1）。單季節目顯示「第1季」是合理的
+    //   （使用者要能看到自己處在哪一季），但 season 缺失時不補。
+    const season = group?.season;
+    if (Number.isFinite(season) && season > 0) segs.push(`第${season}季`);
+
+    // ★ 段三：集資訊（綜藝＝期＋段序；影集＝集數）。
+    let epSeg = null;
+    if (_isVarietyEpisodeName(first)) {
+      // 綜藝優先：只要站方集名是綜藝型，就用期名／日期名。
+      // 這裡不看 g.episode 是否為 null —— 純日期站的 episode 本來就是 null，
+      // 而有期號的站 episode 雖然有值，但顯示「第N集」對不上站方名稱。
+      epSeg = _varietyEpisodeTitle(first) || _varietyDateTitle(first);
+    }
+    if (!epSeg && group?.episode != null) {
+      // 影集：集數就是播放順序。
+      epSeg = `第${group.episode}集`;
+    }
+    if (epSeg) segs.push(epSeg);
+
+    // ★ 都取不到 → 退回站方 description（原本行為）。
+    if (segs.length) return segs.join('．');
+    return first?.description || '未命名';
+  } catch {
+    return first?.description || '未命名';
+  }
+}
+
+/**
  * REX 規範：詳情頁入口。
  *
  * 行為：解析 link 內含的 metadata，呼叫 loadResource 取得當季所有來源，
@@ -13393,9 +14037,7 @@ async function loadDetail(link) {
             type,
             id,
           });
-          const displayTitle = g.episode != null
-            ? `第${g.episode}集`
-            : (first?.description || '未命名');
+          const displayTitle = _playlistEpisodeTitle(g, first, type, title);
           return {
             id: epLink,
             type: 'url',
@@ -13447,9 +14089,7 @@ async function loadDetail(link) {
         type,
         id,
       });
-      const displayTitle = g.episode != null
-        ? `第${g.episode}集`
-        : (first?.description || '未命名');
+      const displayTitle = _playlistEpisodeTitle(g, first, type, title);
       return {
         id: epLink,
         type: 'url',
