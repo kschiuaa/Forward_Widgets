@@ -1314,12 +1314,15 @@ const CONFIG = {
 //   TMDb S1E4 的 air_date（例如 20260115）反查站方同日期的集 → 自動命中，
 //   其餘播出日（20251222 / 20260301…）判定為不相干並丟掉。
 //   使用者不再需要在一堆日期裡手動挑。舊 cache 是髒結果，清掉重搜。
+// bump 到 74：日期站逐站推送抑制 + 跨站日期锚定 + 衍生预筛（E8 的 99 条日期刷屏根因）。
+//   dytt 纯日期站站内无显式集，逐站 filter 全保留 → E8 推几十条；全局 bfzy 有显式 E8，
+//   跨站同日锚定后只留 E8。旧 cache 是脏结果清掉重搜。
 // bump 到 73：綜藝正片收斂（TMDb S1 20 集 = 10 期 × 上/下）。
 //   bfzy 51 段裡 20 段正片（第N期上/下 → slot=(N-1)*2+上1/下2）對齊 20 集，
 //   其餘加更/陪你追日落等衍生（_isVarietyExtraSeg）抽不出集數；ffzy
 //   「第20251225期」日期殼與 lzi「20251225上」同樣未知。詳情頁未知集
 //   不再單獨成組（否則 46 段變 46 個大集號、或全擠進 eX）。舊 cache 脏，重搜。
-  WIDGET_VERSION: 73,
+  WIDGET_VERSION: 74,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1578,7 +1581,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.0.3",
+  version: "4.0.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3352,8 +3355,67 @@ function _toEpisodeNumber(v) {
  * 一律保留會在點第3集時混進第1集的連結，比少給更糟：使用者不會自己分辨。
  * 但若某站完全沒有本集來源，寧可給一個可能可播的選項，也不要讓該站整個消失。
  */
+function _anchorDateOnlySegments(results, targetEpisode) {
+  try {
+    if (!Array.isArray(results) || results.length < 2) return 0;
+    if (targetEpisode == null) return 0;
+    const _dOf = (r) => {
+      try {
+        if (r?._episodeDate != null) {
+          const v = typeof r._episodeDate === 'number' ? r._episodeDate : _parseEpDate(r._episodeDate);
+          if (Number.isFinite(v)) return v;
+        }
+        const d = _parseEpDate(r?.description ?? '');
+        if (Number.isFinite(d)) return d;
+      } catch {}
+      return null;
+    };
+    const dateToEp = new Map();
+    const ambiguous = new Set();
+    for (const r of results) {
+      const lab = episodeLabelOf(r);
+      if (lab == null) continue;
+      const dd = _dOf(r);
+      if (dd == null) continue;
+      if (ambiguous.has(dd)) continue;
+      if (dateToEp.has(dd)) {
+        if (dateToEp.get(dd) !== lab) { dateToEp.delete(dd); ambiguous.add(dd); }
+      } else dateToEp.set(dd, lab);
+    }
+    if (dateToEp.size === 0) return 0;
+    let n = 0;
+    for (const r of results) {
+      try {
+        if (episodeLabelOf(r) != null) continue;
+        const dd = _dOf(r);
+        if (dd == null || ambiguous.has(dd)) continue;
+        const m = dateToEp.get(dd);
+        if (m == null) continue;
+        r._ep = m;
+        n++;
+      } catch {}
+    }
+    return n;
+  } catch { return 0; }
+}
+
 function filterByEpisode(results, targetEpisode, targetAirDate = null) {
   if (!targetEpisode && !targetAirDate) return results;
+  // ★ 综艺衍生段预筛（加更 / 陪你追日落 / 花絮…永不可能是正片 E_target）：
+  //   实测 dytt《日落时分说爱你》97 段里一半是衍生日期；不先剪它们永远
+  //   混在未知候选里。全部是衍生时不动（fallback 语义：宁可多给不给空白）。
+  try {
+    if (Array.isArray(results) && results.length > 1) {
+      const _isExtraR = (r) => {
+        try { return _isVarietyExtraSeg(String(r?.description ?? '')); } catch { return false; }
+      };
+      const _kept = results.filter((r) => !_isExtraR(r));
+      if (_kept.length > 0 && _kept.length < results.length) results = _kept;
+    }
+  } catch {}
+  // ★ 跨站日期锚定：纯日期段（dytt「20260116下」）若与其它站同日期显式集
+  //   （bfzy「20260116(第4期下)」= E8）同日，直接认成那一集，后续按显式集过滤。
+  try { _anchorDateOnlySegments(results, targetEpisode); } catch {}
   const _targetDateInt = (() => {
     if (targetAirDate == null) return null;
     if (typeof targetAirDate === 'number' && Number.isFinite(targetAirDate)) return targetAirDate;
@@ -6974,6 +7036,54 @@ class SmartSearchExecutor {
     let candidates = (this.type === 'tv' && this.targetEpisode !== null)
       ? filterByEpisode(resources, this.targetEpisode, this.targetInfo?._targetAirDate ?? null)
       : resources;
+
+    // ★ 日期站逐站推送抑制（综艺纯日期站刷屏的根因）。
+    //
+    //   实测《日落时分说爱你》E8 推了 99 条：dytt 整站都是纯日期段名
+    //   （20251222、20251225上…），站内抽不出任何显式集数，逐站
+    //   filterByEpisode 时站内 hasExact=false 就把整站日期全保留 → E8 一次
+    //   推几十条日期要手动挑。全局看 bfzy 明明有显式 E8，这些日期根本
+    //   不是 E8，只是本站看不出来。
+    //   修法：本站无命中（无显式 E_target、无日期命中）且过半是日期段时，
+    //   本站这次不推（等全局 batch 尾端的跨站锚定收敛；锚定不到的日期站
+    //   本来就映射不到这一集，缺席比刷屏正确）。
+    if (this.type === 'tv' && this.targetEpisode != null && candidates.length > 0) {
+      try {
+        const _tEp = this.targetEpisode;
+        const _tAirRaw = this.targetInfo?._targetAirDate ?? null;
+        const _tAirInt = (typeof _tAirRaw === 'number' && Number.isFinite(_tAirRaw))
+          ? _tAirRaw : _normalizeAirDateToInt(_tAirRaw);
+        const _hit = (r) => {
+          if (episodeLabelOf(r) === _tEp) return true;
+          if (_tAirInt == null) return false;
+          try {
+            if (r?._episodeDate != null) {
+              const v = typeof r._episodeDate === 'number' ? r._episodeDate : _parseEpDate(r._episodeDate);
+              if (v === _tAirInt) return true;
+            }
+            return _parseEpDate(r?.description ?? '') === _tAirInt;
+          } catch { return false; }
+        };
+        if (!candidates.some(_hit)) {
+          const _isD = (r) => {
+            try {
+              if (r?._episodeDate != null) {
+                const v = typeof r._episodeDate === 'number' ? r._episodeDate : _parseEpDate(r._episodeDate);
+                if (Number.isFinite(v)) return true;
+              }
+              return Number.isFinite(_parseEpDate(r?.description ?? ''));
+            } catch { return false; }
+          };
+          const _dc = resources.filter(_isD).length;
+          // 无 air_date（无 Key 时常见）也抑制：站内无命中时这些日期本来就映射不到本集，
+          // 缺席比刷屏正确；纯日期单站无显式集时全局 batch 仍有 fallback 会保留，不会空白页。
+          if (resources.length > 1 && _dc > 0 && (_dc / resources.length >= 0.5 || _dc >= 3)) {
+            console.log(`📅 日期站抑制(${site.title}): 站内无 E${_tEp} 命中，${candidates.length} 条日期这次不推（等全局锚定）`);
+            candidates = [];
+          }
+        }
+      } catch {}
+    }
 
     // 版本過濾必須在推播之前，否則使用者會先看到別的版本。
     if (this.targetInfo.year) {
