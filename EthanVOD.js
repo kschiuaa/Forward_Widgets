@@ -1314,6 +1314,14 @@ const CONFIG = {
 //   TMDb S1E4 的 air_date（例如 20260115）反查站方同日期的集 → 自動命中，
 //   其餘播出日（20251222 / 20260301…）判定為不相干並丟掉。
 //   使用者不再需要在一堆日期裡手動挑。舊 cache 是髒結果，清掉重搜。
+// bump 到 75：無 Key 也能對上綜藝日期集（TMDb Key 留空不再刷屏）。
+//   空 Key 時 targetAirDate 永遠是 null，日期對齊整段被跳過，dytt/lzi 這類
+//   純日期站（「20251225上」「20260116下」抽不出集數）站內 hasExact=false →
+//   fallback 把整站幾十個日期全保留（E8 點進去看到 32 條）。修法：無 air 時
+//   按播出順序推斷槽位（20251225上=1 … 20260116下=8，同日多源去重、衍生/光禿
+//   日期不參與排序、站內顯式集校準 offset），只綁目標集、其它日期照常剪掉。
+//   跨站同日錨定优先（bfzy 有顯式 E8 時更準），推断只在無錨定時跑。
+//   舊 cache 是髒結果清掉重搜。
 // bump 到 74：日期站逐站推送抑制 + 跨站日期锚定 + 衍生预筛（E8 的 99 条日期刷屏根因）。
 //   dytt 纯日期站站内无显式集，逐站 filter 全保留 → E8 推几十条；全局 bfzy 有显式 E8，
 //   跨站同日锚定后只留 E8。旧 cache 是脏结果清掉重搜。
@@ -1322,7 +1330,7 @@ const CONFIG = {
 //   其餘加更/陪你追日落等衍生（_isVarietyExtraSeg）抽不出集數；ffzy
 //   「第20251225期」日期殼與 lzi「20251225上」同樣未知。詳情頁未知集
 //   不再單獨成組（否則 46 段變 46 個大集號、或全擠進 eX）。舊 cache 脏，重搜。
-  WIDGET_VERSION: 74,
+  WIDGET_VERSION: 75,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1581,7 +1589,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.0.6",
+  version: "4.0.7",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3370,6 +3378,9 @@ function _anchorDateOnlySegments(results, targetEpisode) {
       } catch {}
       return null;
     };
+    // ★ 無 Key 回退前先做「同站同日去重」：dytt 同一播出日會出現兩條
+    //   （dytt / dyttm3u8 兩個播放源各一份，如 20260116下 ×2），它們不是
+    //   兩個不同集，錨定時必須視為同一日期，否則後續排序/推斷會重複計數。
     const dateToEp = new Map();
     const ambiguous = new Set();
     for (const r of results) {
@@ -3395,6 +3406,163 @@ function _anchorDateOnlySegments(results, targetEpisode) {
         n++;
       } catch {}
     }
+    if (n > 0) {
+      try { console.log(`📅 跨站日期錨定: ${n} 條純日期段已錨定（目標 E${targetEpisode}）`); } catch {}
+    }
+    return n;
+  } catch { return 0; }
+}
+
+/**
+ * 無 TMDb Key 回退：綜藝純日期站的「按播出順序推斷槽位」。
+ *
+ * 為什麼需要：沒填 TMDb Key 時 targetAirDate 永遠是 null（見
+ * getTMDBEpisodeAirDateBlocking 開頭的 `if (!CONFIG.TMDB?.API_KEY) return null`），
+ * 日期對齊整段被跳過。dytt/lzi 這類純日期站（「20251225上」「20260116下」，
+ * _macEpNumber 一律回 null）站內抽不出任何顯式集數，filterByEpisode 的
+ * hasExact 永遠是 false → fallback 把整站幾十個日期全保留（E8 點進去看到 32 條）。
+ *
+ * 推斷規則（只在無 air_date 且站內無顯式命中時才跑，多站有顯式錨定時不動）：
+ *   - 只看「非衍生 + 帶日期 + 帶上/下後綴」的主播出段（加更/陪你追日落已由
+ *     _isVarietyExtraSeg 排除；「20251222」這種光禿禿無後綴的首日多為先導片，
+ *     不參與排序、也不位移，否則整季錯位一位）。
+ *   - 按（日期，上/下）排序後第 k 個就是 TMDb 第 k 集（bfzy 實測：
+ *     20251225上=1、20251226下=2 … 20260116下=8，10 期 × 上/下 = 20 集逐日一一對應）。
+ *   - 若站內自帶少量顯式集（如 dytt 尾部的「20260219第10期上=19」），用它們
+ *     校準 offset = 顯式 − 排名（取眾數），再套用到全站；無顯式時 offset=0
+ *     （假設該站從 E1 開始收錄；站內主段數 < targetEpisode 時直接放棄、
+ *     寧可多給也不給錯）。
+ *   - 只給「推斷 == target」的段綁 _ep（不把其它日期亂標集數），讓 hasExact
+ *     變 true 後過濾自然只留本集；其它日期維持未知隨 hasExact 被剪掉。
+ */
+function _inferVarietyEpByDateOrder(results, targetEpisode) {
+  try {
+    if (!Array.isArray(results) || results.length < 2) return 0;
+    if (targetEpisode == null || !Number.isFinite(targetEpisode) || targetEpisode < 1) return 0;
+    // 多站已有顯式錨定可用時不跑（跨站同日錨定更準）。
+    try {
+      if (results.some((r) => episodeLabelOf(r) === targetEpisode)) return 0;
+    } catch {}
+    const _dOf = (r) => {
+      try {
+        if (r?._episodeDate != null) {
+          const v = typeof r._episodeDate === 'number' ? r._episodeDate : _parseEpDate(r._episodeDate);
+          if (Number.isFinite(v)) return v;
+        }
+        const d = _parseEpDate(r?.description ?? '');
+        if (Number.isFinite(d)) return d;
+      } catch {}
+      return null;
+    };
+    const _suffixOf = (r) => {
+      try {
+        const s = String(r?.description ?? '');
+        // 描述形如「片名．20260116下」或「片名．20260116下．更新至…」，
+        // 上/下後面常跟著「．」分隔符，不能只認 ]/空白/結尾。
+        // 先找「日期…上/下」（最準），找不到再看尾端上/下。
+        let m = s.match(/(?:19|20)\d{6}[^上下]*?(上|下)/);
+        if (m) return m[1];
+        m = s.match(/(上|下)\s*(?:[\)）\]．.・\s]|$)/);
+        if (m) return m[1];
+        const t = s.trim();
+        if (/上\s*$/.test(t)) return '上';
+        if (/下\s*$/.test(t)) return '下';
+      } catch {}
+      return null;
+    };
+    // 主播出段：非衍生、有日期、有上/下後綴（光禿日期如先導片不參與排序）。
+    // ★ 同一日多源去重：dytt 同一播出日會出現兩條（dytt / dyttm3u8 各一份），
+    //   排名必須按「不重複日期」算，否則 20260116下 會從第 8 排到第 15、推斷全錯。
+    const mains = [];
+    for (const r of results) {
+      try {
+        if (episodeLabelOf(r) != null) continue;
+        const desc = String(r?.description ?? '');
+        if (_isVarietyExtraSeg(desc)) continue;
+        const dd = _dOf(r);
+        if (dd == null) continue;
+        const suf = _suffixOf(r);
+        if (suf == null) continue;
+        mains.push({ r, dd, suf, key: `${dd}${suf}` });
+      } catch {}
+    }
+    // 必須看起來像綜藝日期列表（過半是日期段），戲劇不受影響。
+    let _dateCount = 0;
+    try {
+      for (const r of results) {
+        const d = _dOf(r);
+        if (d != null) _dateCount++;
+      }
+    } catch {}
+    const _isDateList = results.length > 1 && _dateCount > 0
+      && (_dateCount / results.length >= 0.5 || _dateCount >= 3);
+    if (!_isDateList) return 0;
+    if (mains.length < 2) return 0;
+    mains.sort((a, b) => (a.dd - b.dd) || (a.suf === b.suf ? 0 : (a.suf === '上' ? -1 : 1)));
+    // 按不重复「日期+上/下」排名：dytt 同一日两条（dytt / dyttm3u8 各一份）只算一段，
+    // 否则 20260116下会从第 8 排到第 15、推断全错。
+    const _rankOfKey = new Map();
+    try {
+      let _rank = 0;
+      for (const m of mains) {
+        if (!_rankOfKey.has(m.key)) { _rank++; _rankOfKey.set(m.key, _rank); }
+      }
+      // 站內不重复主段数都不到目标集数 → 该站很可能只收录后半季，排名不可靠放弃。
+      if (_rank < targetEpisode) return 0;
+    } catch {}
+    // 用站內顯式集校準 offset（顯式 − 排名取眾數）；無顯式時 offset=0。
+    let offset = 0;
+    try {
+      const votes = new Map();
+      const _rankOfDate = new Map();
+      const _dateFreq = new Map();
+      try {
+        for (const r2 of results) {
+          const dd2 = _dOf(r2);
+          if (dd2 == null) continue;
+          _dateFreq.set(dd2, (_dateFreq.get(dd2) || 0) + 1);
+        }
+      } catch {}
+      mains.forEach((m) => {
+        try {
+          const rk = _rankOfKey.get(m.key);
+          if (rk != null && !_rankOfDate.has(m.dd)) _rankOfDate.set(m.dd, rk);
+        } catch {}
+      });
+      for (const r of results) {
+        try {
+          const lab = episodeLabelOf(r);
+          if (lab == null) continue;
+          const dd = _dOf(r);
+          if (dd == null) continue;
+          if ((_dateFreq.get(dd) || 0) > 1) continue;
+          const rank = _rankOfDate.get(dd);
+          if (rank == null) continue;
+          const off = lab - rank;
+          if (!Number.isFinite(off) || Math.abs(off) > 5) continue;
+          votes.set(off, (votes.get(off) || 0) + 1);
+        } catch {}
+      }
+      if (votes.size > 0) {
+        let best = 0, bestN = -1;
+        for (const [off, n] of votes.entries()) {
+          if (n > bestN) { bestN = n; best = off; }
+        }
+        offset = best;
+      }
+    } catch {}
+    let n = 0;
+    mains.forEach((m) => {
+      try {
+        const rk = _rankOfKey.get(m.key);
+        if (rk == null) return;
+        const inferred = rk + offset;
+        if (inferred === targetEpisode) { m.r._ep = targetEpisode; n++; }
+      } catch {}
+    });
+    if (n > 0) {
+      try { console.log(`📅 無 Key 日期排序推斷: ${n} 條命中 E${targetEpisode}（主段 ${mains.length}、offset=${offset}）`); } catch {}
+    }
     return n;
   } catch { return 0; }
 }
@@ -3416,6 +3584,14 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null) {
   // ★ 跨站日期锚定：纯日期段（dytt「20260116下」）若与其它站同日期显式集
   //   （bfzy「20260116(第4期下)」= E8）同日，直接认成那一集，后续按显式集过滤。
   try { _anchorDateOnlySegments(results, targetEpisode); } catch {}
+  try {
+    let _needInfer = true;
+    try {
+      if (targetAirDate != null) _needInfer = false;
+      else if (typeof targetAirDate === 'number' && Number.isFinite(targetAirDate)) _needInfer = false;
+    } catch {}
+    if (_needInfer) _inferVarietyEpByDateOrder(results, targetEpisode);
+  } catch {}
   const _targetDateInt = (() => {
     if (targetAirDate == null) return null;
     if (typeof targetAirDate === 'number' && Number.isFinite(targetAirDate)) return targetAirDate;
