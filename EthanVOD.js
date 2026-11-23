@@ -1330,7 +1330,7 @@ const CONFIG = {
 //   其餘加更/陪你追日落等衍生（_isVarietyExtraSeg）抽不出集數；ffzy
 //   「第20251225期」日期殼與 lzi「20251225上」同樣未知。詳情頁未知集
 //   不再單獨成組（否則 46 段變 46 個大集號、或全擠進 eX）。舊 cache 脏，重搜。
-  WIDGET_VERSION: 75,
+  WIDGET_VERSION: 76,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1589,7 +1589,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.0.7",
+  version: "4.0.8",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3357,6 +3357,109 @@ function _toEpisodeNumber(v) {
 }
 
 /**
+ * 跨站「日期 → 集數」全域登錄表。
+ *
+ * 為什麼需要：純日期站（dytt「20260116下」、ffzy「第20260116期」、1080zyku
+ * 「20260116下」）抽不出集數，而有顯式集數的站（bfzy「20260116(第4期下)」=E8）
+ * 只有 bfzy 一站。原先 _anchorDateOnlySegments 只在「單一站的 results 陣列內」
+ * 建 dateToEp map —— 逐站過濾時每站都只有自己的資料，dytt 站內沒有任何顯式集
+ * → dateToEp.size===0 → 直接 return 0，跨站錨定從未發生。串流路徑
+ * (processImmediateResults) 是逐站呼叫 filterByEpisode 的，所以 E8 點進去
+ * dytt/lzi/ffzy 全部推不出集數 → hasExact=false → fallback 把整站幾十個日期
+ * 全保留（實測 32 條不相關集）。
+ *
+ * 修法：任何一站只要出現「顯式集數 + 日期」的組合（例如 bfzy 的
+ * 20260116(第4期下) → E8），就把這個日期→集數對應寫進全域登錄表；
+ * 之後其它站的純日期段都能查表認出自己是第幾集。
+ *
+ * 登錄表以「日期 + 上/下」為 key（不是只有日期）—— 20260116 上/下 是兩集，
+ * 只用日期會互相覆蓋。
+ */
+const _globalDateEpRegistry = new Map();   // key: `${dateInt}${suffix}` -> ep
+const _globalDateEpAmbiguous = new Set();  // key: 衝突且無法判定的
+
+/**
+ * 取出資源的日期（YYYYMMDD 整數）。
+ * 優先用 _episodeDate，其次從 description / 集名反查。
+ */
+function _resDateIntOf(r) {
+  try {
+    if (r?._episodeDate != null) {
+      const v = typeof r._episodeDate === 'number' ? r._episodeDate : _parseEpDate(r._episodeDate);
+      if (Number.isFinite(v)) return v;
+    }
+    const d = _parseEpDate(r?.description ?? '');
+    if (Number.isFinite(d)) return d;
+  } catch {}
+  return null;
+}
+
+/**
+ * 取出資源的上/下後綴（'上' / '下' / null）。
+ *
+ * 站方命名實測有三種：
+ *   - 「20260116上」            → 上/下 緊接日期
+ *   - 「20251226期下」          → 中間夾了「期」字
+ *   - 「第20260219期上」        → 「第」開頭 + 「期」中綴
+ * 舊正則 `/(?:19|20)\d{6}[^上下]*?(上|下)/` 已能涵蓋後兩種（[^上下]*? 會吃掉
+ * 「期」），但「20260116」這種沒有上/下的光禿日期抓不到 —— 而 ffzy 的
+ * 「第20260116期」正是這種，它對應的是當天的正片（可能是上、可能是下）。
+ */
+function _resSuffixOf(r) {
+  try {
+    const s = String(r?.description ?? '');
+    // ★ 「日期…上/下」，中間允許「期」「第」「N」等字。
+    //   實測 bfzy 的「20260116(第4期下)」中間是「第4期」—— 裡面有數字 4，
+    //   舊正則 `[^上下一二三四五六七八九十0-9]*?` 把數字也排除了 → 抓不到
+    //   「下」→ bfzy 的 20260116 登錄成無後綴 → dytt/ffzy 的「20260116下」
+    //   查表查不到 → 跨站對齊整個失效（實測 E8 看到 32 條不相關集）。
+    //   修正：日期之後的「上/下」取**最後**一個匹配，且中間允許數字。
+    let m = s.match(/(?:19|20)\d{6}[^上下]{0,12}?(上|下)/);
+    if (m) return m[1];
+    // 「上/下」緊接其它字元
+    m = s.match(/(上|下)\s*(?:[\)）\]．.・\s]|$)/);
+    if (m) return m[1];
+    const t = s.trim();
+    if (/上\s*$/.test(t)) return '上';
+    if (/下\s*$/.test(t)) return '下';
+  } catch {}
+  return null;
+}
+
+/**
+ * 把資源的（日期, 上/下）組成登錄 key。
+ * 沒有上/下後綴時用 '?' 佔位 —— 單獨的日期無法區分上/下，只能作為
+ * 「該日期至少存在這樣一集」的弱訊號。
+ */
+function _dateEpKeyOf(dateInt, suffix) {
+  return `${dateInt}${suffix || '?'}`;
+}
+
+/**
+ * 從全域登錄表認出純日期段的集數。
+ * 回 null 表示認不出（該日期沒被任何有顯式集數的站覆蓋）。
+ */
+function _lookupGlobalDateEp(dateInt, suffix) {
+  try {
+    if (dateInt == null) return null;
+    // 先試精確（上/下），再試無後綴（'?'）。
+    if (suffix) {
+      const exact = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, suffix));
+      if (exact != null) return exact;
+    }
+    const loose = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, null));
+    if (loose != null) return loose;
+    // 反向：'?' 登錄的日期，本段帶上/下 → 若站內只有一個該日期的集，
+    // 也算命中（ffzy「第20260116期」對應 dytt「20260116下」）。
+    if (suffix) {
+      const v = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, null));
+      if (v != null) return v;
+    }
+    return null;
+  } catch { return null; }
+}
+
+/**
  * 依集數挑出該集的來源。
  *
  * 有些站用日期命名集數（「- 1 -」而不是「第1集」），這類來源抽不出集數。
@@ -3367,20 +3470,31 @@ function _anchorDateOnlySegments(results, targetEpisode) {
   try {
     if (!Array.isArray(results) || results.length < 2) return 0;
     if (targetEpisode == null) return 0;
-    const _dOf = (r) => {
-      try {
-        if (r?._episodeDate != null) {
-          const v = typeof r._episodeDate === 'number' ? r._episodeDate : _parseEpDate(r._episodeDate);
-          if (Number.isFinite(v)) return v;
+    const _dOf = _resDateIntOf;
+    // ★ 步驟 1：把「顯式集數 + 日期」的組合寫進全域登錄表。
+    //   這一步是跨站錨定的關鍵 —— bfzy 的「20260116(第4期下)」= E8 會讓
+    //   dytt/lzi/ffzy/1080zyku 的「20260116下」「第20260116期」全被認成 E8。
+    //   同站同日多線路（dytt / dyttm3u8）不算衝突：集數相同就跳過。
+    try {
+      for (const r of results) {
+        const lab = episodeLabelOf(r);
+        if (lab == null) continue;
+        const dd = _dOf(r);
+        if (dd == null) continue;
+        const suf = _resSuffixOf(r);
+        const key = _dateEpKeyOf(dd, suf);
+        if (_globalDateEpAmbiguous.has(key)) continue;
+        const cur = _globalDateEpRegistry.get(key);
+        if (cur == null) {
+          _globalDateEpRegistry.set(key, lab);
+        } else if (cur !== lab) {
+          // 同日期同後綴卻對應不同集數 → 無法判定，標記歧義。
+          _globalDateEpRegistry.delete(key);
+          _globalDateEpAmbiguous.add(key);
         }
-        const d = _parseEpDate(r?.description ?? '');
-        if (Number.isFinite(d)) return d;
-      } catch {}
-      return null;
-    };
-    // ★ 無 Key 回退前先做「同站同日去重」：dytt 同一播出日會出現兩條
-    //   （dytt / dyttm3u8 兩個播放源各一份，如 20260116下 ×2），它們不是
-    //   兩個不同集，錨定時必須視為同一日期，否則後續排序/推斷會重複計數。
+      }
+    } catch {}
+    // ★ 步驟 2：用全域登錄表認純日期段。
     const dateToEp = new Map();
     const ambiguous = new Set();
     for (const r of results) {
@@ -3392,6 +3506,23 @@ function _anchorDateOnlySegments(results, targetEpisode) {
       if (dateToEp.has(dd)) {
         if (dateToEp.get(dd) !== lab) { dateToEp.delete(dd); ambiguous.add(dd); }
       } else dateToEp.set(dd, lab);
+    }
+    // 站內無顯式集 → 改用全域登錄表認（這才是跨站生效的地方）。
+    if (dateToEp.size === 0) {
+      for (const r of results) {
+        try {
+          if (episodeLabelOf(r) != null) continue;
+          const dd = _dOf(r);
+          if (dd == null) continue;
+          const suf = _resSuffixOf(r);
+          const key = _dateEpKeyOf(dd, suf);
+          if (_globalDateEpAmbiguous.has(key)) continue;
+          const m = _globalDateEpRegistry.get(key)
+            ?? _globalDateEpRegistry.get(_dateEpKeyOf(dd, null));
+          if (m == null) continue;
+          dateToEp.set(dd, m);
+        } catch {}
+      }
     }
     if (dateToEp.size === 0) return 0;
     let n = 0;
@@ -3443,33 +3574,8 @@ function _inferVarietyEpByDateOrder(results, targetEpisode) {
     try {
       if (results.some((r) => episodeLabelOf(r) === targetEpisode)) return 0;
     } catch {}
-    const _dOf = (r) => {
-      try {
-        if (r?._episodeDate != null) {
-          const v = typeof r._episodeDate === 'number' ? r._episodeDate : _parseEpDate(r._episodeDate);
-          if (Number.isFinite(v)) return v;
-        }
-        const d = _parseEpDate(r?.description ?? '');
-        if (Number.isFinite(d)) return d;
-      } catch {}
-      return null;
-    };
-    const _suffixOf = (r) => {
-      try {
-        const s = String(r?.description ?? '');
-        // 描述形如「片名．20260116下」或「片名．20260116下．更新至…」，
-        // 上/下後面常跟著「．」分隔符，不能只認 ]/空白/結尾。
-        // 先找「日期…上/下」（最準），找不到再看尾端上/下。
-        let m = s.match(/(?:19|20)\d{6}[^上下]*?(上|下)/);
-        if (m) return m[1];
-        m = s.match(/(上|下)\s*(?:[\)）\]．.・\s]|$)/);
-        if (m) return m[1];
-        const t = s.trim();
-        if (/上\s*$/.test(t)) return '上';
-        if (/下\s*$/.test(t)) return '下';
-      } catch {}
-      return null;
-    };
+    const _dOf = _resDateIntOf;
+    const _suffixOf = _resSuffixOf;
     // 主播出段：非衍生、有日期、有上/下後綴（光禿日期如先導片不參與排序）。
     // ★ 同一日多源去重：dytt 同一播出日會出現兩條（dytt / dyttm3u8 各一份），
     //   排名必須按「不重複日期」算，否則 20260116下 會從第 8 排到第 15、推斷全錯。
@@ -3482,10 +3588,26 @@ function _inferVarietyEpByDateOrder(results, targetEpisode) {
         const dd = _dOf(r);
         if (dd == null) continue;
         const suf = _suffixOf(r);
-        if (suf == null) continue;
-        mains.push({ r, dd, suf, key: `${dd}${suf}` });
+        // ★ 「第YYYYMMDD期」無上/下後綴（ffzy 整站 92 段都是這種名稱）：
+        //   沒有上/下就分不出同一天是上集還是下集，但它仍然是「主播出段」
+        //   —— 不收進來的話整站推不出任何集數，實測 E8 看到 32 條
+        //   不相關集，漏網的就是 ffzy 這一站。
+        //   收進來後 suf 記為 null、key 用 `${dd}?`（該日期尚未分辨上/下），
+        //   排名只用來定位「本集大致第幾個主段」；真正的集數交給全域
+        //   登錄表的同日精確命中決定（bfzy 的 20260116(第4期下) = E8）。
+        mains.push({ r, dd, suf: suf ?? null, key: `${dd}${suf ?? '?'}` });
       } catch {}
     }
+    // 站內是否帶有可校準用的顯式集（dytt 尾部的「20260219第10期上」= E19）。
+    let _hasInternalExplicit = false;
+    try {
+      for (const r of results) {
+        if (episodeLabelOf(r) == null) continue;
+        if (_isVarietyExtraSeg(String(r?.description ?? ''))) continue;
+        _hasInternalExplicit = true;
+        break;
+      }
+    } catch {}
     // 必須看起來像綜藝日期列表（過半是日期段），戲劇不受影響。
     let _dateCount = 0;
     try {
@@ -3498,7 +3620,11 @@ function _inferVarietyEpByDateOrder(results, targetEpisode) {
       && (_dateCount / results.length >= 0.5 || _dateCount >= 3);
     if (!_isDateList) return 0;
     if (mains.length < 2) return 0;
-    mains.sort((a, b) => (a.dd - b.dd) || (a.suf === b.suf ? 0 : (a.suf === '上' ? -1 : 1)));
+    mains.sort((a, b) => (a.dd - b.dd) || _sufOrder(a.suf) - _sufOrder(b.suf));
+    //   上/下排序值：上=0、裸日期(null)=1、下=2。裸日期夾在中間是因為
+    //   「第YYYYMMDD期」可能是當天的上集也可能是下集，放哪邊都對不上
+    //   —— 它的實際集數交給全域登錄表決定，排序只用來粗略定位。
+    function _sufOrder(s) { return s === '上' ? 0 : (s == null ? 1 : 2); }
     // 按不重复「日期+上/下」排名：dytt 同一日两条（dytt / dyttm3u8 各一份）只算一段，
     // 否则 20260116下会从第 8 排到第 15、推断全错。
     const _rankOfKey = new Map();
@@ -3510,7 +3636,71 @@ function _inferVarietyEpByDateOrder(results, targetEpisode) {
       // 站內不重复主段数都不到目标集数 → 该站很可能只收录后半季，排名不可靠放弃。
       if (_rank < targetEpisode) return 0;
     } catch {}
-    // 用站內顯式集校準 offset（顯式 − 排名取眾數）；無顯式時 offset=0。
+    let n = 0;
+    // ★★ 相對距離推算（以全域錨定為座標系）★★
+    //   站內某主段前面有 n 個主段；某個已確認錨定日期在站內的位置是 m
+    //   （該錨定日期自身的集數 = E_anchor）→ 該段集數 = E_anchor + (n - m)。
+    //   對缺集（1080 缺 20251225）與多集（ffzy 一日一集）都成立，
+    //   前提是中間沒有同日多段的歧義。
+    try {
+      // 已確認的 (日期 → 集數)
+      const _known = new Map();
+      for (const [k, v] of _globalDateEpRegistry.entries()) {
+        const di = parseInt(String(k).slice(0, 8), 10);
+        if (!Number.isFinite(di)) continue;
+        if (_known.has(di) && _known.get(di) !== v) { _known.delete(di); continue; }
+        _known.set(di, v);
+      }
+      if (_known.size > 0) {
+        // 站內主段依日期排序後的索引 → 該索引對應的集數
+        const _ordered = [...mains].sort((a, b) => (a.dd - b.dd) || _sufOrder(a.suf) - _sufOrder(b.suf));
+        // 以「不重複日期+上/下」去重後的序位當座標（同一集多線路不重複計數）
+        const _coord = new Map();
+        let _c = 0;
+        let _prevKey = null;
+        for (const m of _ordered) {
+          const ck = `${m.dd}${m.suf ?? '?'}`;
+          if (ck !== _prevKey) { _c++; _coord.set(ck, _c); _prevKey = ck; }
+        }
+        // 找站內的錨定點
+        const _anchorHits = [];
+        for (const m of _ordered) {
+          const ep = _known.get(m.dd);
+          if (ep == null) continue;
+          const ck = `${m.dd}${m.suf ?? '?'}`;
+          const co = _coord.get(ck);
+          if (co == null) continue;
+          _anchorHits.push({ co, ep });
+        }
+        if (_anchorHits.length > 0) {
+          // 用第一個錨定點做基準推算，並檢查其它錨定點是否一致
+          const _a0 = _anchorHits[0];
+          let _consistent = true;
+          for (const h of _anchorHits) {
+            if (h.ep - h.co !== _a0.ep - _a0.co) { _consistent = false; break; }
+          }
+          if (_consistent) {
+            const _off = _a0.ep - _a0.co;   // 座標 → 集數 的常數偏移
+            for (const m of _ordered) {
+              const ck = `${m.dd}${m.suf ?? '?'}`;
+              const co = _coord.get(ck);
+              if (co == null) continue;
+              const inferred = co + _off;
+              if (inferred === targetEpisode) { m.r._ep = targetEpisode; n++; }
+            }
+            if (n > 0) {
+              try { console.log(`📅 相對距離推斷: ${n} 條命中 E${targetEpisode}（錨定 ${_anchorHits.length} 點、offset=${_off}）`); } catch {}
+            }
+            return n;
+          } else {
+            try { console.log(`📅 相對距離推斷放棄: 錨定點不一致（${_anchorHits.length} 點）`); } catch {}
+          }
+        }
+      }
+    } catch {}
+    // ★ 純站內排序推斷（無任何跨站錨定時的唯一手段）：
+    //   只有在該站日期序列本身自帶顯式集（如 dytt 尾部的「20260219第10期上」
+    //   = E19）時 offset 才有依據；否則不猜。
     let offset = 0;
     try {
       const votes = new Map();
@@ -3551,20 +3741,58 @@ function _inferVarietyEpByDateOrder(results, targetEpisode) {
         offset = best;
       }
     } catch {}
-    let n = 0;
-    mains.forEach((m) => {
+    // 站內沒有任何顯式集可校準 offset → 不猜（寧可缺席也不給錯集）。
+    try {
+      if (!_hasInternalExplicit) {
+        try { console.log(`📅 日期排序推斷放棄: 站内無可校準的显式集`); } catch {}
+        return 0;
+      }
+    } catch {}
+    for (const m of mains) {
       try {
         const rk = _rankOfKey.get(m.key);
         if (rk == null) return;
         const inferred = rk + offset;
         if (inferred === targetEpisode) { m.r._ep = targetEpisode; n++; }
       } catch {}
-    });
+    }
     if (n > 0) {
       try { console.log(`📅 無 Key 日期排序推斷: ${n} 條命中 E${targetEpisode}（主段 ${mains.length}、offset=${offset}）`); } catch {}
     }
     return n;
   } catch { return 0; }
+}
+
+/**
+ * 純日期站的「期號式」命名 → 集數（ffzy「第20260116期」/ 1080zyku「20251226期下」）。
+ *
+ * 為什麼需要：ffzy 整站 92 段的集名是「第YYYYMMDD期」/「第YYYYMMDD期上/下」，
+ * 沒有「第N期」的 N → _macEpNumber 抽不出集數，_suffixOf 也未必抓得到上/下
+ * （「第20260116期」光禿禿一個日期）。這些段在 filterByEpisode 裡 label===null，
+ * 站內又沒任何顯式集 → hasExact=false → fallback 把整站 90 個日期全保留。
+ * 實測 E8 點進去看到 32 條不相關集（20260108上 / 20260109下 / …）就是它。
+ *
+ * 做法：把「第YYYYMMDD期」當成「日期段」處理 —— 走 _inferVarietyEpByDateOrder
+ * 的日期排序推斷。但排序推斷要求有上/下後綴才能排出完整的前後集，所以這裡
+ * 補一個規則：**同一日期可能同時有上/下兩集**（20260116上 = E7、20260116下 = E8），
+ * 當站內只出現「第20260116期」一條而沒有區分上下時，它可能是上集也可能是下集。
+ * 這時不能盲猜 —— 交給跨站錨定（有 bfzy 的「20260116(第4期下)」= E8 時，
+ * 同日期就認成 E8）。
+ *
+ * 所以本函式的責任是：把「第YYYYMMDD期」這種光日期轉成「可排序的主段」，
+ * 讓排序推斷有機會命中；若排序推斷無法定案（缺上/下），則此段仍留 label===null，
+ * 交由 filterByEpisode 的 hasExact fallback 剪掉（寧可少給也不給錯集）。
+ */
+function _varietyDateSlotOf(r) {
+  try {
+    const dd = _resDateIntOf(r);
+    if (dd == null) return null;
+    const suf = _resSuffixOf(r);
+    // 描述裡有「第…期」或純日期 → 視為日期段。
+    const desc = String(r?.description ?? '');
+    if (/(?:19|20)\d{6}/.test(desc)) return { dd, suf };
+    return null;
+  } catch { return null; }
 }
 
 function filterByEpisode(results, targetEpisode, targetAirDate = null) {
@@ -3584,6 +3812,27 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null) {
   // ★ 跨站日期锚定：纯日期段（dytt「20260116下」）若与其它站同日期显式集
   //   （bfzy「20260116(第4期下)」= E8）同日，直接认成那一集，后续按显式集过滤。
   try { _anchorDateOnlySegments(results, targetEpisode); } catch {}
+
+  // ★ 全域登錄表補錨：站內完全沒有显式集時（ffzy 整站「第YYYYMMDD期」），
+  //   _anchorDateOnlySegments 內部的 dateToEp 會是空的，但全域登錄表裡
+  //   可能已經有 bfzy 的「20260116(第4期下)」= E8 → 直接查表認出本集。
+  //   這是串流路徑（逐站過濾）能正確收斂的關鍵：bfzy 先回 → 登錄 → 
+  //   後到的 dytt/lzi/ffzy/1080zyku 純日期段查表認出 E8。
+  try {
+    if (targetEpisode != null) {
+      for (const r of results) {
+        try {
+          if (episodeLabelOf(r) != null) continue;
+          const dd = _resDateIntOf(r);
+          if (dd == null) continue;
+          const suf = _resSuffixOf(r);
+          const m = _lookupGlobalDateEp(dd, suf);
+          if (m == null) continue;
+          r._ep = m;
+        } catch {}
+      }
+    }
+  } catch {}
   try {
     let _needInfer = true;
     try {
@@ -3597,18 +3846,7 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null) {
     if (typeof targetAirDate === 'number' && Number.isFinite(targetAirDate)) return targetAirDate;
     try { const v = _normalizeAirDateToInt(targetAirDate); return v; } catch { return null; }
   })();
-  const _resDateInt = (res) => {
-    try {
-      if (res?._episodeDate != null) {
-        const v = typeof res._episodeDate === 'number' ? res._episodeDate : _parseEpDate(res._episodeDate);
-        if (Number.isFinite(v)) return v;
-      }
-      // adapter 日期資源：episode 為 null 時從 description / epLabel 反查日期
-      const d = _parseEpDate(res?.description ?? '');
-      if (Number.isFinite(d)) return d;
-      return null;
-    } catch { return null; }
-  };
+  const _resDateInt = _resDateIntOf;
   const _isDateHit = (res) => _targetDateInt != null && _resDateInt(res) === _targetDateInt;
   const hasExact = results.some(res => episodeLabelOf(res) === targetEpisode || _isDateHit(res));
   const filtered = results.filter(res => {
@@ -3624,6 +3862,18 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null) {
       if (d != null) return false;
     }
     if (label !== null) return false;
+    // ★ 無 TMDb Key（_targetDateInt === null）時的日期雜訊清理。
+    //   hasExact=true 代表「這一集找到了」，那麼站內其它日期的純日期段
+    //   確定不是本集 —— 同一集只會在同一天播出，日期互斥。
+    //   舊邏輯 `return !hasExact` 會把它們全留著，這就是實測
+    //   「E8 點進去看到 32 條不相關集」的根因：ffzy 的「第20251225期」
+    //   「第20260108期」… 全部混進來。
+    //   修法：label===null 且有日期 且 hasExact=true → 丟掉。
+    //   沒有日期的未知段仍保留（可能真是本集，只是抽不出集數）。
+    if (hasExact) {
+      const d = _resDateInt(res);
+      if (d != null) return false;
+    }
     return !hasExact;
   });
   // ★ S2 修復（實機 Rex season=2 episode=1 回空陣列）：
@@ -10858,16 +11108,74 @@ targetInfo.searchQuery = aliasQ;
         if (_isDateHit(res)) res._ep = targetEpisode;
       }
     }
+    // ★ 综艺衍生段预筛（加更 / 陪你追日落 / 先导片 / 花絮…）：
+    //   这些永远不可能是正片 E_target。ffzy/bfzy 的「先导片」没有日期，
+    //   抽不出集数（label===null）也匹配不到任何日期 → 会被当成
+    //   「未知候选」一路留到最後（实测详情页里混着「先导片」条目）。
+    //   这里先剪掉；全部都是衍生段时不动（宁可多给也不给空白）。
+    try {
+      if (allResults.length > 1) {
+        const _kept0 = allResults.filter(res => {
+          try { return !_isVarietyExtraSeg(String(res?.description ?? '')); } catch { return true; }
+        });
+        if (_kept0.length > 0 && _kept0.length < allResults.length) allResults = _kept0;
+      }
+    } catch {}
+    // ★ 跨站日期锚定：纯日期段若与其它站同日期的显式集对应，先把集数补上。
+    //   bfzy 的「20260116(第4期下)」= E8 会让 dytt/ffzy/1080zyku 的
+    //   「20260116下」「第20260116期」全被认成 E8。
+    try { _anchorDateOnlySegments(allResults, targetEpisode); } catch {}
+    // ★ 再用全域登录表补锚（站内没有显式集时靠其它站登录的对照表）。
+    try {
+      if (targetEpisode != null) {
+        for (const res of allResults) {
+          try {
+            if (episodeLabelOf(res) != null) continue;
+            const dd = _resDateIntOf(res);
+            if (dd == null) continue;
+            const m = _lookupGlobalDateEp(dd, _resSuffixOf(res));
+            if (m == null) continue;
+            res._ep = m;
+          } catch {}
+        }
+      }
+    } catch {}
     const needFilter = allResults.some(res => {
       const label = episodeLabelOf(res);
       if (label === targetEpisode) return false;
       if (_airInt != null) {
-        // 日期集：有命中就留，沒命中就丟（這就是收斂那堆日期的關鍵）。
+        // 日期集：有命中就留，没命中就丢（这就是收敛那堆日期的关键）。
         const d = _resDate(res);
         if (d != null) return d !== _airInt;
       }
       return label !== null;
     });
+    if (needFilter) {
+      // ★ 关键修复：原来这里 `return label === null;` —— 无 TMDb Key 时
+      //   （_airInt === null）把所有抽不出集数的日期段全部放行，
+      //   实测《日落时分说爱你》E8 点进去看到 32 条不相干集
+      //   （ffzy 的「第20251225期」「第20260108期」…）。
+      //   现在：纯日期段若已被认成本集（_ep === targetEpisode）就留，
+      //   否则一旦本集已确定（_airInt 命中或有显式 target）就丢掉。
+      const _hasTargetHit = allResults.some(res => episodeLabelOf(res) === targetEpisode)
+        || (_airInt != null && allResults.some(_isDateHit));
+      finalResults = allResults.filter(res => {
+        const label = episodeLabelOf(res);
+        if (label === targetEpisode) return true;
+        if (_airInt != null) {
+          const d = _resDate(res);
+          if (d != null) return d === _airInt;
+        }
+        // 已被跨站锚定成本集（label 仍为 null 但 _ep 已知）→ 保留。
+        if (label === null && res?._ep === targetEpisode) return true;
+        // 纯日期段：本集已确定时，其余播出日确定不是本集 → 丢掉。
+        if (label === null && _hasTargetHit) {
+          const d = _resDate(res);
+          if (d != null) return false;
+        }
+        return label === null;
+      });
+    }
     if (needFilter) {
       finalResults = allResults.filter(res => {
         const label = episodeLabelOf(res);
