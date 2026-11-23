@@ -1340,7 +1340,7 @@ const CONFIG = {
   //   修法：_isVarietyExtraSeg 先剝掉「更新至…」後綴再判斷。
   //   同時 _lookupGlobalDateEp 補「同日單一上/下錨定」規則，讓
   //   ffzy「第20260116期」（無上/下）對到 E8 而不是位置推斷出的錯日期。
-  WIDGET_VERSION: 77,
+  WIDGET_VERSION: 78,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1599,7 +1599,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.0.9",
+  version: "4.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2278,13 +2278,24 @@ const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆�
       // 實測「仁醫完結篇 - 第02集 - [ffm3u8]」會抓出 3（從 ffm3u8），
       // 「仁医2 - 第01集 - [wjm3u8]」會抓出 8，整個比對規則全面錯亂。
       const sNoBrackets = s.replace(/\[[^\]]*\]/g, '');
-      const digits = [...sNoBrackets.matchAll(/(\d+)/g)]
+      // ★★ 綜藝「第N期」是**期號**（節目第幾期），不是續集序號。
+      //
+      //   實測 bfzy《日落时分说爱你》的集名是
+      //     「20260116(第4期下)．更新至20260301(陪你追日落第10期下)」
+      //   這裡的「第4期」被下面的數字掃描抓到 → sequel=4 → filterBySequel
+      //   的 S1 分支（sq > 1 就丟）把 E3–E18、E20 整批當成「第二季以後的
+      //   作品」丟掉 → 詳情頁只剩零星幾集（實測 20 集只剩 4 集）。
+      //
+      //   判斷方式：數字緊接在「第」後面、且後面跟「期」→ 期號，不是序號。
+      //   （「第2部」是續集序號、已在上面的 diBu 分支處理，不受影響。）
+      const sNoVarietyIssue = sNoBrackets.replace(/第\s*\d+\s*期/g, '第期');
+      const digits = [...sNoVarietyIssue.matchAll(/(\d+)/g)]
         .map(m => ({ raw: m[1], at: m.index }))
         .filter(d => {
           const n = parseInt(d.raw, 10);
           if (!(n > 0 && n < 100)) return false;      // 排除 0 與 100 以上（含年份）
           // 序號前面是中文／英文文字才算續集；「红海行动2018」整個是年份。
-          const before = sNoBrackets.slice(0, d.at);
+          const before = sNoVarietyIssue.slice(0, d.at);
           // 舊條件：數字前方是「文字」或「字串開頭」才算。
           // 問題：對「Back to the Future 3」（空白分隔），before = "Back to the Future "
           // 結尾是空白，不匹配 [^\d\s]，所以 3 被錯誤排除。
@@ -3539,12 +3550,16 @@ function _lookupGlobalDateEp(dateInt, suffix) {
 function _anchorDateOnlySegments(results, targetEpisode) {
   try {
     if (!Array.isArray(results) || results.length < 2) return 0;
-    if (targetEpisode == null) return 0;
     const _dOf = _resDateIntOf;
     // ★ 步驟 1：把「顯式集數 + 日期」的組合寫進全域登錄表。
     //   這一步是跨站錨定的關鍵 —— bfzy 的「20260116(第4期下)」= E8 會讓
     //   dytt/lzi/ffzy/1080zyku 的「20260116下」「第20260116期」全被認成 E8。
     //   同站同日多線路（dytt / dyttm3u8）不算衝突：集數相同就跳過。
+    //
+    //   ★ targetEpisode == null（整季載入）時**仍然要寫登錄表**：
+    //     這一步不依賴目標集數，它是「日期 → 集數」對照表的來源。
+    //     之前在這裡直接 return，導致整季載入時登錄表全空 →
+    //     其它站的純日期段全部認不出集數（詳情頁只有 bfzy 一站有集數）。
     try {
       for (const r of results) {
         const lab = episodeLabelOf(r);
@@ -3608,7 +3623,11 @@ function _anchorDateOnlySegments(results, targetEpisode) {
       } catch {}
     }
     if (n > 0) {
-      try { console.log(`📅 跨站日期錨定: ${n} 條純日期段已錨定（目標 E${targetEpisode}）`); } catch {}
+      try {
+        console.log(targetEpisode != null
+          ? `📅 跨站日期錨定: ${n} 條純日期段已錨定（目標 E${targetEpisode}）`
+          : `📅 跨站日期錨定: ${n} 條純日期段已錨定（整季載入）`);
+      } catch {}
     }
     return n;
   } catch { return 0; }
@@ -9681,7 +9700,20 @@ function filterBySequel(results, targetInfo) {
     const kept = [];
     const dropped = [];
     for (const res of results) {
-      const nm = res._rawName || res.description || '';
+      // ★★ 只能用**作品片名**判斷續集，不能直接用 episode description。
+      //
+      //   description 是「集名」：綜藝的
+      //   「日落時分說愛你．20260116(第4期下)．更新至…」裡的「第4期」
+      //   是綜藝期號不是續集序號；拿它判 sequel 會把正片當成「第四部」。
+      //   （extractSequelNumber 本身也已排除「第N期」，這裡再加一層保險：
+      //   沒有片名、description 又不是片名型 → 不判定，直接放行。）
+      //
+      //   _rawName 是站方片名（「日落时分说爱你」），是判續集的正確來源。
+      const nm = res._rawName || (() => {
+        const d = String(res.description || '');
+        return /[季部]/.test(d) ? d : '';   // 片名型 description 才當備援
+      })();
+      if (!nm) { kept.push(res); continue; }
       const sq = extractSequelNumber(nm);
       if (sq !== null && sq > 1) { dropped.push(res); continue; }
       kept.push(res);
@@ -9707,7 +9739,24 @@ function filterBySequel(results, targetInfo) {
   //
   // 即時搜尋結果（未 clean）走私有欄位，cache 命中結果（已 clean）
   // 走頂層欄位，兩條路徑行為一致。
-  const nameOf = (res) => res._rawName || res.description || '';
+  // ★★ 續集序號只能從**作品片名**判斷；description 只能當備援，且必須是
+  //   「片名型」的 description。
+  //
+  //   兩種 description 形態要分清楚：
+  //     ・片名型（戲劇）：「疾速追殺4 第4季．第01集」→ 開頭是作品名，
+  //       含續集序號 → 可用來判 sequel。
+  //     ・集名型（綜藝）：「日落時分說愛你．20260116(第4期下)．更新至…」→
+  //       開頭是片名但後面全是集資訊，「第4期」是**期號**不是序號 →
+  //       用它判 sequel 會把正片當成「第四部」。
+  //
+  //   判斷方式：先看 _rawName（權威）；沒有（cache 回放後被刪）時，
+  //   只有當 description 帶「季／部」標記時才用 —— 那才是續集序號
+  //   真正會出現的位置。「第N期」沒有季／部標記，自然被排除。
+  const nameOf = (res) => {
+    if (res._rawName) return res._rawName;
+    const d = String(res.description || '');
+    return /[季部]/.test(d) ? d : '';
+  };
   const yearOf = (res) => {
     const y = Number(res._year) || Number(res.year)
       || Number(extractVersionMarker(res._rawName || ''))
@@ -11148,6 +11197,45 @@ targetInfo.searchQuery = aliasQ;
   //   null → 寬鬆版會把它們全部放行，使用者看到的就是「一堆日期」要手動挑。
   //   這裡把「日期 == TMDb E{target} 的 air_date」視為命中並綁成目標集，
   //   其他日期項則視為不相干而丟掉 —— 這才是「自動對上 TMDb 那一集」。
+  //
+  // ★★ 綜藝跨站日期錨定（**不依賴 targetEpisode**，整季載入也要跑）。
+  //
+  //   這一段做的是「把抽不出集數的純日期段補上集數」，對整季載入
+  //   （loadDetail 沒帶 episode → targetEpisode=null）同樣有用，
+  //   而且是那個場景唯一能把各站對到同一集的方法。
+  //
+  //   實測 bfzy《日落时分说爱你》每段集名都帶著
+  //   「．更新至20260301(陪你追日落第10期下)」→ 修掉 _isVarietyExtraSeg
+  //   的誤判後，bfzy 的 20 段正片終於帶著 _ep=1..20 回來 → 這裡把它們
+  //   寫進全域日期登錄表 → dytt/lzi/ffzy/1080zyku 的純日期段
+  //   （「20260116下」「第20260116期」）就能認出自己對應哪一集。
+  //
+  //   沒有這段的話：整季載入時各站的純日期段全是「未知集」，
+  //   詳情頁只會看到 bfzy 那一站有集數、其它站全擠在未知組。
+  try {
+    if (type === 'tv' && allResults.length > 1) {
+      // 步驟 1：把「顯式集數 + 日期」寫進全域登錄表（跨站錨定的來源）。
+      _anchorDateOnlySegments(allResults, targetEpisode ?? null);
+      // 步驟 2：用全域登錄表補錨純日期段。
+      //   這裡只補「已知集數」的項（_ep 會被 clean 提升成頂層 episode），
+      //   補錯比不補更糟：寧可讓純日期段留著由「未知組」剪枝規則處理。
+      for (const res of allResults) {
+        try {
+          if (episodeLabelOf(res) != null) continue;
+          const dd = _resDateIntOf(res);
+          if (dd == null) continue;
+          const m = _lookupGlobalDateEp(dd, _resSuffixOf(res));
+          if (m == null) continue;
+          res._ep = m;
+        } catch {}
+      }
+      try {
+        const _n = allResults.filter(r => episodeLabelOf(r) != null).length;
+        if (_n > 0) console.log(`📅 跨站日期錨定: ${_n} 條已認出集數（整季載入）`);
+      } catch {}
+    }
+  } catch {}
+
   if (type === 'tv' && targetEpisode) {
     const _airInt = (() => {
       try {
@@ -11195,7 +11283,6 @@ targetInfo.searchQuery = aliasQ;
     //   bfzy 的「20260116(第4期下)」= E8 会让 dytt/ffzy/1080zyku 的
     //   「20260116下」「第20260116期」全被认成 E8。
     try { _anchorDateOnlySegments(allResults, targetEpisode); } catch {}
-    // ★ 再用全域登录表补锚（站内没有显式集时靠其它站登录的对照表）。
     try {
       if (targetEpisode != null) {
         for (const res of allResults) {
@@ -11472,7 +11559,50 @@ targetInfo.searchQuery = aliasQ;
     })();
   }
 
-  return finalResults.slice(0, 100);
+  // ★★ 回傳筆數上限（100）改成「依集數均衡取樣」，不能直接 slice。
+  //
+  // 為什麼：整季搜尋（沒有 targetEpisode，loadDetail 的全季載入）時，
+  // 結果裡混著兩類東西：
+  //   ・有顯式集數的正片（bfzy 的 20 段，_ep=1..20）
+  //   ・抽不出集數的純日期段（dytt/ffzy/lzi/1080zyku 的幾十段）
+  // 排序是「分數高者在前」，而分數只看畫質／來源權重，看不到集數 →
+  // 直接 slice(0,100) 會把純日期段全排在後面、砍掉後面的正片，
+  // 結果就是詳情頁只剩零星幾集（實測《日落时分说爱你》20 集只剩 4 集：
+  // E3/E6/E19/E20，238 筆被砍到 100 筆）。
+  //
+  // 修法：先保留每個集數的前幾筆（覆蓋所有集），剩下的名額再依原排序填。
+  // 這樣 100 筆的上限仍然有效，但不會有任何一集被整批砍掉。
+  {
+    const _CAP = 100;
+    if (finalResults.length > _CAP) {
+      const _perEp = new Map();          // epKey -> 已取筆數
+      const _epCap = 3;                  // 每集最多先取幾筆（多來源可選）
+      const _picked = [];
+      const _rest = [];
+      for (const r of finalResults) {
+        const _k = episodeKeyOf(r);
+        const _n = _perEp.get(_k) || 0;
+        if (_n < _epCap && _picked.length < _CAP) {
+          _perEp.set(_k, _n + 1);
+          _picked.push(r);
+        } else {
+          _rest.push(r);
+        }
+      }
+      // 名額還有剩 → 依原排序補滿（同一集的第 4 筆以後、無集數的日期段）
+      for (const r of _rest) {
+        if (_picked.length >= _CAP) break;
+        _picked.push(r);
+      }
+      try {
+        const _epCount = new Set(finalResults.map(r => episodeKeyOf(r))).size;
+        console.log(`✂️ 筆數上限 ${_CAP}: ${finalResults.length} -> ${_picked.length}（依集數均衡取樣，涵蓋 ${_epCount} 個集數槽）`);
+      } catch {}
+      finalResults = _picked;
+    }
+  }
+
+  return finalResults;
 }
 
 // ==================== REX 規範：詳情頁與連結工具 ====================
