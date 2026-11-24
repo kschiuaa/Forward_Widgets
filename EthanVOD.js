@@ -1782,7 +1782,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.0.0",
+  version: "5.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -14740,10 +14740,27 @@ function _playlistEpisodeTitle(group, first, type, showTitle) {
  * ★ 只探「使用者看得到的那幾條」：
  *   只探 customLines 裡的來源（通常 5~8 條），不探整季所有集數 ——
  *   否則一季 36 集 × 7 源 = 252 次請求，播放頁根本打不開。
+ *
+ * ★★ 全域探測預算（安全網）★★
+ *   loadDetail 一次可能回傳多季（合併 S1+S2+…），每季每集都有自己的
+ *   customLines → 理論上探測量 = 總集數 × 源數。
+ *   雖然實測通常只有 1~3 集（loadDetail 只載入當前與相鄰季別），
+ *   但不能只靠這個假設 —— 站方哪天多回幾季就會炸。
+ *
+ *   → 用「本次 loadDetail 的探測預算」限制總量：
+ *     超過預算的集數**不探**（描述維持原樣、不顯示畫質），
+ *     但**使用者正在看的那一集一定會被探到**（優先順序：當前集 → 其他集）。
  */
-async function _buildSourceLinesWithRealRes(resources) {
+const _V89_PROBE_BUDGET = { remaining: 0, MAX: 24 };
+
+async function _buildSourceLinesWithRealRes(resources, priority = false) {
   const list = Array.isArray(resources) ? resources : [];
   if (list.length === 0) return [];
+
+  // ★ 預算檢查：非優先集且預算用完 → 不探（不顯示畫質，但描述照常）。
+  if (!priority && _V89_PROBE_BUDGET.remaining <= 0) {
+    return list.map(r => ({ name: r.name, url: r.url, description: r.description }));
+  }
 
   // ★ 只探「看得到的那幾條」：每集最多前 12 個來源。
   //   12 條 × 約 0.3~2 秒（併發 6）≈ 2~4 秒，播放頁可接受。
@@ -14751,6 +14768,11 @@ async function _buildSourceLinesWithRealRes(resources) {
   const CAP = 12;
   const probeTargets = list.slice(0, CAP);
   const urls = probeTargets.map(r => r?.url).filter(u => typeof u === 'string' && u);
+
+  // ★ 扣預算（按實際要探的條數算，不是整個 list）。
+  if (!priority) {
+    _V89_PROBE_BUDGET.remaining = Math.max(0, _V89_PROBE_BUDGET.remaining - urls.length);
+  }
 
   // ★ 併發探測（探測函式本身已有併發控制，這裡只是等它回來）。
   let probed = [];
@@ -15103,6 +15125,14 @@ async function loadDetail(link) {
       groupsBySeason.get(g.season).push(g);
     }
 
+    // ★★ v89：重設本次 loadDetail 的實時探測預算 ★★
+    //   上限 24 條（≈ 3~4 集的源數量）。使用者**正在看的那一集**
+    //   標成 priority → 不受預算限制，保證一定探得到。
+    _V89_PROBE_BUDGET.remaining = _V89_PROBE_BUDGET.MAX;
+    const _isCurrentEpisode = (g) => (
+      episode != null && g?.episode != null && Number(g.episode) === Number(episode)
+    );
+
     // ★ v89：childItems 的 map 改成 async（切源清單要即時探測畫質），
     //   這裡必須 await 才拿到真正的物件陣列。
     const childItems = (await Promise.all(Array.from(groupsBySeason.entries())
@@ -15133,7 +15163,7 @@ async function loadDetail(link) {
               //   搜尋階段不做這件事（v88）—— 那時探測是背景異步的，
               //   數字會互相矛盾；進了播放頁才做，使用者已在等內容，多等
               //   1~2 秒無感，而且拿到的是「這個源」的即時值。
-              customLines: await _buildSourceLinesWithRealRes(g.resources),
+              customLines: await _buildSourceLinesWithRealRes(g.resources, _isCurrentEpisode(g)),
             } : {})
           };
         }));
@@ -15182,7 +15212,7 @@ async function loadDetail(link) {
         videoUrl: first?.url,
         link: epLink,
         ...(g.resources.length > 1 ? {
-          customLines: await _buildSourceLinesWithRealRes(g.resources),
+          customLines: await _buildSourceLinesWithRealRes(g.resources, _isCurrentEpisode(g)),
         } : {})
       };
     }));
