@@ -1044,7 +1044,12 @@ const CONFIG = {
   // 不阻塞搜尋回傳。單檔 TS（media playlist，無 STREAM-INF）沒有解析度標籤，
   // 探不到是預期的，會保留站方文字標註、不寫假資料。
   ACTUAL_RES_PROBE_TIMEOUT: 2500,
-  ACTUAL_RES_PROBE_CONCURRENCY: 6,
+  // ★ v89：併發 6 → 8（使用者要求）。
+  //   播放頁切源時一次要探 5~8 個來源，併發 6 會分成兩批（2 批 ≈ 2 秒）。
+  //   提到 8 → 單批就打完，最快 ~1.2 秒。
+  //   ★ 不更高的原因：每個探測是對站方 CDN 的 GET，站方有連線數限制；
+  //     8 是實測穩定值，再高會開始出現 timeout。
+  ACTUAL_RES_PROBE_CONCURRENCY: 8,
   ACTUAL_RES_PROBE_LIMIT: 20,
   ACTUAL_RES_CACHE_TTL: 1800,
   // widget 版本號。任何 cache schema 變更時（例如加了版本標籤、改了
@@ -1782,7 +1787,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.1.0",
+  version: "5.2.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7684,7 +7689,7 @@ async function probeUrlsAlive(urls, opts = {}) {
 //      探的是同一路來源，結果可直接對應回包裝 url。
 //
 // 成本控制（不拖慢搜尋）：只在 cache 寫入前的背景任務裡跑（fire-and-forget，
-// 與 probeUrlsAlive 同一個 IIFE），不阻塞回傳；併發 6、超時 2.5s、最多 20 條，
+// 與 probeUrlsAlive 同一個 IIFE），不阻塞回傳；併發 8、超時 2.5s、最多 20 條，
 // 結果寫進 in-memory + 隨 cache 一起持久化。下次 cache 命中時直接顯示實測，
 // 使用者第二次進來就看得到 —— 第一次顯示站方標註是預期的。
 const _ACTUAL_RES_CACHE = new Map(); // stablePath -> { label, level, w, h, ts }
@@ -7831,7 +7836,7 @@ async function _probeOneActualResolution(url) {
 // 與 probeUrlsAlive 同樣的分批啟動，保证最多 concurrency 個同時在飛。
 async function probeActualResolutions(urls, opts = {}) {
   const timeout = opts.timeout ?? CONFIG.ACTUAL_RES_PROBE_TIMEOUT ?? 2500;
-  const concurrency = opts.concurrency ?? CONFIG.ACTUAL_RES_PROBE_CONCURRENCY ?? 6;
+  const concurrency = opts.concurrency ?? CONFIG.ACTUAL_RES_PROBE_CONCURRENCY ?? 8;
   void timeout;
   if (!Array.isArray(urls) || urls.length === 0) return [];
   if (!Widget?.http?.get) return urls.map(() => null);
@@ -14763,7 +14768,7 @@ async function _buildSourceLinesWithRealRes(resources, priority = false) {
   }
 
   // ★ 只探「看得到的那幾條」：每集最多前 12 個來源。
-  //   12 條 × 約 0.3~2 秒（併發 6）≈ 2~4 秒，播放頁可接受。
+  //   12 條 × 約 0.3~2 秒（併發 8）≈ 1.5~3 秒，播放頁可接受。
   //   再多就會讓使用者等太久。
   const CAP = 12;
   const probeTargets = list.slice(0, CAP);
