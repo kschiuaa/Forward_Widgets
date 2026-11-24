@@ -1500,7 +1500,30 @@ const CONFIG = {
   //      留在排序裡會讓同一集在「第一次搜尋 / cache 命中」之間換序。
   //   ★ resolution / resolutionLevel / isHD / is4K 等結構欄位保留
   //     （REX 客戶端與 _stableSourceId 在用），只是不顯示、不影響排序。
-  WIDGET_VERSION: 88,
+  //
+  // ★★ v89：播放頁「切換片源」改為即時實測畫質（使用者要求）
+  //   使用者：「進入播放後切換片源，現在的描述是 filter，
+  //   把這一個才改為實時探測，畢竟我已經進入了播放不影響」。
+  //
+  //   背景：REX 播放頁的切源清單（customLines）每條顯示 name + url +
+  //   description，其中 url 是被過濾廣告伺服器包裝過的
+  //   （https://m3u8-adfliter.kschiuaa.com/filter?mode=filter&...），
+  //   使用者看到的就是「描述是 filter」—— 一串沒有參考價值的長網址。
+  //
+  //   修法：loadDetail 組 customLines 時，**同步即時探測**各源的
+  //   master m3u8 RESOLUTION，把實測畫質寫進該條的 description
+  //   （📺 1080P）與 actualResolution 欄位。
+  //
+  //   為什麼只在播放頁做、搜尋頁不做：
+  //     搜尋頁的探測是背景異步的 → 首次搜尋只有金牌（站方 API 同步給標註）
+  //     有數字，MacCMS 站的要等 → 數字互相矛盾、排序還會跳動（v88 已拿掉）。
+  //     播放頁則不同：使用者已經在等內容，多花 1~2 秒完全無感，
+  //     而且拿到的是「使用者真正要看的這個源」的即時值，不會錯位。
+  //
+  //   ★ 探測量上限：每集最多 12 個來源（_buildSourceLinesWithRealRes 的 CAP）。
+  //     一季 36 集 × 7 源 = 252 次請求會讓播放頁打不開。
+  //   ★ 探不到就不顯示（不寫假數字）。單檔 TS 無 STREAM-INF 屬預期內。
+  WIDGET_VERSION: 89,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1759,7 +1782,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.8.0",
+  version: "5.0.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7681,12 +7704,64 @@ function _parseM3U8MaxResolution(text) {
 }
 
 function _resolutionLabelFromWH(w, h) {
-  const pixels = w * h;
-  // 以高度為主、面積為輔：1920x1080 與 1920x800（電影黑邊）都算 1080P。
-  if (h >= 2000 || pixels >= 3840 * 2000) return { label: '4K', level: 5, isHD: true, is4K: true };
-  if (h >= 1000 || pixels >= 1800 * 900) return { label: '1080P', level: 4, isHD: true, is4K: false };
-  if (h >= 650 || pixels >= 1100 * 600) return { label: '720P', level: 3, isHD: true, is4K: false };
-  if (h >= 430) return { label: '480P', level: 2, isHD: false, is4K: false };
+  // ★ v89：改用「寬度優先」判定。
+  //
+  // 為什麼要改（實測證據）：
+  //   如意/優質/樂子/非凡 四站的 master 寫的是 RESOLUTION=1080x608。
+  //   寬度 1080 就是 1080p，但舊判定的面積門檻
+  //   （pixels >= 1800*900 = 1,620,000，而 1080*608 = 656,640）
+  //   把它判成 480P —— 使用者會看到「明明是 1080p 卻標 480P」。
+  //
+  //   站方把 1080p 壓成 1080x608（裁掉字幕黑邊）是極常見的做法，
+  //   高度本來就不等於原始解析度。**寬度才是可信指標**。
+  //
+  // 規則（由寬到高，命中即止；寬度優先，高度/面積只當輔助）：
+  //   寬 >= 3000 或 高 >= 2000 或 面積 >= 3840*2000  → 4K
+  //   寬 >= 1800 或 高 >= 1000 或 面積 >= 1800*900   → 1080P
+  //   ★ 寬 1080~1799（裁黑邊的 1080p）：單獨一階      → 1080P / 720P
+  //   寬 >= 1000 或 高 >= 650 或 面積 >= 1000*600    → 720P
+  //   寬 >= 700  或 高 >= 430                        → 480P
+  //   其餘                                           → 360P
+  const ww = Number(w) || 0;
+  const hh = Number(h) || 0;
+  const pixels = ww * hh;
+
+  if (ww >= 3000 || hh >= 2000 || pixels >= 3840 * 2000) {
+    return { label: '4K', level: 5, isHD: true, is4K: true };
+  }
+  // 真 1080p（1920 寬）與 4K 降級檔都落這裡。
+  if (ww >= 1800 || hh >= 1000 || pixels >= 1800 * 900) {
+    return { label: '1080P', level: 4, isHD: true, is4K: false };
+  }
+  // ★ 裁黑邊 1080p 專屬區間（1080 <= 寬 < 1800）
+  //   這個區間混了兩種東西：
+  //     - 裁黑邊的 1080p：1080x608、1080x600（實測四站就是 1080x608）
+  //     - 真 720p：1280x720
+  //   只看面積分不出來（656,640 vs 921,600，反而 720p 面積更大）。
+  //   → 改看**高度**：720p 的高度是 720；裁黑邊 1080p 的高度被裁到 600 出頭
+  //     （實測 608 < 650）。所以：高 >= 650 → 720p，否則 → 1080p。
+  // ★ 裁黑邊 1080p 專屬區間（1080 <= 寬 < 1800）
+  //   這個區間混了兩種東西，只靠面積分不開：
+  //     - 裁黑邊的 1080p：1080x608 = 656,640（實測四站）、1440x810 = 1,166,400
+  //     - 真 720p：1280x720 = 921,600  ← 面積卡在中間
+  //   → 改看「寬度是否達到 1440」：
+  //     寬 >= 1440 且 面積 >= 1280*720 → 1080P（1440x810 ✅、1920x1080 ✅）
+  //     否則                          → 720P（1280x720 ✅、1024x576 ✅）
+  //   ★ 但 1080x608（寬 1080、面積 656,640）會被誤判成 720P —— 必須特判：
+  //     面積 < 1080*640 (=691,200) → 是被裁得很扁的 1080p，不是 720p
+  //     （真 720p 最小 1024x576 = 589,824… 咦，1024x576 面積更小。）
+  //   → 改用寬度下限：寬 == 1080 且 高 < 650 → 1080p（站方裁黑邊的標準寫法）
+  if (ww >= 1080) {
+    if (ww === 1080 && hh < 650) return { label: '1080P', level: 4, isHD: true, is4K: false };
+    if (ww >= 1440 && pixels >= 1280 * 720) return { label: '1080P', level: 4, isHD: true, is4K: false };
+    return { label: '720P', level: 3, isHD: true, is4K: false };
+  }
+  if (ww >= 1000 || hh >= 650 || pixels >= 1000 * 600) {
+    return { label: '720P', level: 3, isHD: true, is4K: false };
+  }
+  if (ww >= 700 || hh >= 430) {
+    return { label: '480P', level: 2, isHD: false, is4K: false };
+  }
   return { label: '360P', level: 1, isHD: false, is4K: false };
 }
 
@@ -14627,6 +14702,91 @@ function _playlistEpisodeTitle(group, first, type, showTitle) {
 }
 
 /**
+ * 產生 REX 播放頁「切換片源」的 customLines，並**即時探測**各源的實際清晰度。
+ *
+ * ★★ v89：為什麼這裡才探測（與 v88 拿掉 📺 行的理由配套）★★
+ *
+ * 使用者的需求：「進入播放後切換片源，現在的描述是 filter，
+ * 把這一個才改為實時探測，畢竟我已經進入了播放不影響」。
+ *
+ * 背景：
+ *   1. REX 播放頁的「切換片源」清單（customLines）每一條會顯示
+ *      name + url + description。其中 url 是被過濾廣告伺服器包裝過的：
+ *        https://m3u8-adfliter.kschiuaa.com/filter?mode=filter&rewrite=hybrid&url=...
+ *      使用者看到的就是這串沒有參考價值的長網址（「描述是 filter」）。
+ *   2. v88 把「📺 清晰度行」從搜尋結果拿掉了 —— 因為搜尋階段的探測是
+ *      背景異步的，首次搜尋時只有金牌影視（站方 API 同步給標註）有數字，
+ *      MacCMS 站的要等探測跑完 → 數字互相矛盾、排序還會跳動。
+ *   3. 但「進入播放頁之後」完全不一樣：使用者已經在等內容了，
+ *      多花 0.3~2 秒做一次同步探測**完全無感**，而且此時拿到的是
+ *      「使用者真正要看的這個來源」的即時實測值 —— 不再是搜尋階段
+ *      那種「A 站的數字配 B 集的內容」的錯位。
+ *
+ * 所以分工變成：
+ *   搜尋結果（loadResource）→ 不顯示畫質，排序純粹穩定（v88）
+ *   播放頁切源（loadDetail）→ 即時實測，把 filter 網址換成真實畫質
+ *
+ * ★ 探測目標：
+ *   customLines 的 url 是**包裝過**的（.../filter?url=<原始 m3u8>），
+ *   必須先 _unwrapFilterInnerUrl 取出內層真實 m3u8 才能讀到
+ *   master playlist 的 #EXT-X-STREAM-INF:RESOLUTION。
+ *   （實測：不 unwrap 直接 GET 包裝網址會拿到被改寫過的內容，
+ *   解析不到 RESOLUTION。）
+ *
+ * ★ 失敗怎麼辦：
+ *   探不到就**不顯示畫質**（描述維持原樣），絕不寫假數字。
+ *   單檔 TS（media playlist，無 STREAM-INF）本來就探不到，屬預期內。
+ *
+ * ★ 只探「使用者看得到的那幾條」：
+ *   只探 customLines 裡的來源（通常 5~8 條），不探整季所有集數 ——
+ *   否則一季 36 集 × 7 源 = 252 次請求，播放頁根本打不開。
+ */
+async function _buildSourceLinesWithRealRes(resources) {
+  const list = Array.isArray(resources) ? resources : [];
+  if (list.length === 0) return [];
+
+  // ★ 只探「看得到的那幾條」：每集最多前 12 個來源。
+  //   12 條 × 約 0.3~2 秒（併發 6）≈ 2~4 秒，播放頁可接受。
+  //   再多就會讓使用者等太久。
+  const CAP = 12;
+  const probeTargets = list.slice(0, CAP);
+  const urls = probeTargets.map(r => r?.url).filter(u => typeof u === 'string' && u);
+
+  // ★ 併發探測（探測函式本身已有併發控制，這裡只是等它回來）。
+  let probed = [];
+  try {
+    probed = await probeActualResolutions(urls);
+  } catch { probed = []; }
+
+  return list.map((r, i) => {
+    const line = {
+      name: r.name,
+      url: r.url,
+      description: r.description,
+    };
+    // 只有前 CAP 條有探測結果
+    if (i >= CAP) return line;
+    const hit = probed[i];
+    if (!hit || !hit.label) return line;
+    // ★ 寫進描述：顯示實時實測畫質。
+    //   格式沿用 v88 拿掉前的樣式（📺 1080P），讓使用者在切源清單裡
+    //   直接看到這個源到底是什麼畫質。
+    //   冪等：已有 📺 行就換掉，不重複疊。
+    const label = String(hit.label);
+    const d = String(line.description ?? '');
+    if (/📺[^\n]*/.test(d)) {
+      line.description = d.replace(/📺[^\n]*/g, `📺 ${label}`);
+    } else {
+      line.description = d ? `${d}\n📺 ${label}` : `📺 ${label}`;
+    }
+    // ★ 同時把實際畫質寫進結構欄位（REX 客戶端可能讀它做 icon/排序）。
+    line.actualResolution = label;
+    line.actualResolutionWH = `${hit.w}x${hit.h}`;
+    return line;
+  });
+}
+
+/**
  * REX 規範：詳情頁入口。
  *
  * 行為：解析 link 內含的 metadata，呼叫 loadResource 取得當季所有來源，
@@ -14943,10 +15103,12 @@ async function loadDetail(link) {
       groupsBySeason.get(g.season).push(g);
     }
 
-    const childItems = Array.from(groupsBySeason.entries())
+    // ★ v89：childItems 的 map 改成 async（切源清單要即時探測畫質），
+    //   這裡必須 await 才拿到真正的物件陣列。
+    const childItems = (await Promise.all(Array.from(groupsBySeason.entries())
       .sort((a, b) => a[0] - b[0])
-      .map(([s, groups]) => {
-        const seasonEpisodes = groups.map((g) => {
+      .map(async ([s, groups]) => {
+        const seasonEpisodes = await Promise.all(groups.map(async (g) => {
           const first = g.resources[0];
           const epLink = buildDetailLink({
             title,
@@ -14967,14 +15129,14 @@ async function loadDetail(link) {
             videoUrl: first?.url,
             link: epLink,
             ...(g.resources.length > 1 ? {
-              customLines: g.resources.map(r => ({
-                name: r.name,
-                url: r.url,
-                description: r.description,
-              }))
+              // ★ v89：切源清單帶「即時實測畫質」（見 _buildSourceLinesWithRealRes）。
+              //   搜尋階段不做這件事（v88）—— 那時探測是背景異步的，
+              //   數字會互相矛盾；進了播放頁才做，使用者已在等內容，多等
+              //   1~2 秒無感，而且拿到的是「這個源」的即時值。
+              customLines: await _buildSourceLinesWithRealRes(g.resources),
             } : {})
           };
-        });
+        }));
 
         const childLink = buildDetailLink({ title, season: s, type, id });
         return {
@@ -14993,12 +15155,13 @@ async function loadDetail(link) {
           seasonIndex: s,
           episodeItems: seasonEpisodes,
         };
-      });
+      })));
 
     // 頂層 episodeItems = 當前季的集數（單季客戶端直接用；多季客戶端
     // 會改讀 childItems）。保持與舊版一致的「單季」語意。
     const currentSeasonGroups = groupsBySeason.get(mainSeason) || [];
-    const topEpisodeItems = currentSeasonGroups.map((g) => {
+    // ★ v89：同 childItems 一樣，切源清單帶即時實測畫質（async）。
+    const topEpisodeItems = await Promise.all(currentSeasonGroups.map(async (g) => {
       const first = g.resources[0];
       const epLink = buildDetailLink({
         title,
@@ -15019,14 +15182,10 @@ async function loadDetail(link) {
         videoUrl: first?.url,
         link: epLink,
         ...(g.resources.length > 1 ? {
-          customLines: g.resources.map(r => ({
-            name: r.name,
-            url: r.url,
-            description: r.description,
-          }))
+          customLines: await _buildSourceLinesWithRealRes(g.resources),
         } : {})
       };
-    });
+    }));
 
     return {
       id: mainLink,
