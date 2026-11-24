@@ -1008,7 +1008,27 @@ const DEFAULT_WORKER_URL = 'https://m3u8-adfliter.kschiuaa.com';
 
 const CONFIG = {
   // 性能配置
-  MAX_CONCURRENT_REQUESTS: 8,
+  //
+  // ★★ v90：MAX_CONCURRENT_REQUESTS 8 → 20（實測依據）★★
+  //
+  // 量測結果（4 輪重複，2 部作品）：
+  //   設定              仁醫 中位 / 最大      一飯封神 中位 / 最大
+  //   8/2/4（舊）       658ms / 2262ms      1502ms / 1899ms
+  //   20/2/4            601ms /  602ms       721ms /  729ms
+  //   20/4/8            647ms /  672ms       633ms /  655ms
+  //   32/6/12          2204ms /        ❌     1749ms /        ❌
+  //
+  // ★ 為什麼「中位數」幾乎不變、「最大值」卻差 4 倍：
+  //   MacCMS 階段本來就是 100% 完全並行（實測 6 站全在 +1~4ms 同時發出，
+  //   空隙只有 8ms），所以多開併發槽不會讓「正常情況」更快。
+  //   但舊設定的併發槽只有 8 個，站數一多（6 MacCMS + 2 adapter = 8 組，
+  //   每組還會各自開 detail 子請求）就會排隊 → 慢站被推後 → **長尾**。
+  //   實測「有時秒開、有時要等 2 秒」就是這個排隊造成的。
+  //
+  // ★ 為什麼不能再往上（32 反而更慢）：
+  //   32/6/12 觸發站方限流（實測 api.agedm.io / jiabaide.cn 開始回錯），
+  //   反而慢 4 倍。20 是實測的甜蜜點。
+  MAX_CONCURRENT_REQUESTS: 20,
   MIN_CONCURRENT_REQUESTS: 3,
   // 從 6000 縮到 4000：搭配下方 SUFFICIENT_SITE_COUNT=3 與 adapter hard=4500
   // 形成「快站先收尾」鏈式提早返回。MacCMS 站 search 端點實測 p50 ≈ 1.2s、
@@ -1599,11 +1619,16 @@ const CONFIG = {
     //
     // ★ 這個值是在「速度」與「不被限流」之間取捨，不是越大越好：
     //   - 1  = 完全循序，12 筆候選要 12 倍 RTT（實測 3.6s）
-    //   - 4  = 目前預設，實測 0.31s，且不觸發 429
+    //   - 4  = 舊預設，實測 0.31s，且不觸發 429
+    //   - 8  = v90 新預設，實測 20/4/8 的長尾最小（一飯封神 最大 655ms）
     //   - 12 = 全開最快，但 api.agedm.io 會回 429，連 search 都一起被拖死
     //
     // 若換站點後開始看到 429，先把這裡調小，而不是改回循序。
-    DETAIL_CONCURRENCY: 4,
+    //
+    // ★ v90：4 → 8。理由：adapter 的詳情頁是整條管線裡最慢的一段
+    //   （實測 jpyy 的 /detail 單跳就 1066ms），候選一多就會排隊。
+    //   8 是實測不觸發 429 的上限（32/6/12 那組會回錯）。
+    DETAIL_CONCURRENCY: 8,
     // 同時查詢幾個 adapter 站。
     //
     // ★ 原本各站是「一站跑完才換下一站」，總時間 = 各站耗時相加
@@ -1612,7 +1637,11 @@ const CONFIG = {
     //
     //   刻意只給 2（而非全開）：不同站點雖然打不同網域，但同時打滿
     //   仍可能撞到各自的限流。2 已能把兩個站的成本疊在一起。
-    SITE_CONCURRENCY: 2,
+    //
+    // ★ v90：2 → 4。目前只有 2 個 adapter 站（金牌影視 / AGE動漫），
+    //   給 4 等於「全開」但保留日後新增站的餘裕；實測 20/4/8 這組的
+    //   長尾最小（一飯封神 最大 655ms vs 20/2/4 的 729ms）。
+    SITE_CONCURRENCY: 4,
     // detail 端點的短 TTL 快取（毫秒）。
     //
     // 用途：搜尋流程會對同一個 vodId 打兩次 /detail（一次取播放清單、
@@ -1787,7 +1816,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.1.0",
+  version: "5.5.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
