@@ -1485,7 +1485,22 @@ const CONFIG = {
   //   MacCMS 站本來就照實回報（6 !== 7 → 被殺），只有 adapter 站會漏過。
   //   修法：站方最大集號 < wantEp → 本集尚未播出 → 不謊報 episode，
   //   回報實際集數讓 filterByEpisode 照常過濾（結果 = 0 筆）。
-  WIDGET_VERSION: 87,
+  //
+  // ★★ v88：📺 清晰度行拿掉，排序回歸穩定（使用者要求）
+  //   1. description 不再寫「📺 1080P」這行。
+  //      理由：兩種來源混雜且互相矛盾 ——
+  //      金牌影視是站方 API 的 resolutionName（同步），
+  //      MacCMS 站是背景 GET master m3u8 的 RESOLUTION（異步）。
+  //      實測同一集《誰是被害者》E4：金牌 1080P / 電影天堂 1080P /
+  //      如意 480P / 優質 480P / 樂子 480P / 非凡 480P / 暴風（無）。
+  //      而且 1080x608（寬度就是 1080）被面積門檻判成 480P，數字會飄。
+  //   2. calculateResourceScore 移除 RESOLUTION_BONUS。
+  //   3. comparator 移除 resolutionLevel / qualityScore 比較。
+  //      原本 resolutionLevel 的來源不統一（金牌有、MacCMS 沒有），
+  //      留在排序裡會讓同一集在「第一次搜尋 / cache 命中」之間換序。
+  //   ★ resolution / resolutionLevel / isHD / is4K 等結構欄位保留
+  //     （REX 客戶端與 _stableSourceId 在用），只是不顯示、不影響排序。
+  WIDGET_VERSION: 88,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1744,7 +1759,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.7.0",
+  version: "4.8.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7771,43 +7786,27 @@ async function probeActualResolutions(urls, opts = {}) {
 }
 
 // 把已知的實測清晰度套到一批結果上（冪等，可在 cache 命中路徑調用）。
-// 只升級、不降級：實測 level 高於站方標註才覆蓋 resolution；無實測時不動。
-// 無論升不升級，只要有實測就寫 actualResolution + description 第三行「📺 實測…」。
+//
+// ★★ v88：📺 清晰度行已從顯示層拿掉（使用者要求：數字互相矛盾、實測不可靠、
+//   還會讓排序在兩次載入間跳動）。這個函式**只移除、不新增** 📺 行 ——
+//   作用是清掉舊 cache 裡殘留的 📺 行，讓任何路徑都不會再出現它。
+//   actualResolution 欄位仍會填（結構欄位，REX 客戶端可能用），
+//   但不寫進 description、不影響分數與排序。
 function applyActualResolutions(results) {
   if (!Array.isArray(results) || results.length === 0) return 0;
   let applied = 0;
   for (const r of results) {
     try {
       if (!r || typeof r.url !== 'string') continue;
-      // 舊格式遷移（無需網路）：重啟後 in-memory 實測快取是空的，
-      // 但 cache 裡的 description 可能還留著「📺 實測1080P(1920x1080)」，
-      // 直接改寫成新格式「📺 1080P」，不需重新探測。
-      // 有 actualResolution 的也要遷（舊 cache 在 v62 寫入時就是長格式）。
+      // ★ v88：移除所有 📺 行（舊 cache 的「📺 實測1080P(1920x1080)」
+      //   與舊格式「📺 1080P」都涵蓋）。冪等：移除後再跑一次不會有變化。
       try {
         const d0 = String(r.description || '');
-        if (/📺\s*實測/.test(d0)) {
-          const m0 = d0.match(/📺\s*實測\s*(4K|1080P|720P|480P|360P)/);
-          if (m0) {
-            r.description = d0.replace(/📺\s*實測[^\n]*/g, `📺 ${m0[1]}`);
-            if (!r.actualResolution) r.actualResolution = m0[1];
-            applied++;
-            continue;
-          }
+        if (/📺[^\n]*/.test(d0)) {
+          r.description = d0.replace(/📺[^\n]*/g, '').replace(/\n{2,}/g, '\n').trim();
         }
       } catch {}
       if (r.actualResolution) {
-        // 已有實測但 description 缺 📺 行（舊 cache / clean 後）→ 補行，不跳過。
-        try {
-          const _ar = String(r.actualResolution);
-          const _line = `📺 ${_ar}`;
-          const _d = String(r.description || '');
-          if (/📺\s*實測/.test(_d)) {
-            const _m = _d.match(/📺\s*實測\s*(4K|1080P|720P|480P|360P)/);
-            r.description = _m ? _d.replace(/📺\s*實測[^\n]*/g, _line) : (_d.includes(_line) ? _d : (_d ? `${_d}\n${_line}` : _line));
-          } else if (!_d.includes(_line)) {
-            r.description = _d ? `${_d}\n${_line}` : _line;
-          }
-        } catch {}
         applied++;
         continue;
       } // 已套過（冪等，重複 clean 安全）
@@ -7817,26 +7816,14 @@ function applyActualResolutions(results) {
       const hit = _actualResCacheGet(key)
         || _actualResCacheGet(String(r.url || '').split(/[?#]/)[0].trim());
       if (!hit) continue;
+      // ★ v88：只寫結構欄位，不再寫 description 的 📺 行。
       r.actualResolution = hit.label;
       r.actualResolutionWH = `${hit.w}x${hit.h}`;
-      const desc = String(r.description || '');
-      const line = `📺 ${hit.label}`;
-      if (/📺[^\n]*/.test(desc)) {
-        // 已有 📺 行（clean 時寫的站方行，或舊格式實測行）→ 直接升級為實測，不另起一行。
-        r.description = desc.replace(/📺[^\n]*/g, line);
-      } else {
-        r.description = desc ? `${desc}\n${line}` : line;
-      }
-      // 實測比站方標的高才升級排序依據（站方寫 720P 實測 1080P 的情況很常見）；
-      // ★ 不升級 resolution 本體：_stableSourceId 用 resolution 算 id，
-      //   升級會讓同一路來源在「有實測/無實測」兩次搜尋間 id 漂移，
-      //   REX「繼續播放」會對不上。排序維持站方標註，實測只做顯示。
-      //   （如未來要按實測排序，需把 actualResolution 納入 id 的 resPart。）
       applied++;
     } catch {}
   }
   if (applied > 0) {
-    try { console.log(`📺 實測清晰度: ${applied}/${results.length} 條已套用`); } catch {}
+    try { console.log(`📺 實測清晰度: ${applied}/${results.length} 條已記錄（不顯示）`); } catch {}
   }
   return applied;
 }
@@ -9528,8 +9515,18 @@ function calculateResourceScore(resource, preferResolution = 'auto') {
   if (resource._hasEpInfo) score += weights.HAS_EP_INFO;
   if (resource._updateRecency) score += weights.RECENT_UPDATE;
   
-  score += weights.RESOLUTION_BONUS * (resource.resolutionLevel / 5);
-  
+  // ★★ v88：移除 RESOLUTION_BONUS 的計分 ★★
+  //   原本：score += weights.RESOLUTION_BONUS * (resource.resolutionLevel / 5)
+  //
+  //   拿掉的原因（與 📺 行同一批）：
+  //   resolutionLevel 的來源不統一 —— 金牌影視有站方標註（level=4），
+  //   MacCMS 站從片名抽不到畫質字眼（level=0）。同一集第一次搜尋時
+  //   只有金牌有分數加成，cache 命中後實測回來但**不升級**
+  //   resolutionLevel → 加成消失 → 同一集的排序在兩次載入間跳動。
+  //   既然顯示層已經不給畫質資訊，排序也不該再被畫質影響 ——
+  //   排序回歸「語言 → 版本 tier → 站序 → 分數」，完全穩定。
+  //
+  //   （preferResolution 恆為 'auto'，那段 4k/1080p/720p 加成本來就不觸發。）
   if (resource.qualityScore > 0) {
     score += weights.QUALITY_TAG_BONUS * (Math.min(resource.qualityScore, 30) / 30);
   }
@@ -10874,32 +10871,45 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     }
   }
 
-  // ★ 📺 清晰度行（使用者要求：播放列表一定顯示實際清晰度）。
-  //   根因：舊邏輯只靠背景 probe（fire-and-forget）回來才加 📺 行，
-  //   第一輪搜尋 return 時 probe 還沒跑完 → 永遠沒行；單檔 TS 無
-  //   RESOLUTION 更永遠探不到 → 永遠空白。
-  //   修法：clean 時就寫一行 —— 有 actualResolution 用實測，
-  //   沒有就用站方 resolution（extractResolutionInfo 已從片名/quality 抽出，
-  //   總比空白好；probe 回來後 applyActualResolutions 會覆蓋升級）。
-  //   冪等：已有 📺 行就不重複加；有實測時把站方行升級為實測行。
+  // ★★ v88：📺 清晰度行「拿掉」（使用者要求）★★
+  //
+  // 為什麼拿掉（三個理由，全部實測確認）：
+  //
+  //  1. 兩種來源混雜，數字互相矛盾。
+  //     金牌影視的 📺 來自站方 API 的 resolutionName/resolution 欄位（同步）；
+  //     MacCMS 站的 📺 來自背景 GET master m3u8 的 RESOLUTION（異步）。
+  //     同一集《誰是被害者》E4 實測：
+  //       金牌 1080P / 電影天堂 1080P / 如意 480P / 優質 480P /
+  //       樂子 480P / 非凡 480P / 暴風（無）
+  //     4 個站標 480P、1 個標 1080P、1 個標 1080P、1 個空白 ——
+  //     使用者看到的是「同一集七種畫質」，完全沒有參考價值。
+  //
+  //  2. 實測值本身不可靠。
+  //     如意/優質/樂子/非凡的 master 寫的是 1080x608 —— 寬度 1080 就是
+  //     1080p，但 _resolutionLabelFromWH 的面積門檻（1100x600=660000）
+  //     差 3,360 就把它判成 480P。判定門檻抓的是「站方壓縮後的畫面」
+  //     而不是「原始解析度」，數字會飄。
+  //
+  //  3. 排序會在兩次載入之間跳動。
+  //     resolutionLevel 進了 calculateResourceScore 的 RESOLUTION_BONUS，
+  //     也進了 comparator。第一次搜尋時只有金牌有 level=4、其餘站 level=0；
+  //     cache 命中後實測回來但**不升級** resolutionLevel（為了讓
+  //     _stableSourceId 不漂移）→ level 仍是 0 → 分數變了 → 排序變了。
+  //     同一集在「第一次進」與「第二次進」看到不同順序。
+  //
+  //  ★ 保留 resolution / resolutionLevel / isHD / is4K 等**結構欄位**
+  //    （REX 客戶端與 _stableSourceId 都在用），只是不再寫進 description、
+  //    不再影響分數與排序。
+  //
+  //  ★ 舊 cache 裡的 📺 行怎麼清掉：
+  //    版本 bump 會清空 cache（見 syncWidgetVersion），重搜後自然沒有。
+  //    但若使用者不清 cache 直接看到舊行，applyActualResolutions 仍會
+  //    在舊 description 上補行 —— 為此下面改成「只移除、不新增」，
+  //    讓任何路徑（舊 cache / 新搜尋）都不會再出現 📺 行。
   try {
-    const _resLabel = String(resource.actualResolution || clean.actualResolution || '').trim()
-      || String(clean.resolution || '').trim();
-    if (_resLabel && _resLabel !== '未知') {
-      const _resLine = `📺 ${_resLabel}`;
-      const _d = String(clean.description || '');
-      if (/📺[^\n]*/.test(_d)) {
-        // 已有行：有實測就升級，無實測不動（避免把實測降級回站方標註）。
-        const _ar = String(resource.actualResolution || clean.actualResolution || '').trim();
-        if (_ar && _ar !== '未知') {
-          clean.description = _d.replace(/📺[^\n]*/g, `📺 ${_ar}`);
-        }
-      } else {
-        clean.description = _d ? `${_d}\n${_resLine}` : _resLine;
-      }
-      if (!clean.actualResolution && resource.actualResolution) {
-        clean.actualResolution = resource.actualResolution;
-      }
+    const _d0 = String(clean.description || '');
+    if (/📺[^\n]*/.test(_d0)) {
+      clean.description = _d0.replace(/📺[^\n]*/g, '').replace(/\n{2,}/g, '\n').trim();
     }
   } catch {}
 
@@ -12006,8 +12016,10 @@ targetInfo.searchQuery = aliasQ;
     const aSite = _siteRankOf(a), bSite = _siteRankOf(b);
     if (aSite !== bSite) return aSite - bSite;
     if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
-    if (b.resolutionLevel !== a.resolutionLevel) return b.resolutionLevel - a.resolutionLevel;
-    if (b.qualityScore !== a.qualityScore) return b.qualityScore - a.qualityScore;
+    // ★★ v88：移除 resolutionLevel / qualityScore 的比較 ★★
+    //   resolutionLevel 的來源不統一（金牌有站方標註、MacCMS 沒有），
+    //   留在 comparator 裡會讓同站的兩筆在「第一次搜尋 / cache 命中」
+    //   之間換序。畫質既然不再顯示，排序也不該受它影響。
     if (b.isHttps !== a.isHttps) return b.isHttps ? 1 : -1;
     // ★ 穩定排序：同分時按站名 + URL 兜底，避免 V8 非穩定排序
     //   在同分段內隨機換序 → REX「繼續播放」按位置/名稱回找時偶發對不上。
