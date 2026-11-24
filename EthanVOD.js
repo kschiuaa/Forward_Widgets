@@ -1414,14 +1414,64 @@ const CONFIG = {
   //       episodeLabelOf / 衍生段預篩全部改讀原文。
   //
   //   顯示層的處理：
-  //   - 剝別名（純享版 / 加更版 / 搶先看…）→ 與正片一致
   //   - 剝「更新至…」進度聲明 → 與本集無關
   //   - 剝日期殼「第20260923期」→ 裸日期，與其它站對得上
-  //   - 剝片名裡的「（加更版）」括弧
   //   - 季別統一用「．」夾在片名與集數之間：
   //     「一飯封神．第2季．20260923 上」
   //   舊 cache 的描述是髒結果，bump 版本讓 syncWidgetVersion 清掉重搜。
-  WIDGET_VERSION: 82,
+  //
+  // ★ v83：修「把不同剪輯版本顯示成同一個名字」——
+  //   v81 把「純享版 / 加更版」整個剝掉，讓正片與純享版都顯示成
+  //   「20260923 上」→ 使用者分不出哪一列才是完整版。
+  //
+  //   ★★ 實測證實：這些版本的**內容確實不同**（追 m3u8 量分段/時長）：
+  //     電影天堂 20260923上               → 1020 段 / 68.0 分
+  //     電影天堂 20260923上美食競技純享版 →  740 段 / 49.3 分
+  //     如意   20260923上                 → 1016 段 / 67.7 分
+  //     如意   20260923上美食競技純享版   →  737 段 / 49.0 分
+  //   純享版少了約 18 分鐘（刪掉前段的精華剪輯），檔案 ID 也不同
+  //   （38231 vs 38233 / 21916 vs 21915）→ 是**不同的影片檔**。
+  //
+  //   → 剝掉標記等於誤導（以為是同一份內容，點下去才發現缺 18 分鐘）。
+  //   → 改成**保留版本標記**（用方括號，與版本資訊同一套視覺語意）：
+  //     「一飯封神．第2季．20260923 上」           ← 正片
+  //     「一飯封神．第2季．20260923 上［純享版］」   ← 精華剪輯版
+  //     「一飯封神．第2季［加更版］．20260923 上［純享版］」
+  //
+  //   ★ 選源筆數完全不變（實測 S2E18=9、S2E20=9、S1E8=6、S1E8日落=5），
+  //     因為判定層仍讀 _rawEpName（站方原文）→ 別名/衍生段的
+  //     分流邏輯完全不受影響（見 _resEpIdentityText 註解）。
+  //
+  // ★ v84：剪輯版本改名 + 排序優先序（使用者要求）。
+  //   (1) 改名：「純享版」→「精簡版」、「加更版」→「幕後花絮版」。
+  //       站方行話使用者看不懂；「精簡版」一眼知道是刪減版
+  //       （實測少 18 分鐘），「幕後花絮版」則明確是附屬內容。
+  //   (2) 排序：正片 > 精簡版 > 幕後花絮版（_versionTierOf）。
+  //       放在站序 tier **之前** —— 使用者要的是「正片優先」，
+  //       不是「某站優先」：完整版不該被別站的精簡版擠下去。
+  //
+  // ★ v85：消除站方狀態雜訊（使用者要求）。
+  //   站方 vod_remarks 是「整部片」的狀態，不是「這一集」的屬性：
+  //     已完结 / 完结 / 已完結          → 完結狀態
+  //     全8集 / 12集全 / 全10期 / 4集全  → 總集數進度
+  //     更新至第201集 / 更新至20241104期 → 更新到哪一集
+  //     (201/228)                       → 進度分數
+  //   實測（v84 線上）：
+  //     「誰是被害者．第04集．全8集」
+  //     「誰是被害者．第04集．完結」
+  //     「凡人修仙傳．第195集．更新至第201集」
+  //     「凡人修仙傳．第195集．(201/228)」
+  //   → 旁邊已經寫著集號，這些純粹是雜訊，還把片名擠長。
+  //
+  //   新增 _stripStatusNoise(raw, {keepEpisodeNumber})：
+  //   - MacCMS 路徑：集名 + remark 都過一遍
+  //   - adapter 路徑：_adapterSafeRemark / _adapterEpisodeLabel 都過一遍
+  //   - keepEpisodeNumber=true 用於**集名語境**：「第195集」是本集集號，
+  //     不是「更新到第N集」的重複表述 → 必須保留
+  //     （實測沒加這個選項會讓 AGE動漫 的「第195集」整個消失）
+  //
+  //   ★ 選源筆數完全不變（實測 S2E18=9、S1E9=10、S1E195=8），只清雜訊。
+  WIDGET_VERSION: 85,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1680,7 +1730,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.3.0",
+  version: "4.4.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3319,6 +3369,107 @@ function _episodeNameOnly(name) {
 }
 
 /**
+ * ★★ 站方狀態雜訊清除（v85）★★
+ *
+ * 站方 vod_remarks 欄位是「整部片」��態，不是「這一集」的資訊：
+ *   已完结 / 完结 / 已完結          → 完結狀態
+ *   全8集 / 12集全 / 全10期          → 總集數進度
+ *   更新至20241104期 / 更新至第10期  → 更新到哪一集
+ *   更新至20260301(陪你追日落第10期下) → 更新進度 + 衍生段名
+ *
+ * ★ 為什麼必須清掉：
+ *   實測《誰是被害者》E4 選源顯示成
+ *     「誰是被害者．第04集．全8集」
+ *     「誰是被害者．第04集．完結」
+ *   → 這兩個資訊對「這一集是第4集」毫無幫助（旁邊已經寫著第04集），
+ *     而且每一集都重複顯示整季的狀態 → 純噪音，還把片名擠長。
+ *
+ * ★ 為什麼要「整段丟掉」而不是「抽出保留」：
+ *   這些字串沒有任何一項是「這一集」的屬性，抽出來只會變成
+ *   「第04集．8集」這種更奇怪的東西 → 整段判斷後丟棄。
+ *
+ * ★ 保留例外：像「HD」「國語」「1080P」這類**畫質/語言**標記
+ *   對使用者有意義 → 不在本函式的清除範圍內。
+ *
+ * @param {string} raw 站方 remarks 或任何待檢查字串
+ * @param {object} [opts]
+ * @param {boolean} [opts.keepEpisodeNumber=false]
+ *        true = 「第195集」這類**純集號要保留**（集名語境）。
+ *        預設 false（remark 語境）：純集號是「整季更新到第N集」的重複表述，
+ *        旁邊已經有本集集號 → 當雜訊清掉。
+ * @returns {string} 乾淨的字串；若整段都是雜訊則回傳空字串
+ */
+function _stripStatusNoise(raw, opts) {
+  try {
+    const keepEpNo = !!(opts && opts.keepEpisodeNumber);
+    let s = String(raw ?? '').trim();
+    if (!s) return '';
+
+    // ── 1. 純「完結 / 已完結」狀態 ──
+    if (/^(已?完結|已?完结|完結中|完结中|全?完結版?)$/.test(s)) return '';
+
+    // ── 2. 純集數進度：「全8集」「12集全」「全10期」「共20集」──
+    //    （順序：長的先判，避免「全10期」被「全」吃掉）
+    if (/^(全|共)\s*\d+\s*[集期話]?$/.test(s)) return '';
+    if (/^\d+\s*[集期話]\s*(全|完)?$/.test(s)) return '';
+    // ── 2b. 純集數：「第195集」「195话」「第12期」──
+    //     這是「整季目前更新到第N集」的重複表述，旁邊已經有本集的集號。
+    //     ★ 但「集名語境」（keepEpisodeNumber）下要保留 ——
+    //       AGE動漫的集名就是「第195集」，清掉會讓該筆變成沒有集號。
+    if (!keepEpNo && /^第?\s*\d+\s*[集期話]$/.test(s)) return '';
+    // 「第12集(完結)」「第12集（完結）」「第12集 完結」——
+    // 同一種狀態標記，只是多帶了完結註記。
+    // ★ 這條要求「完結」字樣**必須真的出現**（不能全部 optional），
+    //   否則會連純粹的「第195集」一起吃掉（實測造成 AGE動漫的集號消失）。
+    if (/^第?\s*\d+\s*[集期話]\s*[(（\[【]?\s*(完結|完结|更新完|已完結|已完结)\s*[)）\]】]?$/.test(s)) return '';
+
+    // ── 3. 「更新至/更新到…」開頭 → 整段丟（不管後面接什麼）──
+    //    「更新至20241104期」「更新至第10期加更」「更新至20261011高光回顾」
+    //    「更新至20260301(陪你追日落第10期下)」全屬此類。
+    //    這跟 _episodeNameOnly 的剝法一致（它切掉「更新至」之後、
+    //    保留之前的集名前綴）；這裡因為整段就是更新聲明 → 整段丟。
+    if (/^更新(至|到|至第)?\s*[:：]?\s*[0-9第]/.test(s)) return '';
+    // 「更新至预告片」「更新至第201集」—— 「预告片」不是數字，補一個分支。
+    if (/^更新(至|到|至第)\s*[:：]?\s*\S/.test(s)) return '';
+
+    // ── 3b. 進度分數：「201/228」「201-228/228」──
+    //     站方用「已更新/總集數」表示進度，對「這一集」沒有任何意義。
+    if (/^\d+\s*[/／]\s*\d+$/.test(s)) return '';
+    if (/^\d+\s*[/／]\s*\d+\s*[集期話]$/.test(s)) return '';
+
+    // ── 4. 帶尾巴的完結註記：「已完结(1080P)」「完结 國語」──
+    //    → 剝掉完結字樣（含它自帶的括弧），剩餘有意義的部分照留。
+    //    ★ 括弧要一併吃掉，否則會留下空的「( )」或開頭的「(1080P)」。
+    s = s.replace(/[（(【\[]?\s*(已?完結|已?完结)\s*[)）】\]]?/g, ' ');
+
+    // ── 5. 剝掉括號裡純集數進度：「(36全)」「（12集）」「[20]」──
+    s = s.replace(/[（(【\[]\s*(?:全|共)?\s*\d+\s*[集期話]?\s*(?:全)?\s*[)）\]】]/g, ' ');
+    // ★ 括號裡是「進度分數」：「(201/228)」「(30/228集)」──
+    //   站方用它表示「已更新 201 集 / 共 228 集」，對「這一集」毫無意義。
+    //   （上面那條規則抓不到，因為括號內有「/」不是單純數字。）
+    s = s.replace(/[（(【\[]\s*\d+\s*[/／]\s*\d+\s*[集期話]?\s*[)）\]】]/g, ' ');
+    // ── 6. 剝掉獨立出現的集數進度字樣：「全8集」「12集全」「4集全」──
+    s = s.replace(/(?:^|[\s．.、,，;；])\s*(?:全|共)\s*\d+\s*[集期話]?\s*(?:全)?(?=[\s．.、,，;；]|$)/g, ' ');
+    s = s.replace(/(?:^|[\s．.、,，;；])\s*\d+\s*[集期話]\s*全(?=[\s．.、,，;；]|$)/g, ' ');
+    // 進度分數也可能在長字串中間：「第195集．201/228」
+    s = s.replace(/(?:^|[\s．.、,，;；])\s*\d+\s*[/／]\s*\d+\s*(?:[集期話])?(?=[\s．.、,，;；]|$)/g, ' ');
+
+    // ── 7. 收尾清理空白與多餘分隔符 ──
+    s = s.replace(/\s+/g, ' ').trim();
+    // 剝掉之後可能留下孤立的括號：「(1080P)」→ 「1080P」
+    s = s.replace(/^\s*[（(【\[]\s*/, '').replace(/\s*[)）】\]]\s*$/, '');
+    s = s.replace(/^[\s．.、,，;；]+/, '').replace(/[\s．.、,，;；]+$/, '').trim();
+    s = s.replace(/[．.]\s*[．.]/g, '．').trim();
+    s = s.replace(/^[\s．.]+|[\s．.]+$/g, '').trim();
+
+    // 原本是雜訊 → 乾淨後變空 → 傳回空字串
+    return s;
+  } catch {
+    return '';
+  }
+}
+
+/**
  * 「同集不同版本」的別名關鍵字（純享版 / 美食競技純享版 …）。
  *
  * ★ 為什麼要跟「衍生段」分開：
@@ -3333,14 +3484,126 @@ function _episodeNameOnly(name) {
  *
  * ★ 純享版「看起來」比正片還短，但它是同一集的剪輯版，
  *   播出日期也跟正片不同（20250907 vs 20250904）→ 只能當別名。
+ *
+ * ★★ v84：必須同時收「顯示名」（精簡版 / 幕後花絮版）★★
+ *   顯示層把「純享版」改名成「精簡版」、「加更版」改名成「幕後花絮版」
+ *   後，這兩個字串會出現在 description 裡。而 _VARIETY_DERIV_SEG_RE 含有
+ *   「幕後」（→ 幕後花絮版）與「加更」→ 若別名正則不收顯示名，
+ *   顯示層的標記反而會讓這筆被**誤判成衍生段而整組刪掉**。
+ *
+ *   實測（v84 首次上線）：《一飯封神》S2 E18 選源從 9 筆掉到 8 筆，
+ *   少的正是如意資源的「一饭封神2（加更版）」那一筆 ——
+ *   filterByEpisode 的衍生段預篩把它當成「幕後花絮」剪掉了。
+ *
+ *   → 別名正則必須認得所有「顯示層會寫出來的版本標記」。
  */
-const _VARIETY_ALIAS_SEG_RE = /纯享|純享|美食竞技|美食競賽|纯享版|純享版|加长版|加長版|完整版|抢先看|搶先看/;
+const _VARIETY_ALIAS_SEG_RE = /纯享|純享|美食竞技|美食競賽|纯享版|純享版|加长版|加長版|完整版|抢先看|搶先看|精簡版|精简版|幕後花絮版|幕后花絮版/;
 
 /**
  * 真正的「衍生段」關鍵字 —— 這些是**另一集**，不是同一集的別名。
  * （加更 / 走心局 / 解憂局 / 陪看 / 小館 / 家常菜 / 高光回顧 / 彩蛋 …）
  */
 const _VARIETY_DERIV_SEG_RE = /加更|陪你|花絮|特辑|特輯|老友|直播|彩蛋|超前|预告|預告|片花|幕后|幕後|会员|會員|抢先|搶先|路透|名场面|名場面|撒糖|先导|先導|先行|陪你看|陪看|高光回顾|高光回顧|一饭小馆|一飯小館|一饭家常菜|一飯家常菜|封神陪看|准备开饭|準備開飯|回顾特辑|回顧特輯|小馆|小館|家常菜|走心局|解忧局|解憂局|光头火夫|爱哭包|愛哭包|回顾|回顧|特别篇|特別篇|精编|精編|先導片|片头|片尾/;
+
+/**
+ * ★★★ 剪輯版本標記（v84）—— 正片 / 精簡版 / 幕後花絮版 ★★★
+ *
+ * ★ 為什麼需要獨立成一個模組：
+ *   「xx版」有三種不同語意，混在一起會出錯：
+ *     1. 正片      —— 完整內容（1020 段 / 68.0 分）
+ *     2. 精簡版    —— 刪掉前段的精華剪輯（740 段 / 49.3 分），少約 18 分鐘
+ *     3. 幕後花絮版 —— 站方另存的花絮/加更條目
+ *   三者**內容確實不同**（實測追 m3u8 量分段與時長），必須能分辨。
+ *
+ * ★ 使用者指定的顯示名（v84）：
+ *     純享版 → 精簡版
+ *     加更版 → 幕後花絮版
+ *   「純享版」是站方的行話，使用者看不懂；「精簡版」一眼就知道
+ *   是刪減版。「加更版」改成「幕後花絮版」同理（它就是花絮/加更內容）。
+ *
+ * ★ 排序優先序（使用者要求）：正片 > 精簡版 > 幕後花絮版。
+ *   → 見 _versionTierOf。
+ */
+
+// 版本標記 → 顯示名（繁體統一）。
+const _VERSION_DISPLAY_NAME = {
+  '純享版': '精簡版',
+  '加更版': '幕後花絮版',
+};
+
+// 版本標記 → 排序 tier（數字越小越前面）。
+//   0 = 正片（無標記）
+//   1 = 精簡版（純享版）
+//   2 = 幕後花絮版（加更版）
+//   3 = 其它版本標記（加長版 / 完整版 / 搶先看…）
+const _VERSION_TIER = {
+  '正片': 0,
+  '精簡版': 1,
+  '幕後花絮版': 2,
+};
+
+/**
+ * 把站方版本別名關鍵字轉成「顯示名 + tier」。
+ *
+ * @param {string} tag 站方原始關鍵字（「纯享版」「加更」「加長版」…）
+ * @returns {{name:string, tier:number}|null}
+ */
+function _versionTagInfo(tag) {
+  try {
+    const t = String(tag ?? '').trim();
+    if (!t) return null;
+    // ★ 已經是顯示名的（精簡版 / 幕後花絮版）→ 直接對應 tier。
+    if (_VERSION_TIER[t] != null) return { name: t, tier: _VERSION_TIER[t] };
+    // 純享系列 → 精簡版
+    if (/纯享|純享/.test(t)) return { name: _VERSION_DISPLAY_NAME['純享版'], tier: _VERSION_TIER['精簡版'] };
+    // 加更系列 → 幕後花絮版
+    if (/加更/.test(t)) return { name: _VERSION_DISPLAY_NAME['加更版'], tier: _VERSION_TIER['幕後花絮版'] };
+    // 其它版本標記：保留原名，排在三者之後。
+    return { name: t, tier: 3 };
+  } catch { return null; }
+}
+
+/**
+ * 判斷一個資源屬於哪一級剪輯版本（正片 / 精簡版 / 幕後花絮版）。
+ *
+ * ★ 判定依據（依序檢查）：
+ *   1. resource._versionTag —— 顯示層正規化時存下來的標記（最準）
+ *   2. resource._rawEpName —— 站方原文集名（「20260923上美食競技純享版」）
+ *   3. resource.description —— 顯示文字（「…上［精簡版］」）
+ *   4. resource._rawName —— 站方原文片名（「一饭封神2（加更版）」）
+ *
+ * ★ 回傳 0 = 正片（最常見，也是預設值）。
+ */
+function _versionTierOf(r) {
+  try {
+    let tier = 0;
+    const consider = (tag) => {
+      const info = _versionTagInfo(tag);
+      // ★ 取「最差」的那一級（數字最大）：
+      //   一筆資源可能同時帶兩個標記（片名「（加更版）」+ 集名「純享版」）
+      //   → 那一筆整體就是「幕後花絮版」那一類，該排最後。
+      if (info && info.tier > tier) tier = info.tier;
+    };
+    // 1) 顯示層存下的標記（正規化時抽出的 aliasTag）
+    const vt = r?._versionTag;
+    if (vt != null && String(vt).trim()) consider(vt);
+    // 2) 站方原文集名（「20260923上美食競技純享版」）
+    const rawEp = _resEpIdentityText(r);
+    if (rawEp) {
+      const m = String(rawEp).match(/纯享|純享|加更|加长版|加長版|完整版|抢先看|搶先看/);
+      if (m) consider(m[0]);
+    }
+    // 3) 顯示文字（已含［精簡版］/［幕後花絮版］）
+    const desc = String(r?.description ?? '');
+    const dm = desc.match(/［\s*(精簡版|幕後花絮版|純享版|加更版|纯享版|加更)\s*］/);
+    if (dm) consider(dm[1]);
+    // 4) 站方原文片名（「（加更版）」）
+    const rawName = String(r?._rawName ?? '');
+    const nm = rawName.match(/[（(]\s*(纯享版|純享版|纯享|純享|加更版|加更)\s*[）)]/);
+    if (nm) consider(nm[1]);
+    return tier;  // 0 = 正片
+  } catch { return 0; }
+}
 
 function _isVarietyExtraSeg(name) {
   // ★ 先導片也算衍生：bfzy《日落时分说爱你》51 段 = 先導片 1 + 正片 20 +
@@ -3680,27 +3943,53 @@ function _normalizeVarietySegLabel(epName) {
     s = s.replace(/[．.、,，;；]?\s*$/, '').trim();
     if (!s) return { ok: false, text: null, period: null, seg: null };
 
-    // ── 步驟 2：剝「同集別名」後綴（純享版 / 加長版 / 搶先看…）──
-    //   「20260923上美食競技純享版」→「20260923上」
-    //   ★ 只剝**尾巴**的別名關鍵字，不剝中間的
-    //     （「20260116(第4期下)」的「下」是段序，不能動）。
-    const beforeAlias = s;
-    s = s.replace(/[（(]?\s*(?:美食競技|美食竞技)?\s*(?:純享版|纯享版|純享|纯享|加長版|加长版|完整版|搶先看|抢先看)\s*[）)]?/g, '')
-         .replace(/\s+/g, ' ')
-         .trim();
+    // ── 步驟 2：抽出「版本別名」標記（純享版 / 加長版 / 搶先看…）──
+    //
+    // ★★★ 為什麼要「抽出」而不是「剝掉」★★★
+    //
+    // 實測這些版本的**內容確實不同**（追 m3u8 量分段數與總時長）：
+    //   電影天堂 20260923上                 → 1020 段 / 68.0 分
+    //   電影天堂 20260923上美食競技純享版   →  740 段 / 49.3 分
+    //   如意   20260923上                   → 1016 段 / 67.7 分
+    //   如意   20260923上美食競技純享版     →  737 段 / 49.0 分
+    // 純享版少了約 18 分鐘 —— 它是**刪掉前段的精華剪輯版**，
+    // 跟正片是不同的影片檔（URL 的檔案 ID 也不同：38231 vs 38233）。
+    //
+    // → 把它們顯示成同一個名字是**誤導**：使用者以為是同一份內容，
+    //   點下去才發現少了 18 分鐘，而且無法分辨哪一列才是完整版。
+    // → 所以保留版本標記，讓使用者能自己挑：
+    //     「20260923 上」          ← 正片
+    //     「20260923 上［純享版］」 ← 精華剪輯版
+    //
+    // ★ 標記統一寫進方括號（與版本標記「[2012年 - 韓國]」同一套視覺語意）。
+    //
+    // ★ 只抽**尾巴**的別名關鍵字，不動中間的
+    //   （「20260116(第4期下)」的「下」是段序，不能動）。
+    const aliasMatch = s.match(/[（(]?\s*(美食競技|美食竞技)?\s*(純享版|纯享版|純享|纯享|加長版|加长版|完整版|搶先看|抢先看|加更版|加更)\s*[）)]?\s*$/);
+    let aliasTag = null;
+    if (aliasMatch) {
+      // 「美食競技純享版」→ 標記「精簡版」（前綴「美食競技」是節目名的一部分，
+      //   不放進標記裡 —— 標記只說明剪輯版本類型）。
+      // 「纯享」→ 統一成繁體「精簡版」（v84：使用者指定改名）。
+      // 「加更版」→ 「幕後花絮版」（v84：使用者指定改名）。
+      const info = _versionTagInfo(aliasMatch[2]);
+      aliasTag = info ? info.name : aliasMatch[2];
+      s = s.slice(0, aliasMatch.index).replace(/[（(]?\s*$/, '').replace(/\s+/g, ' ').trim();
+    }
     // 若剝完整段不見了（例如站方集名只有「純享版」而沒有主體）→ 不動。
-    if (!s) s = beforeAlias;
+    if (!s) { s = aliasMatch ? raw : s; aliasTag = null; }
 
     // ── 步驟 3：判斷這是不是「綜藝型集名」──
     //   有「第N期」 → 用期號 + 段序（「第10期 上」）
     //   有日期     → 用日期 + 段序（「20260923 上」）
     //   ★ 日期套期號殼（「第20260923期」）先剝成日期再走日期分支。
+    const withTag = (base) => aliasTag ? `${base}［${aliasTag}］` : base;
     const periodM = s.match(/第\s*0*(\d+)\s*期/);
     if (periodM && !_isDateNumberStr(periodM[1])) {
       const p = _parseVarietyPeriod(s);
       if (p) {
-        return { ok: true, text: p.seg ? `第${p.period}期 ${p.seg}` : `第${p.period}期`,
-                 period: p.period, seg: p.seg };
+        return { ok: true, text: withTag(p.seg ? `第${p.period}期 ${p.seg}` : `第${p.period}期`),
+                 period: p.period, seg: p.seg, aliasTag };
       }
     }
 
@@ -3726,7 +4015,7 @@ function _normalizeVarietySegLabel(epName) {
     if (dateShellM && _isDateNumberStr(dateShellM[1])) {
       const ymd = dateShellM[1];
       // 日期殼裡沒有段序（「第20260923期」沒有上/中/下）→ 只輸出日期。
-      return { ok: true, text: ymd, period: null, seg: null };
+      return { ok: true, text: withTag(ymd), period: null, seg: null, aliasTag };
     }
 
     const dateOnly = s;
@@ -3740,13 +4029,14 @@ function _normalizeVarietySegLabel(epName) {
         //     Android WebView 在舊版本不支援 lookbehind，改用
         //     「(?:^|[^\d])」+「(?!\d)」的等價寫法。
         const segM = dateOnly.match(/(?:^|[^\d])((?:19|20)\d{6})(?!\d)\s*(上|中|下)/);
-        return { ok: true, text: segM ? `${ymd} ${segM[2]}` : ymd, period: null, seg: segM ? segM[2] : null };
+        return { ok: true, text: withTag(segM ? `${ymd} ${segM[2]}` : ymd),
+                 period: null, seg: segM ? segM[2] : null, aliasTag };
       }
     }
 
-    return { ok: false, text: null, period: null, seg: null };
+    return { ok: false, text: null, period: null, seg: null, aliasTag: null };
   } catch {
-    return { ok: false, text: null, period: null, seg: null };
+    return { ok: false, text: null, period: null, seg: null, aliasTag: null };
   }
 }
 
@@ -5848,17 +6138,24 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null, targetAir
 function _adapterEpisodeLabel(rawName) {
   const s = String(rawName ?? '').trim();
   if (!s) return '';
+  // ★★ v85：先清掉站方狀態雜訊 ★★
+  //   站方集名也可能帶「201/228」「全8集」這類進度字樣。
+  //   ★ keepEpisodeNumber=true：集名語境下「第195集」是**本集的集號**，
+  //     不是「更新到第N集」的重複表述 → 必須保留。
+  //     （AGE動漫的集名就是「第195集」，清掉會讓該筆變成沒有集號。）
+  const sClean = _stripStatusNoise(s, { keepEpisodeNumber: true });
+  if (!sClean) return '';
   // 站方已給好格式，不要二次包裝
-  if (/[集期話]/.test(s)) return toDisplayText(s);
+  if (/[集期話]/.test(sClean)) return toDisplayText(sClean);
   // ★ 日期型純數字（「20260301」）不是集數：直接原文顯示，
   //   不得包成「第20260301集」。
-  if (_isDateLikeEpName(s)) return toDisplayText(s);
-  const m = s.match(/^(\d+)$/);
+  if (_isDateLikeEpName(sClean)) return toDisplayText(sClean);
+  const m = sClean.match(/^(\d+)$/);
   if (m) {
     const n = String(parseInt(m[1], 10)).padStart(2, '0');
     return `第${n}集`;
   }
-  return toDisplayText(s);
+  return toDisplayText(sClean);
 }
 
 /**
@@ -5982,21 +6279,36 @@ function _adapterSeasonLabel(rawName, type = 'tv') {
   //   安全網：剝後空字串 → 退回原 s0（絕不刪過頭）。
   const s = stripSeasonMarker(s0).trim() || s0;
 
-  // ★★ 剝掉站方片名尾端的「版本別名」括弧：「（加更版）」「（純享版）」★★
+  // ★★ 抽出站方片名尾端的「版本別名」括弧：「（加更版）」「（純享版）」★★
   //
   // 實測如意資源把《一飯封神》第 2 季存成兩筆條目：
-  //   vod_name = "一饭封神2"            → 顯示「一飯封神 第2季」
-  //   vod_name = "一饭封神2（加更版）"   → 顯示「一飯封神 第2季（加更版）」
-  // 「（加更版）」是**站方的版本別名**（同一季的另一個剪輯版本），
-  // 跟「純享版」同性質 —— 使用者在選源列表看到它會以為是另一個節目。
-  // → 顯示層剝掉，只留片名本身。
+  //   vod_name = "一饭封神2"            → 顯示「一飯封神．第2季」
+  //   vod_name = "一饭封神2（加更版）"   → 顯示「一飯封神．第2季［加更版］」
   //
-  // ★ 只剝「已知的版本別名」括弧，不動語言括弧（粵語/國語等由
+  // ★★★ 為什麼要保留這個標記（而不是直接剝掉）★★★
+  // 實測追 m3u8 量分段數與總時長，這兩個條目的內容**確實不同**：
+  //   如意「20260923上」（正片）           → 1016 段 / 67.7 分
+  //   如意「20260923上美食競技純享版」     →  737 段 / 49.0 分
+  // （URL 的檔案 ID 也不同：21916 vs 21915）
+  //
+  // 「加更版」這條站方條目裡**全部都是純享版剪輯**（沒有正片版），
+  // 內容少了約 18 分鐘。剝掉標記會讓使用者以為跟正片一樣，
+  // 點下去才發現內容缺一截，而且分不出哪一列才是完整版。
+  // → 保留標記，讓使用者自己挑。
+  //
+  // ★ 只抽「已知的版本別名」括弧，不動語言括弧（粵語/國語等由
   //   stripLanguageParen 處理）與其它有意義的註記。
-  const versionAliased = s.replace(/[（(]\s*(?:加更版|加更|纯享版|純享版|纯享|純享|加长版|加長版|完整版|抢先版|搶先版|抢先看|搶先看)\s*[）)]/g, ' ')
-                           .replace(/\s+/g, ' ')
-                           .trim();
-  const sForLabel = versionAliased || s;
+  const _verAliasM = s.match(/[（(]\s*(加更版|加更|纯享版|純享版|纯享|純享|加长版|加長版|完整版|抢先版|搶先版|抢先看|搶先看)\s*[）)]\s*$/);
+  let _verAliasTag = null;
+  let sNoAlias = s;
+  if (_verAliasM) {
+    // v84：統一改名（純享版→精簡版、加更版→幕後花絮版）+ 繁體化。
+    const info = _versionTagInfo(_verAliasM[1]);
+    _verAliasTag = info ? info.name : _verAliasM[1];
+    sNoAlias = s.slice(0, _verAliasM.index).replace(/\s+/g, ' ').trim();
+    if (!sNoAlias) { sNoAlias = s; _verAliasTag = null; }
+  }
+  const sForLabel = sNoAlias;
 
   // ★ 先剝掉片名尾端的「(語言)」括弧：「轻功(粤语)」「轻功（国语）」
   //   → 拆成「轻功」，語言由頂層 language 欄位承擔（見 stripLanguageParen 註解）。
@@ -6009,13 +6321,13 @@ function _adapterSeasonLabel(rawName, type = 'tv') {
   const stripped = stripLanguageParen(sForLabel, selfLang);
   if (stripped === sForLabel) {
     // 沒拆到語言 → 走原本邏輯
-    return _adapterSeasonLabelInner(stripped, type);
+    return _adapterSeasonLabelInner(stripped, type, _verAliasTag);
   }
   // 拆到 → 對剝後字串走季別邏輯；尾端語言括弧不會再被誤判為「季」
-  return _adapterSeasonLabelInner(stripped, type);
+  return _adapterSeasonLabelInner(stripped, type, _verAliasTag);
 }
 
-function _adapterSeasonLabelInner(s, type = 'tv') {
+function _adapterSeasonLabelInner(s, type = 'tv', versionTag = null) {
   // ★ 電影短路：跳過整個「第N季」轉換流程。
   //
   // 為什麼：電影沒「季」概念。「Back to the Future 3」是第 3 集電影，
@@ -6025,7 +6337,10 @@ function _adapterSeasonLabelInner(s, type = 'tv') {
   //
   // 仍要做的清理（語言括弧、站方季別字眼）已在上層 _adapterSeasonLabel
   // 處理過，這裡直接返回剝後字串。
-  if (type === 'movie') return toDisplayText(s);
+  //
+  // ★ 版本別名標記（「加更版」等）仍要保留 —— 內容確實不同
+  //   （見 _adapterSeasonLabel 註解）。
+  if (type === 'movie') return versionTag ? `${toDisplayText(s)}［${versionTag}］` : toDisplayText(s);
 
   // ★ 閘門 1 改寫：站方把季別字眼直接寫進片名（「庆余年第二季」、
   // 「庆余年S2」、「庆余年 第2季」、「庆余年完结篇」）時，把這段字眼
@@ -6084,16 +6399,16 @@ function _adapterSeasonLabelInner(s, type = 'tv') {
           const display = restWithSemantic
             ? `${head}．${seasonText}．${restWithSemantic}`.replace(/\s+/g, ' ').trim()
             : `${head}．${seasonText}`.replace(/\s+/g, ' ').trim();
-          return toDisplayText(display);
+          return versionTag ? `${toDisplayText(display)}［${versionTag}］` : toDisplayText(display);
         }
       }
     }
-    return toDisplayText(s);
+    return versionTag ? `${toDisplayText(s)}［${versionTag}］` : toDisplayText(s);
   }
 
   // 閘門 2 + 3：沿用 extractSequelNumber 的判斷，不重寫數字規則
   const seq = extractSequelNumber(s);
-  if (!seq || seq <= 1) return toDisplayText(s);
+  if (!seq || seq <= 1) return versionTag ? `${toDisplayText(s)}［${versionTag}］` : toDisplayText(s);
 
   // 把「片名 + 序號 + 後綴」拆開，把序號那一段換成「第N季」。
   //
@@ -6111,10 +6426,10 @@ function _adapterSeasonLabelInner(s, type = 'tv') {
   // 也抽得到，否則 head/digits 拆不開，最後整段原樣返回，
   // 顯示就會是「白粉飛第一季 第1季」之類重複。
   const m = s.match(/^(\D*?)([一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾0-9]+)(\D*)$/);
-  if (!m) return toDisplayText(s);
+  if (!m) return versionTag ? `${toDisplayText(s)}［${versionTag}］` : toDisplayText(s);
   const [, head, digits, rest] = m;
   const digitsNum = parseChineseNumeral(digits);
-  if (digitsNum !== seq) return toDisplayText(s);
+  if (digitsNum !== seq) return versionTag ? `${toDisplayText(s)}［${versionTag}］` : toDisplayText(s);
 
   const seasonText = `第${seq}季`;
   // 後綴存在（「：青木時代」）時季別插在後綴之前，否則讀起來像片名被拆開：
@@ -6125,7 +6440,7 @@ function _adapterSeasonLabelInner(s, type = 'tv') {
   const converted = rest.trim()
     ? `${head.trim()}．${seasonText}${rest}`
     : `${head.trim()}．${seasonText}`;
-  return toDisplayText(converted);
+  return versionTag ? `${toDisplayText(converted)}［${versionTag}］` : toDisplayText(converted);
 }
 
 /**
@@ -6166,7 +6481,12 @@ function _adapterSafeRemark(raw) {
   // 「五等分的新娘．第80集．第12集(完結)」—— 旁邊已經有第 80 集，
   // 再補一個「第12集(完結)」是同一件事講兩次。
   if (/^第?\s*\d+\s*[集期話]\s*[(（\[【]?\s*(完結|完结|更新完|已完結|已完结)?\s*[)）\]】]?$/.test(s)) return '';
-  return toDisplayText(s);
+  // ★★ v85：再過一次 _stripStatusNoise ★★
+  //   上面那組規則只涵蓋「整串就是集數/進度」的形式，站方還有
+  //     「已完结」「完结」「全8集」「12集全」「全10期」
+  //     「更新至第10期加更」「更新至20261011高光回顾」
+  //   這些寫法會漏過 → 一律清掉（畫質/語言標記不受影響）。
+  return _stripStatusNoise(toDisplayText(s));
 }
 
 async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetInfo) {
@@ -6723,7 +7043,13 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           // 例：「零之使魔．第01集」 /「进击的巨人 最终季．完结篇」/
           //   「银河铁道之父」+ 結尾「[2012年 - 日本]」。
           const stripFinished = (s) => String(s || '').replace(/已完結|已完结/g, '').replace(/\s+/g, ' ').trim();
-          const epText = stripFinished(displayEp);
+          // ★★ v85：集名本身也可能帶站方狀態雜訊（「201/228」「全8集」），
+          //   與 remark 同樣清掉（但不能整段清空 → 空集名會讓該筆失效，
+          //   所以清空時保留原文）。
+          //   ★ keepEpisodeNumber=true：集名語境下「第195集」是**本集集號**，
+          //     不是「更新到第N集」的重複表述 → 必須保留。
+          const epText = _stripStatusNoise(stripFinished(displayEp), { keepEpisodeNumber: true })
+            || stripFinished(displayEp);
           const remarkText = stripFinished(displayRemarks);
           //
           // ★★ 綜藝集名正規化（選源列表用）★★
@@ -6763,18 +7089,37 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           })();
           const epTextFinal = _vLabel && _vLabel.ok && _vLabel.text ? _vLabel.text : epText;
           //
-          // ★ 「（加更版）」這類站方版本標記也要剝 —— 它是**站方的版本
-          //   別名**（同一集的加更剪輯版），跟「純享版」同性質。
-          //   實測如意資源回「一飯封神 第2季（加更版）．20260923上…」。
-          const epTextFinal2 = epTextFinal
-            .replace(/[（(]\s*加更版\s*[）)]/g, '')
-            .replace(/\s+/g, ' ')
-            .trim();
+          // ★ 「（加更版）」這類站方版本標記要**保留**，不是剝掉。
+          //   實測追 m3u8：純享版／加更版的內容確實不同
+          //   （正片 1016 段 / 67.7 分 vs 純享版 737 段 / 49.0 分），
+          //   檔案 ID 也不同（21916 vs 21915）。
+          //   → 剝掉等於誤導使用者（以為同一份內容，其實少了 18 分鐘）。
+          //
+          // ★ 但「非綜藝集名」時（_vLabel.ok === false），顯示層已用
+          //   displayName 帶上了站方版本別名（「（加更版）」在 vod_name 上），
+          //   這裡的 epText 若還帶著版本字樣會重複 → 該情況才剝。
+          const epTextFinal2 = (_vLabel && _vLabel.ok)
+            ? epTextFinal
+            : epTextFinal
+                .replace(/[（(]\s*加更版\s*[）)]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
           //
           // ★ remark 只在「不是綜藝集名」時才保留。
           //   綜藝站方的 remark（「更新至20261011期」）是更新進度聲明，
           //   與這集無關 → 綜合藝集名時直接丟掉，避免多餘噪音。
-          const remarkFinal = (_vLabel && _vLabel.ok) ? '' : remarkText;
+          //
+          // ★★ v85：非綜藝也必須過 _stripStatusNoise ★★
+          //   站方 remarks 是「整部片」的狀態，不是「這一集」的屬性：
+          //     已完结 / 完结 / 已完結        → 完結狀態
+          //     全8集 / 12集全 / 全10期        → 總集數進度
+          //     更新至20241104期               → 更新到哪一集
+          //   實測《誰是被害者》E4 顯示成
+          //     「誰是被害者．第04集．全8集」
+          //     「誰是被害者．第04集．完結」
+          //   → 旁邊已經寫著第04集，這些純粹是雜訊 → 一律清掉。
+          //   （畫質/語言標記如「HD」「國語」不在清除範圍內，照留。）
+          const remarkFinal = (_vLabel && _vLabel.ok) ? '' : _stripStatusNoise(remarkText);
           // epName / remark 中常含多段空白分隔，保留全部並用「．」串接
           // （user 範例：「进击的巨人 最终季．完结篇」），再追加 remark 段。
           const tail = [epTextFinal2, remarkFinal].filter(Boolean).join('．').replace(/\s+/g, ' ').trim();
@@ -6818,6 +7163,19 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
             //   （衍生段 / 別名 / 期號 / 日期），必須保留原文另存。
             //   見 _resEpIdentityText 註解。
             _rawEpName: epName,
+            // ★★ 剪輯版本標記（v84）：正片 / 精簡版 / 幕後花絮版 ★★
+            //   供 _versionTierOf 判定排序 tier（正片 > 精簡版 > 幕後花絮版）。
+            //   取值來自 _normalizeVarietySegLabel 抽出的 aliasTag（集名層）
+            //   或 displayName 裡的片名別名（vod_name 帶「（加更版）」時）。
+            //   存的是**顯示名**（精簡版 / 幕後花絮版），不是站方原文。
+            _versionTag: (() => {
+              try {
+                if (_vLabel && _vLabel.ok && _vLabel.aliasTag) return _vLabel.aliasTag;
+                const dm2 = String(displayName || '').match(/［([^］]+)］\s*$/);
+                if (dm2) return dm2[1];
+                return null;
+              } catch { return null; }
+            })(),
             _isVariety: dateMatch !== null || epMatch?.[2] === '期',
             _matchType: matchInfo.type,
             _matchScore: matchInfo.score,
@@ -10014,7 +10372,9 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     '_s4FallbackBoost', '_seasonFromItem',
     // ★ 站方原始集名（判定用）。顯示層已用乾淨版 description，
     //   這份原文只供下游判定，不該送到客戶端。
-    '_rawEpName'
+    '_rawEpName',
+    // ★ 剪輯版本標記（v84，內部欄位，供 _versionTierOf 排序用）。
+    '_versionTag'
   ];
   
   // 版本資訊必須在欄位刪除前寫進描述。
@@ -11400,6 +11760,12 @@ targetInfo.searchQuery = aliasQ;
     //   分數加成在 calculateResourceScore（管去重/串流），這裡保證同分也不亂序。
     const aLang = _langRankOf(a), bLang = _langRankOf(b);
     if (aLang !== bLang) return aLang - bLang;
+    // ★ 剪輯版本 tier（v84，使用者要求）：正片 > 精簡版 > 幕後花絮版。
+    //   放在站序之前 —— 使用者要的是「正片優先」，不是「某站優先」。
+    //   同一集的正片／精簡版／花絮版內容確實不同（實測時長差 18 分鐘），
+    //   完整版必須排最前。
+    const aVer = _versionTierOf(a), bVer = _versionTierOf(b);
+    if (aVer !== bVer) return aVer - bVer;
     const aSite = _siteRankOf(a), bSite = _siteRankOf(b);
     if (aSite !== bSite) return aSite - bSite;
     if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
@@ -11421,7 +11787,9 @@ targetInfo.searchQuery = aliasQ;
     '_isMainSource', '_hasEpInfo', '_updateRecency', '_ep',
     '_isVariety', '_episodeDate', '_searchTime', '_site', '_priority',
     '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
-    '_s4FallbackBoost', '_seasonFromItem'
+    '_s4FallbackBoost', '_seasonFromItem',
+    // ★ 剪輯版本標記（v84，內部欄位）。排序用完即可刪，不送到客戶端。
+    '_versionTag'
   ];
   
   finalResults.forEach(res => {
@@ -13639,6 +14007,10 @@ targetInfo.searchQuery = aliasQ;
     // ★ 硬性 tier（使用者要求）：粵語置頂，其次金牌影視 > 電影天堂 > 如意資源。
     const aLang = _langRankOf(a), bLang = _langRankOf(b);
     if (aLang !== bLang) return aLang - bLang;
+    // ★ 剪輯版本 tier（v84，使用者要求）：正片 > 精簡版 > 幕後花絮版。
+    //   理由見 loadResource 內同段註解。
+    const aVer = _versionTierOf(a), bVer = _versionTierOf(b);
+    if (aVer !== bVer) return aVer - bVer;
     const aSite = _siteRankOf(a), bSite = _siteRankOf(b);
     if (aSite !== bSite) return aSite - bSite;
     if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
@@ -13655,7 +14027,9 @@ targetInfo.searchQuery = aliasQ;
                          '_isVariety', '_episodeDate', '_confidence',
                          '_versionConflict', '_versionAmbiguous',
                          '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
-                         '_s4FallbackBoost', '_seasonFromItem'];
+                         '_s4FallbackBoost', '_seasonFromItem',
+                         // ★ 剪輯版本標記（v84，內部欄位）。
+                         '_versionTag'];
   finalResults.forEach(res => {
     const cleaned = cleanResourceForOutput(res, type, {
       seasonNumber: targetInfo?.seasonNumber
