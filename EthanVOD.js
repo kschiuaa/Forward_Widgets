@@ -1471,7 +1471,13 @@ const CONFIG = {
   //     （實測沒加這個選項會讓 AGE動漫 的「第195集」整個消失）
   //
   //   ★ 選源筆數完全不變（實測 S2E18=9、S1E9=10、S1E195=8），只清雜訊。
-  WIDGET_VERSION: 85,
+  //
+  // ★★ v86：金牌影視「未播出」的兩個來源
+  //   1. 日期型綜藝清單找不到目標集時，不再拿別集頂替
+  //      （實測《奔跑吧·大湾区篇》只有 6 集，要第 20 集卻回 20261124）。
+  //   2. typeId1 完整映射（2=連續劇 / 3=綜藝 / 4=動漫 / 88=短劇 → 'tv'），
+  //      讓 isSmartSeriesMatch 的分類守門員真的有效。
+  WIDGET_VERSION: 86,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1730,7 +1736,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.4.0",
+  version: "4.6.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2907,7 +2913,19 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   //
   //   反向（type='movie' 但 _siteTypeName='tv'）也擋：使用者明確要電影，
   //   不要 TV 動漫。
-  if (targetInfo.type && candidateInfo._siteTypeName &&
+  //
+  // ★★ v86：type='variety' 必須跳過這層守門員。
+  //   為什麼：站方的「綜藝」分類（typeId1=3）在 _jpyyTypeName 裡映射成 'tv'
+  //   （它確實是有集數的影集）。但使用者的目標是 type='variety'，
+  //   'variety' !== 'tv' → 守門員會把**每一筆綜藝候選**都判成 spin_off。
+  //   實測（未改守門員時）：
+  //     target「披荊斬棘」vs candidate「披荆斩棘 第五季」
+  //       舊映射（'other'）→ type=season_conflict（正確：季別不符）
+  //       新映射（'tv'）   → type=spin_off（錯誤：分類衝突搶先觸發）
+  //   連 season_conflict 這種「正確診斷」都被蓋掉，後續季別比對根本跑不到。
+  //
+  //   → 綜藝的季別交給後面的 season 比對處理，這裡不分類地把人擋掉。
+  if (targetInfo.type && targetInfo.type !== 'variety' && candidateInfo._siteTypeName &&
       targetInfo.type !== candidateInfo._siteTypeName &&
       candidateInfo._siteTypeName !== 'other') {
     return {
@@ -6581,6 +6599,50 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     // 「46 !== 9999」把整條資源殺掉 —— 使用者看到的是「這個來源消失了」，
     // 而不是「這集不存在，給你看最新一集」。後者才是合理的降級。
     let isFallbackEp = false;
+    // ★★ v86：日期型綜藝清單「找不到目標集」時，**不許拿別集頂替** ★★
+    //
+    // 場景（金牌影視實測）：
+    //   《奔跑吧·大湾区篇》站方只有 6 集（20261019 ~ 20261124），
+    //   使用者在 REX 點第 20 集 → 舊版 fallback 到最後一集，
+    //   輸出「奔跑吧·大灣區篇．20261124」。
+    //   使用者看到的是「第 20 集」的來源，點下去卻是 11/24 那一集 ——
+    //   這正是「明明還沒有播出，為什麼搜出結果」的真相：
+    //   不是站方有未播出的資源，而是**我們拿別的集數冒充**。
+    //
+    //   ★ 為什麼 filterByEpisode 擋不住：
+    //     日期型集名抽不出集數 → _ep=null / episode=null
+    //     → filterByEpisode 無法比對 → 全部放行（實測 3/3 全數存活）。
+    //     而且日期型清單本來就「集號 ≠ 位置」，也不能用位置硬對。
+    //
+    //   ★★ v86.1：判準修正為「站方集數 < 使用者要的集數」。
+    //     第一版只判「日期型清單且找不到目標集 → 丟棄」，結果連
+    //     E1 / E6 這種**確實存在**的集也被殺掉（日期型清單抽不出
+    //     集號 → idx 永遠 -1 → 全被判成找不到）。
+    //     正確的判準是：站方總集數（episodes.length）已經小於
+    //     使用者要的集數 → 這集還沒播出 → 丟棄。
+    //     日期型清單的 episodes.length 就是「已播出的集數」
+    //     （《奔跑吧·大湾区篇》6 筆 = 6 個播出日）。
+    //
+    //   ★ 保守條件（三個都要成立才丟）：
+    //     1. 型別是 variety（影集的 fallback 是「給你看最新一集」，
+    //        那是合理的降級，維持原行為）
+    //     2. 清單是日期型（純數字集名的清單可以精確比對，不受影響）
+    //     3. 使用者確實指定了集數，且 wantEp > 站方集數
+    //   ★ 日期反查命中（_isDateHit）時不受影響 —— 那才是正確對齊。
+    const _dropUnairedDateList = (
+      type === 'variety'
+      && _isDateList
+      && wantEp != null
+      && Number.isFinite(wantEp)
+      && wantEp > episodes.length
+      && !_isDateHit
+    );
+    if (_dropUnairedDateList) {
+      if (CONFIG.ADAPTERS?.DEBUG) {
+        console.log(`[adapter:${site.id}] 「${vod_name}」站方僅 ${episodes.length} 集，E${wantEp} 尚未播出 → 丟棄（不拿別集頂替）`);
+      }
+      return [];
+    }
     if (idx < 0) {
       isFallbackEp = (type === 'tv' && wantEp != null);
       // 落到最後一集的理由：forward 在未指定集數時，UI 預設停在最新一集。
@@ -8402,6 +8464,80 @@ async function _agePlayUrls(site, vodId, nid) {
 //
 // ⚠️ signKey 屬於站方公開前端常數，非秘密憑證。若站方改 key 只需更新
 //   這裡，不需動任何程式邏輯。
+
+/**
+ * 金牌影視（jpyy）的分類 ID → 我們的類別名稱。
+ *
+ * ★ 為什麼需要這張表：
+ *   jpyy 的 typeId1 共有 5 種（實測 291 筆統計）：
+ *     1  = 電影
+ *     2  = 連續劇（甄嬛傳／三體／我的阿勒泰／狂飆／慶餘年）
+ *     3  = 綜藝（甄嬛爱不停／舞千年）
+ *     4  = 動漫（凡人修仙傳）
+ *     88 = 短劇
+ *   舊版只認 1 → 'movie'、4 → 'tv'，其餘全落 'other'。
+ *   而 isSmartSeriesMatch 的分類守門員寫的是
+ *     `candidateInfo._siteTypeName !== 'other'` → 'other' **跳過守門員**。
+ *   → 連續劇（2）與綜藝（3）完全繞過電影/劇集檢查。
+ *
+ *   ★ 映射規則：
+ *     - 1        → 'movie'（電影）
+ *     - 2 / 3 / 4 → 'tv'（連續劇 / 綜藝 / 動漫 都是「有集數的影集」）
+ *     - 88       → 'tv'（短劇也是影集，只是集數短）
+ *     - 其他     → 'other'（站方新增分類時才會走到，不擋任何東西）
+ *
+ *   ★ 為什麼 88（短劇）也算 'tv'：
+ *     短劇是站方新推的短篇劇集，本質仍是影集。歸 'other' 會讓它
+ *     繞過守門員，在 type='movie' 查詢時混進電影結果。
+ *
+ * @param {number|string} typeId1
+ * @returns {'movie'|'tv'|'other'}
+ */
+function _jpyyTypeName(typeId1) {
+  const id = Number(typeId1);
+  if (id === 1) return 'movie';
+  if (id === 2 || id === 3 || id === 4 || id === 88) return 'tv';
+  return 'other';
+}
+
+/**
+ * 站方條目「還沒播出任何一集」的判斷。
+ *
+ * ★ 場景（金牌影視實測）：
+ *   「甄嬛爱不停」 total=0  serial="0"  isend=0 remarks="(06期)"
+ *   「舞千年」     total=8  serial=""   isend=0 remarks="更新至8加更"
+ *   「冰箱时门」   total=0  serial="12" isend=0 remarks="(12集)"
+ *   這些條目在站方目錄裡，但沒有任何可播的集 → 使用者看到
+ *   「明明還沒有播出，為什麼搜出結果」。
+ *
+ * ★ 判準（保守，只擋確定沒播的）：
+ *   serial 為 0（且不是字串 "0" 以外的形式）**且** total 為 0
+ *   → 站方自己也還沒填集數 → 一集都還沒播出。
+ *
+ *   ★ 為什麼不看 isend：
+ *     isend=0 只是「還沒更新完」（凡人修仙傳 total=228 serial="201" isend=0
+ *     是正常的連載中），不能拿來判定「未播出」。
+ *
+ * @param {object} item adapter 的 MacCMS 化 item
+ * @returns {boolean} true = 確定還沒播出任何一集
+ */
+function _adapterNotYetAired(item) {
+  try {
+    const serial = item?._vodSerial;
+    const total = item?._vodTotal;
+    // 沒有帶這兩個欄位 → 不是 jpyy（或站方改版）→ 不擋。
+    if (serial === undefined && total === undefined) return false;
+    const serialNum = Number(String(serial ?? '').trim());
+    const totalNum = Number(total ?? 0);
+    // serial 明確是 0 且 total 也是 0 → 一集都沒播出。
+    //   ★ total 為 0 是關鍵：短劇常有 total=0 但 serial="12"
+    //     （站方只填了期數沒填總數），那種是**有內容**的，不能擋。
+    return serialNum === 0 && totalNum === 0;
+  } catch {
+    return false;
+  }
+}
+
 const ADAPTER_SITES = [
   {
     id: 'jpyy',
@@ -8428,6 +8564,35 @@ const ADAPTER_SITES = [
     // ★ 私有欄 _siteTypeId / _siteTypeName：
     //   下游 extractPlayInfoForCache 內可讀到（item._siteTypeId），
     //   進 isSmartSeriesMatch 前預篩時判 typeId1===1 但 type==='tv' → 擋。
+    //
+    // ★★ v86：typeId1 的完整對應（實測 11 個關鍵字 × 12 筆 = 291 筆統計）
+    //   typeId1=1  電影
+    //   typeId1=2  連續劇（甄嬛傳／三體／我的阿勒泰／狂飆）← 最常見的 TV 類
+    //   typeId1=3  綜藝（甄嬛爱不停／舞千年）
+    //   typeId1=4  動漫
+    //   typeId1=88 短劇
+    //
+    //   ★ 舊版只認 1 → 'movie'、4 → 'tv'，其餘全落 'other'。
+    //     而 isSmartSeriesMatch 的分類守門員（第 2910 行左右）寫的是
+    //       `candidateInfo._siteTypeName !== 'other'` → 'other' **直接跳過守門員**。
+    //     → 連續劇（typeId1=2）跟綜藝（typeId1=3）全部逃過檢查：
+    //       使用者 type='tv' 搜「我的阿勒泰」，站方回 typeId1=2 的連續劇，
+    //       守門員不擋 → 當成 TV 劇結果回傳（這個是對的），
+    //       但 type='movie' 搜任何東西時，typeId1=2 的連續劇也會混進來。
+    //     → 改成把 2/3/4 一律映射成 'tv'、88 映射成 'other'（短劇算影集），
+    //       分類守門員才真的有效。
+    //
+    // ★★ v86：未播出守門員 —— 帶 _vodSerial / _vodTotal / _vodIsEnd
+    //   站方目錄裡有「還沒播出」的條目（金牌影視實測）：
+    //     「甄嬛爱不停」 total=0 serial="0" isend=0 remarks="(06期)"
+    //     「舞千年」     total=8 serial="" isend=0 remarks="更新至8加更"
+    //     「冰箱时门」   total=0 serial="12" isend=0 remarks="(12集)"
+    //   這些條目在目錄裡但沒有可播的集 → 使用者看到「明明還沒播出卻搜出結果」。
+    //   判準：**serial 為 0 且 total 為 0** → 一集都還沒播出 → 丟掉。
+    //   ★ 只在「目標集數大於 1」時才套用這個守門員：
+    //     使用者要看第 1 集時，一集都沒播出的條目連「先導片」都可能沒有
+    //     → 還是應該顯示（站方有時會先放預告）。
+    //     但使用者要看第 5 集時，一集都沒播出的條目一定是錯的。
     toMacItem: (it) => ({
       vod_id: String(it.vodId),
       vod_name: it.vodName,
@@ -8437,7 +8602,11 @@ const ADAPTER_SITES = [
       // ★ vod_remarks 一律不帶 vodDoubanScore（見 _adapterDefaultSearch 註解）。
       vod_remarks: it.vodRemarks || (it.vodVersion || ''),
       _siteTypeId: it.typeId1,
-      _siteTypeName: it.typeId1 === 1 ? 'movie' : (it.typeId1 === 4 ? 'tv' : 'other'),
+      _siteTypeName: _jpyyTypeName(it.typeId1),
+      // ★ v86：未播出判斷所需的欄位（見上方說明）
+      _vodSerial: it.vodSerial,
+      _vodTotal: it.vodTotal,
+      _vodIsEnd: it.vodIsEnd,
     }),
   },
   {
