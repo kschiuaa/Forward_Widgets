@@ -1699,7 +1699,24 @@ const CONFIG = {
     // 過濾廣告伺服器完整 URL(含 https,不含結尾斜線)
     WORKER_URL: 'https://m3u8-adfliter.kschiuaa.com',
     // 為了 cache 命中穩定,base path 寫死。endpoint 內部模式見過濾廣告伺服器端。
-    ENDPOINT: '/filter',
+    //
+    // ★★ v90：從 '/filter' 改成 '/f' ★★
+    //   原因：REX 播放頁的「切換片源」清單（= loadResource 的回傳陣列，
+    //   型別 StreamSourceItem：name / description / url）會把 url 的
+    //   path 段當成副標顯示。使用者回報看到的字就是「filter」——
+    //   來自 https://m3u8-adfliter.kschiuaa.com/filter?mode=filter&...
+    //   的 "/filter"。
+    //
+    //   實測（curl 同一組參數）：
+    //     /filter → HTTP 200 + 正常 m3u8
+    //     /f      → HTTP 200 + 正常 m3u8
+    //     /x /m3u8 /play /stream /a → 全部 HTTP 200 + 正常 m3u8
+    //   → 過濾廣告伺服器是 catch-all 路由，任何 path 都走同一套邏輯，
+    //     所以換成 '/f' **完全不影響去廣告功能**，只是網址不再含 "filter"。
+    //
+    //   ★ 舊的 /filter endpoint 仍保留（伺服器端相容），只是這裡不再使用。
+    //     若日後伺服器改成白名單路由，把這裡改回 '/filter' 即可。
+    ENDPOINT: '/f',
     // 透傳 / 過濾 切換:debug 用。預設 'filter'。
     // 'passthrough' = 走過濾廣告伺服器但不過濾,只驗伺服器通不通。
     MODE: 'filter',
@@ -1787,7 +1804,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.2.0",
+  version: "5.3.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -11191,7 +11208,16 @@ function isAlreadyWrapped(url) {
       // 同源 + 同 endpoint 才算已包裝，避免誤判其他站點的 /filter
       if (u.origin !== bu.origin) return false;
       const ep = (CONFIG.M3U8_FILTER.ENDPOINT || '').replace(/\/+$/, '');
-      if (ep && u.pathname !== bu.pathname.replace(/\/+$/, '') + ep) return false;
+      // ★ v90：也要認「舊 endpoint」（/filter）—— 舊 cache 裡的網址是
+      //   /filter?url=...，若不認，會被再包一層變成
+      //   /f?url=...%2Ffilter%3Furl%3D...（壞掉）。
+      //   舊網址既然已經是同源同結構，就不要再包。
+      const legacyEps = ['/filter'];
+      const okPaths = [bu.pathname.replace(/\/+$/, '') + (ep || '')];
+      for (const lep of legacyEps) {
+        if (!okPaths.includes(bu.pathname.replace(/\/+$/, '') + lep)) okPaths.push(bu.pathname.replace(/\/+$/, '') + lep);
+      }
+      if (!okPaths.includes(u.pathname)) return false;
       return !!u.searchParams.get('url');
     } catch (e) {
       return false;
@@ -11210,8 +11236,13 @@ function isAlreadyWrapped(url) {
     const um = url.match(/^([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/[^\/]+)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
     if (!um || um[1] !== baseOrigin) return false;
     const urlPath = (um[2] || '').replace(/\/+$/, '');
-    const expectedPath = basePath + (ep ? '/' + ep.replace(/^\/+/, '') : '');
-    if (urlPath !== expectedPath.replace(/\/+$/, '')) return false;
+    // ★ v90：同 URL 分支，認現行 endpoint + 舊 endpoint（/filter）。
+    const okPaths = [basePath + (ep ? '/' + ep.replace(/^\/+/, '') : '')];
+    for (const lep of ['/filter']) {
+      const p = basePath + lep;
+      if (!okPaths.includes(p)) okPaths.push(p);
+    }
+    if (!okPaths.map(p => p.replace(/\/+$/, '')).includes(urlPath)) return false;
     return /(?:^|&)url=/.test(um[3] || '');
   } catch (e) {
     return false;
@@ -12137,7 +12168,99 @@ targetInfo.searchQuery = aliasQ;
     Object.keys(res).forEach(k => delete res[k]);
     Object.assign(res, cleaned);
   });
-  
+
+  // ★★ v90：切源清單顯示「實時實測畫質」★★
+  //
+  // 使用者回報：「進入播放後切換片源，現在的描述是 filter，沒有變化」。
+  //
+  // ★★ 為什麼 v89 沒生效（關鍵發現）★★
+  //   v89 把探測加在 loadDetail 的 customLines 上 —— 但 **REX 根本沒有
+  //   customLines 這個欄位**。查證 @rexnow/libs 的官方型別定義：
+  //
+  //     // packages/rslib-plugin/src/generators/stream.ts
+  //     if (module.id === "loadResource") writer.write("Array<StreamSourceItem>");
+  //
+  //     // packages/libs/src/env/stream.ts
+  //     interface StreamSourceItem {
+  //       name: string;
+  //       description?: string;
+  //       url: string;
+  //       customHeaders?: Record<string, string>;
+  //       headers?: Record<string, string>;
+  //       playerType?: 'system' | 'app';
+  //       externalSubtitles?: ExternalSubtitleItem[];
+  //     }
+  //
+  //   → **播放頁的「切換片源」清單就是 loadResource 的回傳陣列本身**，
+  //     REX 直接把每筆的 name 當標題、description 當副標、url 當播放網址。
+  //     loadDetail 的 episodeItems/childItems 是「選集」用的，不含切源清單。
+  //
+  // ★★ 那個「filter」到底是什麼 ★★
+  //   截圖顯示：標題「電影天堂 S1E9」下方小字「filter」。
+  //   我們的 description 是「電影天堂 S1E9．第09集」（乾淨，沒有 filter）。
+  //   唯一含 "filter" 的欄位是 url：
+  //     https://m3u8-adfliter.kschiuaa.com/filter?mode=filter&rewrite=hybrid&url=...
+  //   → REX 顯示的是 **url 的 path 段**（"/filter"），不是 description。
+  //   這也解釋了為什麼改 description 完全沒反應。
+  //
+  // ★★ 本版（v90）怎麼修 ★★
+  //   1. **即時探測**（使用者指定）：在 loadResource 回傳前，對要顯示的
+  //      來源做 master m3u8 RESOLUTION 探測（併發 8），把實測畫質寫進
+  //      `description`（📺 1080P）**與 `subtitle`**（卡片副標）。
+  //   2. **讓 url 不再顯示 "filter"**：把過濾廣告伺服器的 endpoint 從
+  //      `/filter` 換成不含該字眼的路徑（`/f`），網址仍走同一台伺服器、
+  //      同一套邏輯，廣告照過濾，但 REX 不會再把 "filter" 當成副標顯示。
+  //      ★ 這是重點：使用者看到的「filter」就是這個 path。
+  //      ★ 舊的 /filter endpoint 仍保留（伺服器端相容），只是預設改用 /f。
+  //
+  // ★ 為什麼 v88 把 📺 從搜尋結果拿掉、v90 卻要加回來 ★★
+  //   v88 拿掉是因為「搜尋階段」的探測是背景異步的 → 只有部分站有數字、
+  //   數字互相矛盾、排序還跳動。
+  //   v90 加回來是在 **loadResource 的出口**（回傳給播放器之前）同步做，
+  //   而且只影響「description 顯示」，不動任何排序欄位。
+  //   → 使用者已經點進播放頁、正在等內容，多等 1~2 秒完全無感。
+
+  // ★★ v90：即時實測畫質 → 寫進切源清單的 description / subtitle ★★
+  //
+  // 這是「播放頁切換片源」真正看到的資料（REX 的切源清單 = loadResource
+  // 的回傳陣列，見上方 StreamSourceItem 說明）。
+  //
+  // 只探「使用者看得到的那幾條」：
+  //   loadResource 回傳的通常就是當前集的所有來源（5~10 條）。
+  //   但保險起見設個上限，太多會拖慢回傳。
+  if (finalResults.length > 0) {
+    try {
+      const _CAP = 12;
+      const _targets = finalResults.slice(0, _CAP);
+      const _urls = _targets.map(r => r?.url).filter(u => typeof u === 'string' && u);
+      let _probed = [];
+      if (_urls.length) {
+        _probed = await probeActualResolutions(_urls);
+      }
+      _targets.forEach((r, i) => {
+        const hit = _probed[i];
+        if (!hit || !hit.label) return;
+        const label = String(hit.label);
+        // description：顯示實測畫質（獨立一行，跟語言行同樣的排法）
+        const d = String(r.description || '');
+        if (/📺[^\n]*/.test(d)) {
+          r.description = d.replace(/📺[^\n]*/g, `📺 ${label}`);
+        } else {
+          r.description = d ? `${d}\n📺 ${label}` : `📺 ${label}`;
+        }
+        // subtitle：卡片副標（REX 顯示在標題下方的小字）。
+        // ★ 這正是使用者看到「filter」的那個位置 —— 用實測畫質取代它。
+        r.subtitle = label;
+        // 結構欄位也同步（客戶端可能讀它做 icon / 排序）
+        r.actualResolution = label;
+        r.actualResolutionWH = `${hit.w}x${hit.h}`;
+      });
+    } catch (e) {
+      // 探測失敗不影響主流程（沒有畫質但來源照常可用）
+      try { console.warn('[v90] 實測畫質探測失敗:', e?.message || e); } catch {}
+    }
+  }
+
   // cache 寫入前做 URL 健康檢查：m3u8 URL 失效（CDN 清理資源回 502）的話
   // 寫進 cache 會讓「播一會斷線重頭」持續 30 分鐘，直到 TTL 過期重新搜尋。
   // 對 finalResults 內每個 m3u8 探測一次，失效的就過濾掉再寫 cache。
@@ -14707,111 +14830,30 @@ function _playlistEpisodeTitle(group, first, type, showTitle) {
 }
 
 /**
- * 產生 REX 播放頁「切換片源」的 customLines，並**即時探測**各源的實際清晰度。
+ * ★★ v90：v89 的 customLines 探測已移除 ★★
  *
- * ★★ v89：為什麼這裡才探測（與 v88 拿掉 📺 行的理由配套）★★
+ * v89 把實時畫質探測加在 loadDetail 的 customLines 上，但**改錯地方了**：
+ * 查證 @rexnow/libs 官方型別（packages/libs/src/env/stream.ts）：
  *
- * 使用者的需求：「進入播放後切換片源，現在的描述是 filter，
- * 把這一個才改為實時探測，畢竟我已經進入了播放不影響」。
+ *   interface StreamSourceItem {
+ *     name: string;
+ *     description?: string;
+ *     url: string;
+ *     customHeaders?: Record<string, string>;
+ *     headers?: Record<string, string>;
+ *     playerType?: 'system' | 'app';
+ *     externalSubtitles?: ExternalSubtitleItem[];
+ *   }
  *
- * 背景：
- *   1. REX 播放頁的「切換片源」清單（customLines）每一條會顯示
- *      name + url + description。其中 url 是被過濾廣告伺服器包裝過的：
- *        https://m3u8-adfliter.kschiuaa.com/filter?mode=filter&rewrite=hybrid&url=...
- *      使用者看到的就是這串沒有參考價值的長網址（「描述是 filter」）。
- *   2. v88 把「📺 清晰度行」從搜尋結果拿掉了 —— 因為搜尋階段的探測是
- *      背景異步的，首次搜尋時只有金牌影視（站方 API 同步給標註）有數字，
- *      MacCMS 站的要等探測跑完 → 數字互相矛盾、排序還會跳動。
- *   3. 但「進入播放頁之後」完全不一樣：使用者已經在等內容了，
- *      多花 0.3~2 秒做一次同步探測**完全無感**，而且此時拿到的是
- *      「使用者真正要看的這個來源」的即時實測值 —— 不再是搜尋階段
- *      那種「A 站的數字配 B 集的內容」的錯位。
+ * 而 packages/rslib-plugin/src/generators/stream.ts：
+ *   if (module.id === "loadResource") writer.write("Array<StreamSourceItem>");
  *
- * 所以分工變成：
- *   搜尋結果（loadResource）→ 不顯示畫質，排序純粹穩定（v88）
- *   播放頁切源（loadDetail）→ 即時實測，把 filter 網址換成真實畫質
+ * → **REX 沒有 customLines 這個欄位**。播放頁的「切換片源」清單就是
+ *   loadResource 的回傳陣列本身，loadDetail 的 episodeItems/childItems
+ *   是「選集」用的。
  *
- * ★ 探測目標：
- *   customLines 的 url 是**包裝過**的（.../filter?url=<原始 m3u8>），
- *   必須先 _unwrapFilterInnerUrl 取出內層真實 m3u8 才能讀到
- *   master playlist 的 #EXT-X-STREAM-INF:RESOLUTION。
- *   （實測：不 unwrap 直接 GET 包裝網址會拿到被改寫過的內容，
- *   解析不到 RESOLUTION。）
- *
- * ★ 失敗怎麼辦：
- *   探不到就**不顯示畫質**（描述維持原樣），絕不寫假數字。
- *   單檔 TS（media playlist，無 STREAM-INF）本來就探不到，屬預期內。
- *
- * ★ 只探「使用者看得到的那幾條」：
- *   只探 customLines 裡的來源（通常 5~8 條），不探整季所有集數 ——
- *   否則一季 36 集 × 7 源 = 252 次請求，播放頁根本打不開。
- *
- * ★★ 全域探測預算（安全網）★★
- *   loadDetail 一次可能回傳多季（合併 S1+S2+…），每季每集都有自己的
- *   customLines → 理論上探測量 = 總集數 × 源數。
- *   雖然實測通常只有 1~3 集（loadDetail 只載入當前與相鄰季別），
- *   但不能只靠這個假設 —— 站方哪天多回幾季就會炸。
- *
- *   → 用「本次 loadDetail 的探測預算」限制總量：
- *     超過預算的集數**不探**（描述維持原樣、不顯示畫質），
- *     但**使用者正在看的那一集一定會被探到**（優先順序：當前集 → 其他集）。
+ * v90 把探測移到 loadResource 的出口（見該處 v90 說明）。
  */
-const _V89_PROBE_BUDGET = { remaining: 0, MAX: 24 };
-
-async function _buildSourceLinesWithRealRes(resources, priority = false) {
-  const list = Array.isArray(resources) ? resources : [];
-  if (list.length === 0) return [];
-
-  // ★ 預算檢查：非優先集且預算用完 → 不探（不顯示畫質，但描述照常）。
-  if (!priority && _V89_PROBE_BUDGET.remaining <= 0) {
-    return list.map(r => ({ name: r.name, url: r.url, description: r.description }));
-  }
-
-  // ★ 只探「看得到的那幾條」：每集最多前 12 個來源。
-  //   12 條 × 約 0.3~2 秒（併發 8）≈ 1.5~3 秒，播放頁可接受。
-  //   再多就會讓使用者等太久。
-  const CAP = 12;
-  const probeTargets = list.slice(0, CAP);
-  const urls = probeTargets.map(r => r?.url).filter(u => typeof u === 'string' && u);
-
-  // ★ 扣預算（按實際要探的條數算，不是整個 list）。
-  if (!priority) {
-    _V89_PROBE_BUDGET.remaining = Math.max(0, _V89_PROBE_BUDGET.remaining - urls.length);
-  }
-
-  // ★ 併發探測（探測函式本身已有併發控制，這裡只是等它回來）。
-  let probed = [];
-  try {
-    probed = await probeActualResolutions(urls);
-  } catch { probed = []; }
-
-  return list.map((r, i) => {
-    const line = {
-      name: r.name,
-      url: r.url,
-      description: r.description,
-    };
-    // 只有前 CAP 條有探測結果
-    if (i >= CAP) return line;
-    const hit = probed[i];
-    if (!hit || !hit.label) return line;
-    // ★ 寫進描述：顯示實時實測畫質。
-    //   格式沿用 v88 拿掉前的樣式（📺 1080P），讓使用者在切源清單裡
-    //   直接看到這個源到底是什麼畫質。
-    //   冪等：已有 📺 行就換掉，不重複疊。
-    const label = String(hit.label);
-    const d = String(line.description ?? '');
-    if (/📺[^\n]*/.test(d)) {
-      line.description = d.replace(/📺[^\n]*/g, `📺 ${label}`);
-    } else {
-      line.description = d ? `${d}\n📺 ${label}` : `📺 ${label}`;
-    }
-    // ★ 同時把實際畫質寫進結構欄位（REX 客戶端可能讀它做 icon/排序）。
-    line.actualResolution = label;
-    line.actualResolutionWH = `${hit.w}x${hit.h}`;
-    return line;
-  });
-}
 
 /**
  * REX 規範：詳情頁入口。
@@ -15130,20 +15172,10 @@ async function loadDetail(link) {
       groupsBySeason.get(g.season).push(g);
     }
 
-    // ★★ v89：重設本次 loadDetail 的實時探測預算 ★★
-    //   上限 24 條（≈ 3~4 集的源數量）。使用者**正在看的那一集**
-    //   標成 priority → 不受預算限制，保證一定探得到。
-    _V89_PROBE_BUDGET.remaining = _V89_PROBE_BUDGET.MAX;
-    const _isCurrentEpisode = (g) => (
-      episode != null && g?.episode != null && Number(g.episode) === Number(episode)
-    );
-
-    // ★ v89：childItems 的 map 改成 async（切源清單要即時探測畫質），
-    //   這裡必須 await 才拿到真正的物件陣列。
-    const childItems = (await Promise.all(Array.from(groupsBySeason.entries())
+    const childItems = Array.from(groupsBySeason.entries())
       .sort((a, b) => a[0] - b[0])
-      .map(async ([s, groups]) => {
-        const seasonEpisodes = await Promise.all(groups.map(async (g) => {
+      .map(([s, groups]) => {
+        const seasonEpisodes = groups.map((g) => {
           const first = g.resources[0];
           const epLink = buildDetailLink({
             title,
@@ -15164,14 +15196,14 @@ async function loadDetail(link) {
             videoUrl: first?.url,
             link: epLink,
             ...(g.resources.length > 1 ? {
-              // ★ v89：切源清單帶「即時實測畫質」（見 _buildSourceLinesWithRealRes）。
-              //   搜尋階段不做這件事（v88）—— 那時探測是背景異步的，
-              //   數字會互相矛盾；進了播放頁才做，使用者已在等內容，多等
-              //   1~2 秒無感，而且拿到的是「這個源」的即時值。
-              customLines: await _buildSourceLinesWithRealRes(g.resources, _isCurrentEpisode(g)),
+              customLines: g.resources.map(r => ({
+                name: r.name,
+                url: r.url,
+                description: r.description,
+              }))
             } : {})
           };
-        }));
+        });
 
         const childLink = buildDetailLink({ title, season: s, type, id });
         return {
@@ -15190,13 +15222,12 @@ async function loadDetail(link) {
           seasonIndex: s,
           episodeItems: seasonEpisodes,
         };
-      })));
+      });
 
     // 頂層 episodeItems = 當前季的集數（單季客戶端直接用；多季客戶端
     // 會改讀 childItems）。保持與舊版一致的「單季」語意。
     const currentSeasonGroups = groupsBySeason.get(mainSeason) || [];
-    // ★ v89：同 childItems 一樣，切源清單帶即時實測畫質（async）。
-    const topEpisodeItems = await Promise.all(currentSeasonGroups.map(async (g) => {
+    const topEpisodeItems = currentSeasonGroups.map((g) => {
       const first = g.resources[0];
       const epLink = buildDetailLink({
         title,
@@ -15217,10 +15248,14 @@ async function loadDetail(link) {
         videoUrl: first?.url,
         link: epLink,
         ...(g.resources.length > 1 ? {
-          customLines: await _buildSourceLinesWithRealRes(g.resources, _isCurrentEpisode(g)),
+          customLines: g.resources.map(r => ({
+            name: r.name,
+            url: r.url,
+            description: r.description,
+          }))
         } : {})
       };
-    }));
+    });
 
     return {
       id: mainLink,
