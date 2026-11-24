@@ -1477,7 +1477,15 @@ const CONFIG = {
   //      （實測《奔跑吧·大湾区篇》只有 6 集，要第 20 集卻回 20261124）。
   //   2. typeId1 完整映射（2=連續劇 / 3=綜藝 / 4=動漫 / 88=短劇 → 'tv'），
   //      讓 isSmartSeriesMatch 的分類守門員真的有效。
-  WIDGET_VERSION: 86,
+  // ★★ v87：adapter 站（金牌影視）不再拿別集冒充「還沒播出的本集」
+  //   場景：《緊急呼救第十季》站方只有 6 集（更新至第06集），
+  //   使用者點第 7 集 → 舊版 fallback 到第 6 集卻謊報 episode=7，
+  //   filterByEpisode（label === 7）放行 → 詳細頁顯示「第06集」
+  //   掛在「第 7 集」底下，點下去播到的是第 6 集。
+  //   MacCMS 站本來就照實回報（6 !== 7 → 被殺），只有 adapter 站會漏過。
+  //   修法：站方最大集號 < wantEp → 本集尚未播出 → 不謊報 episode，
+  //   回報實際集數讓 filterByEpisode 照常過濾（結果 = 0 筆）。
+  WIDGET_VERSION: 87,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1736,7 +1744,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "4.6.0",
+  version: "4.7.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -6643,6 +6651,54 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       }
       return [];
     }
+    // ★★ v87：影集「站方集數 < 使用者要的集數」→ 這集還沒播出 ══
+    //
+    // 場景（金牌影視實測）：
+    //   《緊急呼救第十季》站方只有 6 集（更新至第06集），
+    //   使用者在 REX 點第 7 集 → 舊版 fallback 到最後一集（第 6 集），
+    //   卻謊報 episode=7 → filterByEpisode（label === 7）放行 →
+    //   詳細頁顯示「緊急呼救．第10季．第06集」掛在「第 7 集」底下。
+    //   點下去播到的是第 6 集 —— 這跟 v86 修掉的「日期型綜藝」是
+    //   同一類問題（拿別集冒充本集），只是這次是影集 + 數字集名。
+    //
+    // ★ 為什麼 MacCMS 站不會中招：
+    //   MacCMS 路徑照實回報實際集數（6），filterByEpisode 以
+    //   「6 !== 7」殺掉 → 實測電影天堂/暴風等 6 站全部回 0 筆。
+    //   只有 adapter 站謊報 wantEp 才會漏過 → 必須在 adapter 端修正。
+    //
+    // ★ 為什麼不能像日期型那樣直接 return []：
+    //   日期型清單抽不出集數 → 無法判斷「本集是否真的不存在」，
+    //   只能用「wantEp > 站方筆數」這個粗略判準（v86 的做法）。
+    //   數字集名的清單則可以精確比對：wantEp > 站方最大集號
+    //   → 本集確實不存在 → 回報實際集數讓下游照常過濾，
+    //   這樣「寧可多給」的 fallback 語意（見下方 idx < 0 分支）
+    //   仍保留給「wantEp 在站方集數範圍內但該集被刪掉」的情境。
+    //
+    // ★ 判準用「站方最大集號」而不是 episodes.length：
+    //   站方清單的集名不一定是連續數字（少數會缺集、會有特別篇），
+    //   用筆數會誤判。取「站方所有集名裡能抽到的最大集號」當上限，
+    //   wantEp 超出它 → 這集必然還沒播出。
+    const _stationMaxEp = (() => {
+      try {
+        let mx = 0;
+        for (const e of episodes) {
+          const n = _adapterEpNumber(e?.name);
+          if (Number.isFinite(n) && n > mx) mx = n;
+        }
+        return mx > 0 ? mx : null;
+      } catch { return null; }
+    })();
+    // ★ 本集確定不存在於站方 → 不得謊報 wantEp。
+    //   （_isDateHit 時 TMDb air_date 已驗證過同日期，是正確對齊，不算謊報）
+    const _unairedEp = (
+      type === 'tv'
+      && wantEp != null
+      && Number.isFinite(wantEp)
+      && _stationMaxEp != null
+      && wantEp > _stationMaxEp
+      && !_isDateHit
+      && !_isDateList
+    );
     if (idx < 0) {
       isFallbackEp = (type === 'tv' && wantEp != null);
       // 落到最後一集的理由：forward 在未指定集數時，UI 預設停在最新一集。
@@ -6774,9 +6830,16 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   此時必須回報 episode=wantEp，否則後段 filterByEpisode（即使帶
       //   targetAirDate）在 cache 回放（_episodeDate 已被 clean 刪掉、
       //   只剩 description 反查）時仍可能因描述格式差異而丟失。
+      //
+      // ★★ v87：_unairedEp 也不許謊報。
+      //   站方集數上限 < 使用者要的集數 → 本集還沒播出，
+      //   舊版 fallback 到最後一集卻謊報 wantEp，讓 filterByEpisode
+      //   （label === wantEp）放行 → 使用者點「第 7 集」卻播到第 6 集。
+      //   這裡回報「實際取到的那一集」→ filterByEpisode 照實殺掉，
+      //   與 MacCMS 站行為一致（實測 6 個 MacCMS 站本來就是 0 筆）。
       episode: (_isDateHit && Number.isFinite(wantEp))
         ? wantEp
-        : ((isFallbackEp && Number.isFinite(wantEp) && !_isDateList)
+        : ((isFallbackEp && !_unairedEp && Number.isFinite(wantEp) && !_isDateList)
           ? wantEp
           : (Number.isFinite(epNumber) ? epNumber : null)),
 
@@ -6807,6 +6870,9 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         // 實際取到的集數（fallback 時與 episode 不同），僅供 log／除錯
         _epActualEp: Number.isFinite(epNumber) ? epNumber : null,
         _adapterFallbackEp: isFallbackEp,
+        // ★ v87：本集尚未播出（站方集數上限 < 使用者要的集數）。
+        //   僅供 log／除錯，判斷本集不存在時 episode 不再謊報 wantEp。
+        _adapterUnairedEp: _unairedEp,
         _areaMismatch: false,
         _areaMatch: false,
       });
@@ -10543,7 +10609,9 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     //   這份原文只供下游判定，不該送到客戶端。
     '_rawEpName',
     // ★ 剪輯版本標記（v84，內部欄位，供 _versionTierOf 排序用）。
-    '_versionTag'
+    '_versionTag',
+    // ★ adapter 內部除錯欄位（v87）。不該送到客戶端。
+    '_adapterFallbackEp', '_adapterUnairedEp', '_epActualEp'
   ];
   
   // 版本資訊必須在欄位刪除前寫進描述。
@@ -11958,7 +12026,9 @@ targetInfo.searchQuery = aliasQ;
     '_versionConflict', '_versionAmbiguous', '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
     '_s4FallbackBoost', '_seasonFromItem',
     // ★ 剪輯版本標記（v84，內部欄位）。排序用完即可刪，不送到客戶端。
-    '_versionTag'
+    '_versionTag',
+    // ★ adapter 內部除錯欄位（v87）。不該送到客戶端。
+    '_adapterFallbackEp', '_adapterUnairedEp', '_epActualEp'
   ];
   
   finalResults.forEach(res => {
@@ -14198,7 +14268,9 @@ targetInfo.searchQuery = aliasQ;
                          '_areaMismatch', '_areaMatch', '_year', '_area', '_rawName',
                          '_s4FallbackBoost', '_seasonFromItem',
                          // ★ 剪輯版本標記（v84，內部欄位）。
-                         '_versionTag'];
+                         '_versionTag',
+                         // ★ adapter 內部除錯欄位（v87）。不該送到客戶端。
+                         '_adapterFallbackEp', '_adapterUnairedEp', '_epActualEp'];
   finalResults.forEach(res => {
     const cleaned = cleanResourceForOutput(res, type, {
       seasonNumber: targetInfo?.seasonNumber
