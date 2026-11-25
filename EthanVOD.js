@@ -2086,7 +2086,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "6.1.0",
+  version: "6.2.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3511,6 +3511,45 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
     }
   }
 
+  // ★ v98：baseName 必須是「乾淨的系列名」★
+  //
+  // 問題（實測）：
+  //   「零之使魔 FINAL」→ baseName = "零之使魔 FINAL"
+  //   「零之使魔4」     → baseName = "零之使魔4"
+  //
+  // 而站方檔名是「零之使魔FINAL」「零之使魔 第四季」「零之使魔4」——
+  // baseName 帶著 marker／序號，比對時對不上：
+  //   target.baseName = "零之使魔 FINAL" vs candidate "零之使魔FINAL"
+  //   → 差一個空格 + 繁簡 → 匹配失敗 → 該站被殺掉。
+  //
+  // ★ 關鍵：marker 資訊不能丟，要搬到 _finalMarker 欄位 ★
+  //   比對層需要知道「使用者輸入的是最終季型片名」，
+  //   才能啟用 inferMarkerSeasonByYear 推導季別。
+  //   baseName 則是「系列本體名」，兩者分工明確。
+  const _markerMatch = rawName.match(_FINAL_SEASON_MARKER_RE);
+  const _hasFinalMarker = !!_markerMatch;
+
+  // ★ 剝掉 marker（FINAL / 完結篇 / 最終季 / 終章…）★
+  baseName = baseName.replace(_FINAL_SEASON_MARKER_RE_G, ' ');
+
+  // ★ 剝掉尾端序號：「零之使魔4」★
+  //   但「无间道2」是電影續集序號，剝了會命中第一部。
+  //   判準：若這部作品有「第N季」的痕跡（seasonNumber > 1）→ 是季別序號。
+  //   單純「零之使魔4」（無「第四季」字樣）→ 序號就是季別 → 剝。
+  //   電影續集走另一條路（type=movie 時不剝，見 buildSearchQuery）。
+  if (seasonNumber === 1 && !_hasFinalMarker) {
+    const _trailSeq = baseName.match(/([0-9]{1,2})\s*$/);
+    if (_trailSeq) {
+      const _n = parseInt(_trailSeq[1], 10);
+      // 序號 ≥ 2 且前面有中文字 → 幾乎都是季別序號（零之使魔4）
+      // 「无间道2」也是這個形狀 → 會被剝掉 ✗
+      // → 交給比對層用「候選集是否有第1季」判斷更準，
+      //   這裡保守：**不剝**，避免電影續集被搜成第一部。
+      //   （實測「零之使魔4」仍能命中樂子的「零之使魔4」，因為站方檔名一致）
+      void _n;
+    }
+  }
+
   baseName = deepCleanSeriesName(baseName);
 
   // 年份刻意不進搜尋字串。
@@ -3587,6 +3626,11 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
     //   spin-off：target.type='tv' 但 candidate._siteTypeName='movie' →
     //   擋掉劇場版。MacCMS 站沒帶這個欄位 → null 不觸發守門員。
     _siteTypeName: srcItem?._siteTypeName || null,
+    // ★ v98：使用者輸入是否為「最終季型片名」★
+    //   「零之使魔 FINAL」「仁医完结篇」「进击的巨人最终季」→ true
+    //   baseName 已剝掉 marker（乾淨的系列名），這個旗標保留原始語意，
+    //   讓比對層能知道「這是最終季型片名，季別要另外推導」。
+    _finalMarker: _hasFinalMarker ? (_markerMatch ? _markerMatch[0] : '') : null,
   });
 }
 
@@ -13790,11 +13834,68 @@ targetInfo.searchQuery = aliasQ;
 //
 // 正確解法：搜尋字串只放裸片名，續集識別交給 isSmartSeriesMatch 內的
 // season 比對 + sequel 邏輯處理。
+//
+// ★ v98 新增：marker 與序號也要剝掉 ★
+//
+// 實測（真實站方回應）：
+//   搜「零之使魔」        → 電影天堂 5 筆、非凡 4 筆、如意 2 筆、樂子 6 筆、
+//                          暴風 7 筆、優質 5 筆
+//   搜「零之使魔 FINAL」 → 電影天堂 0 筆、如意 0 筆、優質 0 筆 ← 只有非凡 1 筆
+//   搜「零之使魔4」      → 電影天堂 0 筆、非凡 0 筆、如意 0 筆、優質 0 筆
+//
+// 站台對關鍵字做的是「起始匹配」，"片名 + FINAL" / "片名 + 4" 這種寫法
+// 會讓多個站直接回 0 筆 —— 但那些站明明有「零之使魔FINAL」這個檔名！
+//
+// 也就是說：使用者輸入「零之使魔 第四季」時，搜尋字串必須是乾淨的
+// 「零之使魔」，讓所有站都回出全部季別，再由比對層挑出第四季。
+// 否則同一個作品會因為「怎麼打字」而拿到完全不同的站點集合。
 function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
-  const base = String(searchQuery)
+  let base = String(searchQuery)
     .replace(/(?:19|20)\d{2}\s*$/, '')  // 年份交給結果階段，這裡不帶
     .replace(/\s+$/, '')
     .trim();
+
+  // ★ 剝掉最終季型 marker（FINAL / 完結篇 / 最終季 / 終章…）★
+  //   站方檔名裡通常**保留**這些字（「零之使魔FINAL」），
+  //   但拿它當搜尋關鍵字會讓站台的起始匹配失效 → 0 筆。
+  base = base.replace(_FINAL_SEASON_MARKER_RE_G, ' ');
+
+  // ★ 剝掉「第四季 / 第4季 / Season 4 / 4」這類季別修飾 ★
+  //   「零之使魔 第四季」→ 「零之使魔」
+  //   「零之使魔4」→ 「零之使魔」
+  //   留著的話只有檔名真的帶數字的站（樂子「零之使魔4」）會回應。
+  //
+  //   ★ 尾端純數字要「看情況」剝 ★
+  //   「零之使魔4」的「4」是季別 → 該剝（否則只有樂子回應）
+  //   「无间道2」的「2」是**電影續集序號** → 不能剝（剷了只會命中第一部）
+  //
+  //   判準：使用者輸入裡的數字 == 目標季別（targetSeason）→ 是季別 → 剝。
+  //        目標是 movie 型別 → 一律不剝（電影沒有「季」）。
+  //        目標季別是 1 → 不剝（「无间道」的「2」不是第一季，
+  //                   而且「X2」在電影語境更常是續集）。
+  const _isMovie = String(targetInfo?.type || '') === 'movie';
+  if (!_isMovie && Number(targetSeason) >= 2) {
+    base = base.replace(/[0-9]{1,2}\s*$/, ' ');
+  }
+  base = base
+    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*[季部]/g, ' ')
+    .replace(/[Ss]eason\s*[0-9]+/g, ' ')
+    .replace(/\b[Ss]\s*[0-9]+\b/g, ' ');
+
+  // ★ 剝掉「Part.1 / 前篇 / 后篇」這類分篇修飾 ★
+  //   站方檔名有「进击的巨人最终季Part.1」也有「进击的巨人最终季」，
+  //   帶著 Part 搜會只命中其中一種寫法。
+  base = base
+    .replace(/\s*Part\.?\s*[0-9]*/gi, ' ')
+    .replace(/\s*[前後]篇/g, ' ');
+
+  base = base.replace(/\s+/g, ' ').trim();
+
+  // ★ 剝完不能變空 ★
+  //   若使用者只輸入「FINAL」這種純 marker，剝完會變空字串 → 站方 0 筆。
+  //   這時保留原字串（寧可搜不到，也不要送空查詢）。
+  if (!base) return String(searchQuery).trim();
+
   return base;
 }
 
