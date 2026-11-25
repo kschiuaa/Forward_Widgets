@@ -1574,7 +1574,14 @@ const CONFIG = {
   //     jiabaide.cn 開始回錯），反而慢 4 倍。20 是實測的甜蜜點。
   //   ★ 輸出零改變：只是讓原本要排隊的請求早點發出，站數、筆數、
   //     排序、去重全部不變（v88 驗證 28/28：兩輪筆數一致、排序一致）。
-  WIDGET_VERSION: 90,
+  //
+  // bump 到 91：解說 / 二次剪輯版本直接篩掉（使用者要求）。
+  //   「解說不應該顯示出來，而是要被直接篩選」—— 不是排到後面，
+  //   是不進結果。詳見 isNarrativeCut 模組註解。
+  //   舊 cache 內可能已有解說條目（standard 路徑靠片名比對碰巧擋掉，
+  //   但 RELAX_ON_EMPTY 的 loose 放寬路徑會放進來）→ bump 版本
+  //   清掉舊 cache 重新搜。
+  WIDGET_VERSION: 91,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1842,7 +1849,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.0.0",
+  version: "5.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2416,6 +2423,100 @@ function resolveRexSeason(seasonParam, seriesName, fallbackSeason) {
 }
 
 /**
+ * ★★★ 解說 / 二次剪輯版本判定（v91）—— 直接篩選掉，不顯示 ★★★
+ *
+ * ★ 使用者需求（2026-11-25）：
+ *   「解說不應該顯示出來，而是要被直接篩選」
+ *   —— 不是排到後面當候選，是根本不進結果。
+ *
+ * ★ 為什麼需要獨立成中央模組：
+ *   站方對「二次剪輯版本」的寫法至少有 10 種，每種在不同站不同年份都不同：
+ *     「[电影解说]」「[電影解說]」「解说版」「解說版」「速看」「剪輯版」
+ *     「剧情解说」「劇情解說」「全片解说」「影评」「電影解说」
+ *   原本的防護散落在三處，且**寫法覆蓋不完整**：
+ *     (1) isSmartSeriesMatch 的 SPIN_OFF_MARK —— 完全沒有「解说」字樣
+ *     (2) performBatchSearch 的 spin-off 過濾 —— 只有「电影解说|電影解說」
+ *     (3) movie 分支的非正片過濾 —— 沒有「解说」
+ *   結果：standard 比對時因為片名不相等而「碰巧」擋掉（副作用，不是設計），
+ *   但 RELAX_ON_EMPTY 的 loose 放寬路徑（見 performBatchSearch 13967 行）
+ *   會放它們進來 —— 實測「無間道」站方只有解說版本時，loose 路徑輸出
+ *   6 筆全是「無間道速看」，使用者看到的是二次剪輯而不是正片。
+ *
+ * ★ 判定依據（片名 + remarks 都看）：
+ *   remarks 尤其重要 —— 站方的 vod_remarks 欄位常直接就是「电影解说」
+ *   （實測暴風資源：「无间道[电影解说]」remarks="电影解说"），
+ *   而片名可能被清理過（stripSubtitle 會把方括號內容清掉 →
+ *   「阿甘正传[电影解说]」的 stripSubtitle 變成「阿甘正传」，
+ *   在 loose 比對下與正版完全同字 → 危險）。
+ *
+ * ★★ 關鍵：不能用裸的「解说」兩字當關鍵字 ★★
+ *   「解說者」（2023 金馬獎電影）、「解說的誘惑」（2001 泰國片）
+ *   都是有正版存在的正片片名。裸「解说」會把它們誤殺。
+ *   判準改成「**解說必須是版本標記**，不是片名的一部分」：
+ *     - 帶「電影/影视/劇情/全片/無水印」等前綴 → 一定是版本標記（「电影解说」）
+ *     - 帶「版」後綴 → 一定是版本標記（「解说版」「解说 电影版」）
+ *     - 帶方括號/方頭括號包住 → 一定是版本標記（「[电影解说]」「【解说】」）
+ *     - 站方 remarks 整串就是「解说」→ 那是分類標籤 → 一定是版本標記
+ *   而「解说者」「解说的诱惑」這些 → 不符合任何一條 → 保留。
+ *
+ * ★★ 繁簡正規化 ★★
+ *   站方片名是簡體、remarks 也是簡體，但同一句話可能混寫（「无间道影視解说」）。
+ *   所有比對都先轉繁體再比 → 一組正則涵蓋兩種字形，不會漏。
+ *
+ * ★ 刻意不納入的字眼（避免誤殺正片）：
+ *   - 「影評」/「影评」：有站方把它當正片分類標籤，風險偏高 → 不納入
+ *   - 裸「剪輯」：正片本身可能就叫「剪輯」→ 只認「剪輯版/剪輯集」
+ *   - 「快看」：不夠明確 → 不納入；「短評」不納入
+ */
+const _NARRATIVE_SEG_RE = /電影解說|影視解說|劇情解說|全片解說|無水印解說|解說版|速看|剪輯版|剪輯集|精簡版/;
+
+// 「解說」出現在方括號 / 圓括號 / 【】 裡 → 一定是版本標記
+const _NARRATIVE_BRACKET_RE = /[\[【（(][^\]】）)]*?(解說|速看|剪輯|精簡)[^\]】）)]*?[\]】）)]/;
+// 「解說」後面接「版」→ 版本標記（「解说版」「解说 电影版」「解说国语版」）
+const _NARRATIVE_BANVER_RE = /解說[^，。！？、）)\]】]{0,6}版/;
+// 站方 remarks 整串就是版本標記（無其他描述）
+const _NARRATIVE_REMARK_RE = /^[　\s]*(電影解說|影視解說|劇情解說|全片解說|無水印解說|解說版|解說|速看|剪輯版|精簡版)[　\s]*$/;
+
+/**
+ * 判斷站方條目是不是「解說 / 二次剪輯版本」。
+ *
+ * @param {string} rawName    站方原始片名（_rawName / vod_name）
+ * @param {string} remarks    站方 remarks（vod_remarks），常直接寫「电影解说」
+ * @returns {boolean} true = 是二次剪輯版本，應直接篩掉
+ */
+function isNarrativeCut(rawName, remarks) {
+  try {
+    // 片名與 remarks 都看。任一處符合「版本標記」語意即判定。
+    //   站方實測：「无间道[电影解说]」remarks="电影解说"（片名可能已被清理）
+    //   而「阿甘正传解说版」remarks="解说版"、remarks 空但片名帶 → 兩種都涵蓋。
+    //
+    //   全部先轉繁體再比 → 簡體/繁體/混寫都涵蓋。
+    const name = convertChinese(String(rawName ?? ''), true);
+    const rem = convertChinese(String(remarks ?? ''), true);
+    if (!name && !rem) return false;
+
+    // 1) 明確的複合關鍵字（「電影解說」「速看」「解說版」…）→ 直接判定
+    if (_NARRATIVE_SEG_RE.test(name)) return true;
+    if (_NARRATIVE_SEG_RE.test(rem)) return true;
+    // 2) 方括號包住的「解說」→ 版本標記（「[電影解說]」「【解說】」）
+    if (_NARRATIVE_BRACKET_RE.test(name)) return true;
+    if (_NARRATIVE_BRACKET_RE.test(rem)) return true;
+    // 3) 「解說 + 版」→ 版本標記（「解說版」「解說 電影版」）
+    if (_NARRATIVE_BANVER_RE.test(name)) return true;
+    if (_NARRATIVE_BANVER_RE.test(rem)) return true;
+    // 4) remarks 整串就是版本標記（「電影解說」）→ 分類標籤，判定
+    if (_NARRATIVE_REMARK_RE.test(rem)) return true;
+    // 5) 片名結尾就是「解說」（前面是片名主體）→ 仍算版本標記
+    //    「无间道解说」「阿甘正传解说」→ 站方把「解说」當片名後綴標記。
+    //    ★ 用「結尾」而非「任意位置」→ 「解说者」「解说的诱惑」不結尾於解說 → 保留。
+    if (/解說[　\s]*$/.test(name)) return true;
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
  * 取出片名中的續集序號。
  *
  * 「战狼2」「无间道II」「窃听风云3：终极监听」「追龙2：追缉大富豪」
@@ -2688,8 +2789,14 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
   // 且跨季 S1~S6 同名反覆出現。用 Map 快取純解析結果，命中直接回傳淺拷貝。
   // 安全：回傳拷貝而非本體，呼叫端後續對 targetInfo 的改寫
   //（searchQuery / _alias 等）不會污染快取；key 含 _siteTypeName 以區分 jpyy 分類訊號。
+  //
+  // ★ v91：key 也要含 remarks —— 解析結果現在帶 remarks（解說版篩選要用），
+  //   而同一個 vod_name 在不同站可能有不同 remarks
+  //   （「无间道[电影解说]」有時 remarks="电影解说"、有時 remarks="已完结"）。
+  //   不含的話會拿 A 站的 remarks 當 B 站的用 → 解說判定會誤殺正片。
   const _cacheKey = seriesName
     ? String(seriesName) + '|' + String(srcItem?._siteTypeName || '')
+      + '|' + String(srcItem?.vod_remarks ?? srcItem?.vodRemarks ?? '')
     : null;
   if (_cacheKey) {
     const _hit = _ENHANCED_INFO_CACHE.get(_cacheKey);
@@ -2715,6 +2822,8 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
     year: null,
     region: 'other',
     rawName: seriesName,
+    // ★ v91：站方 remarks（解說版篩選要用，見 isNarrativeCut）。
+    remarks: String(srcItem?.vod_remarks ?? srcItem?.vodRemarks ?? ''),
     // 站方分類訊號（jpyy 帶 _siteTypeName，MacCMS 站無此欄）。
     // 預設 null，呼叫端沒傳 srcItem 時不打擾既有行為。
     _siteTypeName: null,
@@ -2822,6 +2931,11 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
     year,
     region,
     rawName,
+    // ★ v91：站方 remarks 原文。解說版篩選要用（見 isNarrativeCut）。
+    //   站方常把「电影解说」直接寫在 remarks（實測暴風資源：
+    //   「无间道[电影解说]」vod_remarks="电影解说"），
+    //   而片名可能被 stripSubtitle 清理過 → 只看片名會漏判。
+    remarks: String(srcItem?.vod_remarks ?? srcItem?.vodRemarks ?? ''),
     // ★ 站方分類訊號。jpyy 的 toMacItem 會帶 _siteTypeName
     //   （'tv' / 'movie' / 'other'），下游 isSmartSeriesMatch 用它判
     //   spin-off：target.type='tv' 但 candidate._siteTypeName='movie' →
@@ -3008,6 +3122,37 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       match: false, type: 'spin_off', score: 0,
       similarity: 0, seasonMatch: false,
       targetSub: '', candidateSub: 'spin_off',
+      confidence: 0
+    };
+  }
+
+  // ★★ v91：解說 / 二次剪輯版本 —— 直接判不匹配 ★★
+  //
+  // 為什麼要獨立於上面的 SPIN_OFF_MARK：
+  //   SPIN_OFF_MARK 是「衍生作」（劇場版/OVA/SP）—— 那是**另一部作品**，
+  //   只是同系列；使用者搜正片時不該看到它，但它是合法內容。
+  //   解說版則是**同一個正片的二次剪輯**（別人配旁白剪的精華版），
+  //   內容跟正片不同（實測正片 68 分鐘 vs 解說版 49 分鐘），
+  //   使用者明確要求「解說不應該顯示出來，而是要被直接篩選」。
+  //
+  // 為什麼必須在這一層擋（而不是靠後面的片名比對碰巧失敗）：
+  //   stripSubtitle 會把方括號內容清掉 —— 「阿甘正传[电影解说]」
+  //   的 baseName 變成「阿甘正传」，與正版**完全同字** → similarity 1.0
+  //   → 在 loose 路徑（RELAX_ON_EMPTY 放寬）會被判成 exact 命中。
+  //   實測：站方只有「无间道[电影解说]」時，loose 重試輸出 6 筆全是
+  //   「无间道速看」這類二次剪輯 —— 使用者看到的是剪輯版而非正片。
+  //
+  // 判定同時看片名與 remarks（站方 remarks 常直接寫「电影解说」）。
+  // target 端不判：使用者若真的在找解說版，target 會帶關鍵字。
+  const candidateIsNarrative = isNarrativeCut(
+    candidateInfo.rawName || '',
+    candidateInfo.remarks || candidateInfo.vodRemarks || ''
+  );
+  if (candidateIsNarrative) {
+    return {
+      match: false, type: 'narrative_cut', score: 0,
+      similarity: 0, seasonMatch: false,
+      targetSub: '', candidateSub: 'narrative_cut',
       confidence: 0
     };
   }
@@ -7449,8 +7594,13 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         // 規則：vod_name 內含常見「非正片」字眼 → 跳過，不進 results。
         // 注意：這裡的 vod_name 是從站方解析出的原始片名（_rawName），
         // 站方在標題上常會用方括號 [預告片] 標明 —— 整段抓出來比對。
+        //
+        // ★ v91：解說 / 二次剪輯版本也必須直接篩掉（使用者要求）。
+        //   這裡原本**完全沒有**「解说」字樣 → 電影解說版會進結果。
+        //   用中央判定 isNarrativeCut（片名 + remarks 都看）。
         const isNonMainRelease = /[\[【（(]\s*(预告片|預告片|预告|預告|花絮|片段|彩蛋|片花|幕后|幕後|特辑|特輯|先行|先导|先導|幕后花絮|幕後花絮)[\]】）)]/i.test(vod_name)
-            || /\b(预告|預告|花絮|片段|彩蛋|片花|幕后|幕後|特辑|特輯|先行|先导|先導)\b/i.test(vod_name);
+            || /\b(预告|預告|花絮|片段|彩蛋|片花|幕后|幕後|特辑|特輯|先行|先导|先導)\b/i.test(vod_name)
+            || isNarrativeCut(vod_name, vod_remarks);
         if (!isNonMainRelease) {
           // 單版本時走舊路徑（逐字同輸出）；多版本時每版各建一條 resource，
           // 用語言標籤區分（否則去重鍵撞在一起只剩一版）。
@@ -13424,7 +13574,8 @@ targetInfo.searchQuery = aliasQ;
             if (Number(targetInfo.seasonNumber) >= 1) {
               const usable = items.filter(it => {
                 const rawName = it.vod_name || '';
-                const looksLikeSpinOff = /剧场版|劇場版|电影版|電影版|外传|外傳|特別篇|特别篇|总集篇|總集篇|番外|电影解说|電影解說|[＊∽]/u.test(rawName);
+                const looksLikeSpinOff = /剧场版|劇場版|电影版|電影版|外传|外傳|特別篇|特别篇|总集篇|總集篇|番外|[＊∽]/u.test(rawName)
+                  || isNarrativeCut(rawName, it.vod_remarks);   // ★ v91 解說版直接篩掉
                 const looksLikeOAD = /(^|[^0-9第])OAD($|[^0-9])|^OAD[0-9]|OAD版|OAD化/.test(rawName);
                 const looksLikeSP = /(^|[^0-9第])SP($|[^0-9])|^SP[0-9]/u.test(rawName);
                 return !(looksLikeSpinOff || looksLikeOAD || looksLikeSP);
@@ -13868,7 +14019,8 @@ targetInfo.searchQuery = aliasQ;
           // OAD 同理：「OAD1」這種獨立條目才算番外；「第7話 OAD」是該話的 OAD 版本。
           if (targetInfo.seasonNumber >= 1) {
             const rawName = item.vod_name || '';
-            const looksLikeSpinOff = /特别篇|特別篇|劇場版|剧场版|OVA|外传|外傳|总集篇|總集篇|番外|电影解说|電影解說|＊|∽/.test(rawName);
+            const looksLikeSpinOff = /特别篇|特別篇|劇場版|剧场版|OVA|外传|外傳|总集篇|總集篇|番外|＊|∽/.test(rawName)
+              || isNarrativeCut(rawName, item.vod_remarks);   // ★ v91 解說版直接篩掉
             const looksLikeOAD = /(^|[^0-9第])OAD($|[^0-9])|^OAD[0-9]|OAD版|OAD化/.test(rawName);
             const looksLikeSP = /(^|[^0-9第])SP($|[^0-9])|^SP[0-9]|特别篇SP|特別篇SP/.test(rawName);
             if (looksLikeSpinOff || looksLikeOAD || looksLikeSP) {
@@ -13998,7 +14150,11 @@ targetInfo.searchQuery = aliasQ;
             for (const it of list) {
               if (!it?.vod_name) continue;
               // spin-off 仍要擋掉（外傳/劇場版/解說不是正片）
-              if (/剧场版|劇場版|电影解说|電影解說|外传|外傳|总集篇|總集篇|番外|＊|∽/u.test(it.vod_name)) continue;
+              // ★ v91：解說版用中央判定 isNarrativeCut（涵蓋 10+ 種寫法 + remarks），
+              //   不能只認「电影解说|電影解說」—— 否則 loose 放寬路徑會把
+              //   「速看」「解说版」「剧情解说」當成正版放行。
+              if (/剧场版|劇場版|外传|外傳|总集篇|總集篇|番外|＊|∽/u.test(it.vod_name)) continue;
+              if (isNarrativeCut(it.vod_name, it.vod_remarks)) continue;
               const candKey = normalizeForMatching(stripSeasonMarker(it.vod_name));
               if (!candKey || !targetKey) continue;
               // ★ 用「字元重疊率」而不是子字串包含判斷同名。
@@ -14081,7 +14237,8 @@ targetInfo.searchQuery = aliasQ;
               const eligible = [];
               for (const it of resp.list) {
                 if (!it?.vod_name) continue;
-                if (/剧场版|劇場版|电影解说|電影解說|外传|外傳|总集篇|總集篇|番外|＊|∽/u.test(it.vod_name)) continue;
+                if (/剧场版|劇場版|外传|外傳|总集篇|總集篇|番外|＊|∽/u.test(it.vod_name)) continue;
+                if (isNarrativeCut(it.vod_name, it.vod_remarks)) continue;   // ★ v91 解說版直接篩掉
                 const ci = extractEnhancedInfo(it.vod_name, it);
                 const mr = isSmartSeriesMatch(targetInfo, ci, matchStrictness);
                 if (!mr.match) continue;
