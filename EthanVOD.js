@@ -1856,7 +1856,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.2.0",
+  version: "5.4.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -12545,16 +12545,9 @@ targetInfo.searchQuery = aliasQ;
         // 沒探測到的 URL 仍寫入 cache（保守策略，下次重搜時它們會被探測）。
         // 探測為 dead 的 URL 不寫 cache。
         const deadUrls = new Set(probeUrls.filter((_, i) => !alive[i]));
-        // ★ 實測清晰度（master m3u8 RESOLUTION）：只對活著的 URL 探，
-        //   與 HEAD 存活探測同一個背景 IIFE，不阻塞回傳。只讀 playlist 文字，
-        //   不下載任何 .ts 分片；單檔 TS 無 STREAM-INF 會回 null（預期內，
-        //   保留站方標註）。結果寫進 in-memory + 隨 cache 持久化，
-        //   下次 cache 命中時直接顯示「📺 實測…」行。
-        try {
-          const aliveList = probeUrls.filter((_, i) => alive[i]);
-          const resLimit = Math.min(CONFIG.ACTUAL_RES_PROBE_LIMIT ?? 20, aliveList.length);
-          if (resLimit > 0) await probeActualResolutions(aliveList.slice(0, resLimit));
-        } catch {}
+        // ★ v93：不再做背景清晰度探測。
+        //   v88 已把「📺 清晰度行」從顯示層拿掉 → 探測結果沒有任何用途，
+        //   但每次搜尋仍要打 20 個 m3u8 請求（純浪費 + 可能觸發站方流量統計）。
         const cacheable = finalResults.filter(r => !r.url || !deadUrls.has(r.url));
         try { applyActualResolutions(cacheable); } catch {}
         if (cacheable.length > 0) {
@@ -14757,27 +14750,12 @@ targetInfo.searchQuery = aliasQ;
   //   • MacCMS（無 _adapterSite）→ macCacheKey，與舊內容按 url 去重合併
   //     （跨集累積，避免從 E5 開始搜時把 E1~E4 洗掉）
   //   • Adapter（有 _adapterSite）→ adCacheKey，直接覆蓋（綁定單集）
-  // ★ 實測清晰度先套 in-memory 已探到的（無網路，不阻塞回傳）。
+  // ★ v93：不再做背景清晰度探測（v88 已把「📺 行」從顯示層拿掉，
+  //   探測結果沒有用途，卻每次搜尋都要多打 20 個 m3u8 請求）。
   try { applyActualResolutions(finalResults); } catch {}
   if (finalResults.length > 0 && CONFIG.CACHE_TTL > 0) {
-    // ★ 背景補探 master RESOLUTION + 分流寫 cache（同一個 IIFE，保證順序）。
-    //   只讀 playlist 文字、不下 .ts；探完把「📺 實測…」寫進結果再持久化，
-    //   下次命中直接顯示。不阻塞 return（fire-and-forget，與 smart 路徑同策略）。
-    //   必須同一個 IIFE：分開兩個 IIFE 會有競速 —— 寫 cache 的 IIFE 可能搶在
-    //   探測完成前把「無實測」的結果先寫進去，實測永遠存不進 cache。
+    // ★ 分流寫 cache（同一個 IIFE，保證順序）。
     (async () => {
-      try {
-        const seen = new Set();
-        const urls = [];
-        for (const r of finalResults) {
-          if (!r || typeof r.url !== 'string' || seen.has(r.url)) continue;
-          seen.add(r.url);
-          urls.push(r.url);
-          if (urls.length >= (CONFIG.ACTUAL_RES_PROBE_LIMIT ?? 20)) break;
-        }
-        if (urls.length > 0) await probeActualResolutions(urls);
-        try { applyActualResolutions(finalResults); } catch {}
-      } catch {}
       try {
       const macResults = finalResults.filter(r => !r._adapterSite);
       const adResults  = finalResults.filter(r => !!r._adapterSite);
