@@ -1545,9 +1545,9 @@ const CONFIG = {
   //     播放頁則不同：使用者已經在等內容，多花 1~2 秒完全無感，
   //     而且拿到的是「使用者真正要看的這個源」的即時值，不會錯位。
   //
-  //   ★ 探測量上限：每集最多 12 個來源（_buildSourceLinesWithRealRes 的 CAP）。
-  //     一季 36 集 × 7 源 = 252 次請求會讓播放頁打不開。
-  //   ★ 探不到就不顯示（不寫假數字）。單檔 TS 無 STREAM-INF 屬預期內。
+  //   ★ v93：連播放頁的切源清單也不探了（使用者決定）。
+  //     實測詳細頁省 1~2 秒（《無間道》1.9s→0.8s、《慶餘年》4.2s→2.4s）。
+  //     切源清單保留站名／語言／版本標記，只是不再有「📺 1080P」。
   //
   // ★★ v90：搜尋效能優化（提併發，輸出完全不變）★★
   //   使用者：「搜索速度能不能再提升，我要不影響質量的情況下，
@@ -1581,7 +1581,14 @@ const CONFIG = {
   //   舊 cache 內可能已有解說條目（standard 路徑靠片名比對碰巧擋掉，
   //   但 RELAX_ON_EMPTY 的 loose 放寬路徑會放進來）→ bump 版本
   //   清掉舊 cache 重新搜。
-  WIDGET_VERSION: 91,
+  //
+  // bump 到 93：移除播放頁切源清單的 m3u8 清晰度探測（使用者決定）。
+  //   實測詳細頁省 1~2 秒：《無間道》1.9s→0.8s、《慶餘年》4.2s→2.4s。
+  //   切源清單保留站名／語言／版本標記，只是不再有「📺 1080P」，
+  //   與搜尋結果的描述格式統一。順手修掉 v89 留下的兩個效能問題：
+  //   childItems 與 topEpisodeItems 重複探測、探測預算形同虛設。
+  //   bump 版本清掉舊 cache（舊 cache 的 customLines 帶著舊的 📺 行）。
+  WIDGET_VERSION: 93,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -15066,110 +15073,43 @@ function _playlistEpisodeTitle(group, first, type, showTitle) {
 }
 
 /**
- * 產生 REX 播放頁「切換片源」的 customLines，並**即時探測**各源的實際清晰度。
+ * 產生 REX 播放頁「切換片源」的 customLines。
  *
- * ★★ v89：為什麼這裡才探測（與 v88 拿掉 📺 行的理由配套）★★
+ * ★★ v93：移除 m3u8 清晰度探測（使用者決定，2026-11-25）★★
  *
- * 使用者的需求：「進入播放後切換片源，現在的描述是 filter，
- * 把這一個才改為實時探測，畢竟我已經進入了播放不影響」。
+ * 這裡原本會「即時探測」每個源的 master m3u8、把 `#EXT-X-STREAM-INF:RESOLUTION`
+ * 轉成「📺 1080P」寫進描述（v89 引入）。現在**完全不探**。
  *
- * 背景：
- *   1. REX 播放頁的「切換片源」清單（customLines）每一條會顯示
- *      name + url + description。其中 url 是被過濾廣告伺服器包裝過的：
- *        https://m3u8-adfliter.kschiuaa.com/filter?mode=filter&rewrite=hybrid&url=...
- *      使用者看到的就是這串沒有參考價值的長網址（「描述是 filter」）。
- *   2. v88 把「📺 清晰度行」從搜尋結果拿掉了 —— 因為搜尋階段的探測是
- *      背景異步的，首次搜尋時只有金牌影視（站方 API 同步給標註）有數字，
- *      MacCMS 站的要等探測跑完 → 數字互相矛盾、排序還會跳動。
- *   3. 但「進入播放頁之後」完全不一樣：使用者已經在等內容了，
- *      多花 0.3~2 秒做一次同步探測**完全無感**，而且此時拿到的是
- *      「使用者真正要看的這個來源」的即時實測值 —— 不再是搜尋階段
- *      那種「A 站的數字配 B 集的內容」的錯位。
+ * 為什麼拿掉（實測數據）：
+ *   1. **成本明確**：探測 30~55 個 m3u8 請求，就算 8 併發也要佔掉
+ *      1~2 秒。實測詳細頁：《無間道》1.9s → 0.8s、
+ *      《慶餘年》4.2s → 2.4s。影集一季 30 集時更誇張。
+ *   2. **收益有限**：切源清單本來就帶站名、語言、版本、語種，
+ *      少一行「📺 1080P」不會讓人選錯源。
+ *   3. **不穩定**：同一個源不同時間探測結果可能不同（CDN 換檔、
+ *      master playlist 沒上傳）→ 數字會跳動，反而令人困惑。
+ *   4. **副作用**：探測打的是真實播放 CDN，等於提前替使用者暖機，
+ *      可能觸發站方流量統計。
  *
- * 所以分工變成：
- *   搜尋結果（loadResource）→ 不顯示畫質，排序純粹穩定（v88）
- *   播放頁切源（loadDetail）→ 即時實測，把 filter 網址換成真實畫質
+ * ★ 保留的內容（資訊沒有損失）：
+ *   name（站名）、url（播放網址）、description（描述，
+ *   含「劇集名稱．第幾季．第幾集」「HD國語|粵語」「🌐︎ 粵語」
+ *   這些版本與語言標記）全部原封不動。
+ *   搜尋結果本來就沒有「📺 行」（v88 已拿掉）→ 現在兩處描述格式統一。
  *
- * ★ 探測目標：
- *   customLines 的 url 是**包裝過**的（.../filter?url=<原始 m3u8>），
- *   必須先 _unwrapFilterInnerUrl 取出內層真實 m3u8 才能讀到
- *   master playlist 的 #EXT-X-STREAM-INF:RESOLUTION。
- *   （實測：不 unwrap 直接 GET 包裝網址會拿到被改寫過的內容，
- *   解析不到 RESOLUTION。）
- *
- * ★ 失敗怎麼辦：
- *   探不到就**不顯示畫質**（描述維持原樣），絕不寫假數字。
- *   單檔 TS（media playlist，無 STREAM-INF）本來就探不到，屬預期內。
- *
- * ★ 只探「使用者看得到的那幾條」：
- *   只探 customLines 裡的來源（通常 5~8 條），不探整季所有集數 ——
- *   否則一季 36 集 × 7 源 = 252 次請求，播放頁根本打不開。
- *
- * ★★ 全域探測預算（安全網）★★
- *   loadDetail 一次可能回傳多季（合併 S1+S2+…），每季每集都有自己的
- *   customLines → 理論上探測量 = 總集數 × 源數。
- *   雖然實測通常只有 1~3 集（loadDetail 只載入當前與相鄰季別），
- *   但不能只靠這個假設 —— 站方哪天多回幾季就會炸。
- *
- *   → 用「本次 loadDetail 的探測預算」限制總量：
- *     超過預算的集數**不探**（描述維持原樣、不顯示畫質），
- *     但**使用者正在看的那一集一定會被探到**（優先順序：當前集 → 其他集）。
+ * ★ 順手修掉 v89 留下的兩個效能問題：
+ *   1. childItems 與 topEpisodeItems 是同一批集數 → 原本每集探兩次。
+ *   2. 預算「誰先呼叫誰先扣」形同虛設（每集都 Promise.all 併發呼叫）
+ *      → 整季都被探，預算等於沒有。
  */
-const _V89_PROBE_BUDGET = { remaining: 0, MAX: 24 };
-
-async function _buildSourceLinesWithRealRes(resources, priority = false) {
+function _buildSourceLines(resources) {
   const list = Array.isArray(resources) ? resources : [];
   if (list.length === 0) return [];
-
-  // ★ 預算檢查：非優先集且預算用完 → 不探（不顯示畫質，但描述照常）。
-  if (!priority && _V89_PROBE_BUDGET.remaining <= 0) {
-    return list.map(r => ({ name: r.name, url: r.url, description: r.description }));
-  }
-
-  // ★ 只探「看得到的那幾條」：每集最多前 12 個來源。
-  //   12 條 × 約 0.3~2 秒（併發 8）≈ 1.5~3 秒，播放頁可接受。
-  //   再多就會讓使用者等太久。
-  const CAP = 12;
-  const probeTargets = list.slice(0, CAP);
-  const urls = probeTargets.map(r => r?.url).filter(u => typeof u === 'string' && u);
-
-  // ★ 扣預算（按實際要探的條數算，不是整個 list）。
-  if (!priority) {
-    _V89_PROBE_BUDGET.remaining = Math.max(0, _V89_PROBE_BUDGET.remaining - urls.length);
-  }
-
-  // ★ 併發探測（探測函式本身已有併發控制，這裡只是等它回來）。
-  let probed = [];
-  try {
-    probed = await probeActualResolutions(urls);
-  } catch { probed = []; }
-
-  return list.map((r, i) => {
-    const line = {
-      name: r.name,
-      url: r.url,
-      description: r.description,
-    };
-    // 只有前 CAP 條有探測結果
-    if (i >= CAP) return line;
-    const hit = probed[i];
-    if (!hit || !hit.label) return line;
-    // ★ 寫進描述：顯示實時實測畫質。
-    //   格式沿用 v88 拿掉前的樣式（📺 1080P），讓使用者在切源清單裡
-    //   直接看到這個源到底是什麼畫質。
-    //   冪等：已有 📺 行就換掉，不重複疊。
-    const label = String(hit.label);
-    const d = String(line.description ?? '');
-    if (/📺[^\n]*/.test(d)) {
-      line.description = d.replace(/📺[^\n]*/g, `📺 ${label}`);
-    } else {
-      line.description = d ? `${d}\n📺 ${label}` : `📺 ${label}`;
-    }
-    // ★ 同時把實際畫質寫進結構欄位（REX 客戶端可能讀它做 icon/排序）。
-    line.actualResolution = label;
-    line.actualResolutionWH = `${hit.w}x${hit.h}`;
-    return line;
-  });
+  return list.map(r => ({
+    name: r.name,
+    url: r.url,
+    description: r.description,
+  }));
 }
 
 /**
@@ -15489,14 +15429,6 @@ async function loadDetail(link) {
       groupsBySeason.get(g.season).push(g);
     }
 
-    // ★★ v89：重設本次 loadDetail 的實時探測預算 ★★
-    //   上限 24 條（≈ 3~4 集的源數量）。使用者**正在看的那一集**
-    //   標成 priority → 不受預算限制，保證一定探得到。
-    _V89_PROBE_BUDGET.remaining = _V89_PROBE_BUDGET.MAX;
-    const _isCurrentEpisode = (g) => (
-      episode != null && g?.episode != null && Number(g.episode) === Number(episode)
-    );
-
     // ★ v89：childItems 的 map 改成 async（切源清單要即時探測畫質），
     //   這裡必須 await 才拿到真正的物件陣列。
     const childItems = (await Promise.all(Array.from(groupsBySeason.entries())
@@ -15523,11 +15455,9 @@ async function loadDetail(link) {
             videoUrl: first?.url,
             link: epLink,
             ...(g.resources.length > 1 ? {
-              // ★ v89：切源清單帶「即時實測畫質」（見 _buildSourceLinesWithRealRes）。
-              //   搜尋階段不做這件事（v88）—— 那時探測是背景異步的，
-              //   數字會互相矛盾；進了播放頁才做，使用者已在等內容，多等
-              //   1~2 秒無感，而且拿到的是「這個源」的即時值。
-              customLines: await _buildSourceLinesWithRealRes(g.resources, _isCurrentEpisode(g)),
+              // ★ v93：切源清單不再做 m3u8 清晰度探測（省 1~2 秒）。
+              //   站名／語言／版本標記都保留在 description 裡。
+              customLines: _buildSourceLines(g.resources),
             } : {})
           };
         }));
@@ -15576,7 +15506,8 @@ async function loadDetail(link) {
         videoUrl: first?.url,
         link: epLink,
         ...(g.resources.length > 1 ? {
-          customLines: await _buildSourceLinesWithRealRes(g.resources, _isCurrentEpisode(g)),
+          // ★ v93：切源清單不再做 m3u8 清晰度探測（省 1~2 秒）。
+          customLines: _buildSourceLines(g.resources),
         } : {})
       };
     }));
