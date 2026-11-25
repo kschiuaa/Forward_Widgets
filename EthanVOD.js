@@ -1849,7 +1849,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.1.0",
+  version: "5.2.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2201,13 +2201,29 @@ function isDirectMediaUrl(url) {
 /**
  * 比對前把片名正規化，讓繁體查詢能對上簡體結果。
  * 統一轉繁體 + 去除空白 + 轉小寫。
+ *
+ * ★ v92：尾端的羅馬數字序號 → 阿拉伯數字 ★★
+ *   使用者輸入「無間道II」、站方檔名「无间道2」→ 正規化後
+ *   分別是「無間道ii」與「無間道2」→ 字面完全不同，相似度只有 0.6
+ *   （低於 LOOSE 門檻 0.75）→ 整條被殺 → 0 筆。
+ *   轉成同一種寫法後 → 「無間道2」vs「無間道2」→ similarity 1.0。
+ *
+ *   與 _romanTailToArabic 同一套邏輯，但這裡**轉換整串**（因為比對層
+ *   不需要「只轉結尾」的保守限制 —— 比對層只要兩邊寫法一致即可）。
+ *   仍然只轉 2 個字母以上（單個 I 可能是英文字母的一部分）。
  */
 function normalizeTitleForMatch(title) {
   if (!title) return '';
   const converted = CONFIG.CONVERSION.ENABLED
     ? convertChinese(String(title), true)
     : String(title);
-  return converted.replace(/[\s\u3000]+/g, '').toLowerCase();
+  const noSpace = converted.replace(/[\s\u3000]+/g, '').toLowerCase();
+  // 尾端羅馬數字 → 阿拉伯數字（「無間道ii」→「無間道2」）
+  return noSpace.replace(/([^\da-z])([ivx]{2,4})$/, (m, sep, rn) => {
+    const map = { ii: 2, iii: 3, iv: 4, vi: 6, vii: 7, viii: 8, ix: 9, xi: 11, xii: 12, xiii: 13 };
+    const v = map[rn];
+    return v ? sep + String(v) : m;
+  });
 }
 
 /**
@@ -2513,6 +2529,47 @@ function isNarrativeCut(rawName, remarks) {
     return false;
   } catch (e) {
     return false;
+  }
+}
+
+/**
+ * ★ v92：把「片名結尾」的羅馬數字序號轉成阿拉伯數字（搜尋字串用）。
+ *
+ * 為什麼需要：
+ *   使用者輸入「無間道II」（羅馬數字），站方檔名是「无间道2」
+ *   → 送出 wd=无间道II → 站方零結果 → 使用者看到整頁空白。
+ *   這是「站方搜尋層」的問題，不是比對層的問題 —— 比對再寬都沒用，
+ *   因為站方回傳的 list 根本是空的。
+ *
+ * 範圍（刻意保守，只做有把握的轉換）：
+ *   - 只轉**結尾**的羅馬數字：中间的「星際大戰IV：覺醒」不該動
+ *   - 只轉 2 個字母以上（II / III / IV / V…）：單個 I 常常是英文字母
+ *     的一部分，轉成 1 語意可能相反（「無間道1」在站方指第一部）
+ *   - 不轉 I：見上
+ *
+ * 例：
+ *   「无间道II」  → 「无间道2」
+ *   「无间道III」 → 「无间道3」
+ *   「無間道II」  → 「無間道2」（繁體輸入也能轉）
+ */
+function _romanTailToArabic(text) {
+  try {
+    const s = String(text ?? '');
+    if (!s) return s;
+    // 結尾的 2~4 個羅馬數字。
+    // ★ 前綴用「消耗式」比對：只取「羅馬數字之前的那一個字元」當分隔，
+    //   替換時保留它 —— 不能用 s.replace(整個match) ，那會把分隔字元
+    //   一起吃掉（「無間道II」→ 誤變成「道2」）。
+    const m = s.match(/([^A-Za-z0-9])([IVX]{2,4})$/);
+    if (!m) return s;
+    const map = { II: 2, III: 3, IV: 4, VI: 6, VII: 7, VIII: 8, IX: 9, XI: 11, XII: 12, XIII: 13 };
+    const v = map[m[2].toUpperCase()];
+    // 轉換成功才替換；V / X 單獨結尾不轉（「星際大戰V」站方可能就寫 V）。
+    if (!v) return s;
+    // 只替換尾端的羅馬數字部分，保留前面的分隔字元。
+    return s.slice(0, s.length - m[2].length) + String(v);
+  } catch (e) {
+    return text;
   }
 }
 
@@ -2921,6 +2978,26 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
     searchQuery += String(seasonNumber);
   }
 
+  // ★★ v92：羅馬數字序號 → 阿拉伯數字 ★★
+  //
+  // 問題：使用者輸入「無間道II」（羅馬數字），站方檔名卻是「无间道2」
+  //   （阿拉伯數字）→ 送出 wd=无间道II → **站方零結果** → 使用者看到
+  //   整頁空白（實測：搜「無間道II」0 筆，搜「無間道2」9 筆）。
+  //
+  // 為什麼字面比對救不了：關鍵是**站方搜尋層**就找不到，不是比對層。
+  //   比對層的寬嚴度再怎麼調都沒用 —— 站方回傳的 list 根本是空的。
+  //
+  // 轉換範圍（保守）：
+  //   只轉「片名結尾」的羅馬數字（II / III / IV / V…），且必須是
+  //   至少 2 個字母（單個 I 容易是英文字母的一部分，如「Mission I」）。
+  //   轉成阿拉伯數字後與站方命名一致（「无间道2」）。
+  //
+  // ★ 只轉結尾：中間的羅馬數字常是片名的一部分（「星際大戰IV：覺醒」
+  //   的 IV 在中間、「Resident Evil」不該動），轉了反而搜不到。
+  // ★ 不轉「I」：單字母 I 的誤判成本高（要轉成 1 會得到「无间道1」
+  //   —— 而「無間道1」在站方通常指第一部，語意剛好相反）。
+  searchQuery = _romanTailToArabic(searchQuery);
+
   return _storeEnhanced({
     baseName,
     searchQuery,
@@ -3307,6 +3384,66 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     };
   }
 
+  // ★★ v92：「target 是 candidate 的嚴格前綴」→ 不同作品，擋掉 ★★
+  //
+  // 實測：搜「無間道」時站方回傳「無間道長」（2017 劉德華、劉青雲主演
+  // 的另一部電影，與 2002 年的《無間道》毫無關係），混進結果 8 筆。
+  //
+  // 為什麼序號機制擋不住：
+  //   「無間道長」沒有任何續集標記 → extractSequelNumber 回 null
+  //   → 雙方 sequel 都是 null → sequelConflict 不觸發。
+  //
+  // 為什麼相似度也擋不住：
+  //   「無間道」(3字) vs 「無間道長」(4字)
+  //     char sim = 3/4 = 0.75、edit sim = 3/4 = 0.75
+  //     hybrid = 0.75*0.6 + 0.75*0.4 = 0.75
+  //   而 SIMILARITY_LOOSE 門檻剛好就是 0.75 → 差一點點就放行。
+  //
+  // 判準（保守，只擋「有把握是另一部片」的情況）：
+  //   candidate 去掉續集序號後，**嚴格以 target 開頭**且**還有多出字**
+  //   → 那是另一部作品。
+  //
+  //   為什麼安全（不會誤殺正片）：
+  //     - 「無間道2」對「無間道」：candidate 去掉序號後 = 「無間道」
+  //       = target → 不嚴格大於 → 不擋 ✓
+  //     - 「追龍2：追緝大富豪」對「追龍2」：去掉序號後 = 「追龍：追緝大富豪」
+  //       不以「追龍」開頭 → 不擋 ✓
+  //     - 「仁醫完結篇」對「仁醫」：完結篇被當 sequel=2 → 序號衝突機制處理 ✓
+  //     - 「無間道II」對「無間道」：去掉序號後 = 「無間道」→ 不擋 ✓
+  //   只在 target **無序號**時啟用（target 有序號時語意更複雜，
+  //   交給既有的 sequel 機制，避免誤殺）。
+  //
+  // ★★ v92 修：必須排除「標點分隔」的副標題型片名 ★★
+  //   「那些年，我們一起追過的女孩」對「那些年」→ 是**同一部片**
+  //   （副標題以「，」分隔），但前綴規則會誤殺它。
+  //   判準：**多出的部分不帶標點**才算「另一部片」。
+  //     - 「無間道長」→ 多出「長」（無標點）→ 另一部片 ✓
+  //     - 「無間道風雲：解密風雲」→ 多出「風雲：解密風雲」（含「：」）→ 副標題 → 不擋 ✓
+  //     - 「那些年，我們一起追過的女孩」→ 多出含「，」→ 副標題 → 不擋 ✓
+  if (targetSequelNorm === null && candidateSequel === null) {
+    const _tPrefix = normalizeTitleForMatch(stripSubtitle(targetInfo.baseName))
+      .replace(/完结篇|完結篇/g, '')
+      .replace(/的|之/g, '');
+    const _cPrefix = normalizeTitleForMatch(stripSubtitle(candidateInfo.baseName))
+      .replace(/完结篇|完結篇/g, '')
+      .replace(/的|之/g, '');
+    // candidate 嚴格以 target 開頭，且多出至少 1 個字
+    if (_tPrefix && _cPrefix && _cPrefix.length > _tPrefix.length &&
+        _cPrefix.startsWith(_tPrefix)) {
+      // ★ 多出的尾巴若含標點 → 是副標題（同一部片）→ 不擋
+      const _tail = _cPrefix.slice(_tPrefix.length);
+      const _hasPunct = /[：:，,、。．·｜|／\/—－\-—　\s]/.test(_tail);
+      if (!_hasPunct) {
+        return {
+          match: false, type: 'title_prefix_conflict', score: 0,
+          similarity, seasonMatch: false,
+          targetSub: '', candidateSub: 'different_work',
+          confidence: 0
+        };
+      }
+    }
+  }
+
   // ★★ v78.1：序號相同但主片名不同 → 不同作品，必須擋。
   //
   //   實測搜「海王2」時，站方回傳「上海王2」(2020，另一部電影)，
@@ -3321,9 +3458,16 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   //   target 無序號的情況（使用者只打「海王」）不受影響。
   if (targetSequelNorm !== null && candidateSequel !== null &&
       targetSequelNorm === candidateSequel) {
+    // ★ v92：序號要去掉「阿拉伯數字」**和「羅馬數字」**兩種寫法。
+    //
+    //   問題：使用者輸入「無間道II」、站方檔名「无间道2」→
+    //     coreOf(target)  = 「無間道ii」（只去數字，羅馬留下）
+    //     coreOf(candidate) = 「無間道」
+    //     → 不相等 → 誤判 sequel_conflict → 整條被殺 → 使用者看到 0 筆。
+    //   這是「同一個序號的兩種寫法」，語意上完全相同。
     const coreOf = (s) => stripFiller(
       normalizeTitleForMatch(stripSubtitle(s)).replace(/完结篇|完結篇/g, '')
-    ).replace(/\d+$/, '');
+    ).replace(/\d+$/, '').replace(/[ivx]{1,4}$/, '');
     const targetCoreSeq = coreOf(targetInfo.baseName);
     const candidateCoreSeq = coreOf(candidateInfo.baseName);
     if (targetCoreSeq && candidateCoreSeq && targetCoreSeq !== candidateCoreSeq) {
@@ -3406,8 +3550,11 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     // 不帶「的」，站方檔名卻固定寫「五等分的新娘」，差一個字 core 比對就
     // 失敗，後續 fallback 也要走相似度而非 core match。
     const stripFiller = (s) => s.replace(/的|之/g, '');
-    const targetCoreNoDigit = stripFiller(targetCore).replace(/\d+$/, '');
-    const candidateCoreNoDigit = stripFiller(candidateCore).replace(/\d+$/, '');
+    // ★ v92：尾端序號要去掉「阿拉伯數字」和「羅馬數字」兩種寫法。
+    //   target「無間道II」vs candidate「无间道2」→ 兩者都要歸零成「無間道」
+    //   才能視為同一部片。否則 fallback 也會拒絕 → 0 筆。
+    const targetCoreNoDigit = stripFiller(targetCore).replace(/\d+$/, '').replace(/[ivx]{1,4}$/, '');
+    const candidateCoreNoDigit = stripFiller(candidateCore).replace(/\d+$/, '').replace(/[ivx]{1,4}$/, '');
     const coreMatches = targetCore === candidateCore ||
                         stripFiller(targetCore) === stripFiller(candidateCore) ||
                         (targetCoreNoDigit && targetCoreNoDigit === candidateCoreNoDigit);
