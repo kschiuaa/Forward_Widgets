@@ -2086,7 +2086,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "6.2.0",
+  version: "6.3.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -14990,6 +14990,19 @@ targetInfo.searchQuery = aliasQ;
     const stats = { total: resourceSites.length, success: 0, failed: 0 };
     const requestTasks = [];
 
+    // ★★ 跨站合併的候選池 ★★
+    //
+    // 為什麼用 `let` 在這裡宣告（而不是 const 在 _macSearches 旁邊）：
+    //   adapter task（在 requestTasks 裡）與 MacCMS 搜尋（_macSearches）
+    //   都在同一個函式內，adapter task 的**執行時機**晚於 _macSearches
+    //   的 await（requestTasks 在 Promise.allSettled 才跑，見下方），
+    //   所以這裡先宣告、稍後賦值，adapter 就能讀到跨站資料。
+    //
+    //   為什麼 adapter 需要跨站資料：
+    //   AGE動漫站內只有「零之使魔 第四季」一條 → 年份分群推不出季別。
+    //   借 MacCMS 各站的年份序列（2006/2007/2008/2012）才推得動。
+    let _pooledItems = [];
+
     // ===== 簽名型 adapter 站（與 MacCMS 並行，互不影響）=====
     //
     // 走與 MacCMS 完全相同的下游：item 已被 _adapterSearch 偽裝成
@@ -15025,6 +15038,17 @@ targetInfo.searchQuery = aliasQ;
               targetInfo._targetAirDate ?? null
             );
             if (!items || items.length === 0) return [];
+
+            // ★ marker 推導的跨站上下文 ★
+            //
+            //   adapter 站（AGE動漫 / 金牌影視）自己站內的年份資訊有限
+            //   （AGE 只有「零之使魔 第四季」一條 → 推不出季別），
+            //   必須借 MacCMS 各站的結果一起看。
+            //   context = 本站 items + MacCMS 跨站合併池。
+            const _adapterCtxItems = [
+              ...items,
+              ...(_pooledItems || []),
+            ];
 
             // ★ sub-series 過濾（MacCMS 迴圈在 6869 行有同款檢查，
             //   但簽名型 adapter 走的是這條獨立分支，完全繞過了它）。
@@ -15116,7 +15140,7 @@ targetInfo.searchQuery = aliasQ;
             const settled = await _adapterPool(
               items.map(item => async () => {
                 const candidateInfo = extractEnhancedInfo(item.vod_name, item);
-                const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness, { items });
+                const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness, { items: _adapterCtxItems });
                 return await extractPlayInfoForCache(item, site.title, type, matchResult, targetInfo);
               }),
               CONFIG.ADAPTERS?.DETAIL_CONCURRENCY ?? 4,
@@ -15215,6 +15239,21 @@ targetInfo.searchQuery = aliasQ;
         } catch { return null; }
       })
     );
+    // ★★ 跨站合併的候選池（填入上方宣告的 _pooledItems）★★
+    //
+    // marker（完結篇 / FINAL / 最終季）的季別靠「同年系列條目」推導，
+    // 但**每個站各自只有一部分季別**（實測）：
+    //   非凡資源只回 4 筆（零之使魔/第二季/3/FINAL）→ 年份分群推成 S2 ✗
+    //   暴風資源只回 7 筆 → 也推成 S2 ✗
+    //   電影天堂/優質資源有「零之使魔FINAL」但缺「零之使魔4」→ 推不出 ✗
+    //
+    // 單看任何一個站都推不對，必須把所有站的結果攪在一起：
+    //   6 站合計才有完整的 S1(2006)/S2(2007)/S3(2008)/S4(2012) 年份序列
+    //   → 分群正確 → 推成 S4 ✓
+    //
+    // 這也是「跨站共識」能生效的前提：單站年份可能錯，多站才有真共識。
+    _pooledItems = _macSearches.flatMap(x => (Array.isArray(x?.list) ? x.list : []));
+
     // 預掃：把所有站的集名聯集起來，建立跨站一致的期結構
     //
     // ★ 只能收「確實是本片本季」的候選：站方搜尋結果裡混有其他集、
@@ -15249,6 +15288,23 @@ targetInfo.searchQuery = aliasQ;
               return bm && Array.isArray(bm.sequels) ? bm.sequels.map(Number) : null;
             } catch { return null; }
           })();
+          // ★★ 跨站合併的候選池 ★★
+          //
+          // marker（完結篇 / FINAL / 最終季）的季別是靠「站內同年系列條目」
+          // 推導的，但**每個站各自只有一部分季別**：
+          //   非凡資源只回 4 筆（零之使魔/第二季/3/FINAL）→ 年份分群推成 S2 ✗
+          //   暴風資源只回 7 筆 → 也推成 S2 ✗
+          //   電影天堂/優質資源有「零之使魔FINAL」但缺「零之使魔4」→ 推不出 ✗
+          //
+          // 單看任何一個站都推不對，必須**把所有站的結果攪在一起**看：
+          //   6 站合計才有完整的 S1(2006)/S2(2007)/S3(2008)/S4(2012) 年份序列
+          //   → 分群正確 → 推成 S4 ✓
+          //
+          // 這也是「跨站共識」能生效的前提：單站的年份可能錯（實測
+          // 暴風/非凡把「第三季」標 2017，實際 2018），多站才有真共識。
+          //
+          // ★ _pooledItems 定義在「macTasks 之前」（見下方），
+          //   這裡與 per-site detail 處理共用同一個池。
           for (const { list } of _macSearches) {
             if (!Array.isArray(list)) continue;
             for (const it of list) {
@@ -15257,7 +15313,8 @@ targetInfo.searchQuery = aliasQ;
               let candidateInfo = null;
               try { candidateInfo = extractEnhancedInfo(it.vod_name, it); } catch {}
               if (!candidateInfo) continue;
-              const mr = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness, { items: list });
+              // ★ 用「跨站合併池」當 marker 推導的上下文 ★
+              const mr = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness, { items: _pooledItems });
               if (!mr.match) continue;
               // 季別衝突（站方是第1季、我們要第2季）→ 不收
               //
@@ -15371,6 +15428,11 @@ targetInfo.searchQuery = aliasQ;
         // 黏成同一群，反而把非 S2 內容誤推進 S2 結果）。
         let subtitledResult = null;
         const allItems = response.list.filter(it => it?.vod_name);
+        // ★ marker 推導要用「跨站合併池」★
+        //   單站看不出季別（實測：非凡/暴風單獨看都推成 S2），
+        //   必須用 _pooledItems（6 站合計才有完整年份序列）。
+        //   單站沒有合併池時（cache hit 路徑）才退回站內清單。
+        const _markerCtxItems = (_pooledItems && _pooledItems.length > 0) ? _pooledItems : allItems;
         if (allItems.length > 0) {
           // 計算站內 sequel 命中數（extractSequelNumber(rawName) === targetSeason）。
           let hasSequelHit = false;
@@ -15386,7 +15448,7 @@ targetInfo.searchQuery = aliasQ;
             //   正解：用年份推導（inferMarkerSeasonByYear）判斷該 marker
             //   候選是否就是 target 那一季。
             if (_FINAL_SEASON_MARKER_RE.test(it.vod_name || '')) {
-              const _inferred = inferMarkerSeasonByYear(allItems, it.vod_name);
+              const _inferred = inferMarkerSeasonByYear(_markerCtxItems, it.vod_name);
               if (_inferred != null && _inferred === targetSeason) {
                 hasSequelHit = true;
                 break;
@@ -15403,7 +15465,7 @@ targetInfo.searchQuery = aliasQ;
           if (!item.vod_name) continue;
 
           const candidateInfo = extractEnhancedInfo(item.vod_name, item);
-          const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness, { items: allItems });
+          const matchResult = isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness, { items: _markerCtxItems });
 
           // 通用副標題型續集群啟發式（適用於進擊的巨人、鬼滅之刃等單 series）：
           // 當 candidate 不 match、但屬於 findSubtitledSequels 算出來的目標群 → 放行。
