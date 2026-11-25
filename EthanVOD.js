@@ -2076,7 +2076,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.9.0",
+  version: "5.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2445,14 +2445,8 @@ function normalizeTitleForMatch(title) {
     ? convertChinese(String(title), true)
     : String(title);
   const noSpace = converted.replace(/[\s\u3000]+/g, '').toLowerCase();
-  // ★★ v98：尾端標點剝掉 ★★
-  //   站方檔名常帶全形句點（「侦探已经死了。」「无间道2。」），
-  //   使用者輸入通常沒有 → 比對時多出一個字元，相似度被拉低、
-  //   coreOf 比對直接不相等 → 明明是同一部片卻被殺。
-  //   ★ 只剝**尾端**：中間的標點（「那些年，我們一起追過的女孩」）是副標題。
-  const noTrailPunct = noSpace.replace(/[。．、，,；;：:！!？?．・\-–—_~"'`´ˆ˜¦§¶‐‑‒—―]+$/g, '');
   // 尾端羅馬數字 → 阿拉伯數字（「無間道ii」→「無間道2」）
-  return noTrailPunct.replace(/([^\da-z])([ivx]{2,4})$/, (m, sep, rn) => {
+  return noSpace.replace(/([^\da-z])([ivx]{2,4})$/, (m, sep, rn) => {
     const map = { ii: 2, iii: 3, iv: 4, vi: 6, vii: 7, viii: 8, ix: 9, xi: 11, xii: 12, xiii: 13 };
     const v = map[rn];
     return v ? sep + String(v) : m;
@@ -2525,21 +2519,7 @@ function deepCleanSeriesName(name) {
 
   cleaned = cleaned.replace(/\s*(?:19|20)\d{2}\s*/g, ' ');
   cleaned = cleaned.replace(/第\d+[集话]/g, '');
-  // ★★ v98：尾端標點清理要涵蓋**全形**標點 ★★
-  //   舊寫法只清 `[\.\-\s]`（半形點、連字號、空白）→
-  //   站方檔名「侦探已经死了。」的全形句點「。」留著 →
-  //   baseName 變成「侦探已经死了。」→「侦探已经死了」比對時多一個字
-  //   → coreOf 不相等 → sequel_conflict → 明明是同一季卻被殺。
-  //
-  // ★ 只清**尾端**：片名中間的標點（「那些年，我們一起追過的女孩」）
-  //   是副標題的一部分，不能動。
-  cleaned = cleaned.replace(/[\s。．、，,；;：:！!？?．・\-–—_~"'`´ˆ˜¦§¶‐‑‒—―]+$/g, '');
-  // ★★ v98：片名與「季度／集數標記」之間的分隔標點也要清 ★★
-  //   「侦探已经死了。第二季」→ 「侦探已经死了第二季」
-  //   這個句點是**分隔符**（片名 | 季別），不是片名的一部分。
-  //   判準：標點的**右邊**是季度/集數標記 → 是分隔符 → 清掉；
-  //         標點右邊是普通文字（「那些年，我們一起追過的女孩」）→ 是副標題 → 留著。
-  cleaned = cleaned.replace(/[。．、，,；;：:！!？?．・\-–—_~"'`´ˆ˜¦§¶‐‑‒—―]+(?=\s*(?:第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*[季部集话回]|[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季|[Ss]eason\s*[0-9]+|\b[Ss]\s*[0-9]+\b))/g, '');
+  cleaned = cleaned.replace(/[\.\-\s]+$/g, '');
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
 
   return cleaned;
@@ -2817,69 +2797,6 @@ function _romanTailToArabic(text) {
     return s.slice(0, s.length - m[2].length) + String(v);
   } catch (e) {
     return text;
-  }
-}
-
-/**
- * 「完結篇 / FINAL / 最終季」系列的完結標記偵測。
- *
- * ★★ 為什麼需要集中成一個 helper ★★
- *
- * 實測 bug（使用者回報）：搜「零之使魔」season=4 時**只有樂子有結果**。
- *   暴風資源明明有「零之使魔FINAL」(2012，實際就是 S4) 卻被殺掉。
- *
- * 根因：整條鏈只有「完结篇/完結篇」一種完結標記被認得。
- *   站方對「最後一季」的寫法至少有四種：
- *     「零之使魔FINAL」「零之使魔 FINAL」（日文片常見寫法）
- *     「零之使魔最终季」「零之使魔最終季」
- *     「零之使魔完结篇」「零之使魔完結篇」
- *   前兩種落到 extractSequelNumber → null → 走「target 有 _expectedSequel、
- *   candidate 無序號」的分支 → reverseShapeMismatch → sequel_conflict → 殺掉。
- *
- * ★ 註解與實作曾經不一致：本函式的舊註解寫「完结篇/完結篇/最终季/最終季」，
- *   但程式碼只寫了前兩個。現在統一由這個 helper 提供，
- *   讓 extractSequelNumber / isSmartSeriesMatch / filterBySequel 三處一致。
- *
- * ★ 為什麼不直接讓 extractSequelNumber 對 FINAL 回某個數字：
- *   「最終季」**沒有固定季數**（S3 完結篇、S4 FINAL 都有），
- *   硬編成 2 或 4 都會錯。它只能是一個「有完結標記但序號未知」的旗標，
- *   具體序號要由呼叫端（target 的 _expectedSequel）決定。
- *   只有「完结篇/完結篇」例外 —— 那是 S2 的慣用替身（仁医完结篇），
- *   所以 extractSequelNumber 對它直接回 2。
- */
-function _hasFinaleMark(name) {
-  try {
-    const s = convertChinese(String(name ?? ''), true);
-    if (!s) return false;
-    // 「完结篇/完結篇」「最终季/最終季」「最終章/最终章」
-    // 「FINAL」（大小寫不拘，允許前後有空白）
-    // 「LAST SEASON」「LAST SEASON」「最终回」
-    return /完結篇|最终季|最終季|最終章|最终章|最終回|最后回/.test(s)
-        || /\bFINAL\b/i.test(s)
-        || /\bLAST\s*SEASONS?\b/i.test(s);
-  } catch (e) {
-    return false;
-  }
-}
-
-/**
- * 從片名中**移除**完結標記（FINAL / 最终季 / 完結篇 …）。
- *
- * 用途：比對「主片名」時，完結標記是**續集標記**不是作品名的一部分。
- *   「零之使魔FINAL」的主片名應該是「零之使魔」，不是「零之使魔final」。
- *   不剝掉的話，前綴規則會把「FINAL」當成「另一部片的多出尾巴」而殺掉
- *   （實測 bug：零之使魔 FINAL 對 S1 被判 title_prefix_conflict）。
- *
- * 與 _hasFinaleMark 配套：前者判「有沒有」，這個判「在哪、剝掉它」。
- */
-function _stripFinaleMark(name) {
-  try {
-    return convertChinese(String(name ?? ''), true)
-      .replace(/完結篇|最终季|最終季|最終章|最终章|最終回|最后回/g, '')
-      .replace(/\bFINAL\b/gi, '')
-      .replace(/\bLAST\s*SEASONS?\b/gi, '');
-  } catch (e) {
-    return String(name ?? '');
   }
 }
 
@@ -3598,19 +3515,15 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   // Forward 透過 season=第二季 表達要第 N 季），從 targetInfo._expectedSequel
   // 補。沒有 season 參數時這個欄位是 undefined，行為等同舊版。
   const targetSequel = extractSequelNumber(targetInfo.rawName) ?? targetInfo._expectedSequel ?? null;
-  // 候選序號：除了從檔名抓數字，也把「完結篇 / FINAL / 最終季」視為
+  // 候選序號：除了從檔名抓數字，也把「完结篇/完結篇/最终季/最終季」視為
   // 序號標記 —— 實機上「仁醫第二季」在電影天堂/非凡/樂子/愛蛋四個站的
   // 真實檔名都是「仁医完结篇」，沒有任何數字序號，只能靠這個副標題識別。
-  //
-  // ★★ v98：改用共用的 _hasFinaleMark，補上「FINAL」「最终季/最終季」
-  //   「最終章」「LAST SEASON」等寫法（見 helper 註解的實測 bug：
-  //   搜「零之使魔」season=4 只有樂子有結果，暴風的「零之使魔FINAL」被殺）。
   //
   // 條件：僅在 target 透過 season 明確指定第 N 季時才啟用。
   // 若 target 沒指定，候選「完结篇」可能是別的作品，不能硬塞 sequel。
   let candidateSequel = extractSequelNumber(candidateInfo.rawName);
   if (candidateSequel === null && targetInfo._expectedSequel &&
-      _hasFinaleMark(candidateInfo.rawName)) {
+      /完结篇|完結篇/.test(candidateInfo.rawName)) {
     candidateSequel = targetInfo._expectedSequel;
   }
   // ★ 序號 1 = 原版，不是續集。
@@ -3625,70 +3538,6 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   if (candidateSequel === 1) candidateSequel = null;
   // target 端同理：使用者輸入「庆余年1」時不應被當成有續集序號。
   const targetSequelNorm = targetSequel === 1 ? null : targetSequel;
-
-  // ★★ v98：把「季度標記」與「續集序號」分開 ★★
-  //
-  // extractSequelNumber 對「X季」也回數字（設計如此：站方常把後續季
-  // 命名成「仁医2」而不是「仁医第二季」，比對層需要序號來對齊）。
-  // 但兩者語意不同：
-  //   「仁医2」      → 續集序號 2（作品名的一部分，沒有「季」字）
-  //   「仁医第二季」  → 季度標記（第 2 季，同一部作品）
-  //
-  // 混為一談的後果（實測既有 bug）：
-  //   target「侦探已经死了 第二季」vs candidate「侦探已经死了。 第二季」
-  //     → 雙方序號都是 2，但 baseName 清理後不完全一致
-  //     → sequel_conflict → 明明是同一季卻被殺。
-  //
-  // ★★ 解法：雙方都用「季度對齊」來解析 ★★
-  //
-  //   當某一方的序號**只**來自季度標記時：
-  //     ・使用者明確要求第 N 季（_expectedSequel = N）
-  //     ・候選的季度標記正好是 N
-  //   → 雙方都視為序號 N → 對齊 → 命中。
-  //
-  //   其餘情況（「X季」但沒有明確季別意圖）→ 序號歸零，
-  //   季別交給 season 比對處理（因為「第二季」不代表另一部作品）。
-  const _SEASON_MARK_SRC = /第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季|[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季|[Ss]eason\s*[0-9]+|\b[Ss]\s*[0-9]+\b/;
-  const _onlySeasonNum = (raw, seq) => {
-    if (seq == null) return false;
-    // 去掉季度標記後，如果再也找不到任何數字 → 這個序號只來自季度標記。
-    const stripped = stripSeasonMarker(String(raw || '')).trim();
-    if (!stripped) return false;
-    const nums = [...stripped.matchAll(/(\d+)/g)].map((x) => parseInt(x[1], 10))
-      .filter((n) => n > 0 && n < 100);
-    if (nums.length) return false;
-    // 還有羅馬數字序號 → 不是只靠季度
-    if (/(^|[^\dIVX])([IVX]{2,4})(?=[^IVX]|$)/.test(stripped)) return false;
-    return _SEASON_MARK_SRC.test(String(raw || ''));
-  };
-
-  // 使用者明確要求的季別（season 參數 / _expectedSequel）。
-  const _wantedSeason = Number.isFinite(targetInfo._expectedSequel) && targetInfo._expectedSequel > 1
-    ? targetInfo._expectedSequel : null;
-
-  const _candSeasonOnly = _onlySeasonNum(candidateInfo.rawName, candidateSequel);
-  const _tgtSeasonOnly = _onlySeasonNum(targetInfo.rawName, targetSequelNorm);
-
-  let candidateSequelForCompare = candidateSequel;
-  if (_candSeasonOnly) {
-    // 候選的序號只來自季度標記（「侦探已经死了。 第二季」→ 2）。
-    // 若使用者明確要求第 N 季且候選季度正好是 N → 序號視為 N。
-    // 否則歸零（季別交給 season 比對處理）。
-    candidateSequelForCompare =
-      (_wantedSeason && candidateInfo.seasonNumber === _wantedSeason) ? _wantedSeason : null;
-  }
-  let targetSequelForCompare = targetSequelNorm;
-  if (_tgtSeasonOnly) {
-    // target 的序號只來自季度標記（「侦探已经死了 第二季」→ 2）。
-    // 同理對齊。
-    targetSequelForCompare =
-      (_wantedSeason && targetInfo.seasonNumber === _wantedSeason) ? _wantedSeason : null;
-  }
-  // ★ 雙方都是「季度歸零」時，序號視為對齊（都是 null）。
-  //   target「侦探已经死了」+season=2 vs candidate「侦探已经死了。 第二季」
-  //   → target 有 _expectedSequel=2 → candidate 對齊成 2 ✓
-  //   target「侦探已经死了 第二季」+season=2 vs candidate「… 第二季」
-  //   → 雙方都對齊成 2 ✓
 
   // ★★ v78.1：補上「反向」的序號形狀衝突。
   //
@@ -3706,15 +3555,13 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   //   補值只在 target 有 _expectedSequel 時才生效；這裡再放行一次，
   //   讓「target 有數字序號 + candidate 完结篇」也不被誤殺
   //   （例：target「仁医2」對 candidate「仁医完结篇」）。
-  const candidateIsFinaleMark = _hasFinaleMark(candidateInfo.rawName || '');
-  // ★ v98：序號衝突判斷改用**正規化後**的序號
-  //   （只來自季度標記的序號已歸零：targetSequelForCompare / candidateSequelForCompare）。
-  const targetHasSequel = targetSequelForCompare !== null && targetSequelForCompare >= 2;
+  const candidateIsFinaleMark = /完结篇|完結篇/.test(candidateInfo.rawName || '');
+  const targetHasSequel = targetSequelNorm !== null && targetSequelNorm >= 2;
   const reverseShapeMismatch = targetHasSequel &&
-    (candidateSequelForCompare === null) && !candidateIsFinaleMark;
-  const sequelShapeMismatch = (targetSequelForCompare === null) && (candidateSequelForCompare !== null);
+    (candidateSequel === null) && !candidateIsFinaleMark;
+  const sequelShapeMismatch = (targetSequelNorm === null) && (candidateSequel !== null);
   const sequelConflict = sequelShapeMismatch || reverseShapeMismatch ||
-    (targetSequelForCompare !== null && candidateSequelForCompare !== null && targetSequelForCompare !== candidateSequelForCompare);
+    (targetSequelNorm !== null && candidateSequel !== null && targetSequelNorm !== candidateSequel);
 
   // 季度衝突：使用者選第一季，候選卻是第二季，就不是他要的內容。
   //
@@ -3742,50 +3589,7 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       confidence: 0
     };
   }
-  // ★★ v98：季度衝突的判定準則 ★★
-  //
-  // 問題（實測，既有 bug）：搜「侦探已经死了」（裸名，season=1）時，
-  //   站方回傳的「侦探已经死了。 第二季」被這條規則判成 season_conflict
-  //   → 整條殺掉 → 使用者搜不到任何東西。
-  //   連 target 明確寫「第二季」對候選「第二季」也被殺（sequel_conflict）。
-  //
-  // 為什麼不能無條件判衝突：
-  //   「第二季」這個數字是**季度**，不是**續集序號**。extractSequelNumber
-  //   對「X季」也回數字（設計如此，因為站方常把後續季命名成「仁医2」），
-  //   但兩者語意不同：
-  //     「仁医2」     → 續集序號 2（沒有「第」字，是作品名的一部分）
-  //     「仁医第二季」 → 季度標記（第 2 季，同一部作品）
-  //   把它們混為一談 → 使用者要 S1 時連 S2 都被殺、要 S2 時連 S2 都被殺。
-  //
-  // ★★ v98 最終判準（雙方都要對得上）★★
-  //
-  //   情況 A：target 明確指定 season=N（N>1）
-  //     → 候選季度必須 == N，否則 season_conflict。
-  //   情況 B：target 是裸名（season=1，沒有明確季別意圖）
-  //     → 候選若**明確寫出**季度 M>1 → 那是後續季 → season_conflict
-  //       （實測：搜「无间道」S1 會混進「无间道第二季」「无间道第三季」；
-  //         搜「鬼灭之刃」S1 會混進「第二季(游郭篇)」「第三季(锻刀村篇)」）
-  //     → 候選沒寫季度（裸名）→ 視為 S1 → 放行
-  //
-  //   ★ 情況 B 的判斷關鍵是「候選**有沒有**明確寫季度」——
-  //     extractEnhancedInfo 的 seasonNumber 對裸名回 1，對「第二季」回 2。
-  //     但「第一季」也回 1 → 與裸名同義 → 不衝突 ✓
-  const _targetExplicitSeason = Number.isFinite(targetInfo.seasonNumber) && targetInfo.seasonNumber > 1;
-  // 候選是否「明確寫出」季度（裸名 vs 明寫季別要分得出來）
-  const _candExplicitSeason = /第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*[季部]|[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季|[Ss]eason\s*[0-9]+|\b[Ss]\s*[0-9]+\b/.test(candidateInfo.rawName || '');
-  if (_targetExplicitSeason) {
-    if (candidateInfo.seasonNumber !== 1 && candidateInfo.seasonNumber !== targetInfo.seasonNumber) {
-      return {
-        match: false, type: 'season_conflict', score: 0,
-        similarity: 0,
-        seasonMatch: false,
-        targetSeason: targetInfo.seasonNumber,
-        candidateSeason: candidateInfo.seasonNumber,
-        confidence: 0
-      };
-    }
-  } else if (_candExplicitSeason && candidateInfo.seasonNumber > 1) {
-    // ★ 裸名 target + 候選明寫後續季 → 不同季 → 殺。
+  if (candidateInfo.seasonNumber !== 1 && candidateInfo.seasonNumber !== targetInfo.seasonNumber) {
     return {
       match: false, type: 'season_conflict', score: 0,
       similarity: 0,
@@ -3843,14 +3647,12 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   //     - 「無間道長」→ 多出「長」（無標點）→ 另一部片 ✓
   //     - 「無間道風雲：解密風雲」→ 多出「風雲：解密風雲」（含「：」）→ 副標題 → 不擋 ✓
   //     - 「那些年，我們一起追過的女孩」→ 多出含「，」→ 副標題 → 不擋 ✓
-  if (targetSequelForCompare === null && candidateSequelForCompare === null) {
-    // ★★ v98：完結標記必須**全部**剝掉，否則會被誤判成「另一部片」。
-    //   舊寫法只剝「完结篇/完結篇」→ 「零之使魔FINAL」對「零之使魔」
-    //   多出的尾巴是「FINAL」（無標點）→ title_prefix_conflict → 殺掉。
-    //   （實測：零之使魔 FINAL 對 S1 也被殺，見 regression_finale.js）
-    const _tPrefix = normalizeTitleForMatch(stripSubtitle(_stripFinaleMark(targetInfo.baseName)))
+  if (targetSequelNorm === null && candidateSequel === null) {
+    const _tPrefix = normalizeTitleForMatch(stripSubtitle(targetInfo.baseName))
+      .replace(/完结篇|完結篇/g, '')
       .replace(/的|之/g, '');
-    const _cPrefix = normalizeTitleForMatch(stripSubtitle(_stripFinaleMark(candidateInfo.baseName)))
+    const _cPrefix = normalizeTitleForMatch(stripSubtitle(candidateInfo.baseName))
+      .replace(/完结篇|完結篇/g, '')
       .replace(/的|之/g, '');
     // candidate 嚴格以 target 開頭，且多出至少 1 個字
     if (_tPrefix && _cPrefix && _cPrefix.length > _tPrefix.length &&
@@ -3881,8 +3683,8 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   //
   //   只在「雙方序號相同且非 null」時啟用，避免誤殺：
   //   target 無序號的情況（使用者只打「海王」）不受影響。
-  if (targetSequelForCompare !== null && candidateSequelForCompare !== null &&
-      targetSequelForCompare === candidateSequelForCompare) {
+  if (targetSequelNorm !== null && candidateSequel !== null &&
+      targetSequelNorm === candidateSequel) {
     // ★ v92：序號要去掉「阿拉伯數字」**和「羅馬數字」**兩種寫法。
     //
     //   問題：使用者輸入「無間道II」、站方檔名「无间道2」→
@@ -3890,20 +3692,9 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     //     coreOf(candidate) = 「無間道」
     //     → 不相等 → 誤判 sequel_conflict → 整條被殺 → 使用者看到 0 筆。
     //   這是「同一個序號的兩種寫法」，語意上完全相同。
-    // ★ v98：完結標記也要剝掉（FINAL / 最终季 …），理由同上方
-    //   「序號相同但主片名不同」那段註解。
-    //
-    // ★★ v98：尾端標點也要剝掉 ★★
-    //   實測 bug（A5/A9）：「侦探已经死了」對「侦探已经死了。 第二季」
-    //   站方檔名帶句點 → baseName 保留「。」→ coreOf 不相等 →
-    //   sequel_conflict → 明明是同一季卻被殺。
-    //   句點是**裝飾性標點**，不影響作品識別 → 比對時必須忽略。
     const coreOf = (s) => stripFiller(
-      normalizeTitleForMatch(_stripFinaleMark(stripSubtitle(s)))
-    )
-      .replace(/[。．、；：！？「」『』《》〈〉（）【】〔〕｛｝［］…—–－.,;:!?"'`´ˆ˜¦§¶‐‑‒—―\s]+$/g, '')
-      .replace(/^\s+/, '')
-      .replace(/\d+$/, '').replace(/[ivx]{1,4}$/, '');
+      normalizeTitleForMatch(stripSubtitle(s)).replace(/完结篇|完結篇/g, '')
+    ).replace(/\d+$/, '').replace(/[ivx]{1,4}$/, '');
     const targetCoreSeq = coreOf(targetInfo.baseName);
     const candidateCoreSeq = coreOf(candidateInfo.baseName);
     if (targetCoreSeq && candidateCoreSeq && targetCoreSeq !== candidateCoreSeq) {
@@ -3971,13 +3762,11 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     // 序號則相反 —— 它是區別作品的關鍵，絕不可從主片名中剔除。
     let targetCore = normalizeTitleForMatch(stripSubtitle(targetInfo.baseName));
     let candidateCore = normalizeTitleForMatch(stripSubtitle(candidateInfo.baseName));
-    // 「完结篇/完結篇」「FINAL」「最终季」是續集標記，比對主片名時應去除，
-    // 否則「仁医」跟「仁医完结篇」、「零之使魔」跟「零之使魔FINAL」
-    // 會被當成 baseName 不一致而拒絕。
-    targetCore = _stripFinaleMark(targetCore);
-    candidateCore = _stripFinaleMark(candidateCore);
-    // ★ v98：用正規化後的序號（只來自季度標記的序號已歸零）。
-    const sameSequel = targetSequelForCompare === candidateSequelForCompare;
+    // 「完结篇/完結篇」是續集標記，比對主片名時應去除，否則「仁医」跟
+    // 「仁医完结篇」會被當成 baseName 不一致而拒絕。
+    targetCore = targetCore.replace(/完结篇|完結篇/g, '');
+    candidateCore = candidateCore.replace(/完结篇|完結篇/g, '');
+    const sameSequel = targetSequel === candidateSequel;
 
     // 互補情境：target 是「仁医」+ sequel=2，candidate 是「仁医2」+ sequel=2，
     // 兩者 baseName 一個有 2 一個沒 2，但實際是同一部片。去除尾端單一數字
@@ -4006,18 +3795,14 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     // targetSequel = 2、candidateSequel = null，sameSequel 是 false，
     // fallback 也會拒絕。
     //
-    // 解法：把「完结篇/完結篇」「FINAL」「最终季」字樣視為 sequel = target._expectedSequel。
-    //
-    // ★ v98：原本只認「完结篇/完結篇」，漏了「FINAL」「最终季」等寫法
-    //   → 實測 bug：搜「零之使魔」season=4 只有樂子有結果，
-    //   暴風的「零之使魔FINAL」(2012，實際就是 S4) 被 sequel_conflict 殺掉。
-    const targetIsFinale = _hasFinaleMark(targetInfo.rawName);
-    const candidateIsFinale = _hasFinaleMark(candidateInfo.rawName);
+    // 解法：把「完结篇/完結篇」字樣視為 sequel = target._expectedSequel。
+    const targetIsFinale = /完结篇|完結篇/.test(targetInfo.rawName);
+    const candidateIsFinale = /完结篇|完結篇/.test(candidateInfo.rawName);
     const finaleMatches = targetIsFinale === candidateIsFinale; // 兩者都沒有/都有才算對稱
     const expectedSequel = targetInfo._expectedSequel;
     const sequelCompatible = sameSequel ||
       (expectedSequel &&
-              ((candidateIsFinale && candidateSequelForCompare === null) ||
+              ((candidateIsFinale && candidateSequel === null) ||
                (targetIsFinale && targetSequel === null)));
 
     // ★★ v78.1：修掉「無序號逃逸門」讓序號衝突的候選混進來。
@@ -4066,15 +3851,15 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
         //   因此這裡額外要求「候選序號與 target 序號一致且非空」，
         //   才視為同一部片的副標題。
         const candidateCoreForSub = normalizeTitleForMatch(
-          _stripFinaleMark(stripSubtitle(candidateInfo.baseName))
+          stripSubtitle(candidateInfo.baseName).replace(/完结篇|完結篇/g, '')
         );
         const targetCoreForSub = normalizeTitleForMatch(
-          _stripFinaleMark(stripSubtitle(targetInfo.baseName))
+          stripSubtitle(targetInfo.baseName).replace(/完结篇|完結篇/g, '')
         );
         const sameWorkWithSubtitle =
           candidateCoreForSub === targetCoreForSub &&
-          targetSequelForCompare !== null && candidateSequelForCompare !== null &&
-          targetSequelForCompare === candidateSequelForCompare;
+          targetSequelNorm !== null && candidateSequel !== null &&
+          targetSequelNorm === candidateSequel;
 
         if (!sameWorkWithSubtitle) {
           return {
@@ -13888,29 +13673,6 @@ function filterBySequel(results, targetInfo) {
         if (sq !== targetSeq) { dropped.push(res); continue; }
         kept.push(res); continue;
       }
-      // ★★ v98：候選帶完結標記（FINAL / 最终季 / 完結篇）→ 是續集，不能進 S1。
-      //   舊寫法只靠 extractSequelNumber，而「完结篇」回 2 會被殺、
-      //   「FINAL」「最终季」回 null 卻會被當成 S1 放行 —— 兩者不一致。
-      //   使用者要 S1 卻拿到「零之使魔FINAL」(實際 S4) 是明顯錯誤。
-      if (_hasFinaleMark(nm)) { dropped.push(res); continue; }
-      // ★★ v98：區分「續集序號」與「季度標記」，並各自正確處理 ★★
-      //
-      //   extractSequelNumber 對「X季」也回數字（設計如此：站方常把後續季
-      //   命名成「仁医2」而不是「仁医第二季」，比對層需要序號）。
-      //   但「侦探已经死了。 第二季」這種**明寫季度**的候選，
-      //   序號 2 來自「第二季」而不是「2」→ 它是同一部作品的第二季。
-      //
-      //   ★ S1 分支要殺的是「**另一季的內容**」，兩種寫法都要殺：
-      //     「无间道第二季」      → 季度標記 2 → 殺（使用者要 S1）
-      //     「无间道2」           → 續集序號 2 → 殺（同上）
-      //   ★ v98 之前的舊邏輯（`sq > 1 就殺`）把兩種都殺了 —— 對 S1 正確，
-      //     但同一條規則也用在 S2+ 分支時會誤殺「第二季」的正確候選
-      //     （既有 bug：F2 測項「裸名 target + S2 候選」被殺）。
-      //
-      //   所以這裡用 seasonNumber（季度）而不是序號來判：
-      //   候選明確寫出「第 N 季」且 N > 1 → 是後續季 → S1 不能要 → 殺。
-      const _candSeasonNo = extractEnhancedInfo(nm, {}).seasonNumber;
-      if (_candSeasonNo > 1) { dropped.push(res); continue; }
       if (sq !== null && sq > 1) { dropped.push(res); continue; }
       kept.push(res);
     }
@@ -14030,7 +13792,7 @@ function filterBySequel(results, targetInfo) {
     const targetSeq = extractSequelNumber(targetInfo?.rawName || '');
     if (Number.isFinite(targetSeq) && targetSeq >= 2 && rawName) {
       const coreOfName = (s) => normalizeTitleForMatch(
-        _stripFinaleMark(stripSubtitle(String(s)))
+        stripSubtitle(String(s)).replace(/完结篇|完結篇/g, '')
       ).replace(/的|之/g, '').replace(/\d+$/, '');
       const tCore = coreOfName(targetInfo?.rawName || '');
       const cCore = coreOfName(rawName);
@@ -14040,21 +13802,6 @@ function filterBySequel(results, targetInfo) {
     }
 
     if (sequel === targetSeason) { kept.push(res); continue; }
-
-    // ★★ v98：候選用**季度字樣**標示第 N 季（而非數字序號）→ 也要能對上 ★★
-    //
-    //   實測 bug（F2）：使用者要 S2，站方回「五等分的新娘 第二季」
-    //   → extractSequelNumber 回 2 → 規則 1（sequel===targetSeason）本來就會 keep。
-    //   但「零之使魔第二季」這類「N季」寫法的 **extractSequelNumber 也回 2**，
-    //   同樣能 keep。真正會漏的是「第二季」在某些路徑被當成 null 的情況。
-    //
-    //   ★ 保險起見：用 seasonNumber 再比一次 —— 候選明確寫「第 N 季」且
-    //   N === targetSeason → keep（不管序號解析成什麼）。
-    //   候選明確寫「第 N 季」且 N !== targetSeason → 已被下面的規則 X 殺掉。
-    const _candSeasonNo = extractEnhancedInfo(rawName, {}).seasonNumber;
-    if (_candSeasonNo === targetSeason && targetSeason > 1) {
-      kept.push(res); continue;
-    }
 
   // 規則 X：candidate 的 sequel 明確標示為其他季，無條件 drop。
   //
@@ -14092,30 +13839,6 @@ function filterBySequel(results, targetInfo) {
     // 現在 S1 描述中當成描述語（較罕見），與「全集」一樣要小心。保守只留「篇」。
     if (/完结篇|完結篇/.test(rawName) && sequel === null) {
       kept.push(res); continue;
-    }
-
-    // ★★ v98：完結標記（FINAL / 最终季 / 最終章）的候選怎麼處理 ★★
-    //
-    // 實測 bug：搜「零之使魔」season=4 只有樂子有結果，
-    //   暴風的「零之使魔FINAL」(2012) 被殺掉 —— 因為它的 sequel=null，
-    //   走不到上面的「完結篇」規則，也走不到規則 1（sequel===targetSeason）。
-    //
-    // 「最終季」的序號是**未知**的（可能是 S3 也可能是 S4），
-    // 不能硬編成某個數字。判準只能用「年份」：
-    //   候選年份 >= 命中群最早年份 → 可能是本季或後續季 → 放行
-    //   候選年份 <  命中群最早年份 → 是更早的季 → 殺
-    //
-    // 為什麼對 S4 安全：命中群裡通常有明確標「4」的條目（如「零之使魔4」，
-    //   2012），pooledYearMin=2012；「零之使魔FINAL」年份 2012 → 不早於 →
-    //   放行 ✓。而 S1/S2/S3 的 FINAL 候選年份更早 → 被殺 ✓。
-    //
-    // 沒有 pooledYearMin（站方全回 sequel=null）時不放行 —— 沒有年份依據，
-    // 寧可讓下游 season 比對處理，也不要放寬。
-    if (sequel === null && _hasFinaleMark(rawName) && pooledYearMin !== null) {
-      const candYear = yearOf(res);
-      if (candYear && candYear >= pooledYearMin) {
-        kept.push(res); continue;
-      }
     }
 
     // 片名沒寫季、vod_year 比命中群最早年還要早 1 年以上 → 上一季嫌疑
@@ -15169,13 +14892,6 @@ targetInfo.searchQuery = aliasQ;
               hasSequelHit = true;
               break;
             }
-            // ★ v98：「FINAL」「最终季」也是 sequel 標記，且序號未知。
-            //   當站方有這種寫法時，代表站方確實有「目標季」的條目 → 不需要
-            //   再去撈副標題版本。
-            if (_hasFinaleMark(it.vod_name || '')) {
-              hasSequelHit = true;
-              break;
-            }
           }
           if (!hasSequelHit) {
             subtitledResult = findSubtitledSequels(
@@ -15283,16 +14999,11 @@ targetInfo.searchQuery = aliasQ;
               continue;
             }
           }
-          // 「完结篇 / 完結篇」「FINAL」「最终季」是續集（第二季或最終季）的
-          // 常見副標題，例如「仁醫完結篇」（仁醫第二季，2011）、
-          // 「零之使魔FINAL」（零之使魔最終季 = S4）。
+          // 「完结篇 / 完結篇」是日劇續集（第二季或最終季）的常見副標題，
+          // 例如「仁醫完結篇」（仁醫第二季，2011）。
           // 當目標明確要某一季時，這類候選不可能是本季本體，跳過避免誤推。
-          //
-          // ★ v98：補上「FINAL」「最終章」等寫法（原本只認「完結篇」與
-          //   「最終季」，漏了站方最常見的英文寫法「FINAL」）。
           if (targetInfo.seasonNumber === 1 &&
-              (/完结篇|完結篇|最終季|最终季|第二季|最終章|终章/.test(item.vod_name)
-               || /\bFINAL\b/i.test(item.vod_name || ''))) {
+              /完结篇|完結篇|最終季|最终季|第二季|最終章|终章/.test(item.vod_name)) {
             continue;
           }
           // 番外型副標題：「特別篇 / 特别篇」、「OVA」、「劇場版 / 剧场版」、
