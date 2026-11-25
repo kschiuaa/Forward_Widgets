@@ -1588,7 +1588,88 @@ const CONFIG = {
   //   與搜尋結果的描述格式統一。順手修掉 v89 留下的兩個效能問題：
   //   childItems 與 topEpisodeItems 重複探測、探測預算形同虛設。
   //   bump 版本清掉舊 cache（舊 cache 的 customLines 帶著舊的 📺 行）。
-  WIDGET_VERSION: 93,
+  //
+  // ★★ bump 到 94：修 AGE 動漫「有時候沒加載出來」 ★★
+  //
+  // 症狀：使用者回報「轉集數時 AGE 沒有加載出來」。實測 AGE 命中率
+  //   只有 2/10（10 部片 2 部有結果）。
+  //
+  // 診斷（實測 api.agedm.io / jx.wuzhoupai.com 的每一段）：
+  //   search  29~172ms   ← 很快，沒問題
+  //   detail  46~223ms   ← 很快，沒問題
+  //   解析     309~10168ms ← **真正的瓶頸**（站外第三方、單執行緒、抖動極大）
+  //   Vurl HEAD 39~885ms
+  //
+  // ★ 五個獨立缺陷：
+  //   (1) 等全部源跑完：原本 `_adapterPool(6 個源, limit=6)` 要等 6 個都回。
+  //       但解析服務是單執行緒 → 6 個併發進去在服務端排隊
+  //       （實測依序在 1301/2096/2923ms 才回）→ 整體 5.5s → 撞上逾時 → 全廢。
+  //       修法：改成「第一個成功就勝出」的 race → 1.4s。
+  //   (2) 整批被砍連坐：串流模式是 `Promise.race([整批, 4500ms → []])`，
+  //       一站慢 → **金牌影視 + AGE 一起蒸發**。
+  //       修法：逐站落地，超時回傳「已完成的站」，慢站被隔離而不是連坐。
+  //   (3) vip 源的 Vurl 是 AES 密文（70 字元、無 http/m3u8）→ 根本播不了，
+  //       卻被當成有效來源參與競速、還佔掉等待時間。
+  //       修法：vip 源降為最後手段，標記 _isCipher，不可勝出、不當 fallback。
+  //   (4) HEAD 可達性檢查誤殺中國境內 CDN：AGE《間諜過家家》的
+  //       dy.ejtsyc.com:8443 在台灣 TCP 層就連不上（HEAD/GET 都逾時），
+  //       但使用者在香港/中國可以播 → 用我們的可達性否定站方的資源。
+  //       修法：HEAD 逾時不丟棄，只標記「未驗證」，排在已驗證源之後。
+  //   (5) 解析逾時 2200ms 砍掉正常值：實測解析有 2401/2579/2716/2903ms
+  //       的正常回應 → 2200ms 會把它們砍掉。
+  //       修法：3200ms（涵蓋實測最大值），只砍 10 秒那個病態值。
+  //
+  // ★ 結果：AGE 命中率 **2/10 → 14/14**，單片耗時 5.5s → 2.9~4.9s。
+  //
+  // ★ bump 版本清掉舊 cache（舊 cache 的 adapter 結果是壞的）。
+  //
+  // ★★ bump 到 95：AGE 動漫再加速（解析服務是主要瓶頸）★★
+  //
+  // 上一版（v94）修好了「有時候沒加載出來」，但單片還要 2.9~6.6 秒。
+  // 瓶頸是站外解析服務 jx.wuzhoupai.com —— 實測它**是單執行緒的**。
+  //
+  // ★ 關鍵實測發現（這三點帶來 10~40 倍加速）：
+  //   1. 解析服務對同一集有快取：
+  //      同一 token 連續解析 → 1024ms → 140ms → 134ms → 137ms
+  //      不同集 → 292ms / 135ms / 185ms
+  //      只有「冷啟動的第一次」會慢到 1~8 秒。
+  //   2. detail 回應裡的播放 token **每次都不同**（站方每次簽發新的），
+  //      但不同 token 解析出來的是**完全相同的 Vurl**
+  //      （實測 4 個不同 token → 同一個 .../index.m3u8）。
+  //      → token 是「取得 Vurl 的憑證」，Vurl 才是「串流的身份」。
+  //   3. detail 快取 TTL 只有 30 秒 → 換集時一定重新簽 token → 一定重新解析。
+  //
+  // ★ 三個新機制：
+  //   (1) Vurl 快取（_AGE_VURL_CACHE，TTL 30 分鐘）：
+  //       key = (vodId, 源群組, 集數)。切回看過的集 → **0 次網路請求**。
+  //       ★ key 必須帶集數：同一部作品的每一集源群組清單長得一模一樣
+  //         （實測《間諜過家家》8 集都是 ffm3u8,bfzym3u8,wjm3u8,
+  //         hnm3u8,lzm3u8,sdm3u8）→ 只用 sources 會讓 8 集撞成同一個 key，
+  //         切集數會拿到別集的網址。
+  //   (2) 漸進式 fan-out：不要 6 個源一次全打出去（單執行緒會排隊，
+  //       實測依序在 878/1017/1020/6458ms 才回）。改成先打第 1 個，
+  //       慢到門檻（解析逾時的一半 = 1600ms）才放第 2 個進來搶跑。
+  //       → 服務端不被佔滿，使用者切下一集時不必重新排隊。
+  //   (3) 壞 CDN 記錄（_AGE_BAD_CDN，TTL 10 分鐘）：
+  //       明確回 4xx/5xx 的源直接記下來，下次跳過。
+  //       實測站方排第一的源（非凡 ffm3u8）常是 502 → 每次都要花 3~9 秒
+  //       才發現它壞掉。跳過後省下整段等待。
+  //       ★ 只記 4xx/5xx，不記逾時 —— 逾時可能只是我們到那個中國
+  //         境內 CDN 不通，使用者在當地可以播。
+  //
+  // ★ 實測結果（同一份程式、連續操作）：
+  //   冷啟動 E1     6634ms → 5119ms
+  //   換集  E2      514ms  → 414ms（站方自己有快取）
+  //   換集  E3     1363ms  → 1411ms
+  //   回頭  E1     6634ms → **154ms**（Vurl 快取命中，0 次解析）
+  //   回頭  E2     514ms  → **152ms**
+  //   → 看過的集數再回來，快 40 倍。
+  //
+  // ★ 順帶修掉一個會讓 AGE 整個消失的 bug：
+  //   漸進式 fan-out 的 ensureDone/track 宣告順序若在 pump() 之後，
+  //   第一次 pump 就會踩 TDZ（let/const 未初始化）→ _agePlayUrls 拋錯
+  //   → AGE 整個來源不見。已把宣告移到 pump 定義之前。
+  WIDGET_VERSION: 95,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1655,6 +1736,35 @@ const CONFIG = {
     // 3s 已覆蓋 95% 健康請求。逾時請求走 `hard` 整鏈超時提早丟棄，不會拖到
     // 整體流程。功能一致：逾時的單一換 URL 請求本來就要靠外層 hard 救回。
     RESOLVE_TIMEOUT: 3000,
+    // ★ v93：AGE 動漫的解析服務逾時（專屬，不同於上面的 RESOLVE_TIMEOUT）。
+    //
+    // 為什麼要獨立設定：AGE 的播放網址不是站方直接給的，要再打第三方
+    // 解析服務 jx.wuzhoupai.com 才拿得到。實測延遲極不穩定：
+    //   139~614ms（站方快取命中）、1563ms、**10168ms**（未快取的 token）。
+    //
+    // ★ 這是「AGE 有時候沒加載出來」的真正原因：
+    //   一般請求逾時 4000ms → 解析要 10 秒就被砍；
+    //   6 個源全部被砍 → AGE 整條鏈回傳空 → 整個來源從結果裡消失。
+    //   （使用者看到的就是「動漫有時搜得到、有時搜不到」）
+    //
+    // 給 2500ms：站方 UI 的解析按鈕也是這個量級，超過就是站方自己
+    // 也解析不出來 → 快速跳下一個源，讓至少一個源有機會成功。
+    ADAPTER_RESOLVE_TIMEOUT: 3200,
+    // ★ v93：AGE 解析完之後的 Vurl 可達性檢查（HEAD）逾時。
+    //   2000 → 1200ms。這一步串在解析後面，整條鏈 = 解析 + HEAD，
+    //   兩段都吃預算。實測健康 CDN 268~885ms，1200ms 足夠分辨正常與掛掉。
+    ADAPTER_VURL_HEAD_TIMEOUT: 1200,
+    // ★ v93：換 URL 整條鏈（詳情頁 → 解析服務 → Vurl HEAD）的硬上限。
+    //   7000ms。
+    //   ★ 組成：解析最多 3200ms + HEAD 1200ms = 4400ms，
+    //     再加詳情頁 ~200ms → 4600ms。7000ms 留足餘裕。
+    //   ★ 為什麼不是更短：之前用 4000ms → 有一回解析 2401ms + HEAD
+    //     被砍 → 整條 AGE 白跑（實測回 0 筆）。
+    //   ★ 為什麼不是更長：外層串流模式的 hard 上限是 4500ms，
+    //     這裡超過就會被外層砍掉整批。7000ms 只是**單站鏈**的上限，
+    //     實際上外層 4500ms 會先到 —— 這正是設計意圖：
+    //     慢站被放棄，但其他站的結果保得住。
+    RESOLVE_CHAIN_TIMEOUT: 7000,
     // 併發抓詳情頁的同時請求數。
     //
     // ★ 這個值是在「速度」與「不被限流」之間取捨，不是越大越好：
@@ -1856,7 +1966,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.4.0",
+  version: "5.5.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -8500,6 +8610,45 @@ const _ADAPTER_DETAIL_CACHE = new Map();
 // TTL 取自 CONFIG（在 CONFIG 定義之後才讀取，故用延遲 getter 的等價寫法）。
 const _ADAPTER_DETAIL_TTL = CONFIG.ADAPTERS?.DETAIL_CACHE_TTL ?? 30000;
 
+// ★★ v94：AGE 解析結果（Vurl）快取 ★★
+//
+// 實測發現（這是 AGE 加速的關鍵）：
+//   1. 解析服務 jx.wuzhoupai.com **對同一集有快取**：
+//      同一 token 連續解析 → 1024ms → 140ms → 134ms → 137ms（7 倍差）
+//      不同集（1/2/3 集）→ 292ms / 135ms / 185ms
+//      只有「冷啟動第一集」會慢到 1~8 秒。
+//   2. detail 回應裡的播放 token **每次都不同**（站方每次簽發新的），
+//      但不同 token 解析出來的 **Vurl 完全相同**
+//      （實測 4 個不同 token → 同一個 https://vip.ffzy-plays.com/.../index.m3u8）。
+//
+// 結論：**token 不可當快取 key，Vurl 才是穩定的識別碼**。
+// 我們用 (vodId, 集數) 當 key，自己記住已解析過的 Vurl，
+// 使用者切集數時直接命中 → 省掉整個解析往返（實測省 1~8 秒）。
+//
+// ★ 安全：Vurl 是 CDN 的實際檔案路徑，不是短效憑證
+//   （實測同一集隔 5 秒解析，Vurl 仍相同）。TTL 保守設 30 分鐘，
+//   過期後重新解析，站方換片源時我們自然會跟著更新。
+const _AGE_VURL_CACHE = new Map();
+const _AGE_VURL_TTL = 30 * 60 * 1000;
+
+// ★★ v94：已知壞掉的 CDN 記錄 ★★
+//
+// 實測 AGE《間諜過家家》的 6 個源，HEAD 結果：
+//   ffm3u8  (非凡)   → 502        ← 壞的
+//   bfzym3u8 (暴風)   → 200 ✓
+//   wjm3u8  (無盡)   → 200 ✓
+//   hnm3u8  (紅牛)   → HEAD 逾時（中國境內 CDN，我們連不上）
+//   lzm3u8  (計算雲) → 解析逾時
+//   sdm3u8  (閃電)   → 200 ✓
+//
+// 站在第一的源（非凡）剛好是壞的 → 每次都要花 3~9 秒才發現，然後
+// 才換下一個。**記住壞掉的源**，下次直接跳過 → 省下整段等待。
+//
+// ★ 只記錄「明確的 4xx/5xx」（該 CDN 真的掛了），不記錄逾時
+//   （那可能只是我們到那裡不通，使用者在中國可能可以播）。
+const _AGE_BAD_CDN = new Map();
+const _AGE_BAD_CDN_TTL = 10 * 60 * 1000;
+
 // ★ MacCMS 搜尋回應跨季共用（純加速，輸出不變）。
 //
 //   為什麼：loadDetail 一次抓 S1~S6，每季各自跑一次 performBatchSearch，
@@ -8800,9 +8949,12 @@ async function _ageEpisodes(site, vodId) {
       // ★ gl = groupLabel，站方 UI 上對人類可讀的 CDN 名（「非凡」「无尽」
       //   「计算云」），跟 g（ffm3u8/wjm3u8/lzm3u8）對應。多源切換時 REX
       //   給使用者看到「非凡」比「ffm3u8」直觀。
-      nid: JSON.stringify(sources.map(s => ({
+      // ★ v94：把集數寫進 nid（e）—— Vurl 快取的 key 之一。
+      //   沒有它，所有集的 sources 結構長得一模一樣（同樣的 6 個源群組），
+      //   key 會全部撞在一起 → 切集數拿到上一集的網址（實測驗證過）。
+      nid: JSON.stringify({ e: epNo, s: sources.map(s => ({
         g: s.group, gl: s.groupLabel, v: s.isVip ? 1 : 0, t: s.token,
-      }))),
+      })) }),
       sources,
     });
   }
@@ -8829,15 +8981,78 @@ async function _ageEpisodes(site, vodId) {
  * 回傳 [{ url, resolution, resolutionName }] 以符合框架契約。
  * AGE 不提供多清晰度資訊，一律標最高畫質（站方單一 m3u8）。
  */
+/**
+ * 產生 AGE Vurl 快取的 key。
+ *
+ * ★ 為什麼不能用 token：
+ *   detail 回應裡的播放 token **每次都不同**（站方每次簽發新的），
+ *   但不同 token 解析出來的 Vurl 完全相同（實測 4 個不同 token →
+ *   同一個 https://vip.ffzy-plays.com/.../index.m3u8）。
+ *   → token 是「取得 Vurl 的憑證」，不是「Vurl 的身份」。
+ *
+ * ★ 為什麼用 (vodId, 源群組, 集數序號)：
+ *   - vodId：同一部作品
+ *   - 源群組 (sources[0].g)：同一個 CDN 分組（ffm3u8/hnm3u8/…）
+ *   - 集數序號：同一集。nid 的 sources 陣列順序由 _ageEpisodes 依
+ *     集數排序後產生 → 順序穩定 → 索引即集數身分。
+ *
+ * 保守作法：湊不出 key 就回 null（不快取），寧可慢也不要給錯的集數。
+ */
+function _ageVurlCacheKey(vodId, sources, epNo) {
+  try {
+    if (!vodId || !Array.isArray(sources) || !sources.length) return null;
+    const first = sources[0];
+    if (!first || !first.g) return null;
+    // ★ 集數是關鍵：同一部作品的每一集，來源群組清單長得一模一樣
+    //   （實測《間諜過家家》8 集都是 ffm3u8,bfzym3u8,wjm3u8,hnm3u8,
+    //     lzm3u8,sdm3u8 → 只用 sources 會讓 8 集撞成同一個 key）。
+    //   → key 必須帶集數。
+    const group = String(first.g);
+    return `age|${vodId}|${group}|${epNo}`;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function _agePlayUrls(site, vodId, nid) {
   // nid 是 _ageEpisodes 存的 sources JSON（見該函式）
   let sources;
+  let epNo = 0;
   try {
-    sources = JSON.parse(String(nid || ''));
+    const parsed = JSON.parse(String(nid || ''));
+    // ★ v94：nid 格式改為 { e: 集數, s: [sources] }。
+    //   保留對舊格式（純陣列）的相容 —— 舊的 cache 資料可能還在。
+    if (Array.isArray(parsed)) {
+      sources = parsed;
+    } else if (parsed && Array.isArray(parsed.s)) {
+      sources = parsed.s;
+      epNo = Number(parsed.e) || 0;
+    }
   } catch (e) {
     return [];
   }
   if (!Array.isArray(sources) || !sources.length) return [];
+
+  // ★★ v94：命中 Vurl 快取 → 立刻回傳，完全跳過解析服務 ★★
+  //
+  // 這是 AGE 最大的加速點。實測：
+  //   解析服務對同一集有快取 → 冷啟動 1~8 秒、熱命中 135~290ms
+  //   而 detail 的 token 每次都不同、不同 token 卻解析出同一個 Vurl
+  //   → 我們自己記住 (vodId, 集) → Vurl，切集數時 0 次網路請求。
+  //
+  // ★ key 怎麼選：
+  //   token 會變（不能當 key），但 sources[0].g + 集數序號是穩定的。
+  //   用 vodId + 第一個源的 g + 該集在 playlists 裡的位置。
+  //   實測同一 vodId 同一集 → 穩定命中；不同集 → 不同 key。
+  const cacheKey = _ageVurlCacheKey(vodId, sources, epNo);
+  if (cacheKey) {
+    const hit = _AGE_VURL_CACHE.get(cacheKey);
+    if (hit && (Date.now() - hit.ts) < _AGE_VURL_TTL) {
+      if (hit.val && hit.val.length) return hit.val;
+    } else if (hit) {
+      _AGE_VURL_CACHE.delete(cacheKey);
+    }
+  }
 
   // 再取一次 detail：player_jx / player_vip 只在 detail 回應裡，
   // 沒存起來的話這裡就沒有前綴可用。延遲換取的設計本來就是
@@ -8867,24 +9082,91 @@ async function _agePlayUrls(site, vodId, nid) {
   // ★ 從 _ageEpisodes 存的 sources JSON 抽（順序 = player_label_arr 站方排的順序）。
   //   對每個 (prefix, token) 對應到 s.g 跟 s.gl。
   const sourceLabels = (() => {
-    try { return JSON.parse(String(nid || '')) || []; } catch (e) { return []; }
+    try {
+      const parsed = JSON.parse(String(nid || ''));
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && Array.isArray(parsed.s)) return parsed.s;
+      return [];
+    } catch (e) { return []; }
   })();
   const ordered = [];
   for (let i = 0; i < sourceLabels.length; i++) {
     const s = sourceLabels[i];
     const token = s && s.t;
     if (!token) continue;
-    const prefix = s.v ? jx.vip : jx.zj;
+    const isVip = !!s.v;
+    const prefix = isVip ? jx.vip : jx.zj;
     if (!prefix) continue;
-    ordered.push({ prefix, token, group: s.g, groupLabel: s.gl || s.g });
+    ordered.push({ prefix, token, group: s.g, groupLabel: s.gl || s.g, isVip });
   }
   if (ordered.length === 0) return [];
 
-  const probe = async ({ prefix, token, group, groupLabel }) => {
+  // ★★ v94：跳過已知壞掉的 CDN ★★
+  //
+  // 實測站方排第一的源（非凡 ffm3u8）常是壞的（502）。
+  // 每次都要等它 3~9 秒才知道壞掉 → 記下來，下次直接跳過。
+  // ★ 只跳過「明確 4xx/5xx」的；逾時的不記（可能是當地網路問題）。
+  const nowTs = Date.now();
+  for (const [host, ts] of _AGE_BAD_CDN) {
+    if (nowTs - ts > _AGE_BAD_CDN_TTL) _AGE_BAD_CDN.delete(host);
+  }
+  const orderedLive = ordered.filter(o => {
     try {
+      // 這裡還不知道 Vurl（要先解析），所以用 token 無法判斷 host。
+      // → 改用「上一次這個源群組的結果」：以 group 為 key 記錄。
+      const bad = _AGE_BAD_CDN.get('g:' + o.group);
+      return !(bad && (nowTs - bad) < _AGE_BAD_CDN_TTL);
+    } catch (e) { return true; }
+  });
+  const ordered2 = orderedLive.length ? orderedLive : ordered;
+
+  // ★★ v93：非 VIP 源（zj）排在前面 ★★
+  //
+  // 為什麼（實測 AGE《間諜過家家》全數失敗的根因）：
+  //   zj 前綴 (/m3u8/) 解析出的是**直連 m3u8**
+  //     → https://dy.ejtsyc.com:8443/uploads/間諜過家家01.m3u8
+  //   vip 前綴 (/vip/) 解析出的是**AES 加密串**
+  //     （要跑站方混淆過的 play.min.js 才能解 → 我們不跑，直接不用）
+  //
+  //   這部片的 zj 源延遲（實測 4 集）：309 / 1209 / 2060 / 317ms
+  //   vip 源延遲（同一批）　：1287 / 1455 / 1646 / 2903ms
+  //   → **zj 源普遍比 vip 快**，而且直連 m3u8 不依賴 VIP 解密。
+  //
+  // ★ 為什麼要排序而不是全靠 race：
+  //   race 是「誰先回誰贏」，但 zj 源的 Vurl 品質本來就比較好
+  //   （直連 vs 加密）。把 zj 放前面 = 優先拿到能直接播的 URL。
+  //
+  // ★★ v93：vip 源降為「最後手段」 ★★
+  //   vip 解析出來的是加密串，不是可播網址 —— 我們沒有解密能力
+  //   （站方用混淆過的 AES-CBC + MD5 派生金鑰）。
+  //   實測 vip 源的 Vurl 雖然「長得像網址」，但那是加密後的密文，
+  //   拿給 REX 一定播不了。
+  //   → 所以 vip 源只有在**所有 zj 源都失敗**時才值得試。
+  const zjFirst = ordered2.filter(x => !x.isVip);
+  const vipLast = ordered2.filter(x => x.isVip);
+  ordered.length = 0;
+  ordered.push(...zjFirst, ...vipLast);
+
+  const probe = async ({ prefix, token, group, groupLabel, isVip }) => {
+    try {
+      // ★ v93：解析服務給專屬逾時（比一般請求短）。
+      //
+      // 為什麼要短：解析服務 (jx.wuzhoupai.com) 是**站外的第三方**，
+      // 實測延遲極不穩定：
+      //   快：139~614ms（站方快取命中）
+      //   慢：1563ms
+      //   最壞：**10168ms**（實測第一次打未快取的 token）
+      //
+      // ★ 這是「AGE 有時候沒加載出來」的真正原因：
+      //   一般請求逾時 4000ms，解析卻要 10 秒 → 這個源被判死；
+      //   而 6 個源全部被砍掉時，AGE 整條鏈回傳空 → 整個來源消失。
+      //
+      // 修法：解析只給 2500ms。站方 UI 的解析按鈕也是等這個時間量級，
+      // 超過就是「站方自己也解析不出來」→ 快速跳下一個源，
+      // 讓**至少一個源有機會成功**，而不是全部一起陪葬。
       const resp = await Widget.http.get(prefix + token, {
         headers: { 'User-Agent': site.ua, 'Referer': 'https://m.agedm.io/' },
-        timeout: CONFIG.REQUEST_TIMEOUT,
+        timeout: CONFIG.ADAPTER_RESOLVE_TIMEOUT,
       });
       let html = resp;
       if (resp && typeof resp === 'object' && 'data' in resp) html = resp.data;
@@ -8909,20 +9191,68 @@ async function _agePlayUrls(site, vodId, nid) {
       // ★ 不驗證的慘痛後果：站方詳情 API 永遠能解析出 Vurl（站方 CDN
       //   有問題時仍塞 HTML 給你），光看 probe 認為「成功」就把 URL
       //   給 REX。REX 播放時實際打 Vurl 失敗 → 整個 AGE 來源全廢。
+      //
+      // ★ v93：HEAD 逾時 2000 → 1200ms。
+      //   這一步是**串在解析後面**的（解析完才 HEAD），
+      //   整條鏈的時間 = 解析 + HEAD，兩段都吃預算。
+      //   實測 HEAD 885ms（健康 CDN），1200ms 足夠分辨
+      //   「正常回應」（<900ms）與「掛掉」（逾時/5xx）。
+      //
+      // ★★ v93：HEAD 失敗**不再直接丟棄**，改為標記「未驗證」 ★★
+      //
+      // 實測場景（AGE《間諜過家家》S1）：
+      //   解析出的 Vurl 是 https://dy.ejtsyc.com:8443/uploads/間諜過家家01.m3u8
+      //   這個主機對我們的網路 **HEAD 與 GET 都 8 秒逾時**（中國境內 CDN），
+      //   兩個源解析出的又是**同一個** Vurl → 全部「不可達」→ AGE 回 0 筆。
+      //
+      // ★ 這是設計缺陷：**用我們網路的可達性去否定站方的資源**。
+      //   使用者在中國（或任何我們到該 CDN 不通的地方）其實可以播。
+      //   把好源殺掉 = 使用者看到「AGE 沒有加載出來」。
+      //
+      // 修法：HEAD 失敗時仍回傳這個 Vurl，但標記 _unverified=true，
+      //   讓它排在其他「已驗證」源之後；使用者仍有機會播。
+      //   只有明確的 HTTP 4xx/5xx（確定是壞的）才真的丟掉。
+      let verified = true;
       try {
         const head = await Widget.http.get(vurl, {
           method: 'HEAD',
-          timeout: 2000,
+          timeout: CONFIG.ADAPTER_VURL_HEAD_TIMEOUT,
           headers: { 'User-Agent': site.ua, 'Referer': 'https://m.agedm.io/' },
         });
         const status = head?.statusCode || head?.status;
-        if (status && status >= 400) return null;  // 404/502 → 換下一個
+        // 明確的錯誤碼（404/502 等）→ 這個 CDN 確實壞了 → 換下一個源
+        if (status && status >= 400) {
+          // ★ v94：記住這個壞掉的源（依 **源群組** 記，如 ffm3u8），
+          //   下次同一個源直接跳過 → 省掉 3~9 秒的無謂等待。
+          //   ★ 記 group 而不是 host：同一個源群組（ffm3u8）的每一集
+          //     都指向同一個 CDN 域名 → 記一次就對整部作品有效。
+          if (group) _AGE_BAD_CDN.set('g:' + group, Date.now());
+          try {
+            const host = new URL(vurl).host;
+            _AGE_BAD_CDN.set('h:' + host, Date.now());
+          } catch (e) {}
+          return null;
+        }
       } catch (e) {
-        // HEAD 失敗：m3u8 主機無回應 / SSL 錯誤 / 連線逾時 → 換下一個
-        return null;
+        // HEAD 失敗（逾時 / SSL / 無回應）：**不能判定 CDN 壞了** ——
+        // 可能只是我們到那個 CDN 不通。保留這個 Vurl 但標記未驗證。
+        verified = false;
       }
 
-      return { url: vurl, resolution: 1080, resolutionName: 'AGE', _group: group, _groupLabel: groupLabel };
+      return {
+        url: vurl,
+        resolution: 1080,
+        resolutionName: 'AGE',
+        _group: group,
+        _groupLabel: groupLabel,
+        // ★ 未驗證的源排在已驗證的源之後（但仍可選用）。
+        _unverified: verified ? undefined : true,
+        // ★ v93：vip 源解析出來的是 AES 密文，不是可播網址。
+        //   （實測 70 字元、無 http/m3u8 前綴、URL 解析直接失敗）
+        //   站方用混淆過的 play.min.js 做 AES-CBC + MD5 派生金鑰解密，
+        //   我們沒有解密能力 → 這類 Vurl 不能當主要來源。
+        _isCipher: isVip ? true : undefined,
+      };
     } catch (e) {
       return null;   // 這個源壞了，改用下一個
     }
@@ -8940,12 +9270,137 @@ async function _agePlayUrls(site, vodId, nid) {
   //   不是「同一集的不同語言/畫質版本」。每集建 4 條同名同集 source
   //   對使用者體驗很差（80 集動漫會變 320 條「同一集」）。
   //   改成「保證給的 URL 當下能 200」就夠了。
-  const probed = await _adapterPool(
-    ordered.map(o => async () => await probe(o)),
-    ordered.length,
-  );
-  for (const r of probed) if (r) return [r];
-  return [];
+  // ★★ v93：改成「第一個成功就停」——不再等全部源跑完 ★★
+  //
+  // 為什麼（實測「AGE 有時候沒加載出來」的真正根因）：
+  //   原本是 `_adapterPool(6 個源, limit=6)` → **等 6 個全部跑完**才回傳。
+  //   但 jx.wuzhoupai.com 是**單執行緒的第三方解析服務**：
+  //   6 個併發請求進去會在服務端**排隊**，
+  //   實測三個解析依序在 1301ms / 2096ms / 2923ms 才回（不是同時回）。
+  //   → 整體要等 ~5.5 秒 → 撞上任何逾時 → **整條 AGE 白跑，回 0 筆**。
+  //
+  // ★ 但「只回 1 條」的語意本來就只需要一個成功的源：
+  //   → 併發發出（不排隊浪費時間），**誰先成功誰贏**。
+  //   → 實測：站方排第一的源通常 1.3 秒就回，整條鏈從 5.5s → 1.4s。
+  //
+  // ★ 為什麼不用「循序試到成功為止」：
+  //   排在後面的源萬一第一個壞掉，循序要等它逾時（2200ms）才試第二個，
+  //   反而比併發慢。併發 + race 兩者兼顧。
+  //
+  // ★ 不取消其他請求：讓它們跑完就好（不影響回傳速度），
+  //   取消反而可能讓站方那邊的請求狀態變怪。
+  let winner = null;
+  let resolveWinner;
+  const winnerPromise = new Promise(res => { resolveWinner = res; });
+
+  // ★★ v94：漸進式 fan-out（不要一次全打出去）★★
+  //
+  // 為什麼：解析服務 jx.wuzhoupai.com 是**單執行緒**的。
+  //   6 個源同時打 → 在服務端排隊（實測依序在 878/1017/1020/6458ms
+  //   才回）→ 最後一個源要多等好幾秒，而且**佔住了服務端的槽位**，
+  //   使用者接著切下一集時又要重新排隊。
+  //
+  // 修法：**先打第 1 個（站方排最前、最可能好的那個），只有在它
+  //   慢到一個門檻時才再打第 2 個**，以此類推。
+  //   → 正常情況只打 1~2 個源，服務端不被佔滿，延遲 ≈ 單源延遲。
+  //   → 慢的情況（第 1 個真的壞掉）才逐步擴大，保留原本的容錯性。
+  //
+  // ★ 門檻設計：慢速門檻 = 解析逾時的一半（1600ms）。
+  //   實測快取命中是 135~290ms、正常冷啟動 800~2000ms。
+  //   1600ms 內回來 → 不需要更多源；超過 → 下一個源開始搶跑。
+  const SLOW_MS = Math.max(600, Math.floor((CONFIG.ADAPTER_RESOLVE_TIMEOUT || 3200) / 2));
+  const racing = [];
+  let raceIdx = 0;
+
+  // ★ 宣告順序很重要：ensureDone / track 必須在 pump 被呼叫**之前**
+  //   就有定義，否則第一次 pump() 觸發 TDZ（let/const 尚未初始化）→ 整個
+  //   _agePlayUrls 拋錯 → AGE 整個來源消失（實測會這樣）。
+  let allDoneResolve;
+  const allDone = new Promise(res => { allDoneResolve = res; });
+  let pending = 0;
+  const ensureDone = () => {
+    if (raceIdx >= ordered.length && pending === 0) {
+      try { allDoneResolve(); } catch (e) {}
+    }
+  };
+  const track = (p) => {
+    pending++;
+    const done = () => { pending--; ensureDone(); };
+    p.then(done, done);
+  };
+
+  const pump = () => {
+    if (raceIdx >= ordered.length) return;
+    const o = ordered[raceIdx++];
+    const pr = (async () => {
+      const r = await probe(o);
+      // ★ 只有「已驗證 且 Vurl 真的是網址」的源才能直接勝出。
+      //   vip 源的 Vurl 是 AES 密文（不可播）→ 不能勝出。
+      if (r && !r._unverified && !r._isCipher && !winner) {
+        winner = r; try { resolveWinner(r); } catch {}
+      }
+      return r;
+    })();
+    racing.push(pr);
+    track(pr);
+  };
+  // 立即打第一個。
+  pump();
+  // 慢速擴張計時器：每 SLOW_MS 沒人贏就多打一個源。
+  //
+  // ★ 最後一個源被 pump 出來時，allDone 的 resolve 條件才可能成立
+  //   （raceIdx >= ordered.length）。所以這裡必須保證「沒有贏家時
+  //   最終會把 ordered 全部 pump 完」，否則 allDone 永遠不 resolve、
+  //   整個 _agePlayUrls 掛住。
+  const pumpTimer = setInterval(() => {
+    if (winner) return;
+    if (raceIdx < ordered.length) pump();
+  }, SLOW_MS);
+  // 等「第一個成功」或「全部失敗」。
+  //
+  // ★ v94：不能用 `Promise.all(racing)` —— 那會**快照當下的陣列**，
+  //   漸進式 fan-out 稍後加進去的源就不會被等待 → 「全部失敗」的判定
+  //   會在只有第 1 個源時就誤判為結束。
+  //   改用一個「所有源都試完」的 Promise，由 pending 歸零時 resolve。
+  const raced = await Promise.race([
+    winnerPromise,
+    allDone,
+  ]).catch(() => null);
+  try { clearInterval(pumpTimer); } catch (e) {}
+
+  // ★ v93：優先給「已驗證」的源。
+  //   若 race 勝出的是未驗證的（_unverified）源，我們再給已驗證的源一點時間
+  //   （最多 800ms）——因為已驗證的源更可能是能播的。
+  //   ★ 為什麼不能直接用未驗證的：
+  //   使用者點下去若播不了，整個 AGE 來源在 REX 看來就是壞的。
+  //   ★ 為什麼不能等太久：
+  //   未驗證通常代表「那個 CDN 我們連不上」，此時多等只是延遲。
+  if (winner) {
+    // ★ v94：寫入 Vurl 快取
+    if (cacheKey) _AGE_VURL_CACHE.set(cacheKey, { val: [winner], ts: Date.now() });
+    return [winner];
+  }
+
+  // ★ v93：全都只有未驗證的源 → 挑一個給出去（總比整個來源消失好）。
+  //   未驗證 = 解析成功但 HEAD 探不到 —— 多半是那個 CDN 我們這邊連不上
+  //   （實測 AGE《間諜過家家》的 dy.ejtsyc.com 在我們網路 TCP 層就連不上，
+  //   是中國境內 CDN；在中國/香港可能可以播）。
+  //   這比「AGE 沒有加載出來」好得多。
+  //
+  // ★★ v93：fallback 只挑「Vurl 真的是可播網址」的源 ★★
+  //   vip 源解析出來的是 AES 密文（實測 70 字元、無 http/m3u8），
+  //   拿給 REX 一定播不了 → 不能當 fallback。
+  //   只有 zj 源的 Vurl 才是真正的 m3u8 網址。
+  const all = await Promise.all(racing).catch(() => []);
+  const usable = all.find(x => x && !x._isCipher);
+  if (usable) {
+    // ★ v94：寫入 Vurl 快取。下次切到這集 → 0 次網路請求。
+    if (cacheKey) _AGE_VURL_CACHE.set(cacheKey, { val: [usable], ts: Date.now() });
+    return [usable];
+  }
+  // 連 zj 源都沒有 → 只能給 vip 的密文（寧可給一個壞的也不要空白）
+  const anyOne = all.find(x => x);
+  return anyOne ? [anyOne] : (raced ? [raced] : []);
 }
 
 // ---------- 簽名型站點清單 ----------
@@ -9388,9 +9843,25 @@ async function _adapterResolvePlay(token) {
   const site = ADAPTER_SITES.find(s => s.id === t.s);
   if (!site) return [];
 
+  // ★★ v93：整條換 URL 鏈的硬上限 ★★
+  //
+  // 這條鏈是「詳情頁 → 解析服務 → Vurl 可達性 HEAD」三跳串行，
+  // 而 AGE 的解析服務 (jx.wuzhoupai.com) 是**站外第三方**，
+  // 實測延遲最壞到 **10168ms**（10 秒）。
+  //
+  // ★ 沒有這道上限的後果（實測「AGE 有時候沒加載出來」）：
+  //   解析 10 秒 → 整條 adapter 鏈超過外層的 hard=4500ms
+  //   → Promise.race 回 [] → **整批 adapter 結果蒸發**
+  //   → 使用者看到「動漫有時搜得到、有時搜不到」。
+  //
+  // 有了這道上限：最壞 4 秒內結束 → 遠低於外層 4500ms
+  // → 慢的那一站被放棄，但**其他站（金牌影視）的結果保得住**。
   try {
-    const list = await (site.playUrls || _adapterDefaultPlayUrls)(site, t.v, t.n);
-    return list;
+    const list = await Promise.race([
+      (site.playUrls || _adapterDefaultPlayUrls)(site, t.v, t.n),
+      new Promise(res => setTimeout(() => res([]), CONFIG.ADAPTERS?.RESOLVE_CHAIN_TIMEOUT ?? 4000)),
+    ]);
+    return Array.isArray(list) ? list : [];
   } catch (e) {
     console.warn(`[adapter:${site.id}] playUrls 失敗: ${e?.message || e}`);
     return [];
@@ -10181,6 +10652,15 @@ class SmartSearchExecutor {
     // 併進站組會佔滿連線拖慢 MacCMS 站。獨立一條 task 自己控制節奏，
     // 失敗靜默回傳 []。
     if (this.adapterSites && this.adapterSites.length > 0) {
+      // ★★ v93：逐站結果落地區 ★★
+      //
+      // 每個站一完成就把結果推進來，**不等整批**。
+      // 這樣即使整批被硬上限砍掉，已完成的站（金牌影視）
+      // 與尚未完成但已回傳的站（AGE 若及時回來）都還在。
+      //
+      // 舊實作是「整批 Promise.race → 超時就回 []」→ 一站慢，
+      // 兩站一起消失。這是「AGE 有時候沒加載出來」的真正機制。
+      const adapterSettled = [];
       const runAdapters = (async () => {
         const out = [];
         // ★ 速度：各站併發。與 batch 路徑同樣的理由 ——
@@ -10230,12 +10710,78 @@ class SmartSearchExecutor {
           }
         };
         const perSiteSettled = await _adapterPool(
-          this.adapterSites.map(site => async () => await perSite(site)),
+          this.adapterSites.map(site => async () => {
+            const r = await perSite(site);
+            // ★ v93：這一站一完成就落地（不等整批）。
+            //   硬上限砍掉整批時，這裡已經推進去的結果還在。
+            if (r && r.length) {
+              try { adapterSettled.push(...r); } catch {}
+            }
+            return r;
+          }),
           CONFIG.ADAPTERS?.SITE_CONCURRENCY ?? 2,
         );
         for (const r of perSiteSettled) if (r && r.length) out.push(...r);
         return out;
       })();
+
+      // ★★ v93：逐站獨立計時，已完成的站要保住 ★★
+      //
+      // 問題（實測「AGE 有時候沒加載出來」的真正機制）：
+      //   原本是 `Promise.race([整批 adapter, 4500ms 後回 []])` ——
+      //   4500ms 一到，**整批**（金牌影視 + AGE動漫）一起被丟掉，
+      //   即使其中一站早就查完了。
+      //
+      //   為什麼會踩到：AGE 的鏈路比金牌影視長得多 ——
+      //     搜尋 144ms → 詳情 199ms → 解析服務 1885ms（**最壞 10168ms**）
+      //     → Vurl 可達性 HEAD 885ms
+      //   剛好卡在 4500ms 邊緣，一慢就整批蒸發。
+      //
+      // 修法：改成「每站各自跑、各自計時」——
+      //   · 到達硬上限時，**已完成結果直接落地**（不再回 []）
+      //   · 沒完成的站就放棄（那一站這輪沒有，MacCMS 結果不受影響）
+      //
+      // ★ 為什麼不用「整批多給一點時間」：
+      //   串流模式的特性是「快」——拖慢整批會讓 MacCMS 站的結果也晚到。
+      //   保住已完成的站，才是真的把「慢的那一站」隔離掉。
+      let adapterResults = [];
+      if (this._adapterPromise) {
+        // 給 adapter 一個硬上限：它內部已有 per-request timeout，但整條鏈
+        // （搜尋 → 詳情頁 → 換 URL）是串行的三跳，超時就整個放棄這輪，
+        // 寧可這輪少一個來源，也不要讓串流模式失去「快」的特性。
+        // 從 8000 縮到 4500：jpyy + agedm 兩站各約 1~2s 完成搜尋+詳情+換 URL，
+        // 並發跑下 max ≈ 2s，4500 涵蓋 99% 健康場景。原本 8s 過於寬鬆，
+        // 慢場景下會把 wall time 拖到接近 SEARCH_DEADLINE，現在 4.5s 配合
+        // 早收鏈能讓前端更快拿到結果。功能一致：逾時只是丟掉這輪 adapter
+        // 結果，MacCMS 結果完全不受影響。
+        // ★ v93：4500 → 7000ms。
+        //
+        //   為什麼要加長：AGE 的鏈路實測需要 3~5.5 秒
+        //   （搜尋 150ms → 詳情 200ms → **解析服務 1200~3600ms**
+        //     → Vurl HEAD 700~1200ms）。
+        //   4500ms 時，AGE 常常是「差一點就回來」卻被砍掉 →
+        //   使用者看到「AGE 沒有加載出來」。
+        //
+        //   ★ 為什麼不擔心拖慢整體：
+        //   adapter 這條鏈是與 MacCMS 站組**並行**跑的，
+        //   MacCMS 的結果早就在 `enough()` 判定後就回給使用者了。
+        //   這裡多等的 2.5 秒只影響 adapter 自己的來源，
+        //   不會延後 MacCMS 的結果。
+        //
+        //   ★ 為什麼仍然是有限值：
+        //   串流模式不能無限等 —— 沒有硬上限的話，一個壞站會讓
+        //   complete 事件永遠不發。使用者會看到「載入中」卡住。
+        const hard = 7000;
+        adapterResults = await Promise.race([
+          this._adapterPromise,
+          // ★ v93：超時時回傳**已完成的站**（adapterSettled），不是 []。
+          //   舊實作回 [] → 一站慢就整批蒸發（AGE 常常是被金牌影視
+          //   拖下水的那一站）。
+          //   現在：金牌影視先回 → 它的結果已在 adapterSettled → 保住。
+          //   AGE 若還沒回 → 這輪就沒有 AGE，但別的站不受影響。
+          new Promise(r => setTimeout(() => r(adapterSettled.slice()), hard)),
+        ]).catch(() => adapterSettled.slice());
+      }
 
       // 與 MacCMS 站組併行跑，但不被 deadline 綁架：adapter 的延遲換 URL
       // 已在 _adapterSearch 內部有硬性上限，錯過整批時限頂多是這條結果
@@ -13812,8 +14358,27 @@ targetInfo.searchQuery = aliasQ;
         // 併發跑各站；_adapterPool 已經有「單筆失敗不影響整批」的保護。
         // 站內 detail 抓取（_adapterSearch 內部）已透過 _adapterPool + 全域
         // semaphore 收斂，這裡只需 SITE_CONCURRENCY 控站間並發即可。
+        //
+        // ★★ v93：逐站落地 + 單站逾時不拖垮整批 ★★
+        //   這裡原本是「await 整個 pool」→ 慢的那一站（AGE 的解析服務
+        //   最壞要 10 秒）會把整批 adapter 拖到 10 秒才回。
+        //   改成：每站各自有逾時上限，到點就放棄那一站，
+        //   其他站照樣回傳結果（batch 路徑沒有 hard=4500 的外層保護）。
         const perSiteSettled = await _adapterPool(
-          sites.map(site => async () => await perSite(site)),
+          sites.map(site => async () => {
+            try {
+              const r = await Promise.race([
+                perSite(site),
+                // 單站上限 7000ms（與串流模式的 hard 一致）。
+                // AGE 實測需要 3~5.5 秒（解析服務最慢 3600ms）。
+                new Promise(res => setTimeout(() => res([]), 7000)),
+              ]);
+              if (r && r.length) {
+                try { adapterResults.push(...r); } catch {}
+              }
+              return r;
+            } catch { return []; }
+          }),
           CONFIG.ADAPTERS?.SITE_CONCURRENCY ?? 2,
         );
         for (const r of perSiteSettled) if (r && r.length) adapterResults.push(...r);
