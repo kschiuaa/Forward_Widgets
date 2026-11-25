@@ -1750,78 +1750,7 @@ const CONFIG = {
   //
   // ★ 既有功能完全不變：解析出的 Vurl、來源標籤、清晰度標記、
   //   Vurl 快取、壞源記錄、切源清單全部照舊。
-  //
-  // ★★ bump 到 98：修 AGE 動漫「標題帶句點 → 比對卡住」 ★★
-  //
-  // 症狀：使用者搜「侦探已经死了」，AGE 的 API 有回 2 筆，但結果 0 筆。
-  //
-  // ★ AGE 實測（api.agedm.io/v2/search?query=侦探已经死了）：
-  //   「侦探已经死了。 第二季」 id=20260281 S2 第08集  ← 名字帶「。 」+ 季別
-  //   「侦探已经死了」          id=20210067 S1 第12集完结
-  //
-  // ★ 三個根因疊在一起（缺一個都不會出事，三個疊起來就 0 筆）：
-  //
-  //   (1) ★ 句點沒被清掉 → 主片名比較失敗
-  //       deepCleanSeriesName 尾端只清 `[\.\-\s]+$`（**半形**句點），
-  //       中文全形「。」不在清單裡 → baseName 留著「偵探已經死了。」
-  //       → normalizeTitleForMatch 也不清標點 → 兩邊字面差一個「。」
-  //       → 掉到 LOOSE 門檻以下 → sequel_conflict → 整筆殺掉。
-  //       修法：normalizeTitleForMatch 去標點（新增 _TITLE_PUNCT_RE）、
-  //             deepCleanSeriesName 清全形句點。
-  //       ★ 保留「，」「·」「＊」「：」—— 那些承載語意（副標題分隔、
-  //         正篇/特別篇標記），剋掉會誤殺「那些年，我們一起追過的女孩」。
-  //
-  //   (2) ★ 季度 ≠ 續集序號
-  //       extractSequelNumber 刻意把「第二季」回 2（season filter 需要），
-  //       但「第二季」是**同一部作品的第 2 季**，「無間道2」是**另一部作品**。
-  //       舊邏輯分不出 → target 裸名（無序號）對上 candidate「第二季」
-  //       → sequelShapeMismatch → sequel_conflict → 整筆殺掉。
-  //       修法：新增 classifyTitleNumberKind 判別「季度」vs「序號」，
-  //             在 isSmartSeriesMatch 的序號衝突判斷裡把季度序號降級。
-  //
-  //   (3) ★ 裸名搜尋不該被季別擋掉
-  //       target.seasonNumber=1 有兩種來源：「使用者明確要 S1」與
-  //       「使用者沒說要第幾季（1 只是預設值）」。舊邏輯分不出，
-  //       一視同仁地擋掉站方寫明的 S2 → 使用者搜「侦探已经死了」
-  //       連 S1 都被 season_conflict 殺掉。
-  //       修法：isSmartSeriesMatch 用「target 是否有明確季別訊號」
-  //             （片名季標記 or Forward season 參數）決定要不要擋；
-  //             未指定季別時站方回 S2 是合法回應。
-  //
-  // ★ filterBySequel 也要同步修（S1 反向阻擋）：
-  //   它用 extractSequelNumber > 1 判「續集」→ 候補「第二季」被殺。
-  //   同樣用 classifyTitleNumberKind 把季度序號放行（真正的續集照殺）。
-  //
-  // ★★ 第四個根因：AGE 的 API 對 query 格式極度嚴格 ★★
-  //
-  // 實測 api.agedm.io/v2/search（每個不符都回 code=40050「参数错误！」）：
-  //   ✗ query 含空白        「侦探已经死了 第二季」
-  //   ✗ query 結尾是數字    「侦探已经死了2」「无间道2」
-  //   ✗ 站方沒這部片        「无间道」「仁医」（AGE 是純動畫站）
-  //   ✓ 純中文片名          「侦探已经死了」→ 200
-  //
-  // 問題：我們的 searchQuery 會帶季別序號（extractEnhancedInfo 的
-  //   `searchQuery += String(seasonNumber)`，MacCMS 站靠它才搜得到 S2），
-  //   對 AGE 就是直接被拒 → 整站零結果。
-  //   ★ 這是「前綴匹配」站（query 必須是站方片名的開頭），
-  //     季別應該交給下游比對層判，不要塞進搜尋字串。
-  //
-  // 修法：adapter 站可定義 searchQueryTransform(query, targetInfo)，
-  //   送出前洗成站方能接受的形狀。AGE 站的實作：
-  //     1. 去所有空白（含全形）
-  //     2. 去結尾季別序號（數字 / 第N季 / 第N部 / Season N / S N）
-  //   其他站（jpyy）不定義 → 行為完全不變。
-  //
-  // ★ 為什麼安全：AGE 的搜尋是「片名前綴匹配」，它自己就會把
-  //   「侦探已经死了」和「侦探已经死了。 第二季」都回出來
-  //   （實測裸名查詢就回 2 筆）。季別交給 isSmartSeriesMatch 判斷
-  //   （本次已修好季度 vs 序號的辨識），搜尋層不需要帶序號。
-  //
-  // ★ bump 版本的理由：
-  //   cache key 用 normalizeTitleForMatch(baseName) 組 → 標點清掉後
-  //   key 变了（「偵探已經死了。」→「偵探已經死了」），
-  //   加上比對語意本身變了 → 舊 cache 必須清掉重新搜。
-  WIDGET_VERSION: 98,
+  WIDGET_VERSION: 97,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2147,7 +2076,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.8.0",
+  version: "5.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2497,49 +2426,8 @@ function isDirectMediaUrl(url) {
 }
 
 /**
- * 比對層要剋掉的標點集合（v96）。
- *
- * ★ 為什麼要剋：站方片名帶標點的寫法極多（AGE 動漫實測就有
- *   「侦探已经死了。 第二季」「五等分的新娘: 暑假篇」「漫动画·至尊神魔」），
- *   使用者輸入的裸名幾乎不會帶 → 兩邊正規化後字面不等 → 相似度被拉低
- *   → 掉門檻 → 整筆被殺。
- *
- * ★ 剋哪些（純標點，不含任何語意）：
- *   中文句點/逗號/頓號/分號/冒號/問號/驚嘆號/引號/括號/書名號…
- *   半形 . , ; : ! ? " ' ( ) [ ] { } < > / \ | ~ ` 等
- *
- * ★ 不剋哪些（承載語意，見 normalizeTitleForMatch 的說明）：
- *   `＊`（全形星號）— 站方用它標示「正篇 vs 特別篇」
- *   `·` / `・`（間隔號）— 「漫动画·至尊神魔」是「主體·副標題」的固定寫法
- *   `，`（逗號）— 副標題分隔符，見下方說明
- *
- * 之所以連 `·` 也保留：它是**中點分隔符**而非純裝飾，去掉會讓
- * 「漫动画·至尊神魔」變成「漫動畫至尊神魔」，跟另一部「漫动 画至尊神魔」
- * 混為一談。反之 `。` 純粹是句號，不承載任何分詞語意。
- *
- * ★ 為什麼逗號也不剋（v96 實測踩到）：
- *   isSmartSeriesMatch 的「嚴格前綴」規則用 normalizeTitleForMatch
- *   算出的 _cPrefix，並靠「多出來的尾巴有沒有標點」來分辨
- *   「副標題（同一部片）」與「另一部片」：
- *     「那些年，我們一起追過的女孩」對「那些年」
- *       → 尾巴「我們一起追過的女孩」若帶「，」→ 是副標題 → 不擋 ✓
- *       → 尾巴若沒有標點 → 判成 title_prefix_conflict（同一部片被殺）✗
- *   剋掉逗號會讓尾巴變成「我們一起追過的女孩」（無標點）→ 誤殺。
- *   → 逗號必須保留，與 deepCleanSeriesName 的處理一致。
- *
- * ★ 冒號（：）照剋不誤：
- *   副標題的判斷另有專責 —— stripSubtitle 會在冒號處切開，
- *   isSmartSeriesMatch 的 targetSub/candidateSub 比對也用**未剋標點的
- *   baseName**（extractEnhancedInfo 的輸出），兩者都不受這條影響。
- *   反之剋掉冒號能讓「A：B」與「A」更容易落到互補分支 —— 那是同一部片
- *   的正確結果（「無間道風雲：解密風雲」與「無間道」本來就是不同作品，
- *   由 title_prefix_conflict 那條規則擋，跟冒號無關）。
- */
-const _TITLE_PUNCT_RE = /[。．、；：！？「」『』《》〈〉（）【】〔〕｛｝［］…—–－\.,;:!?"'`´ˆ˜¦§¶‐‑‒—―]/g;
-
-/**
  * 比對前把片名正規化，讓繁體查詢能對上簡體結果。
- * 統一轉繁體 + 去除空白 + 去除標點 + 轉小寫。
+ * 統一轉繁體 + 去除空白 + 轉小寫。
  *
  * ★ v92：尾端的羅馬數字序號 → 阿拉伯數字 ★★
  *   使用者輸入「無間道II」、站方檔名「无间道2」→ 正規化後
@@ -2556,32 +2444,7 @@ function normalizeTitleForMatch(title) {
   const converted = CONFIG.CONVERSION.ENABLED
     ? convertChinese(String(title), true)
     : String(title);
-  // ★★ v96：去除標點 ★★
-  //
-  // 問題（AGE 動漫實測）：站方片名帶中文句點與各種標點，
-  //   「侦探已经死了。 第二季」的 baseName 是「侦探已经死了。」
-  //   → 正規化後是「偵探已經死了。」；使用者輸入的裸名正規化後是
-  //   「偵探已經死了」→ 兩者字面差一個「。」→ similarity 0.857
-  //   → 掉到 LOOSE 門檻以下 → sequel_conflict → 整筆被殺。
-  //
-  // 為什麼之前漏掉：`deepCleanSeriesName` 尾端只清 `[\.\-\s]+`（半形句點），
-  //   中文全形「。」不在清單裡，站方一改名就破功。
-  //
-  // ★ 為什麼可以安全地全剋：比對層要的是「是否為同一部作品」，
-  //   標點從來不承載這個語意。剋掉標點只會讓比較更寬鬆，
-  //   真正「不同作品」的判斷（序號衝突 / 前綴衝突 / 副標題衍生作）
-  //   都不依賴標點 —— 它們各自有獨立的守門員。
-  //
-  //   例外要留意的：`：`（冒號）是**副標題分隔符**，但副標題的判斷
-  //   另有專責（stripSubtitle + targetSub/candidateSub 比對），
-  //   這裡剋掉冒號不會讓那條規則失效 —— 反而讓「A：B」與「A」的
-  //   baseName 比較更容易落到互補分支（那是同一部片的正確結果）。
-  //
-  // 保留的例外：`＊`（全形星號）與 `·`（間隔號）—— 這兩個在站方
-  //   片名裡是「正篇/特別篇」的區隔記號（「五等分的新娘＊」），
-  //   帶不帶它代表不同版本，不該視為等價。見 _TITLE_PUNCT_KEEP。
-  const noPunct = converted.replace(_TITLE_PUNCT_RE, '');
-  const noSpace = noPunct.replace(/[\s\u3000]+/g, '').toLowerCase();
+  const noSpace = converted.replace(/[\s\u3000]+/g, '').toLowerCase();
   // 尾端羅馬數字 → 阿拉伯數字（「無間道ii」→「無間道2」）
   return noSpace.replace(/([^\da-z])([ivx]{2,4})$/, (m, sep, rn) => {
     const map = { ii: 2, iii: 3, iv: 4, vi: 6, vii: 7, viii: 8, ix: 9, xi: 11, xii: 12, xiii: 13 };
@@ -2643,31 +2506,11 @@ function deepCleanSeriesName(name) {
     /剧场版|电影版|特别篇|SP|OVA/gi,
     /\s*(HD|高清|超清|蓝光|4K|1080[Pp]|720[Pp]|HDR|杜比|Dolby|HEVC|X265|X264)\s*/gi,
     /\s*(WEB[-\s]?DL|WEBRip|BluRay|BDrip|BDRip|HDTV|TVrip|HQC)\s*/gi,
-    /\s*(国语|粤语|英语|日语|韩语|中字|双语|简繁|内封|内嵌|字幕|未删减|未刪減|完整版|全集|合集|番外)\s*/g,
+    /\s*(国语|粤语|英语|日语|韩语|中字|双语|简繁|内封|内嵌|字幕|未删减|完整版|全集|合集|番外)\s*/g,
     // 「完结」獨立出現才算 ——「完结篇」是續集的真實副標題，
     // 整段刪掉會留下「仁医篇」，後續相似度比對就錯了。
     /\s+完结\s*$/g, /\s+完結\s*$/g,
     /[\[\]()【】《》「」『』]/g,
-    // ★ v96：中文全形**句點** —— 站方片名裡的句號。
-    //
-    //   實測（AGE 動漫）：「侦探已经死了。 第二季」→ baseName 原本是
-    //   「侦探已经死了。」→ 送給站方的查詢字串也帶著「。」。
-    //
-    //   ★ 只剋「句點」，**不剋逗號/頓號**：
-    //     「那些年，我们一起追过的的女孩」裡的逗號是**副標題的分隔符**，
-    //     isSmartSeriesMatch 的「嚴格前綴」規則靠它判斷
-    //     「多出來的部分是副標題（同一部片）」還是「另一部片」——
-    //     剋掉逗號會讓「那些年」對「那些年我們一起追過的女孩」
-    //     被誤判成 title_prefix_conflict（同一部片被殺）。
-    //
-    //   ★ 也不剋冒號（副標題分隔）、中點（主體·副標題）、
-    //     全形星號（正篇/特別篇）—— 那三個承載語意。
-    //
-    //   ★ 為什麼連中段的一起剋：
-    //     「侦探已经死了。第二季」裡的句點在中段，但它是純句號，
-    //     不分隔任何成分 → 剋掉後 baseName 變「侦探已经死了」，
-    //     與使用者輸入的裸名完全一致（比對層最乾淨的狀態）。
-    /[。．]/g,
   ];
 
   removablePatterns.forEach(pattern => {
@@ -2677,16 +2520,6 @@ function deepCleanSeriesName(name) {
   cleaned = cleaned.replace(/\s*(?:19|20)\d{2}\s*/g, ' ');
   cleaned = cleaned.replace(/第\d+[集话]/g, '');
   cleaned = cleaned.replace(/[\.\-\s]+$/g, '');
-  // ★ v96：中文全形標點也要清尾端 ★★
-  //
-  // 原先只有 `[\.\-\s]+$`（半形句點/連字號/空白），站方片名帶全形
-  // 「。」（AGE 動漫實測：「侦探已经死了。 第二季」）時，baseName 會
-  // 留著尾端「。」→ 送給站方的查詢字串變成「侦探已经死了。」→
-  // 站方做起始匹配時可能對不上，且比對層兩邊字面不等。
-  //
-  // 這裡只清**尾端**的標點：片名中間的標點（副標題分隔等）有意義，
-  // 由 stripSubtitle 與各自的守門員處理，不在這裡動。
-  cleaned = cleaned.replace(/[。．、，；：！？~～…·・\s]+$/g, '');
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
 
   return cleaned;
@@ -2886,23 +2719,6 @@ const _NARRATIVE_BRACKET_RE = /[\[【（(][^\]】）)]*?(解說|速看|剪輯|�
 const _NARRATIVE_BANVER_RE = /解說[^，。！？、）)\]】]{0,6}版/;
 // 站方 remarks 整串就是版本標記（無其他描述）
 const _NARRATIVE_REMARK_RE = /^[　\s]*(電影解說|影視解說|劇情解說|全片解說|無水印解說|解說版|解說|速看|剪輯版|精簡版)[　\s]*$/;
-
-/**
- * 片名裡「明確標示季度」的樣式（v96）。
- *
- * ★ 用途：區分「使用者明確要第 N 季」與「使用者只給了裸名」。
- *   seasonNumber 兩種情況都是 1，rawName 才有辦法分辨：
- *     「侦探已经死了 第二季」 → 有標記 → 使用者明確指定
- *     「侦探已经死了」        → 無標記 → 使用者沒說要第幾季
- *
- * ★ 涵蓋的寫法（站方實測）：
- *   中文：第二季 / 第2季 / 第 二 季
- *   英文：Season 2 / season2 / S2 / S 2
- *
- * ★ 不涵蓋「第N集」—— 那是集數不是季別（extractSequelNumber
- *   也有同樣的排除，兩處刻意一致）。
- */
-const _SEASON_MARK_RE = /第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季|[Ss]eason\s*[0-9]+|\b[Ss]\s*[0-9]+\b/;
 
 /**
  * 判斷站方條目是不是「解說 / 二次剪輯版本」。
@@ -3117,67 +2933,6 @@ const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆�
       if (digits.length) return parseInt(digits[0].raw, 10);
 
   return null;
-}
-
-/**
- * 判斷片名裡的數字是「季度」還是「續集序號」（v96）。
- *
- * ★ 為什麼需要這個判別：
- *   extractSequelNumber 刻意把「第二季」回成 2（為了讓 season filter
- *   能運作），但「第二季」是**同一部作品的第 2 季**，
- *   「無間道2」是**另一部作品**。兩者語意完全不同，
- *   卻在 isSmartSeriesMatch 的「續集序號衝突」檢查裡被當成同一件事。
- *
- *   實測（AGE 動漫，2026-11-26）：
- *     target「侦探已经死了」（裸名，沒有任何序號）
- *     candidate「侦探已经死了。 第二季」
- *       → candidateSequel = 2（來自「第二季」）
- *       → 觸發 sequelShapeMismatch（target 無序號 vs candidate 有序號）
- *       → 判成 sequel_conflict → 整筆殺掉
- *     使用者搜「侦探已经死了」卻完全看不到 AGE 的結果。
- *
- * ★ 判準：**去掉季度標記之後還有沒有別的序號**。
- *   - 「侦探已经死了。 第二季」→ 去掉「第二季」後沒數字 → 純季度 → 是季度
- *   - 「无间道2」           → 去掉季度標記（沒有）後還有「2」→ 是序號
- *   - 「侦探已经死了 第二季 第02集」→ 去掉季度標記後還有數字
- *     但那是**集數**不是序號 → 仍算純季度
- *
- * @returns {'season'|'sequel'|null} season=只有季度標記、sequel=有真正的
- *          續集序號、null=兩者都沒有（純裸名）
- */
-function classifyTitleNumberKind(name) {
-  if (!name) return null;
-  const s = String(name);
-
-  // 有沒有任何季度標記？
-  const hasSeasonMark = _SEASON_MARK_RE.test(s);
-
-  // ★ 先看「不含數字的續集標記」—— 這兩個本身就是序號，
-  //   不能在剋掉之後才判（否則會被誤判成沒有序號）。
-  //   「完结篇/完結篇」：S2 的替身寫法（「仁医完结篇」）
-  //   「第X部」：續集序號（「窃听风云第二部」）
-  if (/完结篇|完結篇/.test(s)) return 'sequel';
-  if (/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*部/.test(s)) return 'sequel';
-
-  // 去掉季度標記後，剩下的片名還有沒有「序號」？
-  //  · 續集序號：阿拉伯數字（海王2 / 无间道2）、羅馬數字（無間道II）
-  //  · 排除：年份（2018）、集數（第02集）、期號（第4期）
-  let rest = s
-    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季/g, ' ')
-    .replace(/[Ss]eason\s*[0-9]+/g, ' ')
-    .replace(/\b[Ss]\s*[0-9]+\b/g, ' ')
-    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*[集话話回]/g, ' ')
-    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*期/g, ' ')
-    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*部/g, ' ')
-    .replace(/\((?:19|20)\d{2}\)/g, ' ')
-    .replace(/\b(?:19|20)\d{2}\b/g, ' ');
-
-  // 羅馬數字序號（II / III / IV）—— 至少 2 個字母才算序號
-  if (/(^|[^\dIVX])([IVX]{2,4})(?=[^IVX]|$)/.test(rest)) return 'sequel';
-  // 阿拉伯數字序號
-  if (/\d/.test(rest)) return 'sequel';
-
-  return hasSeasonMark ? 'season' : null;
 }
 
 function calculateStringSimilarity(str1, str2) {
@@ -3782,54 +3537,7 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   //   這裡正規化成 null，讓「無序號 target ↔ 序號1 candidate」正常比對。
   if (candidateSequel === 1) candidateSequel = null;
   // target 端同理：使用者輸入「庆余年1」時不應被當成有續集序號。
-  let targetSequelNorm = targetSequel === 1 ? null : targetSequel;
-
-  // ★★ v96：季度標記 ≠ 續集序號 ★★
-  //
-  // 問題（AGE 動漫實測，2026-11-26）：
-  //   candidate「侦探已经死了。 第二季」→ extractSequelNumber 回 2
-  //   （因為「第二季」裡有數字 2）。但「第二季」是**同一部作品的第 2 季**，
-  //   不是「另一部作品」—— 跟「無間道2」完全不同。
-  //
-  //   舊邏輯分不出這兩者 → target 裸名（無序號）對上 candidate「第二季」
-  //   → sequelShapeMismatch 觸發 → sequel_conflict → 整筆殺掉。
-  //   使用者搜「侦探已经死了」在 AGE 看到 0 筆，就是這條造成的。
-  //
-  // ★ 為什麼在這裡正規化（而不是改 extractSequelNumber）：
-  //   extractSequelNumber 刻意把「第二季」回 2，是因為下游的 season filter
-  //   需要這個值（否則「仁医完结篇」這種沒數字的 S2 會漏掉）。
-  //   改它會動到 filterBySequel 等多處已驗證的行為。
-  //   → 這裡只在「續集衝突判斷」這一個用途上把季度序號降級成 null，
-  //     語意精確且不影響其他呼叫端。
-  //
-  // ★ 判準用 classifyTitleNumberKind：它會把「去掉季度標記後還有沒有
-  //   真正的序號」判清楚，不會把集數（第02集）/期號（第4期）/年份誤認。
-  const candidateNumberKind = classifyTitleNumberKind(candidateInfo.rawName);
-  if (candidateNumberKind === 'season' && candidateSequel === candidateInfo.seasonNumber) {
-    // 這個數字來自季度標記，不是續集序號 → 不參與序號衝突判斷。
-    candidateSequel = null;
-  }
-  // target 端同理：使用者輸入「仁醫 第二季」時，那個 2 也是季度不是序號。
-  const targetNumberKind = classifyTitleNumberKind(targetInfo.rawName);
-  if (targetNumberKind === 'season' && targetSequelNorm === targetInfo.seasonNumber) {
-    targetSequelNorm = null;
-  }
-  // ★ target 的序號是「Forward 帶 season=2 參數」補進來時，那個值也是
-  //   **季度**不是續集序號 —— 使用者要的是「這部片的第 2 季」，
-  //   不是「這部片的第 2 部」。不同作品 vs 同作續季，語意差一階。
-  //
-  //   實測（AGE 動漫，2026-11-26）：使用者搜「侦探已经死了」+ Forward
-  //   season=2 → target._expectedSequel = 2 → targetSequel = 2 →
-  //   對上 candidate「侦探已经死了。 第二季」（candidateSequel 已降級為 null）
-  //   → sequelShapeMismatch（target 有序號 vs candidate 沒序號）→ 誤殺。
-  //
-  //   ★ 只在「序號完全來自 _expectedSequel」時降級：
-  //     若片名本身就有序號（「海王2」），那是真的序號，不能降級。
-  if (targetInfo._expectedSequel != null &&
-      targetSequelNorm === targetInfo._expectedSequel &&
-      extractSequelNumber(targetInfo.rawName) === null) {
-    targetSequelNorm = null;
-  }
+  const targetSequelNorm = targetSequel === 1 ? null : targetSequel;
 
   // ★★ v78.1：補上「反向」的序號形狀衝突。
   //
@@ -3870,48 +3578,8 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   //   只擋「明確寫出 S1」的（第一季/S1/Season 1/第1部）；無季標的裸名
   //   （白粉飞）仍放行交給 filterBySequel 年份規則，避免誤殺仁醫這類裸名。
   //   這是 Zen `season>1 && foundSeason!==season → 0` 的同義實現。
-  //
-  // ★★ v96：target 的季別「是否為使用者明確指定」—— 決定要不要擋 ★★
-  //
-  // 問題（AGE 動漫實測，2026-11-26）：
-  //   使用者搜「侦探已经死了」（裸名，Forward 沒帶 season），
-  //   AGE 的 /v2/search 回兩筆：
-  //     「侦探已经死了。 第二季」（id 20260281，S2，第08集）
-  //     「侦探已经死了」      （id 20210067，S1，第12集完结）
-  //   走 isSmartSeriesMatch 時，**兩筆都被判 season_conflict**：
-  //     target.seasonNumber 是預設值 1（不是使用者挑的），
-  //     candidate.seasonNumber 是站方寫明的 2 → 季別不等 → 整筆殺掉。
-  //   結果：AGE 貢獻 0 筆，使用者看到「動漫搜不到」。
-  //
-  // 為什麼這是錯的：
-  //   target.seasonNumber = 1 有兩個完全不同的來源：
-  //     (a) 使用者明確要第一季（Forward 傳 season=1）
-  //     (b) 使用者根本沒說要第幾季 → 1 只是預設值
-  //   舊程式分不出這兩者，一視同仁地擋掉 (b)。
-  //   但 (b) 的語意是「給我這部片」，站方只有 S2 時，S2 就是答案。
-  //
-  // ★「使用者明確指定季別」的兩個訊號（任一成立即算明確）：
-  //   1. 片名裡有季度標記（「侦探已经死了 第二季」）
-  //   2. Forward 帶了 season 參數且 > 1（targetInfo._expectedSequel 有值）
-  //      —— 這代表使用者在詳細頁按了「第二季」，是明確的意圖。
-  //
-  //   兩者都沒有 → 使用者只給了裸名 → 站方寫明第 N 季不該擋。
-  //
-  // ★ 為什麼用 rawName + _expectedSequel 而不是只看 seasonNumber：
-  //   seasonNumber=1 同時代表「明確 S1」與「未指定」，
-  //   rawName / _expectedSequel 才有辦法分辨這兩者。
-  //
-  // ★ 為什麼「Forward 傳 season=1」不在明確名單裡：
-  //   Forward 未選季別時傳的就是空字串，傳「1」是使用者另外挑的，
-  //   但語意上「我要第一部」跟「我要這部片」在 S1 站方庫裡幾乎等價
-  //   （S1 存在時本來就會優先）。真正會出錯的是「站方只有 S2」，
-  //   那時使用者要的還是這部片 → 不該擋。
-  //   S1 的嚴格性交給下游 filterBySequel 的「S1 反向阻擋」處理。
-  const targetHasExplicitSeasonMark =
-    _SEASON_MARK_RE.test(targetInfo.rawName || '') ||
-    (targetInfo._expectedSequel != null && targetInfo._expectedSequel > 1);
   if (candidateInfo.seasonNumber === 1 && targetInfo.seasonNumber > 1 &&
-      _SEASON_MARK_RE.test(candidateInfo.rawName || '')) {
+      /第\s*[一1１]\s*[季部]|Season\s*1\b|\bS1\b/i.test(candidateInfo.rawName || '')) {
     return {
       match: false, type: 'season_conflict', score: 0,
       similarity: 0,
@@ -3921,40 +3589,13 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       confidence: 0
     };
   }
-  // ★ v96：只有在使用者**明確指定**季別時，季別不符才是衝突。
-  //   未指定季別（裸名搜尋）時，站方寫明第 N 季是正常回應，不擋。
-  if (candidateInfo.seasonNumber !== 1 && candidateInfo.seasonNumber !== targetInfo.seasonNumber &&
-      targetHasExplicitSeasonMark) {
+  if (candidateInfo.seasonNumber !== 1 && candidateInfo.seasonNumber !== targetInfo.seasonNumber) {
     return {
       match: false, type: 'season_conflict', score: 0,
       similarity: 0,
       seasonMatch: false,
       targetSeason: targetInfo.seasonNumber,
       candidateSeason: candidateInfo.seasonNumber,
-      confidence: 0
-    };
-  }
-  // ★ v96：使用者明確要第 N 季（season 參數或片名標記）時，
-  //   候選是 S1 內容必須擋 —— 即使候選片名沒寫「第一季」。
-  //
-  //   為什麼需要這一條：上方那條只擋「候選明確寫出 S1」的
-  //   （「白粉飞第一季」）。但站方常常不寫（S1 候選就是裸片名），
-  //   實測 AGE「侦探已经死了」（S1，裸名）對上使用者要的 S2
-  //   → 候選 seasonNumber=1、target=2 → 兩條守門員都沒擋到
-  //   → 以 exact(100) 混入 → 使用者看到第一部的內容。
-  //
-  //   ★ 為什麼這裡可以擋（而裸名 target 那一側不擋）：
-  //   使用者要 S2 是**明確意圖**（season=2 或片名寫第二季），
-  //   拿到 S1 內容一定是錯的。反之 target 沒指定季別時，
-  //   站方只有 S1/S2 都是合法回應，該由下游排序決定。
-  if (candidateInfo.seasonNumber === 1 && targetInfo.seasonNumber > 1 &&
-      targetHasExplicitSeasonMark) {
-    return {
-      match: false, type: 'season_conflict', score: 0,
-      similarity: 0,
-      seasonMatch: false,
-      targetSeason: targetInfo.seasonNumber,
-      candidateSeason: 1,
       confidence: 0
     };
   }
@@ -10177,38 +9818,6 @@ const ADAPTER_SITES = [
     search: _ageSearch,
     episodes: _ageEpisodes,
     playUrls: _agePlayUrls,
-    // ★★ v98：AGE 的 query 格式限制 ★★
-    //
-    // 實測 api.agedm.io/v2/search 的驗證規則（每個都回 code=40050）：
-    //   ✗ 含空白       「侦探已经死了 第二季」→ 参数错误！
-    //   ✗ 結尾是數字   「侦探已经死了2」「无间道2」→ 参数错误！
-    //   ✓ 純中文片名   「侦探已经死了」→ 200，2 筆
-    //
-    // 我們的 searchQuery 會帶季別序號（extractEnhancedInfo 的
-    // `searchQuery += String(seasonNumber)`，MacCMS 站靠它才搜得到 S2），
-    // 對 AGE 這種嚴格的站會直接被拒 → 整站零結果。
-    //
-    // 修法：送出前把 query 洗成「純片名」形狀 ——
-    //   1. 去掉所有空白（站方不接受）
-    //   2. 去掉結尾的季別序號（數字 / 第N季 / Season N / S N）
-    //
-    // ★ 為什麼這樣安全：AGE 的搜尋是「片名模糊匹配」，它自己就會
-    //   把「侦探已经死了」和「侦探已经死了。 第二季」都回出來
-    //   （實測裸名查詢就回 2 筆）。季別交給下游 isSmartSeriesMatch
-    //   判斷（v98 已修好季度 vs 序號的辨識），搜尋層不需要帶序號。
-    searchQueryTransform(query) {
-      let q = String(query || '').trim();
-      // 1. 去空白（含全形空格）
-      q = q.replace(/[\s\u3000]+/g, '');
-      if (!q) return q;
-      // 2. 去結尾季別：第N季 / 第N部 / Season N / S N / 純數字
-      q = q
-        .replace(/第[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+[季部]$/g, '')
-        .replace(/[Ss]eason\s*[0-9]+$/g, '')
-        .replace(/\b[Ss]\s*[0-9]+$/g, '')
-        .replace(/\d+$/g, '');
-      return q;
-    },
   },
 ];
 
@@ -10376,27 +9985,6 @@ async function _adapterPool(tasks, limit = 4) {
 async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode, targetAirDate = null) {
   const t0 = Date.now();
   let items;
-  // ★★ v98：站方搜尋字串可覆寫 ★★
-  //
-  // 有些站對 query 的格式非常嚴格。實測 api.agedm.io 的 /v2/search：
-  //   query 含空白      → code=40050「参数错误！」
-  //   query 結尾是數字  → code=40050「参数错误！」
-  //   （「侦探已经死了 第二季」「侦探已经死了2」「无间道2」全部被拒）
-  //
-  // 問題在於我們的 searchQuery 會帶季別序號（extractEnhancedInfo 的
-  // `searchQuery += String(seasonNumber)`，MacCMS 站需要它才有 S2）。
-  // 對 AGE 這種嚴格的站，必須先把 query 洗成站方能接受的形狀。
-  //
-  // 設計：站方物件可定義 searchQueryTransform(query, targetInfo)，
-  // 回傳要送出的字串。不定義就用原字串（其他站行為完全不變）。
-  if (typeof site.searchQueryTransform === 'function') {
-    try {
-      const _t = site.searchQueryTransform(searchQuery, targetInfo);
-      if (typeof _t === 'string' && _t !== searchQuery) searchQuery = _t;
-    } catch (e) {
-      console.warn(`[adapter:${site.id}] searchQueryTransform 失敗: ${e?.message || e}`);
-    }
-  }
   // ★ 跨季共用：同 keyword 同站只打一次 search（loadDetail S1~S6 同字）。
   //   只快取「原始搜尋結果」，下游 standard 比對每季各自重跑，輸出逐字相同。
   const _searchKey = `${site.id}|${String(searchQuery || '')}|${String(type || '')}`;
@@ -14083,32 +13671,6 @@ function filterBySequel(results, targetInfo) {
       if (hasTargetSeq) {
         // ★ 目標明講要第 N 部 → 候選序號必須正好是 N。
         if (sq !== targetSeq) { dropped.push(res); continue; }
-        kept.push(res); continue;
-      }
-      // ★★ v96：候選的「序號」其實是**季度**時，不該被 S1 反向阻擋殺掉 ★★
-      //
-      // 問題（AGE 動漫實測，2026-11-26）：
-      //   使用者搜「侦探已经死了」（裸名，Forward 沒帶 season=1）
-      //   → 走這個 S1 分支 → 候選「侦探已经死了。 第二季」
-      //   → extractSequelNumber 回 2（「第二季」裡的數字）→ sq > 1 → 被殺
-      //   → AGE 只剩 S1 那筆；站方明明有 S2，使用者卻看不到。
-      //
-      // ★ 為什麼「第二季」不該算「續集序號 > 1」：
-      //   「第二季」是**同一部作品的第 2 季**，「無間道2」是**另一部作品**。
-      //   S1 反向阻擋的語意是「使用者要 S1，別把 S2 內容混進來」，
-      //   但使用者搜裸名時**沒有指定 S1** → 站方回 S2 是正常回應。
-      //
-      // ★ 與 isSmartSeriesMatch 的 v96 修正一致：
-      //   那裡用 classifyTitleNumberKind 把「季度序號」從序號衝突判斷降級，
-      //   這裡用同一個判斷把「季度序號」從 S1 反向阻擋降級。
-      //   兩層一致 → 整條管線的語意統一。
-      //
-      // ★ 什麼情況仍然要殺：
-      //   候選是**真正的續集**（「無間道2」「战狼2」）→ 仍是不同作品 → 照殺。
-      //   候選是**使用者明確要的 S2**（target 有季標記）→ 由上面的分支處理。
-      const candKind = classifyTitleNumberKind(nm);
-      if (candKind === 'season') {
-        // 候選只是標了第 N 季（不是另一部作品）→ 放行，交由排序決定先後。
         kept.push(res); continue;
       }
       if (sq !== null && sq > 1) { dropped.push(res); continue; }
