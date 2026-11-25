@@ -2086,7 +2086,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "6.0.0",
+  version: "6.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3003,6 +3003,29 @@ const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆�
 function inferMarkerSeasonByYear(items, markerRawName) {
   if (!Array.isArray(items) || !items.length || !markerRawName) return null;
 
+  // ────────────────────────────────────────────────────────────────────
+  // ★★ 站方年份不可信：必須用「跨站共識」★★
+  //
+  // 實測（真實站方資料）：
+  //   进击的巨人第三季 → 電影天堂/如意/優質 標 2018（非凡/暴風 標 2017 ← 錯）
+  //   进击的巨人第四季 → 只有如意資源有（2020），其他站根本沒有這條
+  //
+  // 也就是說：
+  //   1. 同一作品在不同站的 vod_year 會不同（有的站填錯、有的是重製版年份）
+  //   2. 某個站可能**缺**某幾季的條目 → 該站的 peer 集合不完整
+  //
+  // 若直接取「第一筆符合的年份」，會被單一站的錯年份帶偏；
+  // 若直接把多站年份混在一起做分群，錯年份會製造假的分群邊界。
+  //
+  // 解法：
+  //   a) marker 自己的年份 → 收集所有站對「同一 marker」的年份，取**眾數**
+  //      （同樣的年份最多 → 那是共識）；若眾數與次多同票，取較早者
+  //      （站方常把「完結年」填得比「首播年」晚）。
+  //   b) peer 年份 → 同一個片名在多站可能有多個年份，一樣取眾數。
+  //   c) 「最高已知季」→ 取所有站都同意的序號最大值，而不是任一站的說法。
+  //
+  // ────────────────────────────────────────────────────────────────────
+
   // marker 條目自己的年份（站方 vod_year；檔名年份也接受）
   //
   // ★ 匹配必須用「保留 marker 的完整名稱」★
@@ -3016,9 +3039,15 @@ function inferMarkerSeasonByYear(items, markerRawName) {
   //     2. normalize（保留 marker）後完全相等
   //     3. 兩者長度差 ≤ 4 且其中一方以另一方開頭
   //        （容忍「前篇/后篇」等尾綴差異）
+  //
+  // ★ 跨站投票要「加權」★
+  //   score 0（完全相等）→ 權重 100
+  //   score 1（normalize 相等）→ 權重 50
+  //   score 2（前綴近似）  → 權重 10
+  //   否則「仁医完结篇」會被「仁医」(2009) 以 score2 拉票，與 2011 平手，
+  //   而平手時取較早者 → 會推成 S1（錯）。加權後 2011 完勝。
   const markerFullNorm = normalizeTitleForMatch(String(markerRawName));
-  let my = null;
-  let best = null;   // { year, score }
+  const markerYearVotes = new Map();   // year → 加權票數
   for (const it of items) {
     if (!it || !it.vod_name) continue;
     const y = Number(String(it.vod_year || '').slice(0, 4));
@@ -3036,10 +3065,10 @@ function inferMarkerSeasonByYear(items, markerRawName) {
                (cn.startsWith(markerFullNorm) || markerFullNorm.startsWith(cn))) score = 2;
     }
     if (score < 0) continue;
-    if (!best || score < best.score) best = { year, score };
-    if (score === 0) break;
+    const weight = score === 0 ? 100 : (score === 1 ? 50 : 10);
+    markerYearVotes.set(year, (markerYearVotes.get(year) || 0) + weight);
   }
-  if (best) my = best.year;
+  const my = _consensusYear(markerYearVotes);
   if (my === null) return null;
 
   // marker 去掉後的主片名（用於認 peers）
@@ -3058,7 +3087,11 @@ function inferMarkerSeasonByYear(items, markerRawName) {
   //   「进击的巨人最终季」(2020, S4 Part1) 都是 marker，但年份不同 → 有鑑別力。
   //   只有「marker 文字完全相同」的條目才排除（那是同一季的不同版本）。
   const markerText = (String(markerRawName).match(_FINAL_SEASON_MARKER_RE) || [''])[0];
-  const peers = [];
+  // ★ peer 的年份也要用「跨站共識」★
+  //   同一個片名在多站可能標不同年份（「进击的巨人第三季」→ 2018 / 2017）。
+  //   先收集「每個 normalized 片名 → 年份投票」，再各自取眾數當該片的年份。
+  const peerYearVotes = new Map();   // cn → Map<year, count>
+  const peerSeq = new Map();        // cn → seq
   for (const it of items) {
     if (!it || !it.vod_name) continue;
     if (it.vod_name === markerRawName) continue;
@@ -3085,8 +3118,16 @@ function inferMarkerSeasonByYear(items, markerRawName) {
     if (cnCore !== base) continue;
     const y = Number(String(it.vod_year || '').slice(0, 4));
     if (!Number.isFinite(y) || y <= 0) continue;
-    const seq = extractSequelNumber(it.vod_name);
-    peers.push({ year: y, seq });
+    let vm = peerYearVotes.get(cn);
+    if (!vm) { vm = new Map(); peerYearVotes.set(cn, vm); }
+    vm.set(y, (vm.get(y) || 0) + 1);
+    if (!peerSeq.has(cn)) peerSeq.set(cn, extractSequelNumber(it.vod_name));
+  }
+  const peers = [];
+  for (const [cn, vm] of peerYearVotes) {
+    const y = _consensusYear(vm);
+    if (y === null) continue;
+    peers.push({ year: y, seq: peerSeq.get(cn) });
   }
   if (peers.length === 0) return null;
 
@@ -3128,6 +3169,35 @@ function inferMarkerSeasonByYear(items, markerRawName) {
       if (diff < 0 && diff >= -2) return maxSeq;       // 略早（站方標首播年）→ 那一季
     }
 
+    // ★★★ 「季序連續性」規則 ★★★
+    //
+    // 站方常**缺季**：某些站只有第一~第三季，沒有「第四季」（實測：非凡資源、
+    // 暴風資源都沒有進擊的巨人第四季條目）。此時「最終季」marker 若只靠
+    // 「最高已知季 + 年份」推導，會被推成 S3（錯）。
+    //
+    // 但語意上「最終季」= 該系列的最後一季，而且已知季是**連續**的
+    // （S1、S2、S3 都在 → 表示系列還在進行到 S3 之後）→ 最終季就是 S4。
+    //
+    // 判準：
+    //   已知季序號集合連續且最高為 maxSeq（1..maxSeq 都有）
+    //   → marker 語意是「最終季」→ 結果 = maxSeq + 1
+    //   （但若 maxSeq 那一季的年份已經和 marker 同年 → 就是那一季 → maxSeq）
+    const knownSeqs = new Set(withSeq.map(p => p.seq));
+    let contiguous = true;
+    for (let s = 1; s <= maxSeq; s++) {
+      if (!knownSeqs.has(s)) { contiguous = false; break; }
+    }
+    if (contiguous) {
+      // marker 年份若落在 maxSeq 那一季之後 → 可能是下一季的「最終季」
+      const maxSeqYear = Math.max(...withSeq.filter(p => p.seq === maxSeq).map(p => p.year));
+      const diff = my - maxSeqYear;
+      if (diff > 0 && diff <= 5) {
+        if (_FINAL_SEASON_SUFFIX_MARKER_RE.test(markerRawName)) return maxSeq;
+        return maxSeq + 1;
+      }
+      if (diff <= 0 && diff >= -2) return maxSeq;
+    }
+
     let best = null, bestD = Infinity;
     for (const p of withSeq) {
       const d = Math.abs(p.year - my);
@@ -3165,6 +3235,30 @@ function inferMarkerSeasonByYear(items, markerRawName) {
     if (my > grpMax && my - grpMax <= 5) return gi2 + 2;
   }
   return null;
+}
+
+/**
+ * 從年份投票表取「共識年份」。
+ *
+ * 為什麼需要：站方 vod_year 不可信，同一作品在不同站可能標不同年份
+ *   （實測：进击的巨人第三季 → 有的站 2018、有的站 2017）。
+ *   取第一筆會被單站的錯值帶偏 → 用**眾數**（出現次數最多的年份）。
+ *
+ * 平手時取**較早**的年份：站方常把「完結/上映年」填得比「首播年」晚，
+ *   而年份分群是以「首播年」為準的（第一季最晚 → 最後一季）。
+ *
+ * @param {Map<number, number>} votes  year → 次數
+ * @returns {number|null}
+ */
+function _consensusYear(votes) {
+  if (!(votes instanceof Map) || votes.size === 0) return null;
+  let bestYear = null, bestCount = -1, bestMin = Infinity;
+  for (const [y, c] of votes) {
+    // 同票 → 取較早者（tieBreak 用 min）
+    const better = c > bestCount || (c === bestCount && y < bestMin);
+    if (better) { bestCount = c; bestYear = y; bestMin = y; }
+  }
+  return bestYear;
 }
 
 /**
