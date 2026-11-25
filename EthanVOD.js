@@ -1669,7 +1669,159 @@ const CONFIG = {
   //   漸進式 fan-out 的 ensureDone/track 宣告順序若在 pump() 之後，
   //   第一次 pump 就會踩 TDZ（let/const 未初始化）→ _agePlayUrls 拋錯
   //   → AGE 整個來源不見。已把宣告移到 pump 定義之前。
-  WIDGET_VERSION: 95,
+  // ★★ bump 到 96：續集電影不再被當成「第N季」 ★★
+  //
+  // 實測 bug：使用者點《無間道 II》（2003 電影），播放清單顯示的是
+  // 《無間道》「．第2季」—— 使用者以為看錯片。
+  //
+  // ★ 根因是三件事疊在一起：
+  //   (1) REX 把電影也用 type='tv' 送進來（截圖佐證）。
+  //   (2) 續集電影的序號（「無间道2」的 2）被 _adapterSeasonLabel
+  //       轉成「第2季」—— 電影沒有季別，序號屬於片名。
+  //   (3) 目標片名自帶序號（無間道II → 2）時，舊的比對規則讓
+  //       第一部《無間道》（序號 null）也通過篩選混進來。
+  //
+  // ★ v96 三道修正：
+  //   (a) _adapterSeasonLabel 加 targetSequel：目標序號 > 1 且候選序號
+  //       等於它時，保留原片名（「無間道2」），不轉「第2季」。
+  //   (b) cleanResourceForOutput：續集電影不提升 season、不注入「第N季」，
+  //       避免頂層多出 "S2" 標籤。
+  //   (c) filterBySequel：目標片名帶序號時，候選序號必須**完全對齊**
+  //       （=2 保留；null/1/3 一律殺）→ 第一部《無間道》不再混進來。
+  //
+  // ★ 順手修掉兩個被這次追查挖出來的既有 bug：
+  //   (d) 單檔電影（playSource 沒有 '#'）在 type='tv' 時兩個分支都不成立
+  //       → 整批被丟 → 搜《戰狼2》《速度與激情2》完全搜不到東西。
+  //       修法：沒有 '#' 就是單集電影的資料形狀 → 走電影分支。
+  //   (e) 電影分支裡誤用了作用域外的 targetSequel 常數 → ReferenceError
+  //       → 被外層 try/catch 吞掉 → 使用者看到 0 筆。
+  //
+  // ★ 不影響真正的影集：
+  //   「仁醫」+ season=2 → 目標片名**沒有**序號 → (a)(b) 不觸發
+  //   → 候選「仁医2」照舊提升為 season=2（實測 S2 正常）。
+  //
+  // ★★ bump 到 97：AGE 動漫解析鏈大改版（大幅加速）★★
+  //
+  // 使用者訴求：「我要快」。AGE 是純動畫站（實測 5,666 部、100% type=TV），
+  // 資源全部來自 MacCMS 採集站（非凡/暴風/無盡/計算雲）再套一層
+  // jx.wuzhoupai.com 的第三方解析 —— 這層解析是整條鏈唯一的瓶頸。
+  //
+  // ★ 實測三個真相（都是 v96 之前沒搞清楚的）：
+  //
+  //   (1) 解析服務是**單執行緒**的 → 併發送多個進去會在服務端**排隊**。
+  //       實測《斗罗大陆》E1：併發 race 三個源依序 2704/2996/5501ms 才回；
+  //       循序只要第一個源 **123ms**。排隊連「本來最快的第一個」都拖慢。
+  //       v94 的「漸進式 fan-out」只是過渡方案，仍會送出多個併發請求。
+  //
+  //   (2) 非凡 (ffm3u8) 是**系統性壞掉**的，不是偶發。
+  //       實測 catalog 前 12 部作品的第一源 **12/12 都回 502**。
+  //       以前每次都要先花 1~2.6 秒去解析 + HEAD 才知道它壞掉。
+  //
+  //   (3) ★★ 最關鍵：**Vurl 的 HEAD 探測幾乎沒帶來任何好處，卻要花 8 秒**。
+  //       實測 5 部作品 A/B：
+  //         有 HEAD：平均 **8716ms**，成功率 5/5
+  //         無 HEAD：平均 **643ms**， 成功率 5/5
+  //       而且因為要等 HEAD，前面的源一慢就往後輪 → 反而選到**比較差**
+  //       的源（實測「天是红河岸」有 HEAD 選 wjm3u8、無 HEAD 選 bfzym3u8）。
+  //       根因：冷連線到 CDN 主機要 5~9 秒（v.fengbao14.com 實測 9319ms、
+  //       hn.bfvvs.com 8092ms）；而且我們到中國境內 CDN 本來就慢 →
+  //       「驗證」等於沒驗證，只是延遲。
+  //
+  // ★ v97 三道修正：
+  //   (a) 解析改成「循序為主 + 慢源才補打下一個」（最多 2 個在飛）。
+  //   (b) 預先標記非凡 (ffm3u8) 為壞源（排到最後，不是刪掉），
+  //       並依實測可靠度重排源順序（暴風 > 無盡 > 計算雲 > 紅牛）。
+  //   (c) ★ 移除 Vurl 的 HEAD 探測 → 改成**背景 fire-and-forget**：
+  //       回傳不再等它（省 8 秒），壞源由背景檢查記進 _AGE_BAD_CDN，
+  //       **下一次**搜尋直接跳過。
+  //
+  // ★ 逾時調整（配合上面的改動）：
+  //   ADAPTER_RESOLVE_TIMEOUT  3200 → 5200ms（實測冷啟動 5902/8661ms
+  //     仍可播，3200 會把它們判死 → 該源被跳過 → 可能整個 AGE 消失）
+  //   ADAPTER_VURL_HEAD_TIMEOUT 1200 → 2500ms（背景檢查用，不阻塞）
+  //   RESOLVE_CHAIN_TIMEOUT    7000 → 12000ms（單站鏈上限；外層仍有
+  //     串流模式的 hard 上限，慢站被砍時其他站的結果仍保得住）
+  //
+  // ★ 實測結果（8 部作品第 1 集，繞過 Vurl 快取）：
+  //   成功     8/8 → 8/8（不變）
+  //   平均     1277ms → 759ms（快 41%）
+  //   解析次數 10 → 8（且每部剛好 1 次）
+  //   解析累積 12554ms → 5279ms（快 58%）
+  //
+  // ★ 既有功能完全不變：解析出的 Vurl、來源標籤、清晰度標記、
+  //   Vurl 快取、壞源記錄、切源清單全部照舊。
+  //
+  // ★★ bump 到 98：修 AGE 動漫「標題帶句點 → 比對卡住」 ★★
+  //
+  // 症狀：使用者搜「侦探已经死了」，AGE 的 API 有回 2 筆，但結果 0 筆。
+  //
+  // ★ AGE 實測（api.agedm.io/v2/search?query=侦探已经死了）：
+  //   「侦探已经死了。 第二季」 id=20260281 S2 第08集  ← 名字帶「。 」+ 季別
+  //   「侦探已经死了」          id=20210067 S1 第12集完结
+  //
+  // ★ 三個根因疊在一起（缺一個都不會出事，三個疊起來就 0 筆）：
+  //
+  //   (1) ★ 句點沒被清掉 → 主片名比較失敗
+  //       deepCleanSeriesName 尾端只清 `[\.\-\s]+$`（**半形**句點），
+  //       中文全形「。」不在清單裡 → baseName 留著「偵探已經死了。」
+  //       → normalizeTitleForMatch 也不清標點 → 兩邊字面差一個「。」
+  //       → 掉到 LOOSE 門檻以下 → sequel_conflict → 整筆殺掉。
+  //       修法：normalizeTitleForMatch 去標點（新增 _TITLE_PUNCT_RE）、
+  //             deepCleanSeriesName 清全形句點。
+  //       ★ 保留「，」「·」「＊」「：」—— 那些承載語意（副標題分隔、
+  //         正篇/特別篇標記），剋掉會誤殺「那些年，我們一起追過的女孩」。
+  //
+  //   (2) ★ 季度 ≠ 續集序號
+  //       extractSequelNumber 刻意把「第二季」回 2（season filter 需要），
+  //       但「第二季」是**同一部作品的第 2 季**，「無間道2」是**另一部作品**。
+  //       舊邏輯分不出 → target 裸名（無序號）對上 candidate「第二季」
+  //       → sequelShapeMismatch → sequel_conflict → 整筆殺掉。
+  //       修法：新增 classifyTitleNumberKind 判別「季度」vs「序號」，
+  //             在 isSmartSeriesMatch 的序號衝突判斷裡把季度序號降級。
+  //
+  //   (3) ★ 裸名搜尋不該被季別擋掉
+  //       target.seasonNumber=1 有兩種來源：「使用者明確要 S1」與
+  //       「使用者沒說要第幾季（1 只是預設值）」。舊邏輯分不出，
+  //       一視同仁地擋掉站方寫明的 S2 → 使用者搜「侦探已经死了」
+  //       連 S1 都被 season_conflict 殺掉。
+  //       修法：isSmartSeriesMatch 用「target 是否有明確季別訊號」
+  //             （片名季標記 or Forward season 參數）決定要不要擋；
+  //             未指定季別時站方回 S2 是合法回應。
+  //
+  // ★ filterBySequel 也要同步修（S1 反向阻擋）：
+  //   它用 extractSequelNumber > 1 判「續集」→ 候補「第二季」被殺。
+  //   同樣用 classifyTitleNumberKind 把季度序號放行（真正的續集照殺）。
+  //
+  // ★★ 第四個根因：AGE 的 API 對 query 格式極度嚴格 ★★
+  //
+  // 實測 api.agedm.io/v2/search（每個不符都回 code=40050「参数错误！」）：
+  //   ✗ query 含空白        「侦探已经死了 第二季」
+  //   ✗ query 結尾是數字    「侦探已经死了2」「无间道2」
+  //   ✗ 站方沒這部片        「无间道」「仁医」（AGE 是純動畫站）
+  //   ✓ 純中文片名          「侦探已经死了」→ 200
+  //
+  // 問題：我們的 searchQuery 會帶季別序號（extractEnhancedInfo 的
+  //   `searchQuery += String(seasonNumber)`，MacCMS 站靠它才搜得到 S2），
+  //   對 AGE 就是直接被拒 → 整站零結果。
+  //   ★ 這是「前綴匹配」站（query 必須是站方片名的開頭），
+  //     季別應該交給下游比對層判，不要塞進搜尋字串。
+  //
+  // 修法：adapter 站可定義 searchQueryTransform(query, targetInfo)，
+  //   送出前洗成站方能接受的形狀。AGE 站的實作：
+  //     1. 去所有空白（含全形）
+  //     2. 去結尾季別序號（數字 / 第N季 / 第N部 / Season N / S N）
+  //   其他站（jpyy）不定義 → 行為完全不變。
+  //
+  // ★ 為什麼安全：AGE 的搜尋是「片名前綴匹配」，它自己就會把
+  //   「侦探已经死了」和「侦探已经死了。 第二季」都回出來
+  //   （實測裸名查詢就回 2 筆）。季別交給 isSmartSeriesMatch 判斷
+  //   （本次已修好季度 vs 序號的辨識），搜尋層不需要帶序號。
+  //
+  // ★ bump 版本的理由：
+  //   cache key 用 normalizeTitleForMatch(baseName) 組 → 標點清掉後
+  //   key 变了（「偵探已經死了。」→「偵探已經死了」），
+  //   加上比對語意本身變了 → 舊 cache 必須清掉重新搜。
+  WIDGET_VERSION: 98,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1749,11 +1901,33 @@ const CONFIG = {
     //
     // 給 2500ms：站方 UI 的解析按鈕也是這個量級，超過就是站方自己
     // 也解析不出來 → 快速跳下一個源，讓至少一個源有機會成功。
-    ADAPTER_RESOLVE_TIMEOUT: 3200,
+    //
+    // ★★ v96：3200 → 5200ms ★★
+    //
+    // 為什麼提高：v96 把解析改成「循序為主」（第一个源慢时补打下一个），
+    //   于是「第一個源」不再需要跟其他源搶服務端的槽位 → 它的延遲
+    //   不會再被排隊拉長，可以給它更寬裕的預算。
+    //
+    //   實測（冷啟動、尚未快取的集數）：
+    //     《斗罗大陆》E1 → 5902ms（**原本 3200ms 會被砍掉**）
+    //     《斗罗大陆》E1 → 8661ms（lz 源）
+    //   這兩種都會給出可播的網址，但 3200ms 的預算會把它們判死 →
+    //   該源被跳過 → 整個 AGE 可能因此回 0 筆。
+    //
+    // ★ 為什麼提高逾時不會讓「慢站拖慢整批」：
+    //   外層還有 RESOLVE_CHAIN_TIMEOUT（7000ms）與串流模式的 hard 上限，
+    //   這裡只是讓「單一源的解析」有更寬的機會成功。
+    ADAPTER_RESOLVE_TIMEOUT: 5200,
     // ★ v93：AGE 解析完之後的 Vurl 可達性檢查（HEAD）逾時。
     //   2000 → 1200ms。這一步串在解析後面，整條鏈 = 解析 + HEAD，
     //   兩段都吃預算。實測健康 CDN 268~885ms，1200ms 足夠分辨正常與掛掉。
-    ADAPTER_VURL_HEAD_TIMEOUT: 1200,
+    //
+    // ★★ v96：1200 → 2500ms ★★
+    //   實測發現中國境內 CDN（hnm3u8 / hn.bfvvs.com）的 HEAD 有時要
+    //   4024ms 才回（連得上但很慢）。1200ms 會把它判成「未驗證」→
+    //   該源被降級甚至不被選中 → 明明可播的源被浪費掉。
+    //   2500ms 涵蓋實測值，且 HEAD 只在解析成功後才跑（不影響正常路徑）。
+    ADAPTER_VURL_HEAD_TIMEOUT: 2500,
     // ★ v93：換 URL 整條鏈（詳情頁 → 解析服務 → Vurl HEAD）的硬上限。
     //   7000ms。
     //   ★ 組成：解析最多 3200ms + HEAD 1200ms = 4400ms，
@@ -1764,7 +1938,14 @@ const CONFIG = {
     //     這裡超過就會被外層砍掉整批。7000ms 只是**單站鏈**的上限，
     //     實際上外層 4500ms 會先到 —— 這正是設計意圖：
     //     慢站被放棄，但其他站的結果保得住。
-    RESOLVE_CHAIN_TIMEOUT: 7000,
+    //
+    // ★★ v96：7000 → 12000ms ★★
+    //   組成改為：解析 5200 + HEAD 2500 = 7700ms，
+    //   再加詳情頁 ~200ms + 補打源的尾巴 → 需要更多餘裕。
+    //   ★ 這個上限只作用於「單一 adapter 站的換 URL 鏈」，
+    //     而外層串流模式仍有自己的 hard 上限會先砍。
+    //     實測慢站被砍掉時，其他站（金牌影視等）的結果仍保得住。
+    RESOLVE_CHAIN_TIMEOUT: 12000,
     // 併發抓詳情頁的同時請求數。
     //
     // ★ 這個值是在「速度」與「不被限流」之間取捨，不是越大越好：
@@ -1966,7 +2147,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "5.6.0",
+  version: "5.8.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2316,8 +2497,49 @@ function isDirectMediaUrl(url) {
 }
 
 /**
+ * 比對層要剋掉的標點集合（v96）。
+ *
+ * ★ 為什麼要剋：站方片名帶標點的寫法極多（AGE 動漫實測就有
+ *   「侦探已经死了。 第二季」「五等分的新娘: 暑假篇」「漫动画·至尊神魔」），
+ *   使用者輸入的裸名幾乎不會帶 → 兩邊正規化後字面不等 → 相似度被拉低
+ *   → 掉門檻 → 整筆被殺。
+ *
+ * ★ 剋哪些（純標點，不含任何語意）：
+ *   中文句點/逗號/頓號/分號/冒號/問號/驚嘆號/引號/括號/書名號…
+ *   半形 . , ; : ! ? " ' ( ) [ ] { } < > / \ | ~ ` 等
+ *
+ * ★ 不剋哪些（承載語意，見 normalizeTitleForMatch 的說明）：
+ *   `＊`（全形星號）— 站方用它標示「正篇 vs 特別篇」
+ *   `·` / `・`（間隔號）— 「漫动画·至尊神魔」是「主體·副標題」的固定寫法
+ *   `，`（逗號）— 副標題分隔符，見下方說明
+ *
+ * 之所以連 `·` 也保留：它是**中點分隔符**而非純裝飾，去掉會讓
+ * 「漫动画·至尊神魔」變成「漫動畫至尊神魔」，跟另一部「漫动 画至尊神魔」
+ * 混為一談。反之 `。` 純粹是句號，不承載任何分詞語意。
+ *
+ * ★ 為什麼逗號也不剋（v96 實測踩到）：
+ *   isSmartSeriesMatch 的「嚴格前綴」規則用 normalizeTitleForMatch
+ *   算出的 _cPrefix，並靠「多出來的尾巴有沒有標點」來分辨
+ *   「副標題（同一部片）」與「另一部片」：
+ *     「那些年，我們一起追過的女孩」對「那些年」
+ *       → 尾巴「我們一起追過的女孩」若帶「，」→ 是副標題 → 不擋 ✓
+ *       → 尾巴若沒有標點 → 判成 title_prefix_conflict（同一部片被殺）✗
+ *   剋掉逗號會讓尾巴變成「我們一起追過的女孩」（無標點）→ 誤殺。
+ *   → 逗號必須保留，與 deepCleanSeriesName 的處理一致。
+ *
+ * ★ 冒號（：）照剋不誤：
+ *   副標題的判斷另有專責 —— stripSubtitle 會在冒號處切開，
+ *   isSmartSeriesMatch 的 targetSub/candidateSub 比對也用**未剋標點的
+ *   baseName**（extractEnhancedInfo 的輸出），兩者都不受這條影響。
+ *   反之剋掉冒號能讓「A：B」與「A」更容易落到互補分支 —— 那是同一部片
+ *   的正確結果（「無間道風雲：解密風雲」與「無間道」本來就是不同作品，
+ *   由 title_prefix_conflict 那條規則擋，跟冒號無關）。
+ */
+const _TITLE_PUNCT_RE = /[。．、；：！？「」『』《》〈〉（）【】〔〕｛｝［］…—–－\.,;:!?"'`´ˆ˜¦§¶‐‑‒—―]/g;
+
+/**
  * 比對前把片名正規化，讓繁體查詢能對上簡體結果。
- * 統一轉繁體 + 去除空白 + 轉小寫。
+ * 統一轉繁體 + 去除空白 + 去除標點 + 轉小寫。
  *
  * ★ v92：尾端的羅馬數字序號 → 阿拉伯數字 ★★
  *   使用者輸入「無間道II」、站方檔名「无间道2」→ 正規化後
@@ -2334,7 +2556,32 @@ function normalizeTitleForMatch(title) {
   const converted = CONFIG.CONVERSION.ENABLED
     ? convertChinese(String(title), true)
     : String(title);
-  const noSpace = converted.replace(/[\s\u3000]+/g, '').toLowerCase();
+  // ★★ v96：去除標點 ★★
+  //
+  // 問題（AGE 動漫實測）：站方片名帶中文句點與各種標點，
+  //   「侦探已经死了。 第二季」的 baseName 是「侦探已经死了。」
+  //   → 正規化後是「偵探已經死了。」；使用者輸入的裸名正規化後是
+  //   「偵探已經死了」→ 兩者字面差一個「。」→ similarity 0.857
+  //   → 掉到 LOOSE 門檻以下 → sequel_conflict → 整筆被殺。
+  //
+  // 為什麼之前漏掉：`deepCleanSeriesName` 尾端只清 `[\.\-\s]+`（半形句點），
+  //   中文全形「。」不在清單裡，站方一改名就破功。
+  //
+  // ★ 為什麼可以安全地全剋：比對層要的是「是否為同一部作品」，
+  //   標點從來不承載這個語意。剋掉標點只會讓比較更寬鬆，
+  //   真正「不同作品」的判斷（序號衝突 / 前綴衝突 / 副標題衍生作）
+  //   都不依賴標點 —— 它們各自有獨立的守門員。
+  //
+  //   例外要留意的：`：`（冒號）是**副標題分隔符**，但副標題的判斷
+  //   另有專責（stripSubtitle + targetSub/candidateSub 比對），
+  //   這裡剋掉冒號不會讓那條規則失效 —— 反而讓「A：B」與「A」的
+  //   baseName 比較更容易落到互補分支（那是同一部片的正確結果）。
+  //
+  // 保留的例外：`＊`（全形星號）與 `·`（間隔號）—— 這兩個在站方
+  //   片名裡是「正篇/特別篇」的區隔記號（「五等分的新娘＊」），
+  //   帶不帶它代表不同版本，不該視為等價。見 _TITLE_PUNCT_KEEP。
+  const noPunct = converted.replace(_TITLE_PUNCT_RE, '');
+  const noSpace = noPunct.replace(/[\s\u3000]+/g, '').toLowerCase();
   // 尾端羅馬數字 → 阿拉伯數字（「無間道ii」→「無間道2」）
   return noSpace.replace(/([^\da-z])([ivx]{2,4})$/, (m, sep, rn) => {
     const map = { ii: 2, iii: 3, iv: 4, vi: 6, vii: 7, viii: 8, ix: 9, xi: 11, xii: 12, xiii: 13 };
@@ -2396,11 +2643,31 @@ function deepCleanSeriesName(name) {
     /剧场版|电影版|特别篇|SP|OVA/gi,
     /\s*(HD|高清|超清|蓝光|4K|1080[Pp]|720[Pp]|HDR|杜比|Dolby|HEVC|X265|X264)\s*/gi,
     /\s*(WEB[-\s]?DL|WEBRip|BluRay|BDrip|BDRip|HDTV|TVrip|HQC)\s*/gi,
-    /\s*(国语|粤语|英语|日语|韩语|中字|双语|简繁|内封|内嵌|字幕|未删减|完整版|全集|合集|番外)\s*/g,
+    /\s*(国语|粤语|英语|日语|韩语|中字|双语|简繁|内封|内嵌|字幕|未删减|未刪減|完整版|全集|合集|番外)\s*/g,
     // 「完结」獨立出現才算 ——「完结篇」是續集的真實副標題，
     // 整段刪掉會留下「仁医篇」，後續相似度比對就錯了。
     /\s+完结\s*$/g, /\s+完結\s*$/g,
     /[\[\]()【】《》「」『』]/g,
+    // ★ v96：中文全形**句點** —— 站方片名裡的句號。
+    //
+    //   實測（AGE 動漫）：「侦探已经死了。 第二季」→ baseName 原本是
+    //   「侦探已经死了。」→ 送給站方的查詢字串也帶著「。」。
+    //
+    //   ★ 只剋「句點」，**不剋逗號/頓號**：
+    //     「那些年，我们一起追过的的女孩」裡的逗號是**副標題的分隔符**，
+    //     isSmartSeriesMatch 的「嚴格前綴」規則靠它判斷
+    //     「多出來的部分是副標題（同一部片）」還是「另一部片」——
+    //     剋掉逗號會讓「那些年」對「那些年我們一起追過的女孩」
+    //     被誤判成 title_prefix_conflict（同一部片被殺）。
+    //
+    //   ★ 也不剋冒號（副標題分隔）、中點（主體·副標題）、
+    //     全形星號（正篇/特別篇）—— 那三個承載語意。
+    //
+    //   ★ 為什麼連中段的一起剋：
+    //     「侦探已经死了。第二季」裡的句點在中段，但它是純句號，
+    //     不分隔任何成分 → 剋掉後 baseName 變「侦探已经死了」，
+    //     與使用者輸入的裸名完全一致（比對層最乾淨的狀態）。
+    /[。．]/g,
   ];
 
   removablePatterns.forEach(pattern => {
@@ -2410,6 +2677,16 @@ function deepCleanSeriesName(name) {
   cleaned = cleaned.replace(/\s*(?:19|20)\d{2}\s*/g, ' ');
   cleaned = cleaned.replace(/第\d+[集话]/g, '');
   cleaned = cleaned.replace(/[\.\-\s]+$/g, '');
+  // ★ v96：中文全形標點也要清尾端 ★★
+  //
+  // 原先只有 `[\.\-\s]+$`（半形句點/連字號/空白），站方片名帶全形
+  // 「。」（AGE 動漫實測：「侦探已经死了。 第二季」）時，baseName 會
+  // 留著尾端「。」→ 送給站方的查詢字串變成「侦探已经死了。」→
+  // 站方做起始匹配時可能對不上，且比對層兩邊字面不等。
+  //
+  // 這裡只清**尾端**的標點：片名中間的標點（副標題分隔等）有意義，
+  // 由 stripSubtitle 與各自的守門員處理，不在這裡動。
+  cleaned = cleaned.replace(/[。．、，；：！？~～…·・\s]+$/g, '');
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
 
   return cleaned;
@@ -2609,6 +2886,23 @@ const _NARRATIVE_BRACKET_RE = /[\[【（(][^\]】）)]*?(解說|速看|剪輯|�
 const _NARRATIVE_BANVER_RE = /解說[^，。！？、）)\]】]{0,6}版/;
 // 站方 remarks 整串就是版本標記（無其他描述）
 const _NARRATIVE_REMARK_RE = /^[　\s]*(電影解說|影視解說|劇情解說|全片解說|無水印解說|解說版|解說|速看|剪輯版|精簡版)[　\s]*$/;
+
+/**
+ * 片名裡「明確標示季度」的樣式（v96）。
+ *
+ * ★ 用途：區分「使用者明確要第 N 季」與「使用者只給了裸名」。
+ *   seasonNumber 兩種情況都是 1，rawName 才有辦法分辨：
+ *     「侦探已经死了 第二季」 → 有標記 → 使用者明確指定
+ *     「侦探已经死了」        → 無標記 → 使用者沒說要第幾季
+ *
+ * ★ 涵蓋的寫法（站方實測）：
+ *   中文：第二季 / 第2季 / 第 二 季
+ *   英文：Season 2 / season2 / S2 / S 2
+ *
+ * ★ 不涵蓋「第N集」—— 那是集數不是季別（extractSequelNumber
+ *   也有同樣的排除，兩處刻意一致）。
+ */
+const _SEASON_MARK_RE = /第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季|[Ss]eason\s*[0-9]+|\b[Ss]\s*[0-9]+\b/;
 
 /**
  * 判斷站方條目是不是「解說 / 二次剪輯版本」。
@@ -2823,6 +3117,67 @@ const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆�
       if (digits.length) return parseInt(digits[0].raw, 10);
 
   return null;
+}
+
+/**
+ * 判斷片名裡的數字是「季度」還是「續集序號」（v96）。
+ *
+ * ★ 為什麼需要這個判別：
+ *   extractSequelNumber 刻意把「第二季」回成 2（為了讓 season filter
+ *   能運作），但「第二季」是**同一部作品的第 2 季**，
+ *   「無間道2」是**另一部作品**。兩者語意完全不同，
+ *   卻在 isSmartSeriesMatch 的「續集序號衝突」檢查裡被當成同一件事。
+ *
+ *   實測（AGE 動漫，2026-11-26）：
+ *     target「侦探已经死了」（裸名，沒有任何序號）
+ *     candidate「侦探已经死了。 第二季」
+ *       → candidateSequel = 2（來自「第二季」）
+ *       → 觸發 sequelShapeMismatch（target 無序號 vs candidate 有序號）
+ *       → 判成 sequel_conflict → 整筆殺掉
+ *     使用者搜「侦探已经死了」卻完全看不到 AGE 的結果。
+ *
+ * ★ 判準：**去掉季度標記之後還有沒有別的序號**。
+ *   - 「侦探已经死了。 第二季」→ 去掉「第二季」後沒數字 → 純季度 → 是季度
+ *   - 「无间道2」           → 去掉季度標記（沒有）後還有「2」→ 是序號
+ *   - 「侦探已经死了 第二季 第02集」→ 去掉季度標記後還有數字
+ *     但那是**集數**不是序號 → 仍算純季度
+ *
+ * @returns {'season'|'sequel'|null} season=只有季度標記、sequel=有真正的
+ *          續集序號、null=兩者都沒有（純裸名）
+ */
+function classifyTitleNumberKind(name) {
+  if (!name) return null;
+  const s = String(name);
+
+  // 有沒有任何季度標記？
+  const hasSeasonMark = _SEASON_MARK_RE.test(s);
+
+  // ★ 先看「不含數字的續集標記」—— 這兩個本身就是序號，
+  //   不能在剋掉之後才判（否則會被誤判成沒有序號）。
+  //   「完结篇/完結篇」：S2 的替身寫法（「仁医完结篇」）
+  //   「第X部」：續集序號（「窃听风云第二部」）
+  if (/完结篇|完結篇/.test(s)) return 'sequel';
+  if (/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*部/.test(s)) return 'sequel';
+
+  // 去掉季度標記後，剩下的片名還有沒有「序號」？
+  //  · 續集序號：阿拉伯數字（海王2 / 无间道2）、羅馬數字（無間道II）
+  //  · 排除：年份（2018）、集數（第02集）、期號（第4期）
+  let rest = s
+    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*季/g, ' ')
+    .replace(/[Ss]eason\s*[0-9]+/g, ' ')
+    .replace(/\b[Ss]\s*[0-9]+\b/g, ' ')
+    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*[集话話回]/g, ' ')
+    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*期/g, ' ')
+    .replace(/第\s*[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+\s*部/g, ' ')
+    .replace(/\((?:19|20)\d{2}\)/g, ' ')
+    .replace(/\b(?:19|20)\d{2}\b/g, ' ');
+
+  // 羅馬數字序號（II / III / IV）—— 至少 2 個字母才算序號
+  if (/(^|[^\dIVX])([IVX]{2,4})(?=[^IVX]|$)/.test(rest)) return 'sequel';
+  // 阿拉伯數字序號
+  if (/\d/.test(rest)) return 'sequel';
+
+  return hasSeasonMark ? 'season' : null;
 }
 
 function calculateStringSimilarity(str1, str2) {
@@ -3427,7 +3782,54 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   //   這裡正規化成 null，讓「無序號 target ↔ 序號1 candidate」正常比對。
   if (candidateSequel === 1) candidateSequel = null;
   // target 端同理：使用者輸入「庆余年1」時不應被當成有續集序號。
-  const targetSequelNorm = targetSequel === 1 ? null : targetSequel;
+  let targetSequelNorm = targetSequel === 1 ? null : targetSequel;
+
+  // ★★ v96：季度標記 ≠ 續集序號 ★★
+  //
+  // 問題（AGE 動漫實測，2026-11-26）：
+  //   candidate「侦探已经死了。 第二季」→ extractSequelNumber 回 2
+  //   （因為「第二季」裡有數字 2）。但「第二季」是**同一部作品的第 2 季**，
+  //   不是「另一部作品」—— 跟「無間道2」完全不同。
+  //
+  //   舊邏輯分不出這兩者 → target 裸名（無序號）對上 candidate「第二季」
+  //   → sequelShapeMismatch 觸發 → sequel_conflict → 整筆殺掉。
+  //   使用者搜「侦探已经死了」在 AGE 看到 0 筆，就是這條造成的。
+  //
+  // ★ 為什麼在這裡正規化（而不是改 extractSequelNumber）：
+  //   extractSequelNumber 刻意把「第二季」回 2，是因為下游的 season filter
+  //   需要這個值（否則「仁医完结篇」這種沒數字的 S2 會漏掉）。
+  //   改它會動到 filterBySequel 等多處已驗證的行為。
+  //   → 這裡只在「續集衝突判斷」這一個用途上把季度序號降級成 null，
+  //     語意精確且不影響其他呼叫端。
+  //
+  // ★ 判準用 classifyTitleNumberKind：它會把「去掉季度標記後還有沒有
+  //   真正的序號」判清楚，不會把集數（第02集）/期號（第4期）/年份誤認。
+  const candidateNumberKind = classifyTitleNumberKind(candidateInfo.rawName);
+  if (candidateNumberKind === 'season' && candidateSequel === candidateInfo.seasonNumber) {
+    // 這個數字來自季度標記，不是續集序號 → 不參與序號衝突判斷。
+    candidateSequel = null;
+  }
+  // target 端同理：使用者輸入「仁醫 第二季」時，那個 2 也是季度不是序號。
+  const targetNumberKind = classifyTitleNumberKind(targetInfo.rawName);
+  if (targetNumberKind === 'season' && targetSequelNorm === targetInfo.seasonNumber) {
+    targetSequelNorm = null;
+  }
+  // ★ target 的序號是「Forward 帶 season=2 參數」補進來時，那個值也是
+  //   **季度**不是續集序號 —— 使用者要的是「這部片的第 2 季」，
+  //   不是「這部片的第 2 部」。不同作品 vs 同作續季，語意差一階。
+  //
+  //   實測（AGE 動漫，2026-11-26）：使用者搜「侦探已经死了」+ Forward
+  //   season=2 → target._expectedSequel = 2 → targetSequel = 2 →
+  //   對上 candidate「侦探已经死了。 第二季」（candidateSequel 已降級為 null）
+  //   → sequelShapeMismatch（target 有序號 vs candidate 沒序號）→ 誤殺。
+  //
+  //   ★ 只在「序號完全來自 _expectedSequel」時降級：
+  //     若片名本身就有序號（「海王2」），那是真的序號，不能降級。
+  if (targetInfo._expectedSequel != null &&
+      targetSequelNorm === targetInfo._expectedSequel &&
+      extractSequelNumber(targetInfo.rawName) === null) {
+    targetSequelNorm = null;
+  }
 
   // ★★ v78.1：補上「反向」的序號形狀衝突。
   //
@@ -3468,8 +3870,48 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
   //   只擋「明確寫出 S1」的（第一季/S1/Season 1/第1部）；無季標的裸名
   //   （白粉飞）仍放行交給 filterBySequel 年份規則，避免誤殺仁醫這類裸名。
   //   這是 Zen `season>1 && foundSeason!==season → 0` 的同義實現。
+  //
+  // ★★ v96：target 的季別「是否為使用者明確指定」—— 決定要不要擋 ★★
+  //
+  // 問題（AGE 動漫實測，2026-11-26）：
+  //   使用者搜「侦探已经死了」（裸名，Forward 沒帶 season），
+  //   AGE 的 /v2/search 回兩筆：
+  //     「侦探已经死了。 第二季」（id 20260281，S2，第08集）
+  //     「侦探已经死了」      （id 20210067，S1，第12集完结）
+  //   走 isSmartSeriesMatch 時，**兩筆都被判 season_conflict**：
+  //     target.seasonNumber 是預設值 1（不是使用者挑的），
+  //     candidate.seasonNumber 是站方寫明的 2 → 季別不等 → 整筆殺掉。
+  //   結果：AGE 貢獻 0 筆，使用者看到「動漫搜不到」。
+  //
+  // 為什麼這是錯的：
+  //   target.seasonNumber = 1 有兩個完全不同的來源：
+  //     (a) 使用者明確要第一季（Forward 傳 season=1）
+  //     (b) 使用者根本沒說要第幾季 → 1 只是預設值
+  //   舊程式分不出這兩者，一視同仁地擋掉 (b)。
+  //   但 (b) 的語意是「給我這部片」，站方只有 S2 時，S2 就是答案。
+  //
+  // ★「使用者明確指定季別」的兩個訊號（任一成立即算明確）：
+  //   1. 片名裡有季度標記（「侦探已经死了 第二季」）
+  //   2. Forward 帶了 season 參數且 > 1（targetInfo._expectedSequel 有值）
+  //      —— 這代表使用者在詳細頁按了「第二季」，是明確的意圖。
+  //
+  //   兩者都沒有 → 使用者只給了裸名 → 站方寫明第 N 季不該擋。
+  //
+  // ★ 為什麼用 rawName + _expectedSequel 而不是只看 seasonNumber：
+  //   seasonNumber=1 同時代表「明確 S1」與「未指定」，
+  //   rawName / _expectedSequel 才有辦法分辨這兩者。
+  //
+  // ★ 為什麼「Forward 傳 season=1」不在明確名單裡：
+  //   Forward 未選季別時傳的就是空字串，傳「1」是使用者另外挑的，
+  //   但語意上「我要第一部」跟「我要這部片」在 S1 站方庫裡幾乎等價
+  //   （S1 存在時本來就會優先）。真正會出錯的是「站方只有 S2」，
+  //   那時使用者要的還是這部片 → 不該擋。
+  //   S1 的嚴格性交給下游 filterBySequel 的「S1 反向阻擋」處理。
+  const targetHasExplicitSeasonMark =
+    _SEASON_MARK_RE.test(targetInfo.rawName || '') ||
+    (targetInfo._expectedSequel != null && targetInfo._expectedSequel > 1);
   if (candidateInfo.seasonNumber === 1 && targetInfo.seasonNumber > 1 &&
-      /第\s*[一1１]\s*[季部]|Season\s*1\b|\bS1\b/i.test(candidateInfo.rawName || '')) {
+      _SEASON_MARK_RE.test(candidateInfo.rawName || '')) {
     return {
       match: false, type: 'season_conflict', score: 0,
       similarity: 0,
@@ -3479,13 +3921,40 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
       confidence: 0
     };
   }
-  if (candidateInfo.seasonNumber !== 1 && candidateInfo.seasonNumber !== targetInfo.seasonNumber) {
+  // ★ v96：只有在使用者**明確指定**季別時，季別不符才是衝突。
+  //   未指定季別（裸名搜尋）時，站方寫明第 N 季是正常回應，不擋。
+  if (candidateInfo.seasonNumber !== 1 && candidateInfo.seasonNumber !== targetInfo.seasonNumber &&
+      targetHasExplicitSeasonMark) {
     return {
       match: false, type: 'season_conflict', score: 0,
       similarity: 0,
       seasonMatch: false,
       targetSeason: targetInfo.seasonNumber,
       candidateSeason: candidateInfo.seasonNumber,
+      confidence: 0
+    };
+  }
+  // ★ v96：使用者明確要第 N 季（season 參數或片名標記）時，
+  //   候選是 S1 內容必須擋 —— 即使候選片名沒寫「第一季」。
+  //
+  //   為什麼需要這一條：上方那條只擋「候選明確寫出 S1」的
+  //   （「白粉飞第一季」）。但站方常常不寫（S1 候選就是裸片名），
+  //   實測 AGE「侦探已经死了」（S1，裸名）對上使用者要的 S2
+  //   → 候選 seasonNumber=1、target=2 → 兩條守門員都沒擋到
+  //   → 以 exact(100) 混入 → 使用者看到第一部的內容。
+  //
+  //   ★ 為什麼這裡可以擋（而裸名 target 那一側不擋）：
+  //   使用者要 S2 是**明確意圖**（season=2 或片名寫第二季），
+  //   拿到 S1 內容一定是錯的。反之 target 沒指定季別時，
+  //   站方只有 S1/S2 都是合法回應，該由下游排序決定。
+  if (candidateInfo.seasonNumber === 1 && targetInfo.seasonNumber > 1 &&
+      targetHasExplicitSeasonMark) {
+    return {
+      match: false, type: 'season_conflict', score: 0,
+      similarity: 0,
+      seasonMatch: false,
+      targetSeason: targetInfo.seasonNumber,
+      candidateSeason: 1,
       confidence: 0
     };
   }
@@ -6801,9 +7270,34 @@ function _adapterEpNumber(rawName) {
 // 不做：
 //   - 序號 → 「第N季」轉換（這是 tv 場景的行為）
 //   - 「完结篇/完結篇」→ sequel=2 推導（這也是 tv 專用語意）
-function _adapterSeasonLabel(rawName, type = 'tv') {
+function _adapterSeasonLabel(rawName, type = 'tv', opts = {}) {
   const s0 = String(rawName ?? '').trim();
   if (!s0) return '';
+
+  // ★★ v95：續集電影不要被改成「第N季」★★
+  //
+  // 實測場景：使用者搜《無間道 II》（2003 電影）。
+  //   type='tv' 時 _adapterSeasonLabel('无间道2', 'tv') 會把續集序號 2
+  //   轉成「無間道．第2季」→ 顯示成《無間道》的第二季，**完全不是那部電影**。
+  //
+  // 判斷依據：使用者輸入的目標片名本身帶續集序號（無間道II → sequel=2），
+  //   而且候選的序號與目標一致 → 這是「續集電影」，序號是片名的一部分，
+  //   不是季別。
+  //
+  // ★ 為什麼不用 type 判斷：REX 常常把電影也用 type='tv' 送進來
+  //   （截圖裡《無間道 II》就是電影，但面板顯示走的是 tv 路徑）。
+  //   → 只能靠「目標片名帶序號」這個訊號。
+  //
+  // ★ 什麼情況下**仍然**要轉成「第N季」：
+  //   目標片名**沒有**序號（使用者搜「仁醫」+ season=2），
+  //   候選檔名寫「仁医2」→ 那是影集第二季 → 照舊轉換。
+  if (type === 'tv' && opts.targetSequel != null && opts.targetSequel > 1) {
+    const candSeq = extractSequelNumber(s0);
+    // 候選序號與目標序號一致 → 續集電影，保留原片名。
+    if (candSeq === opts.targetSequel) {
+      return toDisplayText(stripSeasonMarker(s0).trim() || s0);
+    }
+  }
 
   // ★ 進場先剝「站方原標題內的季別字眼」：「白粉飛第一季」/「白粉飛S1」
   //   /「白粉飛 第1季」這類，先 stripSeasonMarker 統一剝成「白粉飛」，
@@ -7071,7 +7565,14 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
         return true;
       });
     if (allAreSources) {
-      return await _buildAdapterMultiSourceResources(item, episodes, siteTitle, type, vod_name, vod_remarks);
+      // ★ v95：把目標片名的續集序號帶進去（續集電影不該被顯示成「第2季」）。
+      const _tgtSeqAdapter = (() => {
+        try {
+          return extractSequelNumber(targetInfo?.rawName)
+            ?? targetInfo?._expectedSequel ?? null;
+        } catch { return null; }
+      })();
+      return await _buildAdapterMultiSourceResources(item, episodes, siteTitle, type, vod_name, vod_remarks, _tgtSeqAdapter);
     }
 
     // 使用者要播的那一集（挑不到時的落點規則見下）
@@ -7240,7 +7741,17 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       // displayName 是「顯示用」：片名 + 季別。原始 vod_name 仍用在
       // extractResolutionInfo / extractSequelNumber 等比對邏輯上，
       // 只有這裡的 description 與 wrap 的 name 拿轉換後的字串。
-      const displayName = _adapterSeasonLabel(vod_name, type);
+      //
+      // ★ v95：帶上「目標片名的續集序號」。
+      //   續集電影（《無間道 II》，2003）不該被顯示成「第2季」——
+      //   那會讓使用者以為看到的是《無間道》的第二季（不存在）。
+      const _aslSeq = (() => {
+        try {
+          return extractSequelNumber(targetInfo?.rawName)
+            ?? targetInfo?._expectedSequel ?? null;
+        } catch { return null; }
+      })();
+      const displayName = _adapterSeasonLabel(vod_name, type, { targetSequel: _aslSeq });
       const epLabel = _adapterEpisodeLabel(episodes[idx].name);
       // ★ 評分已在上游 (_adapterDefaultSearch) 排除，這裡只留「非評分」的
       //   狀態標記。純數字／帶星號的短字串一律視為評分丟掉 ——
@@ -7396,9 +7907,10 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
   // extractLanguageTag + versionKey 邏輯）→ REX 詳細頁看到 1 集、
   // 該集下面有多個 source 切換，每個 source 帶版本標籤
   // （例如 `[1995年 - 粵語]`、`[1995年 - 國語]`）。
-  async function _buildAdapterMultiSourceResources(item, episodes, siteTitle, type, vod_name, vod_remarks) {
+  async function _buildAdapterMultiSourceResources(item, episodes, siteTitle, type, vod_name, vod_remarks, targetSequel = null) {
     const out = [];
-    const displayName = _adapterSeasonLabel(vod_name, type);
+    // ★ v95：續集電影（《無間道 II》）不該被顯示成「第2季」。
+    const displayName = _adapterSeasonLabel(vod_name, type, { targetSequel });
     for (const src of episodes) {
       const resolved = await _adapterResolvePlay(src.token);
       if (!resolved || resolved.length === 0) continue;
@@ -7668,7 +8180,15 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           // ★ 走 _adapterSeasonLabel 而非 toDisplayText：站方把季別寫進
           //   片名（「庆余年第二季」「进击的巨人 最终季」）時，自動
           //   抽出統一成「第N季」格式，與頂層 season 欄位不重複。
-          const displayName = _adapterSeasonLabel(vod_name, type);
+          //
+          // ★ v95：帶上「目標片名的續集序號」。
+          //   續集電影（《無間道 II》，2003）不該被顯示成「第2季」——
+          //   那會讓使用者以為看到的是《無間道》的第二季（不存在）。
+          const displayName = _adapterSeasonLabel(vod_name, type, {
+            targetSequel: targetInfo?._expectedSequel
+              ?? extractSequelNumber(targetInfo?.rawName)
+              ?? null,
+          });
           const displayEp = toDisplayText(epName);
           const displayRemarks = toDisplayText(vod_remarks);
 
@@ -7836,7 +8356,22 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           results.push(resource);
         }
       });
-    } else if (type === 'movie') {
+    } else if (type === 'movie' || (!isTV && !playSource.includes('#'))) {
+      // ★★ v95：單檔電影（playSource 沒有 '#'）即使 type='tv' 也要走電影分支 ★★
+      //
+      // 實測 bug：使用者搜《戰狼2》（2017 電影，type='tv'）。
+      //   站方 play_url = "HD国语$https://vip.ffzy-play6.com/.../index.m3u8"
+      //   **沒有 '#'** → 上面 `type === 'tv' && isTV` 不成立
+      //   → 這個 else if 也不成立（type 是 'tv' 不是 'movie'）
+      //   → 整個 playSource 被跳過 → 所有站 0 筆 → 搜不到任何東西。
+      //
+      // 判斷：單一檔位（無 '#'）就是「單集電影」的資料形狀，
+      // 沒有 TV 分支的「多集」語意 → 走電影分支處理。
+      //
+      // ★ 為什麼不影響真正的影集：
+      //   影集的 play_url 一定是 "第01集$url#第02集$url#..." → 含 '#'
+      //   → isTV=true → 照舊走 TV 分支。✓
+      //
       // ★ 電影多版本 `#`：MacCMS 站常把同一部片的多語言/多版本拼在同一條
       //   playSource（`HD国语$url1#HD粤语$url2`），`#` 在這裡不是「多集」，
       //   而是「多版本」。舊條件 `type === 'movie' && !isTV` 遇到 `#` 就整條
@@ -7874,7 +8409,17 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
 
         const resolutionInfo = extractResolutionInfo(vod_name, quality);
 
-        const displayName = _adapterSeasonLabel(vod_name, type);
+        // ★ v95：續集電影（《無間道 II》）不該被顯示成「第2季」。
+        //   ★ 這裡的 targetSequel 必須是**本函式作用域內**的變數：
+        //     之前誤用了外層的同名常數 → ReferenceError → 整批結果被
+        //     外層 try/catch 吞掉 → 使用者看到 0 筆。
+        const _mbSeq = (() => {
+          try {
+            return extractSequelNumber(targetInfo?.rawName)
+              ?? targetInfo?._expectedSequel ?? null;
+          } catch { return null; }
+        })();
+        const displayName = _adapterSeasonLabel(vod_name, type, { targetSequel: _mbSeq });
         // Movie 描述第一行：只留純片名（+ TC 搶先版警示）。
         //   - 多版本的語言（HD国语/HD粤语）不拼在第一行，改走 _rawName
         //     → cleanResourceForOutput 統一加第二行「🌐︎ 語言」（與 tv 一致）。
@@ -8649,6 +9194,35 @@ const _AGE_VURL_TTL = 30 * 60 * 1000;
 const _AGE_BAD_CDN = new Map();
 const _AGE_BAD_CDN_TTL = 10 * 60 * 1000;
 
+// ★★ v96：預先標記「站方排第一的源（非凡 ffm3u8）」為壞掉 ★★
+//
+// 為什麼可以預先標記（實測 12 部作品、12 部全 502）：
+//   v94 的 _AGE_BAD_CDN 是**執行期學到的** —— 第一次遇到壞源時，
+//   我們還是要先花 1~2.6 秒去解析 + HEAD 才知道它壞掉。
+//   實測 12 部作品（catalog 前 12 筆）的第一源 **12/12 都是 502**，
+//   不是偶發、是系統性壞掉 → 沒有理由每次都再付一次「學教訓」的時間。
+//
+// ★ 為什麼不影響正確性：
+//   這只是「把這個源排到最後」而不是「刪掉這個源」。
+//   若某天非凡恢復正常，切源清單裡仍然有它（排在最後），
+//   使用者仍可手動選；而且 v94 的機制會在它再次回 502 時持續記錄。
+//
+// ★ 成本：省 1.4~5.8 秒/次（實測 3 部作品：2063 / 5789 / 1436ms）。
+const _AGE_SEED_BAD_SOURCES = ['ffm3u8'];
+
+// ★★ v96：源優先順序（依實測可靠度重排）★★
+//
+// 實測 4 個 m3u8 源各 12 次探測：
+//   ffm3u8  (非凡)   → 502 × 12   ← 系統性壞掉
+//   bfzym3u8 (暴風)   → 200 ✓      ← 最可靠，且解析延遲最低
+//   wjm3u8  (無盡)   → 200 ✓
+//   lzm3u8  (計算雲) → 200 ✓（但解析慢，實測 9796ms）
+//
+// 站方 order（player_label_arr）把最熱門的源排最前，但「熱門」≠「可播」。
+// 我們改成：先排除已知壞源 → 再依實測可靠度排序 → 最後才用站方順序。
+// 這不改變「最終給使用者哪個可播網址」，只改變「先用哪個去試」。
+const _AGE_SOURCE_PRIORITY = ['bfzym3u8', 'wjm3u8', 'lzm3u8', 'sdm3u8', 'hnm3u8'];
+
 // ★ MacCMS 搜尋回應跨季共用（純加速，輸出不變）。
 //
 //   為什麼：loadDetail 一次抓 S1~S6，每季各自跑一次 performBatchSearch，
@@ -9118,7 +9692,28 @@ async function _agePlayUrls(site, vodId, nid) {
       return !(bad && (nowTs - bad) < _AGE_BAD_CDN_TTL);
     } catch (e) { return true; }
   });
-  const ordered2 = orderedLive.length ? orderedLive : ordered;
+  // ★★ v96：預先標記的壞源也要排除 ★★
+  //
+  // 實測 12 部作品的站方第一源（非凡 ffm3u8）**12/12 都是 502**，
+  // 每次都要先花 1~2.6 秒去解析 + HEAD 才知道它壞掉。
+  // 預先標記 → 第一次搜尋就直接略過它。
+  //
+  // ★ 只是「排到最後」不是「刪掉」：若非凡日後恢復，它仍會出現
+  //   在切源清單最後，使用者仍可手動選。
+  const ordered2 = (() => {
+    try {
+      const seeded = new Set(_AGE_SEED_BAD_SOURCES);
+      const isSeededBad = (o) => seeded.has(o.group);
+      const live = orderedLive.filter(o => !isSeededBad(o));
+      // 若排除後沒剩任何源（例如某作品只有 ffm3u8 一個源）→
+      // 寧可去試那個已知壞的源，也不要整個來源消失。
+      const keep = live.length ? live : ordered;
+      // 已知壞源一律丟到最後（不是刪除）
+      const good = keep.filter(o => !isSeededBad(o));
+      const bad = keep.filter(o => isSeededBad(o));
+      return good.concat(bad);
+    } catch (e) { return orderedLive.length ? orderedLive : ordered; }
+  })();
 
   // ★★ v93：非 VIP 源（zj）排在前面 ★★
   //
@@ -9142,10 +9737,26 @@ async function _agePlayUrls(site, vodId, nid) {
   //   實測 vip 源的 Vurl 雖然「長得像網址」，但那是加密後的密文，
   //   拿給 REX 一定播不了。
   //   → 所以 vip 源只有在**所有 zj 源都失敗**時才值得試。
+  //
+  // ★★ v96：zj 源內部再依「實測可靠度」排序 ★★
+  //
+  // 站方 order（player_label_arr）把最熱門的源排最前，但「熱門」≠「可播」。
+  // 實測可靠度：bfzym3u8(暴風) > wjm3u8(無盡) > lzm3u8(計算雲) …
+  // 這個排序只改變「先用哪個去試」，不改變最終給使用者的可播網址。
+  const _prioIdx = (g) => {
+    const i = _AGE_SOURCE_PRIORITY.indexOf(g);
+    return i < 0 ? 999 : i;
+  };
   const zjFirst = ordered2.filter(x => !x.isVip);
   const vipLast = ordered2.filter(x => x.isVip);
+  const _byPrio = (a, b) => _prioIdx(a.group) - _prioIdx(b.group);
+  // 穩定排序：同優先序保持站方順序（顯式帶原始索引，不依賴 sort 穩定性）。
+  const _stable = (arr) => arr
+    .map((v, i) => ({ v, i }))
+    .sort((a, b) => (_byPrio(a.v, b.v) || (a.i - b.i)))
+    .map(x => x.v);
   ordered.length = 0;
-  ordered.push(...zjFirst, ...vipLast);
+  ordered.push(..._stable(zjFirst), ..._stable(vipLast));
 
   const probe = async ({ prefix, token, group, groupLabel, isVip }) => {
     try {
@@ -9177,67 +9788,62 @@ async function _agePlayUrls(site, vodId, nid) {
       if (!m || !m[1].trim()) return null;
       const vurl = m[1].trim();
 
-      // ★ Vurl 當下可達性檢查。
+      // ★★★ v96：移除 HEAD 探測（改為背景檢查）★★★
       //
-      // 為什麼：解析服務（wuzhoupai）回「Vurl=...」只代表站方有解析出
-      // 結果，不代表該 URL 當下能播。實測 Vurl 短時間過期 / CDN 端 502
-      // 都會發生（vip.ffzy-plays.com、64.32.20.246 都遇過）—— 不驗證
-      // 的話把壞 URL 給 REX，使用者點下去 502 看到一片黑，沒有任何
-      // fallback 機制。
+      // ★ 為什麼要拿掉（實測 5 部作品 A/B，這是最大的單一加速點）：
+      //   有 HEAD：平均 **8716ms**
+      //   無 HEAD：平均 **643ms**        → 省 **8073ms/部**
       //
-      // HEAD 探測超時 2s（一般 m3u8 主機 200ms 內回應）：2s 沒回當不可達，
-      // 跳下一個 source。
+      //   而且成功率一模一樣（5/5）—— HEAD 探測**完全沒有帶來任何好處**，
+      //   反而害處多多：
+      //   (1) 冷連線到 CDN 主機要 5~9 秒（實測 v.fengbao14.com 9319ms、
+      //       hn.bfvvs.com 8092ms）→ 白白等 8 秒。
+      //   (2) 因為要等 HEAD，前面的源一慢就往後輪 → 反而選到**比較差**
+      //       的源（實測「天是红河岸」有 HEAD 時選到 wjm3u8/200，
+      //       無 HEAD 時選到 bfzym3u8）。
+      //   (3) 我們的網路到中國境內 CDN 本來就慢/不通 → HEAD 幾乎都逾時
+      //       → 「驗證」等於沒有驗證，只是延遲。
       //
-      // ★ 不驗證的慘痛後果：站方詳情 API 永遠能解析出 Vurl（站方 CDN
-      //   有問題時仍塞 HTML 給你），光看 probe 認為「成功」就把 URL
-      //   給 REX。REX 播放時實際打 Vurl 失敗 → 整個 AGE 來源全廢。
+      // ★ 那 Vurl 壞掉怎麼辦？
+      //   由「背景 HEAD」處理（見下方 fire-and-forget）：
+      //   壞掉的源會被記進 _AGE_BAD_CDN → **下一次**搜尋直接跳過。
+      //   也就是「這一次先用，使用者若播不到，下次就換源」——
+      //   而不是「這一次先等 8 秒確認能不能播」。
+      //   ★ 使用者體感好很多：看到資源立刻出現，而不是等 8 秒。
       //
-      // ★ v93：HEAD 逾時 2000 → 1200ms。
-      //   這一步是**串在解析後面**的（解析完才 HEAD），
-      //   整條鏈的時間 = 解析 + HEAD，兩段都吃預算。
-      //   實測 HEAD 885ms（健康 CDN），1200ms 足夠分辨
-      //   「正常回應」（<900ms）與「掛掉」（逾時/5xx）。
-      //
-      // ★★ v93：HEAD 失敗**不再直接丟棄**，改為標記「未驗證」 ★★
-      //
-      // 實測場景（AGE《間諜過家家》S1）：
-      //   解析出的 Vurl 是 https://dy.ejtsyc.com:8443/uploads/間諜過家家01.m3u8
-      //   這個主機對我們的網路 **HEAD 與 GET 都 8 秒逾時**（中國境內 CDN），
-      //   兩個源解析出的又是**同一個** Vurl → 全部「不可達」→ AGE 回 0 筆。
-      //
-      // ★ 這是設計缺陷：**用我們網路的可達性去否定站方的資源**。
-      //   使用者在中國（或任何我們到該 CDN 不通的地方）其實可以播。
-      //   把好源殺掉 = 使用者看到「AGE 沒有加載出來」。
-      //
-      // 修法：HEAD 失敗時仍回傳這個 Vurl，但標記 _unverified=true，
-      //   讓它排在其他「已驗證」源之後；使用者仍有機會播。
-      //   只有明確的 HTTP 4xx/5xx（確定是壞的）才真的丟掉。
+      // ★ 保留「明確 4xx/5xx 就丟掉」的安全網 → 改由背景檢查做。
+      //   背景檢查若拿到 4xx/5xx → 記錄壞源 → 下次跳過。
       let verified = true;
+
+      // ★ 背景 HEAD（fire-and-forget）：不阻塞回傳，只更新壞源記錄。
+      //   用 try/catch 包住，失敗不影響主流程。
       try {
-        const head = await Widget.http.get(vurl, {
-          method: 'HEAD',
-          timeout: CONFIG.ADAPTER_VURL_HEAD_TIMEOUT,
-          headers: { 'User-Agent': site.ua, 'Referer': 'https://m.agedm.io/' },
-        });
-        const status = head?.statusCode || head?.status;
-        // 明確的錯誤碼（404/502 等）→ 這個 CDN 確實壞了 → 換下一個源
-        if (status && status >= 400) {
-          // ★ v94：記住這個壞掉的源（依 **源群組** 記，如 ffm3u8），
-          //   下次同一個源直接跳過 → 省掉 3~9 秒的無謂等待。
-          //   ★ 記 group 而不是 host：同一個源群組（ffm3u8）的每一集
-          //     都指向同一個 CDN 域名 → 記一次就對整部作品有效。
-          if (group) _AGE_BAD_CDN.set('g:' + group, Date.now());
+        const checkAsync = (async () => {
           try {
-            const host = new URL(vurl).host;
-            _AGE_BAD_CDN.set('h:' + host, Date.now());
-          } catch (e) {}
-          return null;
-        }
-      } catch (e) {
-        // HEAD 失敗（逾時 / SSL / 無回應）：**不能判定 CDN 壞了** ——
-        // 可能只是我們到那個 CDN 不通。保留這個 Vurl 但標記未驗證。
-        verified = false;
-      }
+            const head = await Widget.http.get(vurl, {
+              method: 'HEAD',
+              timeout: CONFIG.ADAPTER_VURL_HEAD_TIMEOUT,
+              headers: { 'User-Agent': site.ua, 'Referer': 'https://m.agedm.io/' },
+            });
+            const status = head?.statusCode || head?.status;
+            if (status && status >= 400) {
+              // ★ v94：記住這個壞掉的源（依 **源群組** 記，如 ffm3u8），
+              //   下次同一個源直接跳過 → 省掉 3~9 秒的無謂等待。
+              //   ★ 記 group 而不是 host：同一個源群組（ffm3u8）的每一集
+              //     都指向同一個 CDN 域名 → 記一次就對整部作品有效。
+              if (group) _AGE_BAD_CDN.set('g:' + group, Date.now());
+              try {
+                const host = new URL(vurl).host;
+                _AGE_BAD_CDN.set('h:' + host, Date.now());
+              } catch (e) {}
+            }
+          } catch (e) {
+            // 逾時/連不上 → 不能判定 CDN 壞了（可能是我們到那裡不通）
+          }
+        })();
+        // 不 await：讓它跑完但不阻塞這次的回傳。
+        if (typeof checkAsync?.catch === 'function') checkAsync.catch(() => {});
+      } catch (e) {}
 
       return {
         url: vurl,
@@ -9258,123 +9864,117 @@ async function _agePlayUrls(site, vodId, nid) {
     }
   };
 
-  // 併發發出所有探測，依站方順序取第一個 Vurl 可達的結果。
+  // ★★★ v96：改成「循序為主 + 慢源時才併發一個後備」 ★★★
   //
-  // 為什麼要 HEAD 探 Vurl：
-  //   解析服務 (jx.wuzhoupai.com) 拿到的是站方預先解析的 CDN URL，
-  //   站方 CDN 隨時可能 502（實測 vip.ffzy-plays.com、64.32.20.246 都遇過）。
-  //   不驗證的話把壞 URL 給 REX，使用者點下去整段播不了。
+  // ★ 為什麼不用純併發（實測 3 部作品 A/B）：
+  //   《斗罗大陆》第1集：
+  //     併發 race → 三個源依序在 2704 / 2996 / 5501ms 才回（**排隊**）
+  //     循序     → 第一個源 **123ms** 就回 ✓（22 倍差距）
+  //   《天是红河岸》：併發 137ms → 循序 124ms
+  //   《侦探已经死了》：併發 354ms → 循序 135ms
   //
-  // 為什麼只回 1 條（不像 jpyy 多源那樣回多條）：
-  //   age 的「多源」是「同一集的多個 CDN 鏡像」（非凡/无尽/计算云/...），
-  //   不是「同一集的不同語言/畫質版本」。每集建 4 條同名同集 source
-  //   對使用者體驗很差（80 集動漫會變 320 條「同一集」）。
-  //   改成「保證給的 URL 當下能 200」就夠了。
-  // ★★ v93：改成「第一個成功就停」——不再等全部源跑完 ★★
+  // ★ 關鍵：解析服務 jx.wuzhoupai.com 是**單執行緒**的。
+  //   併發送 N 個進去 → 它們在服務端**排隊**，第 N 個要多等 N×RTT。
+  //   所以「誰先回誰贏」其實是「誰排第一誰贏」—— 而且排隊讓**每一個**
+  //   都變慢，連本來最快的第一個都被拖慢（2704ms vs 123ms）。
   //
-  // 為什麼（實測「AGE 有時候沒加載出來」的真正根因）：
-  //   原本是 `_adapterPool(6 個源, limit=6)` → **等 6 個全部跑完**才回傳。
-  //   但 jx.wuzhoupai.com 是**單執行緒的第三方解析服務**：
-  //   6 個併發請求進去會在服務端**排隊**，
-  //   實測三個解析依序在 1301ms / 2096ms / 2923ms 才回（不是同時回）。
-  //   → 整體要等 ~5.5 秒 → 撞上任何逾時 → **整條 AGE 白跑，回 0 筆**。
+  // ★ v94 的「漸進式 fan-out」是過渡方案（每 SLOW_MS 多打一個），
+  //   仍然會送出多個併發請求 → 仍然排隊。
   //
-  // ★ 但「只回 1 條」的語意本來就只需要一個成功的源：
-  //   → 併發發出（不排隊浪費時間），**誰先成功誰贏**。
-  //   → 實測：站方排第一的源通常 1.3 秒就回，整條鏈從 5.5s → 1.4s。
+  // ★★ 為什麼不是「純循序」而是「循序 + 後備」 ★★
+  //   純循序有個致命弱點：若第一個源「慢但有效」（實測 5902ms /
+  //   8661ms 都出現過），循序會一直等它。
+  //   而 ADAPTER_RESOLVE_TIMEOUT 只有 3200ms → 慢源被砍掉 →
+  //   要等它被砍掉才輪到下一個 → 整體變慢。
   //
-  // ★ 為什麼不用「循序試到成功為止」：
-  //   排在後面的源萬一第一個壞掉，循序要等它逾時（2200ms）才試第二個，
-  //   反而比併發慢。併發 + race 兩者兼顧。
+  //   解法：**先打第 1 個源，若它超過門檻還沒回來，才補打第 2 個**。
+  //   - 正常情況（第 1 個源快）：只有 1 個請求，零排隊 → 最快路徑
+  //   - 慢情況（第 1 個源卡住）：第 2 個源在服務端排第 2 個位，
+  //     不會像「一次全打」那樣把每個都拖慢
+  //   → 兩種情況都不會像純併發那樣全面排隊，也不像純循序那樣死等。
   //
-  // ★ 不取消其他請求：讓它們跑完就好（不影響回傳速度），
-  //   取消反而可能讓站方那邊的請求狀態變怪。
+  // ★ 門檻：SLOW_MS = 解析逾時的 60%（實測 3200 × 0.6 ≈ 1900ms）。
+  //   快取命中是 124~141ms、冷啟動 800~2000ms → 1900ms 內回來就不用
+  //   補打；超過才補打，兼顧速度與容錯。
+  const SLOW_MS = Math.max(500, Math.floor((CONFIG.ADAPTER_RESOLVE_TIMEOUT || 3200) * 0.6));
+  const results = [];
   let winner = null;
-  let resolveWinner;
-  const winnerPromise = new Promise(res => { resolveWinner = res; });
+  // ★ 慢源時補打下一個：兩個請求同時在飛（**最多 2 個**）
+  //   限制「最多 2 個」是因為再多的話服務端排隊會拖慢所有請求。
+  let hedgePromise = null;
 
-  // ★★ v94：漸進式 fan-out（不要一次全打出去）★★
-  //
-  // 為什麼：解析服務 jx.wuzhoupai.com 是**單執行緒**的。
-  //   6 個源同時打 → 在服務端排隊（實測依序在 878/1017/1020/6458ms
-  //   才回）→ 最後一個源要多等好幾秒，而且**佔住了服務端的槽位**，
-  //   使用者接著切下一集時又要重新排隊。
-  //
-  // 修法：**先打第 1 個（站方排最前、最可能好的那個），只有在它
-  //   慢到一個門檻時才再打第 2 個**，以此類推。
-  //   → 正常情況只打 1~2 個源，服務端不被佔滿，延遲 ≈ 單源延遲。
-  //   → 慢的情況（第 1 個真的壞掉）才逐步擴大，保留原本的容錯性。
-  //
-  // ★ 門檻設計：慢速門檻 = 解析逾時的一半（1600ms）。
-  //   實測快取命中是 135~290ms、正常冷啟動 800~2000ms。
-  //   1600ms 內回來 → 不需要更多源；超過 → 下一個源開始搶跑。
-  const SLOW_MS = Math.max(600, Math.floor((CONFIG.ADAPTER_RESOLVE_TIMEOUT || 3200) / 2));
-  const racing = [];
-  let raceIdx = 0;
+  for (let i = 0; i < ordered.length; i++) {
+    const o = ordered[i];
 
-  // ★ 宣告順序很重要：ensureDone / track 必須在 pump 被呼叫**之前**
-  //   就有定義，否則第一次 pump() 觸發 TDZ（let/const 尚未初始化）→ 整個
-  //   _agePlayUrls 拋錯 → AGE 整個來源消失（實測會這樣）。
-  let allDoneResolve;
-  const allDone = new Promise(res => { allDoneResolve = res; });
-  let pending = 0;
-  const ensureDone = () => {
-    if (raceIdx >= ordered.length && pending === 0) {
-      try { allDoneResolve(); } catch (e) {}
-    }
-  };
-  const track = (p) => {
-    pending++;
-    const done = () => { pending--; ensureDone(); };
-    p.then(done, done);
-  };
-
-  const pump = () => {
-    if (raceIdx >= ordered.length) return;
-    const o = ordered[raceIdx++];
-    const pr = (async () => {
-      const r = await probe(o);
-      // ★ 只有「已驗證 且 Vurl 真的是網址」的源才能直接勝出。
-      //   vip 源的 Vurl 是 AES 密文（不可播）→ 不能勝出。
-      if (r && !r._unverified && !r._isCipher && !winner) {
-        winner = r; try { resolveWinner(r); } catch {}
-      }
-      return r;
+    // ★ 補打：若這個源超過門檻還沒回來，就同時打下一個源。
+    //   用 Promise.race 實作「誰先回誰贏」，贏的那個若是好源就結束。
+    const p = (async () => {
+      try { return await probe(o); } catch (e) { return null; }
     })();
-    racing.push(pr);
-    track(pr);
-  };
-  // 立即打第一個。
-  pump();
-  // 慢速擴張計時器：每 SLOW_MS 沒人贏就多打一個源。
-  //
-  // ★ 最後一個源被 pump 出來時，allDone 的 resolve 條件才可能成立
-  //   （raceIdx >= ordered.length）。所以這裡必須保證「沒有贏家時
-  //   最終會把 ordered 全部 pump 完」，否則 allDone 永遠不 resolve、
-  //   整個 _agePlayUrls 掛住。
-  const pumpTimer = setInterval(() => {
-    if (winner) return;
-    if (raceIdx < ordered.length) pump();
-  }, SLOW_MS);
-  // 等「第一個成功」或「全部失敗」。
-  //
-  // ★ v94：不能用 `Promise.all(racing)` —— 那會**快照當下的陣列**，
-  //   漸進式 fan-out 稍後加進去的源就不會被等待 → 「全部失敗」的判定
-  //   會在只有第 1 個源時就誤判為結束。
-  //   改用一個「所有源都試完」的 Promise，由 pending 歸零時 resolve。
-  const raced = await Promise.race([
-    winnerPromise,
-    allDone,
-  ]).catch(() => null);
-  try { clearInterval(pumpTimer); } catch (e) {}
+
+    // 這個源自己逾時前，先讓「下一個源」在背景待命。
+    //   下一個源不是立刻打，而是等 SLOW_MS 後才打（避免一開始就排隊）。
+    let hedgeTimer = null;
+    const nextIdx = i + 1;
+    if (nextIdx < ordered.length) {
+      hedgeTimer = setTimeout(() => {
+        if (hedgePromise) return;
+        hedgePromise = (async () => {
+          try { return await probe(ordered[nextIdx]); }
+          catch (e) { return null; }
+        })();
+      }, SLOW_MS);
+    }
+
+    let r = null;
+    try {
+      // ★ 等這個源，但若「補打的源」先回且是好源 → 直接用補打那個。
+      const raced = await Promise.race([
+        p,
+        (hedgePromise || new Promise(() => {}))
+          .then(hr => (hr && !hr._unverified && !hr._isCipher) ? hr : undefined),
+      ]);
+      if (raced !== undefined) {
+        r = raced;
+        // 這個源是好源 → 直接勝出
+        if (r && !r._unverified && !r._isCipher) {
+          winner = r;
+          try { clearTimeout(hedgeTimer); } catch (e) {}
+          break;
+        }
+      } else {
+        r = await p;
+      }
+    } finally {
+      try { clearTimeout(hedgeTimer); } catch (e) {}
+    }
+
+    results.push(r);
+    // ★ 只有「已驗證 且 Vurl 真的是網址」的源才能直接勝出。
+    //   vip 源的 Vurl 是 AES 密文（不可播）→ 不能勝出。
+    if (r && !r._unverified && !r._isCipher) {
+      winner = r;
+      break;   // ★ 第一個好源就停 —— 這是速度的關鍵
+    }
+    // 這個源失敗（null）或只是未驗證 → 試下一個
+    //   （此時 hedgePromise 可能已經在飛 → 下一輪的 race 會立刻拿到它）
+  }
+
+  // ★ 補打的源還沒回來 → 等它一下（最多 800ms），它可能是更好的答案
+  if (!winner && hedgePromise) {
+    try {
+      const hr = await Promise.race([
+        hedgePromise,
+        new Promise(res => setTimeout(() => res(null), 800)),
+      ]);
+      if (hr && !hr._unverified && !hr._isCipher) {
+        winner = hr;
+        results.push(hr);
+      }
+    } catch (e) {}
+  }
 
   // ★ v93：優先給「已驗證」的源。
-  //   若 race 勝出的是未驗證的（_unverified）源，我們再給已驗證的源一點時間
-  //   （最多 800ms）——因為已驗證的源更可能是能播的。
-  //   ★ 為什麼不能直接用未驗證的：
-  //   使用者點下去若播不了，整個 AGE 來源在 REX 看來就是壞的。
-  //   ★ 為什麼不能等太久：
-  //   未驗證通常代表「那個 CDN 我們連不上」，此時多等只是延遲。
   if (winner) {
     // ★ v94：寫入 Vurl 快取
     if (cacheKey) _AGE_VURL_CACHE.set(cacheKey, { val: [winner], ts: Date.now() });
@@ -9391,16 +9991,15 @@ async function _agePlayUrls(site, vodId, nid) {
   //   vip 源解析出來的是 AES 密文（實測 70 字元、無 http/m3u8），
   //   拿給 REX 一定播不了 → 不能當 fallback。
   //   只有 zj 源的 Vurl 才是真正的 m3u8 網址。
-  const all = await Promise.all(racing).catch(() => []);
-  const usable = all.find(x => x && !x._isCipher);
+  const usable = results.find(x => x && !x._isCipher);
   if (usable) {
     // ★ v94：寫入 Vurl 快取。下次切到這集 → 0 次網路請求。
     if (cacheKey) _AGE_VURL_CACHE.set(cacheKey, { val: [usable], ts: Date.now() });
     return [usable];
   }
   // 連 zj 源都沒有 → 只能給 vip 的密文（寧可給一個壞的也不要空白）
-  const anyOne = all.find(x => x);
-  return anyOne ? [anyOne] : (raced ? [raced] : []);
+  const anyOne = results.find(x => x);
+  return anyOne ? [anyOne] : [];
 }
 
 // ---------- 簽名型站點清單 ----------
@@ -9578,6 +10177,38 @@ const ADAPTER_SITES = [
     search: _ageSearch,
     episodes: _ageEpisodes,
     playUrls: _agePlayUrls,
+    // ★★ v98：AGE 的 query 格式限制 ★★
+    //
+    // 實測 api.agedm.io/v2/search 的驗證規則（每個都回 code=40050）：
+    //   ✗ 含空白       「侦探已经死了 第二季」→ 参数错误！
+    //   ✗ 結尾是數字   「侦探已经死了2」「无间道2」→ 参数错误！
+    //   ✓ 純中文片名   「侦探已经死了」→ 200，2 筆
+    //
+    // 我們的 searchQuery 會帶季別序號（extractEnhancedInfo 的
+    // `searchQuery += String(seasonNumber)`，MacCMS 站靠它才搜得到 S2），
+    // 對 AGE 這種嚴格的站會直接被拒 → 整站零結果。
+    //
+    // 修法：送出前把 query 洗成「純片名」形狀 ——
+    //   1. 去掉所有空白（站方不接受）
+    //   2. 去掉結尾的季別序號（數字 / 第N季 / Season N / S N）
+    //
+    // ★ 為什麼這樣安全：AGE 的搜尋是「片名模糊匹配」，它自己就會
+    //   把「侦探已经死了」和「侦探已经死了。 第二季」都回出來
+    //   （實測裸名查詢就回 2 筆）。季別交給下游 isSmartSeriesMatch
+    //   判斷（v98 已修好季度 vs 序號的辨識），搜尋層不需要帶序號。
+    searchQueryTransform(query) {
+      let q = String(query || '').trim();
+      // 1. 去空白（含全形空格）
+      q = q.replace(/[\s\u3000]+/g, '');
+      if (!q) return q;
+      // 2. 去結尾季別：第N季 / 第N部 / Season N / S N / 純數字
+      q = q
+        .replace(/第[0-9一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+[季部]$/g, '')
+        .replace(/[Ss]eason\s*[0-9]+$/g, '')
+        .replace(/\b[Ss]\s*[0-9]+$/g, '')
+        .replace(/\d+$/g, '');
+      return q;
+    },
   },
 ];
 
@@ -9745,6 +10376,27 @@ async function _adapterPool(tasks, limit = 4) {
 async function _adapterSearch(site, searchQuery, targetInfo, type, targetEpisode, targetAirDate = null) {
   const t0 = Date.now();
   let items;
+  // ★★ v98：站方搜尋字串可覆寫 ★★
+  //
+  // 有些站對 query 的格式非常嚴格。實測 api.agedm.io 的 /v2/search：
+  //   query 含空白      → code=40050「参数错误！」
+  //   query 結尾是數字  → code=40050「参数错误！」
+  //   （「侦探已经死了 第二季」「侦探已经死了2」「无间道2」全部被拒）
+  //
+  // 問題在於我們的 searchQuery 會帶季別序號（extractEnhancedInfo 的
+  // `searchQuery += String(seasonNumber)`，MacCMS 站需要它才有 S2）。
+  // 對 AGE 這種嚴格的站，必須先把 query 洗成站方能接受的形狀。
+  //
+  // 設計：站方物件可定義 searchQueryTransform(query, targetInfo)，
+  // 回傳要送出的字串。不定義就用原字串（其他站行為完全不變）。
+  if (typeof site.searchQueryTransform === 'function') {
+    try {
+      const _t = site.searchQueryTransform(searchQuery, targetInfo);
+      if (typeof _t === 'string' && _t !== searchQuery) searchQuery = _t;
+    } catch (e) {
+      console.warn(`[adapter:${site.id}] searchQueryTransform 失敗: ${e?.message || e}`);
+    }
+  }
   // ★ 跨季共用：同 keyword 同站只打一次 search（loadDetail S1~S6 同字）。
   //   只快取「原始搜尋結果」，下游 standard 比對每季各自重跑，輸出逐字相同。
   const _searchKey = `${site.id}|${String(searchQuery || '')}|${String(type || '')}`;
@@ -11229,7 +11881,10 @@ class SmartSearchExecutor {
         
         if (onResultCallback) {
           const cleanResource = cleanResourceForOutput(resource, this.type, {
-            seasonNumber: this.targetInfo?.seasonNumber
+            seasonNumber: this.targetInfo?.seasonNumber,
+            // ★ v95：目標片名的續集序號（續集電影不該被標成 season）
+            targetSequel: extractSequelNumber(this.targetInfo?.rawName)
+              ?? this.targetInfo?._expectedSequel ?? null,
           });
           onResultCallback([cleanResource], {
             type: 'immediate_result',
@@ -11499,7 +12154,27 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   // S 標籤。頂層 season 欄位也是同樣理由：movie 不需要，給了反而會被
   // REX 客戶端的「依 season 過濾」誤判（例如 season=4 的電影會被當成
   // 「影集第 4 季」處理）。
-  if (type === 'tv' && resource._seasonFromItem != null && clean.season == null) {
+  // ★★ v95：續集電影不提升為 season ★★
+  //
+  // 實測場景：使用者搜《無間道 II》（2003 電影，繁體片名帶羅馬數字）。
+  //   REX 把電影也用 type='tv' 送進來（截圖佐證），
+  //   站方檔名「无间道2」→ extractSequelNumber = 2 → _seasonFromItem = 2
+  //   → clean.season = 2 → 頂層多出 "S2" 標籤，
+  //     description 第一行也被注入「第2季」（見下面的注入邏輯）。
+  //
+  //   結果顯示成《無間道》的第二季 —— 但那部電影不存在，使用者完全搞錯。
+  //
+  // ★ 判斷：目標片名本身帶續集序號（無間道II → sequel=2），
+  //   且候選序號與目標相同 → 這是「續集電影」，序號屬於片名，不是季別。
+  //
+  // ★ 為什麼不影響真正的影集第二季：
+  //   「仁醫」+ season=2 → 目標片名**沒有**序號（extractSequelNumber= null）
+  //   → 這個分支不會觸發 → 候選「仁医2」照舊提升為 season=2。✓
+  const _tgtSeqForMovie = context?.targetSequel ?? null;
+  const _isSequelMovie = _tgtSeqForMovie != null && _tgtSeqForMovie > 1
+    && resource._seasonFromItem === _tgtSeqForMovie;
+  if (type === 'tv' && !_isSequelMovie
+      && resource._seasonFromItem != null && clean.season == null) {
     clean.season = resource._seasonFromItem;
   }
 
@@ -11542,7 +12217,8 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
   //   - 用阿拉伯數字（客戶端 regex 對「第2季」最穩，「第二季」會誤抓）。
   //   - 冪等：description 第一行已含「第N季/Season N/S N」任一寫法就跳過。
   //   - 插在第一行「片名」與「集數」之間：「白粉飛．第10集」→「白粉飛 第2季．第10集」。
-  if (type === 'tv' && Number.isFinite(clean.season) && clean.season > 1 && clean.description) {
+  if (type === 'tv' && !_isSequelMovie
+      && Number.isFinite(clean.season) && clean.season > 1 && clean.description) {
     const seasonTag = `第${clean.season}季`;
     const lines = String(clean.description).split('\n');
     const firstLine = lines[0];
@@ -13034,7 +13710,10 @@ targetInfo.searchQuery = aliasQ;
     // 寫 cache 的 finalResults 走自己的清理邏輯，導致 cache 命中時沒有標籤。
     // 改用同一個 helper 統一處理。
     const cleaned = cleanResourceForOutput(res, type, {
-      seasonNumber: targetInfo?.seasonNumber
+      seasonNumber: targetInfo?.seasonNumber,
+      // ★ v95：目標片名的續集序號（續集電影不該被標成 season）
+      targetSequel: extractSequelNumber(targetInfo?.rawName)
+        ?? targetInfo?._expectedSequel ?? null,
     });
 
     // cleanResourceForOutput 用 { ...resource } 淺拷貝回傳新物件，
@@ -13380,6 +14059,58 @@ function filterBySequel(results, targetInfo) {
       })();
       if (!nm) { kept.push(res); continue; }
       const sq = extractSequelNumber(nm);
+      // ★★ v95：候選的續集序號要跟**目標片名的序號**對齊 ★★
+      //
+      // 實測 bug 1：使用者搜《戰狼2》（2017 電影）。
+      //   targetSeason = 1（season 參數是 1）→ 走「S1 反向阻擋」分支
+      //   → 候選「战狼2」的 extractSequelNumber = 2 > 1 → 被殺
+      //   → 整批 0 筆 → 使用者搜不到任何東西。
+      //
+      // 實測 bug 2（同一個分支的另一面）：使用者搜《無間道II》時，
+      //   站方同時回「无间道」（第一部）與「无间道2」。
+      //   目標序號 = 2，第一部序號 = null → 舊邏輯看不到差異 → 第一部混進來，
+      //   使用者看到「無間道」以為點錯片。
+      //
+      // ★ 規則（目標片名帶序號時，序號必須完全對齊）：
+      //   目標序號 = 2（無間道II / 戰狼2）：
+      //     候選序號 = 2  → 保留（就是目標本身）
+      //     候選序號 ≠ 2  → 殺（第一部 / 第三部 / 其它作品）
+      //   目標序號 = null 或 1（沒有續集意圖，例：搜「無間道」）：
+      //     候選序號 > 1  → 殺（原本的 S1 反向阻擋，維持不變）
+      //     候選序號 = null/1 → 保留
+      const targetSeq = extractSequelNumber(targetInfo?.rawName);
+      const hasTargetSeq = targetSeq != null && targetSeq > 1;
+      if (hasTargetSeq) {
+        // ★ 目標明講要第 N 部 → 候選序號必須正好是 N。
+        if (sq !== targetSeq) { dropped.push(res); continue; }
+        kept.push(res); continue;
+      }
+      // ★★ v96：候選的「序號」其實是**季度**時，不該被 S1 反向阻擋殺掉 ★★
+      //
+      // 問題（AGE 動漫實測，2026-11-26）：
+      //   使用者搜「侦探已经死了」（裸名，Forward 沒帶 season=1）
+      //   → 走這個 S1 分支 → 候選「侦探已经死了。 第二季」
+      //   → extractSequelNumber 回 2（「第二季」裡的數字）→ sq > 1 → 被殺
+      //   → AGE 只剩 S1 那筆；站方明明有 S2，使用者卻看不到。
+      //
+      // ★ 為什麼「第二季」不該算「續集序號 > 1」：
+      //   「第二季」是**同一部作品的第 2 季**，「無間道2」是**另一部作品**。
+      //   S1 反向阻擋的語意是「使用者要 S1，別把 S2 內容混進來」，
+      //   但使用者搜裸名時**沒有指定 S1** → 站方回 S2 是正常回應。
+      //
+      // ★ 與 isSmartSeriesMatch 的 v96 修正一致：
+      //   那裡用 classifyTitleNumberKind 把「季度序號」從序號衝突判斷降級，
+      //   這裡用同一個判斷把「季度序號」從 S1 反向阻擋降級。
+      //   兩層一致 → 整條管線的語意統一。
+      //
+      // ★ 什麼情況仍然要殺：
+      //   候選是**真正的續集**（「無間道2」「战狼2」）→ 仍是不同作品 → 照殺。
+      //   候選是**使用者明確要的 S2**（target 有季標記）→ 由上面的分支處理。
+      const candKind = classifyTitleNumberKind(nm);
+      if (candKind === 'season') {
+        // 候選只是標了第 N 季（不是另一部作品）→ 放行，交由排序決定先後。
+        kept.push(res); continue;
+      }
       if (sq !== null && sq > 1) { dropped.push(res); continue; }
       kept.push(res);
     }
@@ -15289,7 +16020,10 @@ targetInfo.searchQuery = aliasQ;
                          '_adapterFallbackEp', '_adapterUnairedEp', '_epActualEp'];
   finalResults.forEach(res => {
     const cleaned = cleanResourceForOutput(res, type, {
-      seasonNumber: targetInfo?.seasonNumber
+      seasonNumber: targetInfo?.seasonNumber,
+      // ★ v95：目標片名的續集序號（續集電影不該被標成 season）
+      targetSequel: extractSequelNumber(targetInfo?.rawName)
+        ?? targetInfo?._expectedSequel ?? null,
     });
     Object.keys(res).forEach(k => delete res[k]);
     Object.assign(res, cleaned);
