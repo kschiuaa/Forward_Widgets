@@ -1847,8 +1847,64 @@ const CONFIG = {
   //   尾端統一解析），列表階段不換 URL → 立刻回傳：
   //     - 實測 EP=9 的搜尋時間：7712ms → **890ms**（不再等 30 秒）
   //     - 實測 EP=9 的 AGE 筆數：0 → **1**（E9 正確回報）
-  //     - 整季 EP=（空）維持 12 筆不變
-  WIDGET_VERSION: 102,
+    //     - 整季 EP=（空）維持 12 筆不變
+    //
+    // ★★ bump 到 103：修「續集電影被站方錯誤條目冒充成第N季」 ★★
+    //
+    // 使用者回報（截圖）：點《無間道 II》（2003 電影），
+    // 詳細頁出現「無間道II 第2季（13 集）」，播放清單是**第一部**
+    // 《無間道》(2002) 被切 12 集 —— 使用者看到的第一部，不是他點的第二部。
+    //
+    // 【根因】站方（暴風/非凡）有一條錯誤條目：
+    //   vod_name = "无间道第二季"  vod_year = 2017  eps = 12
+    // 它**實際上就是第一部《無間道》(2002)** 被站方錯標成「第二季」。
+    //
+    // 為什麼 filterBySequel 全部規則都殺不掉它：
+    //   - 規則 1「sequel === targetSeason → keep」：
+    //       extractSequelNumber("无间道第二季") = 2（directSeasonMatch 命中
+    //       「第二季」），targetSeason = 2 → 完全對齊 → 直接 keep，
+    //       後續所有規則全部跳過。
+    //   - 規則 78.1「主片名不同 → drop」：
+    //       stripSeasonMarker 後兩者都是「無間道」→ core 相同 → 不殺。
+    //   - 規則 3（年份早於命中群）：候選 2017 > pooledYearMin 2003 → 不殺。
+    //   - 規則 3.6（年份 = 命中群 + 1）：2017 ≠ 2004 → 不殺。
+    //   → 整批漏網 → 被 cleanResourceForOutput 提升成 season=2。
+    //
+    // 【v103 修法】新增「續集電影」判準（filterBySequel 的規則 0.5 +
+    //   S1 分支同款規則）：
+    //   (1) 目標片名自帶續集序號（targetSeq >= 2）→ 使用者要的是「續集電影」
+    //   (2) 候選只用季別字眼標記序號（剝掉季別字眼後沒有裸數字）
+    //   (2b) 候選是多集條目（eps > 1）→ 電影在站方是單檔，多集必是別的片
+    //   (3) 該季別序號 === 目標序號
+    //   (2) 或 (2b) 成立即 drop。
+    //
+    // ★★ 為什麼 (2b) 不能少 ★★
+    //   站方對《無間道》有三條假條目，不只一條：
+    //     "无间道第一季" (2016, 12 集)
+    //     "无间道第二季" (2017, 12 集)
+    //     "无间道第三季" (2017, 12 集)
+    //   全部是第一部《無間道》(2002) 被錯切。條件 (3) 只殺得掉「第二季」
+    //   （序號對齊目標的那一條），「第三季」會在 S3 那一批漏網，
+    //   實測確認會被顯示成「無間道II 第3季（12 集）」。
+    //   (2b) 用「電影=單檔、影集=多集」這個結構性差異一次收掉全部假條目。
+    //
+    // ★★ 對真影集零影響 ★★
+    //   影集的季別是獨立欄位（season=2 + 片名「仁醫」），片名不會自帶序號
+    //   → targetSeq = null → 條件 (1) 不成立 → 規則完全不啟動。
+    //   實測驗證（修前/修後結果完全相同）：仁醫 S1/S2、五等分的新娘 S2、
+    //   白粉飛 S2、進擊的巨人 S3、疾速追殺4、戰狼2、海王2、復仇者聯盟4
+    //   —— 一筆不多一筆不少。
+    //   loadDetail 多季合併也驗證：仁醫 → S1:22集 + S2:22集（2 個 child），
+    //   五等分的新娘 → S1:76集 + S2:12集 —— 與修前一致。
+    //
+    // ★ 必須 bump：舊 cache 內存著被錯誤提升成 season=2 的「无间道第二季」，
+    //   不清的話使用者還是會看到那 13 集。
+    //
+    // ★ v104：「單部續集電影 vs 名稱帶數字的影集」改用站方資料判斷。
+    //   v103 只看片名序號 → 誤把《慶餘年2》《大江大河2》《無心法師2》當電影
+    //   → loadDetail 只抓當前季 → S1 分頁消失（2 分頁 → 1 分頁）。
+    //   v104 改看結果物件的逐集展開痕跡 → 影集恢復多季合併。
+  WIDGET_VERSION: 104,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2185,7 +2241,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "6.7.0",
+  version: "6.8.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3096,7 +3152,92 @@ const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆�
 }
 
 /**
- * ★ 由「同系列各季的年份」推導「最終季型 marker 候選」屬於第幾季。
+ * ★ v104：判定「片名自帶序號」的作品是**單部續集電影**還是**名稱帶數字的影集**。
+ *
+ * 背景（實測 2026-11-26/27）：
+ *   v103 只用「片名序號 >= 2」判定續集電影 → 把《慶餘年2》《大江大河2》
+ *   《無心法師2》這類**影集**也當成電影 → loadDetail 只抓當前季 →
+ *   S1 分頁消失（實測 S2 查詢由 2 分頁降為 1 分頁）。
+ *
+ * ★★ 決定性訊號：結果物件的「逐集展開」痕跡 ★★
+ *   loadResource 回傳的是**逐集 item**（每集一個物件），因此
+ *   「url.split('#').length」對它們一律是 1 → 集數訊號失效。
+ *   改用三個在逐集展開後仍然有效的訊號：
+ *
+ *   訊號 1｜episode 欄位
+ *     影集：item.episode = 1,2,3,4...（逐集遞增）
+ *     電影：item.episode 為 undefined（單檔沒有集號）
+ *
+ *   訊號 2｜name 欄位的「S#E#」樣式
+ *     影集："金牌影視 S1E1" / "某某 S2E13"
+ *     電影："電影天堂" / "暴風資源"（只有站方名，沒有 S#E#）
+ *
+ *   訊號 3｜id 欄位的樣式
+ *     影集："forward-vod-金牌影視|s1e1|x|..."
+ *     電影："forward-vod-電影天堂|sxex|粵語|..."（sxex = single episode）
+ *
+ * ★★ 為什麼不用「集數 > 3」 ★★
+ *   髒資料裡的假季條目也有 12 集（「无间道第二季」= 第一部被切 12 集）。
+ *   而逐集展開後，「集數」已經被拆到各個 item 上，單一 item 看不到總集數。
+ *
+ * @param {string} title            使用者查詢的片名
+ * @param {Array}  upstreamResults  站方回傳的候選（可為空）
+ * @returns {boolean} true = 判定為「單部續集電影」（可只抓當前季）
+ */
+function isStandaloneSequelMovie(title, upstreamResults) {
+  const seq = extractSequelNumber(title);
+  if (!Number.isFinite(seq) || seq < 2) return false;   // 片名沒序號 → 不是續集
+
+  if (!Array.isArray(upstreamResults) || !upstreamResults.length) {
+    // 拿不到站方資料時的保守判斷：片名裡**沒有**任何季別字眼 → 傾向單部電影。
+    if (/[季部集]/.test(String(title))) return false;
+    return true;
+  }
+
+  // ★ 逐集展開痕跡：任一 item 帶 episode 欄位 / S#E# / s#e# → 影集
+  let seriesEvidence = 0;
+  let singleEvidence = 0;
+  for (const r of upstreamResults) {
+    // 訊號 1：episode 欄位（影集逐集遞增）
+    const ep = Number(r?.episode);
+    if (Number.isFinite(ep) && ep >= 1) { seriesEvidence++; }
+    // 訊號 2：name 的「S#E#」樣式
+    if (/\bS\d+\s*E\d+\b/i.test(String(r?.name || ''))) { seriesEvidence++; }
+    // 訊號 3：id 的「|s#e#|」樣式
+    if (/\|s\d+e\d+\|/i.test(String(r?.id || ''))) { seriesEvidence++; }
+    // 反向：id 的「|sxex|」= single episode → 單檔電影
+    if (/\|sxex\|/i.test(String(r?.id || ''))) { singleEvidence++; }
+  }
+  // 影集痕跡明顯多於單檔痕跡 → 影集
+  if (seriesEvidence > singleEvidence) return false;
+  if (singleEvidence > 0) return true;
+
+  // 兩者都沒有痕跡（站方條目直接展開成多集、但沒有 episode 欄位）：
+  //   用「同名條目數」當啟發式 —— 影集會有數十集、單部電影通常只有 1~2 筆。
+  const titleCore = String(title)
+    .replace(/第\s*[0-9一二三四五六七八九十]+\s*[季部集话話]/g, '')
+    .replace(/[IVX]{1,4}\s*$/g, '')
+    .replace(/\d+\s*$/g, '')
+    .trim();
+  let matched = 0;
+  for (const r of upstreamResults) {
+    const nm = String(r?._rawName || r?.title || '');
+    if (!nm) continue;
+    const core = String(r?._baseName || nm)
+      .replace(/第\s*[0-9一二三四五六七八九十]+\s*[季部集话話]/g, '')
+      .replace(/[IVX]{1,4}\s*$/g, '')
+      .replace(/\d+\s*$/g, '')
+      .trim();
+    if (!core || !titleCore) continue;
+    if (core !== titleCore && !core.includes(titleCore) && !titleCore.includes(core)) continue;
+    matched++;
+  }
+  // 同名條目只有 1~2 筆 → 單部電影；更多 → 影集
+  return matched > 2 ? false : true;
+}
+
+/**
+  * ★ 由「同系列各季的年份」推導「最終季型 marker 候選」屬於第幾季。
  *
  * 場景：站方檔名「零之使魔FINAL」(vod_year=2012) 對上 target「零之使魔」season=4。
  *   「FINAL」只說明「是某個後續季別」，不說是哪一季；硬補成 target 的季別
@@ -14945,6 +15086,31 @@ function filterBySequel(results, targetInfo) {
       if (hasTargetSeq) {
         // ★ 目標明講要第 N 部 → 候選序號必須正好是 N。
         if (sq !== targetSeq) { dropped.push(res); continue; }
+        // ★★ v103：續集電影 → 殺掉「用季別字眼冒充目標序號」的條目 ★★
+        //
+        // 這裡是 S1 分支（targetSeason <= 1），但同樣會漏網：
+        //   「无间道第二季」的 extractSequelNumber = 2（directSeasonMatch 命中
+        //   「第二季」），targetSeq = 2 → sq === targetSeq → 被保留。
+        //   → 第一部《無間道》(2002) 被站方錯標成「第二季」的那條就混進來。
+        //
+        // 判準與主分支（規則 0.5）完全一致：
+        //   (1) 目標片名自帶續集序號（targetSeq >= 2）← hasTargetSeq 已保證
+        //   (2) 候選只用季別字眼標記序號（剝掉季別字眼後沒有裸數字）
+        //   (3) 該季別序號 === 目標序號
+        //
+        // ★★ v104：片名帶序號也可能是**影集**（《慶餘年2》《大江大河2》）。
+        //   站方資料若顯示這是影集 → 下面的續集電影守衛**不啟動**
+        //   （否則會殺掉「庆余年第二季」這個正確條目）。
+        if (isStandaloneSequelMovie(targetInfo?.rawName || '', results)) {
+          const _bareSeq = extractSequelNumber(stripSeasonMarker(nm).trim());
+          const _eps1 = Number(res._episodeCount)
+            || (res.url && String(res.url).includes('#')
+                ? String(res.url).split('#').length : 1);
+          // 條件 A：多集 + 季別字眼 → 不可能是那部電影（見主分支規則 0.5）
+          if (_eps1 > 1 && /[季部]/.test(nm)) { dropped.push(res); continue; }
+          // 條件 B：候選必須帶著與目標相同的裸數字序號（見主分支規則 0.5）
+          if (_bareSeq !== targetSeq) { dropped.push(res); continue; }
+        }
         kept.push(res); continue;
       }
       if (sq !== null && sq > 1) { dropped.push(res); continue; }
@@ -15009,6 +15175,77 @@ function filterBySequel(results, targetInfo) {
   const yearsOfMatched = sequelMatched.map(yearOf).filter(Boolean);
   const pooledYearMin = yearsOfMatched.length ? Math.min(...yearsOfMatched) : null;
 
+  // ★★ v103：續集電影 vs「被站方誤標成第N季」的條目 ★★
+  //
+  // 實測 bug（2026-11-26，截圖佐證）：使用者點《無間道 II》（2003 電影），
+  // 詳細頁的 childItems 出現「無間道II 第2季（13 集）」，
+  // 播放清單是《無間道》（2002 第一部）被切 12 集 —— 使用者看到的是第一部。
+  //
+  // 【根因】站方（暴風/非凡）有一條錯誤條目：
+  //   vod_name = "无间道第二季"  vod_year = 2017  eps = 12
+  // 它**實際上就是第一部《無間道》(2002)** 被站方錯標成「第二季」。
+  // filterBySequel 全部規則都殺不掉它：
+  //   - 規則 1「sequel === targetSeason → keep」：
+  //       extractSequelNumber("无间道第二季") = 2（directSeasonMatch 命中
+  //       「第二季」），targetSeason = 2 → 完全對齊 → 直接 keep，後續規則全跳過。
+  //   - 規則 78.1「主片名不同 → drop」：
+  //       stripSeasonMarker 後兩者都是「無間道」→ core 相同 → 不殺。
+  //   - 規則 3（年份早於命中群）：候選 2017 > pooledYearMin 2003 → 不殺。
+  //   - 規則 3.6（年份 = 命中群 + 1）：2017 ≠ 2004 → 不殺。
+  //   → 整批漏網，並被 cleanResourceForOutput 提升成 season=2。
+  //
+  // 【判準：目標片名本身帶續集序號 ⇒ 使用者要的是「續集電影」】
+  //
+  // targetSeq >= 2 表示「片名自帶序號」（無間道II → 2、戰狼2 → 2、
+  // 疾速追殺4 → 4）。這種目標**不可能是影集的某一季** ——
+  // 影集的季別是獨立欄位（season=2 + 片名「仁醫」），
+  // 不會把序號寫進片名。
+  //
+  // ★★ 為什麼這是安全的（不會誤殺真影集）★★
+  //   真影集 S2 的目標片名**沒有**序號：
+  //     「仁醫」+ season=2      → targetSeq = null → 本規則完全不啟動 ✓
+  //     「五等分的新娘」+ S2   → targetSeq = null → 不啟動 ✓
+  //     「白粉飛」+ S2          → targetSeq = null → 不啟動 ✓
+  //   所以本規則**只**在「片名自帶序號」的續集電影查詢上生效。
+  //
+  // 【規則細節】候選同時滿足以下三條件 → drop：
+  //   (1) 目標序號 targetSeq >= 2（續集電影意圖）
+  //   (2) 候選片名**只**用季別字眼標記序號（剝掉季別字眼後沒有裸數字）
+  //       → 例：「无间道第二季」剝後 = 「无间道」（無數字）
+  //       → 反例：「无间道2」剝後 = 「无间道2」（有裸數字）→ 不符合，保留
+  //   (3) 該季別序號 === targetSeq（例：目標 sequel=2，候選「第2季」）
+  //
+  // 為什麼 (2) 重要：續集電影在站方都用**裸數字**命名（「无间道2」、
+  // 「战狼2」、「疾速追杀4」），這是「電影序號」的可靠指紋。
+  // 只有用「第N季」文字的才可能是在**冒充**電影序號 —— 而對真正的影集
+  // 條目來說「第N季」才是本分（但那種情況 targetSeq 必然是 null，規則不啟動）。
+  //
+  // ★ 為什麼不用年份判斷：站方年份本身是髒的（第一部被標成 2017），
+  //   而且真續集電影的年份差距可以很大（第一部 2002 → 第二部 2003；
+  //   《疾速追殺》4 = 2023 但前三部跨 10 年）。年份不可靠，序號形狀才可靠。
+  //
+  // ★ 為什麼不放寬成「剝掉季別字眼後沒有裸數字就一律 drop」：
+  //   那會誤殺「无间道3：终极无间」以外的邊界案例。條件 (3) 把範圍
+  //   限縮到「冒充成**目標那個**序號」的條目，精度最高。
+  const _targetSeqForMovieGuard = extractSequelNumber(targetInfo?.rawName || '');
+  const _isSequelMovieIntent = Number.isFinite(_targetSeqForMovieGuard)
+    && _targetSeqForMovieGuard >= 2;
+  // ★★ v104：片名帶序號 ≠ 一定是續集電影 ★★
+  //   《慶餘年2》《大江大河2》《無心法師2》《鄉村愛情9》都是「片名帶序號」
+  //   的**影集**。用 isStandaloneSequelMovie() 看站方資料：
+  //     結果物件帶逐集展開痕跡（episode 欄位 / S#E# / |s#e#|）→ 影集
+  //       → 規則 0.5 不啟動
+  //     結果物件是單檔（|sxex|）→ 單部電影 → 規則 0.5 啟動
+  //   這讓續集電影的過濾**只**作用在真正的電影上。
+  const _isStandaloneMovieContext = _isSequelMovieIntent
+    && isStandaloneSequelMovie(targetInfo?.rawName || '', results);
+  // 預先算出「續集電影式裸數字序號」的候選，供規則 0.5 與後續比對共用。
+  const _bareSeqOf = (res) => {
+    const nm = nameOf(res);
+    if (!nm) return null;
+    return extractSequelNumber(stripSeasonMarker(nm).trim());
+  };
+
   // 「片名沒寫季也沒年份」但跨多站回的同名檔案計數 —— 規則 4 用。
   // 計數單位是 baseName（去空白、去集數尾），如「五等分的新娘」。
   const unversionedBases = new Map();
@@ -15050,6 +15287,75 @@ function filterBySequel(results, targetInfo) {
     //   舊規則的正則漏了這個符號，是實測漏網的直接原因。
     if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇|[＊∽]/.test(rawName)) {
       dropped.push(res); continue;
+    }
+
+    // ★★ v103 規則 0.5：續集電影 → 殺掉「用季別字眼冒充目標序號」的條目 ★★
+    //
+    // 實測 bug（2026-11-26）：使用者點《無間道 II》（2003 電影），
+    // 詳細頁出現「無間道II 第2季（13 集）」，播放清單是**第一部**
+    // 《無間道》(2002) 被站方錯誤條目「无间道第二季」(2017, 12 集) 撈進來。
+    //
+    // 為什麼放在規則 1（sequel === targetSeason → keep）之前：
+    //   extractSequelNumber("无间道第二季") = 2（directSeasonMatch 命中「第二季」），
+    //   targetSeason = 2 → 規則 1 會直接 keep，後面所有規則都跳過 → 漏網。
+    //
+    // 判準（三條件全中才 drop）：
+    //   (1) 目標片名自帶續集序號（targetSeq >= 2）→ 使用者要的是「續集電影」
+    //   (2) 候選**只**用季別字眼標記序號（剝掉季別字眼後沒有裸數字）
+    //   (3) 該季別序號 === 目標序號
+    //
+    // ★★ v104：條件 (1) 必須再過一道「是不是單部電影」的資料檢查 ★★
+    //   《慶餘年2》《大江大河2》《無心法師2》也是「片名帶序號」，但它們是
+    //   **影集**（站方結果帶逐集展開痕跡）。
+    //   若把它們也當成續集電影 → 條件 A 會殺掉「庆余年第二季」這類**正確**
+    //   的影集條目 → 使用者搜 S2 找不到東西。
+    //   → 改用 isStandaloneSequelMovie()：站方資料顯示是影集 → 本規則不啟動。
+    if (_isSequelMovieIntent && rawName && _isStandaloneMovieContext) {
+      const _bareSeq = _bareSeqOf(res);
+      const _eps = Number(res._episodeCount)
+        || (res.url && String(res.url).includes('#')
+            ? String(res.url).split('#').length : 1);
+
+      // ★★★ 條件 A：多集條目 → 不可能是那部電影 ★★★
+      //
+      // 【站方真實資料（暴風資源，實測 2026-11-26）】
+      //   "无间道2"      year=2003  eps=1   已完结             ← 真正的第二部電影
+      //   "无间道第一季" year=2016  eps=12  已完结             ← 假條目
+      //   "无间道第二季" year=2017  eps=12  已完结             ← 假條目
+      //   "无间道第三季" year=2017  eps=12  已完结             ← 假條目
+      //   "无间道"       year=2003  eps=31  刘德华梁朝伟巅峰对决 ← 第一部被切 31 集
+      // 後四條**全部是第一部《無間道》(2002) 被站方錯標/錯切**。
+      //
+      // 電影在站方是**單檔**（eps=1），影集才會被切成多集。
+      // 續集電影查詢下拿到多集條目 = 拿到別的片 → drop。
+      //
+      // ★★ 為什麼條件 A 不能少 ★★
+      //   原本只靠「冒充的季別序號 === 目標序號」→ 只殺得掉「无间道第二季」。
+      //   「无间道第三季」(2017, 12 集) 冒充的是第 3 季 → 抓不到 →
+      //   實測確認會在 season=3 那一批漏網，被顯示成「無間道II 第3季（12 集）」。
+      if (_eps > 1 && /[季部]/.test(rawName)) { dropped.push(res); continue; }
+
+      // ★★★ 條件 B：候選必須帶著與目標相同的**裸數字序號** ★★★
+      //
+      // 續集電影在站方一律用裸數字命名（无间道2 / 战狼2 / 疾速追杀4 /
+      // 海王2 / 复仇者联盟4）。片名裡**沒有**目標那個序號的，就是同系列
+      // 的前作或別的作品，不是使用者要看的那部：
+      //   "无间道"                → 沒有序號 → 是第一部 → drop
+      //   "无间道第二季"/"第三季"  → 季別字眼 → 是第一部被錯標 → drop
+      //   "无间道3：终极无间"       → 序號 3 ≠ 2 → 是第三部 → drop
+      //
+      // ★ 為什麼不能用「片名核心名不同就 drop」（規則 78.1 那套）★★
+      //   續集電影的正式中文片名常帶副標題（海王2：失落的王國、
+      //   復仇者聯盟4：終局之戰），核心名比對要靠 stripSubtitle。
+      //   而「無間道II」與「无间道」的核心名**完全相同**（都是「無間道」），
+      //   規則 78.1 殺不掉第一部那條 → 必須靠「序號有沒有對上」來分。
+      //
+      // ★★ 對真影集零影響 ★★
+      //   影集目標片名不會自帶序號（仁醫 / 五等分的新娘 → targetSeq=null）
+      //   → _isSequelMovieIntent = false → 本區塊完全不執行。
+      //   實測驗證：仁醫 S1/S2、五等分的新娘 S2、白粉飛 S2、進擊的巨人 S3
+      //   全部維持原結果，一筆不多、一筆不少。
+      if (_bareSeq !== _targetSeqForMovieGuard) { dropped.push(res); continue; }
     }
 
     // ★★ v78.1：target 有續集序號時，主片名不同的候選必須 drop。
@@ -16850,7 +17156,17 @@ targetInfo.searchQuery = aliasQ;
       console.log(`🎬 電影續集過濾(batch, 第${targetInfo.seasonNumber}部): ${r.before} -> ${finalResults.length}（pooledYearMin=${r.pooledYearMin ?? 'null'}）`);
       console.log(`📊 第${targetInfo.seasonNumber}部過濾後送往 forward app 的最終清單（confirm count）: ${finalResults.length}`);
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
-      console.log(`⚠️ 電影續集過濾(batch)無命中(${r.before}筆)，保留全部候選`);
+      // ★★ v103：續集電影 → 0 筆就真的是 0 筆，不放行被殺的資料 ★★
+      // （與 TV 分支同款理由，見該處註解）
+      // ★★ v104：加站方資料判斷，避免誤傷《慶餘年2》這類名稱帶數字的影集。
+      const _seqGuardM = extractSequelNumber(targetInfo?.rawName || '');
+      if (Number.isFinite(_seqGuardM) && _seqGuardM >= 2
+          && isStandaloneSequelMovie(targetInfo?.rawName || '', r.kept || [])) {
+        finalResults = [];
+        console.log(`🎬 電影續集過濾(batch): ${r.before} -> 0（續集電影(序號=${_seqGuardM})，不放入被判定無關的候選）`);
+      } else {
+        console.log(`⚠️ 電影續集過濾(batch)無命中(${r.before}筆)，保留全部候選`);
+      }
     }
   }
 
@@ -16869,7 +17185,30 @@ targetInfo.searchQuery = aliasQ;
         s4FallbackUsed = true;
       }
     } else if (r.before !== undefined && r.before > 0 && (!r.kept || r.kept.length === 0)) {
-      console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾(batch)無命中(${r.before}筆)，保留全部候選`);
+      // ★★ v103：續集電影 → 0 筆就真的是 0 筆，不放行被殺的資料 ★★
+      //
+      // 安全網的語意是「寧可多給，不可全無」—— 那是為**影集**設計的：
+      //   影集有「第 N 季」語意，某一批季別查不到時，放寬到別的季別
+      //   比空白好。
+      //
+      // ★★ 但續集電影沒有「季別」語意 ★★
+      //   《無間道II》(2003 電影) 只有一部。放行的每一筆都是**別的片**
+      //   （實測 S3 批次放行了「无间道」= 第一部，被顯示成「無間道．第2季」）。
+      //   這正是截圖裡使用者看到第一部的原因。
+      //
+      // 判準：目標片名自帶續集序號（targetSeq >= 2）→ 續集電影 → 不放行。
+      //   影集的片名不會自帶序號 → targetSeq = null → 安全網照舊（零影響）。
+      //
+      // ★★ v104：片名帶序號也可能是**影集**（《慶餘年2》《大江大河2》）。
+      //   這時若不放行 → 使用者搜不到該影集的 S2 → 必須靠站方資料判斷。
+      const _seqGuard = extractSequelNumber(targetInfo?.rawName || '');
+      if (Number.isFinite(_seqGuard) && _seqGuard >= 2
+          && isStandaloneSequelMovie(targetInfo?.rawName || '', r.kept || [])) {
+        finalResults = [];
+        console.log(`🎬 第${targetInfo.seasonNumber}季過濾(batch): ${r.before} -> 0（續集電影(序號=${_seqGuard})，不放入被判定無關的候選）`);
+      } else {
+        console.log(`⚠️ 第${targetInfo.seasonNumber}季過濾(batch)無命中(${r.before}筆)，保留全部候選`);
+      }
     } else if (r.kept && r.kept.length === r.before && r.before > 0) {
       // 全部通過即「沒 S4 命中」+ 「全部候選都是 S1 沒人可殺」 —— 退回保留全部。
       // log 寫明這是 fallback，不要讓人誤會成「filter 確認這就是答案」。
@@ -17410,18 +17749,57 @@ async function loadDetail(link) {
     //   原封不動。若單部 0 結果，再補抓其餘季做 fallback，語意與舊版一致。
     const explicitSeason = meta.season ?? null;
 
+    // ★★ v103：續集電影（片名自帶序號）→ 不併抓其它季 ★★
+    //
+    // 場景：使用者點《無間道 II》（2003 **電影**，片名帶羅馬數字序號）。
+    //   REX 把電影也用 type='tv' 送進來 → 走 TV 路徑 → 併抓 S1/S2/S3。
+    //
+    // ★★ 為什麼這是問題 ★★
+    //   續集電影只有「一部」，沒有「第 N 季」的語意。
+    //   併抓 S2/S3 會帶回兩個壞結果：
+    //     (a) S2/S3 批次的 filterBySequel 會把「无间道2」(序號 2)
+    //         當成「序號 ≠ 該批次季別」殺掉 → 該批次 0 筆
+    //         → 觸發呼叫端的安全網「保留全部候選」→ 髒資料全部放回來。
+    //     (b) 該批次剩下的「无间道」(第一部，被站方錯標) 就被提升成
+    //         season=2/3，顯示成「無間道．第2季」—— 使用者點進去看第一部。
+    //
+    // ★ 判準（v104 修正）：**不能**只看片名序號 >= 2。
+    //   《慶餘年2》《大江大河2》《無心法師2》也是「片名帶數字」，但它們是
+    //   **影集**（站方結果帶逐集展開痕跡）。若照舊只抓當前季，
+    //   實測 S2 查詢的分頁由「S1+S2」降為只剩「S2」→ 功能退化。
+    //
+    //   → 判斷改用**站方實際資料**：isStandaloneSequelMovie() 檢查結果物件
+    //     是否帶逐集展開痕跡（episode 欄位 / S#E# / |s#e#|）；有 → 影集
+    //     → 照舊併抓多季；無（單檔 |sxex|）→ 單部電影 → 只抓當前季。
+    //
+    //   實作上無法在發出請求前知道站方資料，因此採「先抓當前季，再決定要不要
+    //   補抓其它季」：當前季結果若顯示是影集 → 補抓；
+    //   否則視為單部電影 → 不補抓（這正是要修的場景）。
+    const _detailTargetSeq = extractSequelNumber(title);
+    const _seqInTitle = Number.isFinite(_detailTargetSeq) && _detailTargetSeq >= 2;
+
     const isMovieDetail = type === 'movie';
     const seasonsToFetch = isMovieDetail
       ? [season]
       : (explicitSeason != null
         ? [...new Set([explicitSeason, 1, 2])]
         : [1, 2, 3]);
+    if (_seqInTitle && type !== 'movie') {
+      console.log(`🎬 [loadDetail] 《${title}》片名帶序號(${_detailTargetSeq}) → 先抓當前季 S${season}，再依站方資料判定是否為單部電影`);
+    }
     const seenKey = new Set();
     let allResults = [];
     // ★ 併發抓多季：三個 loadResource 各自走獨立 cache key（_s${s}），
     //   無共享狀態，併發安全。總時間 = max(各季) 而非 sum。
+    //
+    // ★★ v104：片名帶序號且 type='tv' → **先只抓當前季** ★★
+    //   續集電影只有一部；但《慶餘年2》這種影集要併抓其它季。
+    //   兩者的差別只有在站方資料裡看得出來 → 先抓當前季拿到資料，
+    //   再決定要不要補抓其它季（見下方 _maybeFetchExtraSeasons）。
+    const _deferSeasonDecision = _seqInTitle && type !== 'movie';
+    const _initialSeasons = _deferSeasonDecision ? [season] : seasonsToFetch;
     const batchArrays = await Promise.all(
-      seasonsToFetch.map((s) => loadResource({
+      _initialSeasons.map((s) => loadResource({
         seriesName: title,
         title,
         type,
@@ -17440,8 +17818,8 @@ async function loadDetail(link) {
         m3u8FilterAdapterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterAdapterMode') || {}).value || 'skip',
       }))
     );
-    for (let bi = 0; bi < seasonsToFetch.length; bi++) {
-      const s = seasonsToFetch[bi];
+    for (let bi = 0; bi < _initialSeasons.length; bi++) {
+      const s = _initialSeasons[bi];
       const batchResults = batchArrays[bi] || [];
       for (const r of batchResults) {
         if (!r.url) continue;
@@ -17461,6 +17839,62 @@ async function loadDetail(link) {
         allResults.push(r);
       }
       console.log(`📡 [loadDetail] 季 S${s}: ${batchResults.length} 條（去重後累計 ${allResults.length}）`);
+    }
+
+    // ★★ v104：依站方實際資料決定要不要補抓其它季 ★★
+    //
+    //   場景：《慶餘年2》《大江大河2》這類**名稱帶數字的影集**。
+    //   上一版（v103）只看片名序號就把它们當成「單部續集電影」→ 只抓當前季
+    //   → S1 分頁消失（實測 S2 查詢：2 分頁 → 1 分頁）。
+    //
+    //   判別方式（isStandaloneSequelMovie）：結果物件若帶逐集展開痕跡
+    //   （episode 欄位 / S#E# / |s#e#|）→ 是**影集** → 補抓其它季；
+    //   單檔（|sxex|）→ 是**單部電影** → 不補抓。
+    if (_deferSeasonDecision) {
+      const _isStandalone = isStandaloneSequelMovie(title, allResults);
+      if (_isStandalone) {
+        console.log(`🎬 [loadDetail] 《${title}》站方資料顯示為**單部電影** → 不補抓其它季（避免帶回第一部髒資料）`);
+      } else {
+        const _extraSeasons = seasonsToFetch.filter((s) => !_initialSeasons.includes(s));
+        if (_extraSeasons.length > 0) {
+          console.log(`🎬 [loadDetail] 《${title}》站方資料顯示為**影集** → 補抓 ${_extraSeasons.join(',')} 季`);
+          try {
+            const extraArrays = await Promise.all(
+              _extraSeasons.map((s) => loadResource({
+                seriesName: title,
+                title,
+                type,
+                season: s,
+                episode,
+                id,
+                link,
+                searchMode: 'batch',
+                matchStrictness: 'standard',
+                preferResolution: 'auto',
+                VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
+                m3u8FilterWorkerUrl: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterWorkerUrl') || {}).value || '',
+                m3u8FilterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterMode') || {}).value || 'filter',
+                m3u8FilterAdapterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterAdapterMode') || {}).value || 'skip',
+              }))
+            );
+            for (let ei = 0; ei < _extraSeasons.length; ei++) {
+              const s = _extraSeasons[ei];
+              const batchResults = extraArrays[ei] || [];
+              for (const r of batchResults) {
+                if (!r.url) continue;
+                if (r.season == null) r.season = s;
+                const dkey = `s${r.season}||${r.url}`;
+                if (seenKey.has(dkey)) continue;
+                seenKey.add(dkey);
+                allResults.push(r);
+              }
+              console.log(`📡 [loadDetail] 補抓季 S${s}: ${batchResults.length} 條（去重後累計 ${allResults.length}）`);
+            }
+          } catch (err) {
+            console.log(`⚠️ [loadDetail] 《${title}》補抓其它季失敗: ${err && err.message}`);
+          }
+        }
+      }
     }
     // ★ 電影 fallback：單部 0 結果時補抓其餘季，語意與舊版三季合併一致。
     //   只在「首抓完全沒東西」時觸發一次；正常命中時零額外成本。
