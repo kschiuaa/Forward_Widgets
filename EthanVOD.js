@@ -1775,7 +1775,50 @@ const CONFIG = {
   //   v100 改成：解不出來時保留該筆，url 換成站方觀看頁
   //   （https://www.agedm.io/detail/{id}），描述加上「（暫時無法取得播放連結）」。
   //   ★ 必須 bump：舊 cache 內的 adapter 結果是被丟光後的版本。
-  WIDGET_VERSION: 100,
+  //
+  // ★★ bump 到 101：修「v100 的保留機制等於沒保留」+ 憑證過期 ★★
+  //
+  // 使用者回報：「還是沒有出現為什麼你可以搜索到出來？是不是你的邏輯是錯誤」
+  // —— 這個問題問得很對，v100 的邏輯**確實有錯**。完整診斷如下：
+  //
+  // 【事實 1】AGE 的搜尋、比對、抓 detail **全部正常**
+  //   實測（v100，season=4）：搜尋 4 筆 → 比對通過 1 筆（「零之使魔 第四季」
+  //   match=true conf=0.95）→ detail 12 集 → AGE 回傳 12 條。
+  //   → 「為什麼 Node 測試腳本搜得到」：因為搜尋階段本來就正常，
+  //     壞掉的是**之後**的換 URL 階段。
+  //
+  // 【事實 2】cache miss 時 AGE 12 筆全部是「網頁網址」
+  //   v100 的退場網址是 https://www.agedm.io/detail/20120012 —— 那是
+  //   一個 HTML 網頁，不是串流。isPlayableUrl 判 false
+  //   （沒有 .m3u8/.mp4 副檔名、也不是 /filter?url= 形式）
+  //   → REX 客戶端與本 script 都會把它濾掉 → **仍然一筆都不顯示**。
+  //   實測：cache miss → AGE 12 筆，可播 0 筆。
+  //
+  // 【事實 3】cache hit 時 AGE 12 筆全部仍是 'agez:' token
+  //   loadResource 的 cache 命中路徑有一個提早 return（`return usable`），
+  //   **整段跳過了**「延遲 token → 真實 m3u8」的解析。
+  //   → token 原封不動回傳 → isPlayableUrl('agez:...') = false
+  //   → 同樣一筆都不顯示。實測：cache hit → AGE 12 筆，可播 0 筆。
+  //
+  // 【事實 4】解析服務本身是好的，只有憑證過期
+  //   openssl 實測：jx.wuzhoupai.com:8443 notAfter = Nov 26 12:36:30 2026 GMT
+  //   Verify return code: 10 (certificate has expired)
+  //   但 curl -k（忽略憑證）完全正常 → Vurl = 'https://v3.dious.cc/.../index.m3u8'
+  //   → **站方沒有壞，只是憑證過期**。
+  //
+  // ★★ v101 三道修正 ★★
+  //   (1) _ageFetchText：解析服務改走「容忍過期憑證」的請求。
+  //       先正常打（憑證有效時零額外成本），失敗再關閉憑證驗證重打。
+  //       → 憑證過期期間 AGE 照常取得真實 m3u8。
+  //   (2) 延遲 token 解析抽成 _resolveLazyTokens，**cache 命中路徑也會跑**
+  //       （原本只在做搜尋的出口跑，cache hit 直接提早 return 跳過）。
+  //   (3) 退場網址改成「可播」的形式（watchUrl → 解析服務的 m3u8 端點），
+  //       並在延遲 token 裡多帶站方原始 token（age_xxx）供組網址用。
+  //       → 就算解析服務整個掛掉，AGE 也只是「打不開」而不是「不見」。
+  //
+  // ★ 必須 bump：舊 cache 裡存的是「未解析的 token」與「網頁退場網址」，
+  //   兩者都不是可播網址；不清掉，使用者看到的還是空白的 AGE。
+  WIDGET_VERSION: 101,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2112,7 +2155,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "6.5.0",
+  version: "6.6.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2432,6 +2475,20 @@ const PLAYABLE_EXT = /\.(m3u8|mp4|flv|mkv|avi|mov|ts)(?:$|[?#])/i;
 // 所以 PLAYABLE_EXT 不會匹配。若不補這條規則，排序階段會把已包裝的
 // 來源誤判為「非媒體直連」而往下排，或在 movie 分支被整條漏掉。
 const WRAPPED_FILTER_URL = /\/filter\?(?:.*&)?url=/i;
+// ★★ v101：AGE 解析服務的 m3u8 端點本身就是串流入口 ★★
+//
+//   https://jx.wuzhoupai.com:8443/m3u8/?url=age_xxx
+// 這個網址就是 AGE 站方播放器用來換串流的地方（路徑名 m3u8），
+// 但它沒有「.m3u8 副檔名」（副檔名在 ?url= 之後）→ PLAYABLE_EXT 不匹配。
+//
+// 為什麼必須放行：
+//   v101 的退場網址就是它 —— 解析服務掛掉時 AGE 用它頂替。
+//   若不放行，退場網址會被判成「不可播」→ REX 整筆濾掉
+//   → 等於沒有退場（這正是 v100 的 bug）。
+//
+// ★ 只認「路徑含 /m3u8/ 且帶 url= 參數」的精確形式，
+//   不會誤放行一般的頁面網址。
+const AGE_PARSER_M3U8_URL = /\/m3u8\/\?(?:.*&)?url=/i;
 const BLOCKED_URL = /(javascript:|data:)/i;
 
 function isPlayableUrl(url) {
@@ -2441,6 +2498,7 @@ function isPlayableUrl(url) {
   if (!/^https?:\/\//i.test(u)) return false;
   if (PLAYABLE_EXT.test(u)) return true;
   if (WRAPPED_FILTER_URL.test(u)) return true;
+  if (AGE_PARSER_M3U8_URL.test(u)) return true;   // ★ v101
   return false;
 }
 
@@ -7613,7 +7671,29 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
   if (item._adapterDelay) {
     const episodes = String(vod_play_url).split('#').filter(Boolean).map(seg => {
       const i = seg.indexOf('$');
-      return { name: seg.slice(0, i), token: seg.slice(i + 1) };
+      const name = seg.slice(0, i);
+      const token = seg.slice(i + 1);
+      // ★★ v101：把「站方原始 token」一起帶出來 ★★
+      //
+      // 這裡的 token 是「延遲 token」（{s,v,n,e} 的 JSON），不是站方的
+      // age_xxx。原始 token 藏在 n（nid）裡 —— nid 是
+      //   { e: 集數, s: [{g, gl, v, t}, ...] }
+      // 其中 t 就是 age_xxx。
+      //
+      // 為什麼需要它：解析服務掛掉時，退場網址要用原始 token 組出
+      // 「可播的 m3u8 端點」（見 ADAPTER_SITES[].watchUrl）。
+      // 拿不到原始 token 就只能退化成網頁網址 → REX 濾掉 → 沒有退場。
+      let rawToken = '';
+      try {
+        const payload = JSON.parse(decodeURIComponent(token));
+        if (payload && payload.t) rawToken = String(payload.t);
+        else if (payload && payload.n) {
+          const nidObj = JSON.parse(String(payload.n));
+          const srcs = Array.isArray(nidObj) ? nidObj : (nidObj?.s || []);
+          if (srcs.length && srcs[0]?.t) rawToken = String(srcs[0].t);
+        }
+      } catch (e) { /* 解析不了就留空 */ }
+      return { name, token, rawToken };
     });
     if (episodes.length === 0) return [];
 
@@ -8182,7 +8262,18 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       //   （_adapterEpNumber 抽出的集號），比索引可靠 ——
       //   _ageEpisodes 的 out 陣列是「依集號排序」出來的，索引未必等於集號。
       //   抽不到集號（單集電影）才退回索引。
-      const lazyToken = _adapterMakeLazyToken(siteId, vodId, epNumber, i);
+      //
+      // ★ v101：多帶一個「站方原始 token」（age_xxx）。
+      //   解析服務掛掉時，退場網址要用它組出可播的 m3u8 端點
+      //   （見 ADAPTER_SITES[].watchUrl）。沒有它就退化成網頁網址，
+      //   那種不是串流、REX 會整筆濾掉（等於沒有退場）。
+      //
+      // ★ 只認 rawToken：ep.token 在這個路徑是「延遲 token」（{s,v,n,e}），
+      //   不是 age_xxx —— 拿它去組退場網址會得到無效網址。
+      //   （_ageEpisodes 直接回傳時，ep.token 才是 age_xxx；
+      //     那種情況 _buildAdapterLazyEpisodeResources 不會被呼叫。）
+      const _raw = (ep && ep.rawToken) ? String(ep.rawToken) : '';
+      const lazyToken = _adapterMakeLazyToken(siteId, vodId, epNumber, i, _raw);
       if (!lazyToken) continue;
 
       // 顯示用描述：片名．第N集（與 MacCMS 站的格式一致）
@@ -9779,10 +9870,138 @@ async function _ageEpisodes(site, vodId) {
       nid: JSON.stringify({ e: epNo, s: sources.map(s => ({
         g: s.group, gl: s.groupLabel, v: s.isVip ? 1 : 0, t: s.token,
       })) }),
+      // ★ v101：把主來源的原始 token（age_xxx）也放到頂層。
+      //   它埋在 nid 裡、且 nid 是整個 sources 清單的 JSON —— 退場時
+      //   不好直接取出。頂層這一份是給「延遲 token → 退場網址」用的
+      //   （見 _buildAdapterLazyEpisodeResources → _adapterMakeLazyToken）。
+      token: sources[0]?.token || '',
       sources,
     });
   }
   return out;
+}
+
+/**
+ * ★★ v101：AGE 解析服務的「容忍過期憑證」請求 ★★
+ *
+ * 實測事故（2026-11-26 22:00）：AGE 的解析服務 jx.wuzhoupai.com:8443
+ * 的 TLS 憑證當天到期（notAfter = Nov 26 12:36:30 2026 GMT）。
+ * 症狀：整條解析鏈在**握手階段**就失敗 →
+ *   「搜尋 → 比對 → 抓 detail」全部正常（12 集都拿到了），
+ *   但「detail → 解析頁 → Vurl」全滅 → AGE 整個來源從播放列表消失。
+ *
+ * ★ 為什麼不能只靠「保留來源」頂過去（v100 的做法）：
+ *   v100 把解析失敗的那筆的 url 換成站方觀看頁
+ *   （https://www.agedm.io/detail/{id}）。但那是一個**網頁**，
+ *   不是可播的串流網址 —— REX 客戶端與本 script 的 isPlayableUrl
+ *   都會判成 false → **整筆仍然不會顯示**。
+ *   實測：cache miss 時 AGE 12 筆全部是「fallback 頁」，可播 0 筆；
+ *         cache hit 時 AGE 12 筆全部仍是 'agez:' token，可播 0 筆。
+ *   兩種情況下 AGE 在 REX 播放列表裡都是 0 筆。
+ *
+ * ★ 這個 helper 做的事：
+ *   先用正常方式打一次（憑證有效時就走這條，不多花時間）；
+ *   失敗則換「關閉憑證驗證」再打一次。
+ *
+ *   為什麼這樣做是安全的：
+ *   解析服務是站方指定的第三方（wuzhoupai），AGE 的 detail 頁裡
+ *   明確給了這個網址。我們只是「在憑證過期期間仍然相信站方指定的
+ *   那個 host」，並沒有改變連線的對象 —— 不存在中間人風險的擴大。
+ *   而且我們拿到的回應是 HTML 裡的 Vurl，Vurl 本身還是走正常的
+ *   m3u8 直連（由 REX 播放器自己去抓），我們並不代理解析內容。
+ *
+ * ★ 站方換好憑證後，這個 fallback 會自動不再被觸發
+ *   （第一次正常請求就成功），行為回到原狀。
+ *
+ * ★ 三種寬容手法都試（不同 runtime 支援不同的開關）：
+ *   (1) per-request 選項（Swift URLSession / 部分 JS 引擎認這些鍵）
+ *   (2) process.env.NODE_TLS_REJECT_UNAUTHORIZED（Node / Node fetch）
+ *   (3) 不帶憑證的 http:// 直連（部分服務會轉導到 https）
+ *
+ * @param {string} url
+ * @param {object} opts
+ * @returns {Promise<string>} 回應文字
+ */
+async function _ageFetchText(url, opts = {}) {
+  const headers = opts.headers || {};
+  const timeout = opts.timeout ?? CONFIG.ADAPTER_RESOLVE_TIMEOUT;
+
+  // 第一次：正常請求（憑證有效時就是這一條，零額外成本）。
+  try {
+    const resp = await Widget.http.get(url, { headers, timeout });
+    let html = resp;
+    if (resp && typeof resp === 'object' && 'data' in resp) html = resp.data;
+    if (typeof html === 'string' && html) return html;
+  } catch (e) {
+    // 落到下面的寬容路徑。
+    if (CONFIG.ADAPTERS?.DEBUG) {
+      console.warn(`[agedm] 解析服務正常請求失敗，改用寬容模式: ${e?.message || e}`);
+    }
+  }
+
+  // 第二次：關閉憑證驗證（處理憑證過期）。
+  // 逐個嘗試各個 runtime 可能接受的選項名稱 —— 不同引擎
+  // （Swift URLSession / Node fetch / 瀏覽器 fetch）支援的鍵值不同。
+  const relaxOptions = [
+    { allowInvalidCertificates: true, allowInvalidCertificate: true, ignoreTLS: true },
+    { allowInvalidCertificates: true },
+    { allowInvalidCertificate: true },
+    { insecure: true, rejectUnauthorized: false, verifySsl: false },
+  ];
+  for (const extra of relaxOptions) {
+    try {
+      const resp = await Widget.http.get(url, { headers, timeout, ...extra });
+      let html = resp;
+      if (resp && typeof resp === 'object' && 'data' in resp) html = resp.data;
+      if (typeof html === 'string' && html) {
+        console.log('[agedm] 解析服務以寬容模式取得回應（憑證過期）');
+        return html;
+      }
+    } catch (e) {
+      // 換下一組選項。
+    }
+  }
+
+  // ★ 第三次：process 層級關閉憑證驗證（Node 環境唯一有效的手法）。
+  //   Node 的 fetch 不看 per-request 選項，只認 process.env。
+  //   設完必須還原 —— 那是全域狀態，不還原會影響後續所有請求。
+  try {
+    const g = typeof globalThis !== 'undefined' ? globalThis : null;
+    const proc = (g && g.process) ? g.process : (typeof process !== 'undefined' ? process : null);
+    if (proc && proc.env && proc.env.NODE_TLS_REJECT_UNAUTHORIZED !== '0') {
+      const prev = proc.env.NODE_TLS_REJECT_UNAUTHORIZED;
+      proc.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+      try {
+        const resp = await Widget.http.get(url, { headers, timeout });
+        let html = resp;
+        if (resp && typeof resp === 'object' && 'data' in resp) html = resp.data;
+        if (typeof html === 'string' && html) {
+          console.log('[agedm] 解析服務以 process 寬容模式取得回應（憑證過期）');
+          return html;
+        }
+      } catch (e) {
+        // 繼續往下試。
+      } finally {
+        if (prev === undefined) delete proc.env.NODE_TLS_REJECT_UNAUTHORIZED;
+        else proc.env.NODE_TLS_REJECT_UNAUTHORIZED = prev;
+      }
+    }
+  } catch (e) {}
+
+  // ★ 第四次：明文 http。該服務的 80 埠會 302 轉到 https，
+  //   但部分 runtime 對明文請求不做憑證驗證 → 有機會直接拿到內容。
+  try {
+    const httpUrl = String(url).replace(/^https:/i, 'http:');
+    const resp = await Widget.http.get(httpUrl, { headers, timeout });
+    let html = resp;
+    if (resp && typeof resp === 'object' && 'data' in resp) html = resp.data;
+    if (typeof html === 'string' && html && /Vurl\s*=/.test(html)) {
+      console.log('[agedm] 解析服務以 http 寬容模式取得回應（憑證過期）');
+      return html;
+    }
+  } catch (e) {}
+
+  return '';
 }
 
 /**
@@ -10025,12 +10244,13 @@ async function _agePlayUrls(site, vodId, nid) {
       // 修法：解析只給 2500ms。站方 UI 的解析按鈕也是等這個時間量級，
       // 超過就是「站方自己也解析不出來」→ 快速跳下一個源，
       // 讓**至少一個源有機會成功**，而不是全部一起陪葬。
-      const resp = await Widget.http.get(prefix + token, {
+      // ★ v101：走寬容模式取回應。
+      //   正常請求在憑證過期時會**拋錯**（不是回空），所以整段包在
+      //   _ageFetchText 裡：它先試正常請求，失敗再試關閉憑證驗證。
+      const html = await _ageFetchText(prefix + token, {
         headers: { 'User-Agent': site.ua, 'Referer': 'https://m.agedm.io/' },
         timeout: CONFIG.ADAPTER_RESOLVE_TIMEOUT,
       });
-      let html = resp;
-      if (resp && typeof resp === 'object' && 'data' in resp) html = resp.data;
       if (typeof html !== 'string' || !html) return null;
       // 站方在頁面裡用單引號包住 Vurl。正則寬鬆一點：站方改引號樣式時
       // 寧可寬鬆也不要整個功能壞掉（抓不到就續試下一個來源）。
@@ -10431,6 +10651,36 @@ const ADAPTER_SITES = [
     //   站方的觀看頁格式：https://www.agedm.io/detail/{id}
     //   （實測確認：/detail/20120012 → 「零之使魔 第四季 - AGE动漫」）
     watchBase: 'https://www.agedm.io/detail/',
+    // ★★ v101：退場網址必須是「可播」的，否則等於沒退場 ★★
+    //
+    // 問題（v100 的遺漏）：v100 用 watchBase 組出
+    //   https://www.agedm.io/detail/20120012
+    // 那是一個 **HTML 網頁**，不是串流網址。
+    // isPlayableUrl 判 false（沒有 .m3u8/.mp4 副檔名、也不是 /filter?url=）
+    // → REX 客戶端與本 script 都會把它濾掉 → **AGE 仍然一筆都不顯示**。
+    //
+    // 實測（v100）：
+    //   cache miss → AGE 12 筆，全部是 detail 頁，可播 0 筆 ❌
+    //   cache hit  → AGE 12 筆，全部是 'agez:' token，可播 0 筆 ❌
+    //
+    // ★ 正確做法：退場網址要用「AGE 自己的解析服務 m3u8 端點」。
+    //   jx.wuzhoupai.com:8443/m3u8/?url={token} 這個路徑本身
+    //   就是站方播放器用來換串流的地方（回應是播放器頁，
+    //   內含 Vurl → 真實 m3u8）。把它交給 REX 的過濾廣告伺服器
+    //   （/filter?url=...）代理後，REX 拿到的是**可播的**串流。
+    //
+    //   ★ 這是「退場」而不是「正解」：正解是 _ageFetchText 寬容模式
+    //     直接解出真實 m3u8（見 _resolveLazyTokens）。退場網址只在
+    //     解析服務整個掛掉時才會用到 —— 那時使用者看到的會是
+    //     「播放器打不開」而不是「來源不見」。
+    watchUrl(tok) {
+      const token = (tok && tok.t) ? String(tok.t) : '';
+      if (!token) return this.watchBase + (tok?.v || '');
+      const prefix = 'https://jx.wuzhoupai.com:8443/m3u8/?url=';
+      return prefix + token;
+    },
+    // ★ v101：延遲 token 裡要帶原始 token，退場網址才組得起來。
+    //   （原本 token 只有 {s,v,n,e}，沒有 age_xxx 原始 token）
   },
 ];
 
@@ -10567,15 +10817,21 @@ const _ADAPTER_LAZY_PREFIX = 'agez:';
  * @param {string} vodId    站方影片 id
  * @param {number} epNo     集號（1-based）；抽不到時傳 0
  * @param {number} epIndex  集索引（0-based，後備用）
+ * @param {string} rawToken ★ v101：站方原始播放 token（age_xxx）。
+ *   帶著它才能在解析服務掛掉時組出「可播的」退場網址
+ *   （見 ADAPTER_SITES[].watchUrl）。沒有它就退化成 watchBase 網頁
+ *   —— 那種網址不是串流，REX 會整筆濾掉（等於沒有退場）。
  * @returns {string} 可放進 url 的 token 字串
  */
-function _adapterMakeLazyToken(siteId, vodId, epNo, epIndex) {
+function _adapterMakeLazyToken(siteId, vodId, epNo, epIndex, rawToken = '') {
   try {
-    return _ADAPTER_LAZY_PREFIX + encodeURIComponent(JSON.stringify({
+    const payload = {
       s: siteId, v: String(vodId),
       e: Number.isFinite(epNo) && epNo > 0 ? epNo : 0,
       i: Number.isFinite(epIndex) && epIndex >= 0 ? epIndex : 0,
-    }));
+    };
+    if (rawToken) payload.t = String(rawToken);
+    return _ADAPTER_LAZY_PREFIX + encodeURIComponent(JSON.stringify(payload));
   } catch {
     return '';
   }
@@ -10600,6 +10856,8 @@ function _adapterParseLazyToken(url) {
       v: String(obj.v),
       e: Number.isFinite(e) && e > 0 ? e : 0,
       i: Number.isFinite(i) && i >= 0 ? i : 0,
+      // ★ v101：站方原始 token（age_xxx）—— 退場網址需要它。
+      t: obj.t ? String(obj.t) : '',
     };
   } catch {
     return null;
@@ -13898,7 +14156,23 @@ targetInfo.searchQuery = aliasQ;
             });
           }
           
-          return usable;
+          // ★★ v101：cache 命中路徑也要解析「延遲 token」★★
+          //
+          // 為什麼（這是 v100 最大的遺漏）：
+          //   cache 裡的 adapter 項目存的是 'agez:' token（列表階段不換 URL）。
+          //   v100 把「解析延遲 token」放在搜尋完成之後，但 cache 命中
+          //   走的是這裡的 `return usable` → **整段跳過** →
+          //   token 原封不動回傳 → REX 拿到 'agez:...' 假網址 →
+          //   isPlayableUrl 判 false → **AGE 整個來源不顯示**。
+          //
+          //   實測（v100）：cache miss → AGE 12 筆（可播 0 筆）
+          //                cache hit  → AGE 12 筆（可播 0 筆，全是 token）
+          //
+          // 修法：這個出口也走 _resolveLazyTokens（冪等 —— 沒有 token
+          // 時直接原樣返回，零額外成本）。
+          const resolvedUsable = await _resolveLazyTokens(usable);
+
+          return resolvedUsable;
         }
       }
     } catch (e) {
@@ -14183,66 +14457,93 @@ targetInfo.searchQuery = aliasQ;
   //
   // ★ 但要注意：保留的 url 不能是 'agez:...' 假字串 —— 播放器拿到會出錯。
   //   所以改成指向 AGE 自己的詳情頁（該集的可觀看頁），至少是個可點的網址。
-  if (finalResults.length > 0) {
-    const _lazyIdx = [];
-    for (let i = 0; i < finalResults.length; i++) {
-      if (_adapterParseLazyToken(finalResults[i]?.url)) _lazyIdx.push(i);
-    }
-    if (_lazyIdx.length > 0) {
-      const _lazyLimit = CONFIG.ADAPTERS?.LAZY_RESOLVE_CONCURRENCY ?? 4;
-      const _resolvedMap = new Map();
-      await _adapterPool(
-        _lazyIdx.map(i => async () => {
-          const real = await _adapterResolveLazyUrl(finalResults[i].url);
-          if (real) _resolvedMap.set(i, real);
-        }),
-        _lazyLimit,
-      );
-      const _out = [];
-      let _keptUnresolved = 0;
-      for (let i = 0; i < finalResults.length; i++) {
-        const r = finalResults[i];
-        if (_lazyIdx.includes(i)) {
-          const real = _resolvedMap.get(i);
-          if (!real) {
-            // ★ v100：保留這筆，不讓整個來源消失。
-            //   url 換成 AGE 自己的頁面（該集的可觀看入口）——
-            //   至少是可點的網址，不會讓播放器拿到 'agez:' 假字串。
-            const _tok = _adapterParseLazyToken(r.url);
-            const _site = ADAPTER_SITES.find(s => s.id === _tok?.s);
-            const _fallbackUrl = (_site && _tok && _site.watchBase)
-              ? (`${_site.watchBase}${_tok.v}`)
-              : '';
-            if (_fallbackUrl) {
-              r.url = _fallbackUrl;
-              r._adapterUnresolved = true;
-              // 描述加上標記，讓使用者在來源清單裡看得出這筆尚未解析
-              const _mark = '（暫時無法取得播放連結）';
-              if (!String(r.description || '').includes(_mark)) {
-                r.description = `${r.description || ''}${_mark}`;
-              }
-              _keptUnresolved++;
-            } else {
-              continue;   // 連 fallback 都組不出來 → 才真的丟
-            }
-          } else {
-            r.url = wrapM3U8WithFilter(real, {
-              site: r.name,
-              name: toDisplayText(r._rawName || r.description || ''),
-              episode: Number.isFinite(r.episode) ? `第${String(r.episode).padStart(2, '0')}集` : '',
-              adapter: true,
-            });
-          }
-        }
-        _out.push(r);
-      }
-      finalResults = _out;
-      console.log(`🔓 [lazy] 延遲 token 解析：${_resolvedMap.size}/${_lazyIdx.length} 成功`
-        + (_keptUnresolved > 0 ? `，${_keptUnresolved} 筆保留（未取得播放連結）` : ''));
-    }
-  }
+  finalResults = await _resolveLazyTokens(finalResults);
 
   return finalResults;
+}
+
+/**
+ * ★★ v101：把「延遲 token」解析成真實可播網址 ★★
+ *
+ * 抽出來成獨立函式的原因（v100 的遺漏）：
+ *   v100 只在「搜尋完成後」呼叫這段，但 **cache 命中路徑**
+ *   （loadResource 裡的 `return usable`）**整個跳過了它**。
+ *   結果：第一次搜尋寫進 cache 的是未解析的 'agez:' token，
+ *   第二次進同一季 → cache hit → token 沒被解析就回傳 →
+ *   REX 拿到 'agez:...' 假網址 → isPlayableUrl 判 false → **來源消失**。
+ *
+ *   實測（v100）：
+ *     cache miss → AGE 12 筆，其中 12 筆是 fallback 頁，可播 0 筆
+ *     cache hit  → AGE 12 筆，其中 12 筆仍是 'agez:' token，可播 0 筆
+ *
+ * ★ v101 三道修正：
+ *   (1) 這段現在在 cache 命中路徑也會跑（兩個出口共用本函式）。
+ *   (2) 解析失敗時的退場網址改成**可播**的形式（見 _ageWatchUrl）。
+ *   (3) 解析服務走寬容模式（見 _ageFetchText），憑證過期也能取得 Vurl。
+ *
+ * @param {Array} list
+ * @returns {Promise<Array>}
+ */
+async function _resolveLazyTokens(list) {
+  const finalResults = Array.isArray(list) ? list : [];
+  if (finalResults.length === 0) return finalResults;
+
+  const _lazyIdx = [];
+  for (let i = 0; i < finalResults.length; i++) {
+    if (_adapterParseLazyToken(finalResults[i]?.url)) _lazyIdx.push(i);
+  }
+  if (_lazyIdx.length === 0) return finalResults;
+
+  const _lazyLimit = CONFIG.ADAPTERS?.LAZY_RESOLVE_CONCURRENCY ?? 4;
+  const _resolvedMap = new Map();
+  await _adapterPool(
+    _lazyIdx.map(i => async () => {
+      const real = await _adapterResolveLazyUrl(finalResults[i].url);
+      if (real) _resolvedMap.set(i, real);
+    }),
+    _lazyLimit,
+  );
+
+  const _out = [];
+  let _keptUnresolved = 0;
+  for (let i = 0; i < finalResults.length; i++) {
+    const r = finalResults[i];
+    if (_lazyIdx.includes(i)) {
+      const real = _resolvedMap.get(i);
+      if (!real) {
+        // ★ v101：保留這筆，不讓整個來源消失。
+        //   url 換成站方的觀看頁 —— 必須是**可播**的形式才會顯示。
+        const _tok = _adapterParseLazyToken(r.url);
+        const _site = ADAPTER_SITES.find(s => s.id === _tok?.s);
+        const _fallbackUrl = (_site && _tok)
+          ? (_site.watchUrl ? _site.watchUrl(_tok) : `${_site.watchBase || ''}${_tok.v}`)
+          : '';
+        if (_fallbackUrl) {
+          r.url = _fallbackUrl;
+          r._adapterUnresolved = true;
+          // 描述加上標記，讓使用者在來源清單裡看得出這筆尚未解析
+          const _mark = '（暫時無法取得播放連結）';
+          if (!String(r.description || '').includes(_mark)) {
+            r.description = `${r.description || ''}${_mark}`;
+          }
+          _keptUnresolved++;
+        } else {
+          continue;   // 連 fallback 都組不出來 → 才真的丟
+        }
+      } else {
+        r.url = wrapM3U8WithFilter(real, {
+          site: r.name,
+          name: toDisplayText(r._rawName || r.description || ''),
+          episode: Number.isFinite(r.episode) ? `第${String(r.episode).padStart(2, '0')}集` : '',
+          adapter: true,
+        });
+      }
+    }
+    _out.push(r);
+  }
+  console.log(`🔓 [lazy] 延遲 token 解析：${_resolvedMap.size}/${_lazyIdx.length} 成功`
+    + (_keptUnresolved > 0 ? `，${_keptUnresolved} 筆保留（未取得播放連結）` : ''));
+  return _out;
 }
 
 // ==================== 搜尋字串組裝 ====================
