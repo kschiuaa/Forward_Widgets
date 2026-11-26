@@ -2241,7 +2241,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "6.8.0",
+  version: "2.0.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -17792,12 +17792,17 @@ async function loadDetail(link) {
     // ★ 併發抓多季：三個 loadResource 各自走獨立 cache key（_s${s}），
     //   無共享狀態，併發安全。總時間 = max(各季) 而非 sum。
     //
-    // ★★ v104：片名帶序號且 type='tv' → **先只抓當前季** ★★
-    //   續集電影只有一部；但《慶餘年2》這種影集要併抓其它季。
-    //   兩者的差別只有在站方資料裡看得出來 → 先抓當前季拿到資料，
-    //   再決定要不要補抓其它季（見下方 _maybeFetchExtraSeasons）。
+    // ★★ v104：片名帶序號且 type='tv' → 多季**照樣併抓**，只是結果要不要留 ★★
+    //   續集電影只有一部；《慶餘年2》這種影集要併抓其它季。
+    //   兩者的差別只有在站方資料裡看得出來 → 先併抓（保住 max(各季) 的速度），
+    //   再用「當前季」的資料判斷：若判定為單部電影 → **丟掉其它季的結果**。
+    //
+    //   ★ 為什麼不能「先抓當前季再補抓其它季」★
+    //   那樣總時間會變成 sum(當前季) + max(其它季)，比原本的 max(全部) 慢一截。
+    //   實測《慶餘年2》S2：4994ms → 9119ms（慢 +4125ms）。不可接受。
+    //   → 改成「全部併抓 → 再決定丟不丟」，速度與修前完全一致。
     const _deferSeasonDecision = _seqInTitle && type !== 'movie';
-    const _initialSeasons = _deferSeasonDecision ? [season] : seasonsToFetch;
+    const _initialSeasons = seasonsToFetch;
     const batchArrays = await Promise.all(
       _initialSeasons.map((s) => loadResource({
         seriesName: title,
@@ -17841,59 +17846,30 @@ async function loadDetail(link) {
       console.log(`📡 [loadDetail] 季 S${s}: ${batchResults.length} 條（去重後累計 ${allResults.length}）`);
     }
 
-    // ★★ v104：依站方實際資料決定要不要補抓其它季 ★★
+    // ★★ v104：依站方實際資料決定要不要**丟掉其它季** ★★
     //
-    //   場景：《慶餘年2》《大江大河2》這類**名稱帶數字的影集**。
-    //   上一版（v103）只看片名序號就把它们當成「單部續集電影」→ 只抓當前季
-    //   → S1 分頁消失（實測 S2 查詢：2 分頁 → 1 分頁）。
+    //   場景：《無間道II》（續集電影）與《慶餘年2》（名稱帶數字的影集）
+    //   片名都自帶序號，光看片名分不出來 → 必須看站方資料。
     //
     //   判別方式（isStandaloneSequelMovie）：結果物件若帶逐集展開痕跡
-    //   （episode 欄位 / S#E# / |s#e#|）→ 是**影集** → 補抓其它季；
-    //   單檔（|sxex|）→ 是**單部電影** → 不補抓。
+    //   （episode 欄位 / S#E# / |s#e#|）→ 是**影集** → 保留其它季；
+    //   單檔（|sxex|）→ 是**單部電影** → 丟掉其它季（避免帶回第一部髒資料）。
+    //
+    //   ★ 只用「當前季」的結果來判斷 ★
+    //   其它季的結果正是髒資料的來源（「无间道第二季」= 第一部被切 12 集）。
+    //   若把它們也拿來判斷，電影會被誤判成影集 → 又會帶回第一部。
     if (_deferSeasonDecision) {
-      const _isStandalone = isStandaloneSequelMovie(title, allResults);
+      const _currentSeasonResults = [];
+      for (const r of allResults) {
+        if (r.season === season) _currentSeasonResults.push(r);
+      }
+      const _isStandalone = isStandaloneSequelMovie(title, _currentSeasonResults);
       if (_isStandalone) {
-        console.log(`🎬 [loadDetail] 《${title}》站方資料顯示為**單部電影** → 不補抓其它季（避免帶回第一部髒資料）`);
+        const _before = allResults.length;
+        allResults = allResults.filter((r) => r.season === season);
+        console.log(`🎬 [loadDetail] 《${title}》站方資料顯示為**單部電影** → 丟棄其它季結果（${_before} → ${allResults.length}），避免帶回第一部髒資料`);
       } else {
-        const _extraSeasons = seasonsToFetch.filter((s) => !_initialSeasons.includes(s));
-        if (_extraSeasons.length > 0) {
-          console.log(`🎬 [loadDetail] 《${title}》站方資料顯示為**影集** → 補抓 ${_extraSeasons.join(',')} 季`);
-          try {
-            const extraArrays = await Promise.all(
-              _extraSeasons.map((s) => loadResource({
-                seriesName: title,
-                title,
-                type,
-                season: s,
-                episode,
-                id,
-                link,
-                searchMode: 'batch',
-                matchStrictness: 'standard',
-                preferResolution: 'auto',
-                VodData: (WidgetMetadata.globalParams.find(p => p.name === 'VodData') || {}).value || RESOURCE_SITES,
-                m3u8FilterWorkerUrl: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterWorkerUrl') || {}).value || '',
-                m3u8FilterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterMode') || {}).value || 'filter',
-                m3u8FilterAdapterMode: (WidgetMetadata.globalParams.find(p => p.name === 'm3u8FilterAdapterMode') || {}).value || 'skip',
-              }))
-            );
-            for (let ei = 0; ei < _extraSeasons.length; ei++) {
-              const s = _extraSeasons[ei];
-              const batchResults = extraArrays[ei] || [];
-              for (const r of batchResults) {
-                if (!r.url) continue;
-                if (r.season == null) r.season = s;
-                const dkey = `s${r.season}||${r.url}`;
-                if (seenKey.has(dkey)) continue;
-                seenKey.add(dkey);
-                allResults.push(r);
-              }
-              console.log(`📡 [loadDetail] 補抓季 S${s}: ${batchResults.length} 條（去重後累計 ${allResults.length}）`);
-            }
-          } catch (err) {
-            console.log(`⚠️ [loadDetail] 《${title}》補抓其它季失敗: ${err && err.message}`);
-          }
-        }
+        console.log(`🎬 [loadDetail] 《${title}》站方資料顯示為**影集** → 保留全部 ${allResults.length} 季別結果`);
       }
     }
     // ★ 電影 fallback：單部 0 結果時補抓其餘季，語意與舊版三季合併一致。
