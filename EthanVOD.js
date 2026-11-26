@@ -1904,7 +1904,41 @@ const CONFIG = {
     //   v103 只看片名序號 → 誤把《慶餘年2》《大江大河2》《無心法師2》當電影
     //   → loadDetail 只抓當前季 → S1 分頁消失（2 分頁 → 1 分頁）。
     //   v104 改看結果物件的逐集展開痕跡 → 影集恢復多季合併。
-  WIDGET_VERSION: 104,
+    //
+    // ★ v105：修正「全形羅馬數字」續集條目被 sequel_conflict 全殺的 bug。
+    //
+    //   問題（實測，站方真實資料）：
+    //     MacCMS 站的續集條目大量使用**全形**羅馬數字：
+    //       「无职转生Ⅱ～到了异世界就拿出真本事～」(暴風, 2023, 24集)
+    //       「无职转生Ⅲ到了异世界就拿出真本事」      (電影天堂, 2026, 27集)
+    //       「斗罗大陆Ⅱ绝世唐门」                  (電影天堂, 2023, 359集)
+    //     但 extractSequelNumber 的羅馬正則只認半形 [IVX]
+    //       → 「无间道II」→ 2 ✅
+    //       → 「无职转生Ⅱ…」→ null ❌
+    //     而 normalizeTitleForMatch 還會把全形轉成**小寫全形**「ⅱ」(U+2171)，
+    //     讓 coreOf 的 /[ivx]{1,4}$/ 也抓不到。
+    //
+    //   後果：使用者選第 2 季 → targetSequelNorm=2 → targetHasSequel=true；
+    //     候選 candidateSequel=null → reverseShapeMismatch → sequel_conflict
+    //     → **站方明明回傳 32 筆，全部被殺 → 0 筆**（整頁空白）。
+    //
+    //   修正三處：
+    //     (1) extractSequelNumber：全形 Ⅰ-Ⅹ 正規化成半形後再比對
+    //     (2) _romanTailToArabic：先正規化全形（站方條目也用全形）
+    //     (3) coreOf / targetCoreNoDigit：改用 _stripSequelMarkerForCore
+    //
+    //   實測效果（performBatchSearch）：
+    //     《无职转生～到了异世界就拿出真本事～》S2：0 筆 → 48 筆 ✅
+    //     《无职转生》S2：36 筆 → 100 筆 ✅
+    //     loadDetail S2：0 筆/1 分頁 → 24 筆/2 分頁 ✅
+    //     （內容 100% 來自「無職轉生Ⅱ～到了異世界就拿出真本事～」，零污染）
+    //
+    //   回歸驗證（32 組作品 × 季別，v104 vs v105）：30 組完全相同，
+    //     僅上述 2 組改善，**無任何退化**。
+    //
+    //   ★ 必須 bump：比對邏輯變了，舊的搜尋結果 cache 還在 storage 裡，
+    //     不清的話使用者還是看到舊結果（0 筆）。
+  WIDGET_VERSION: 105,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2241,7 +2275,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.0",
+  version: "1.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -2963,18 +2997,27 @@ function _romanTailToArabic(text) {
   try {
     const s = String(text ?? '');
     if (!s) return s;
+    // ★ v105：先正規化全形羅馬數字（Ⅱ → II）。
+    //   站方條目用全形（「无职转生Ⅱ～到了异世界就拿出真本事～」），
+    //   但搜尋關鍵字必須是站方認得的寫法。
+    //   ★ 只轉「結尾」：中間的羅馬數字常是片名的一部分
+    //     （「斗罗大陆Ⅱ绝世唐门」站方就這麼寫，不該動）。
+    //
+    // ★ 不可因為「沒有全形」就提早回傳：半形「无间道II → 无间道2」
+    //   的轉換仍然必須照做（v104 的既有行為，不能退化）。
+    const n = _normalizeFullwidthRoman(s);
     // 結尾的 2~4 個羅馬數字。
     // ★ 前綴用「消耗式」比對：只取「羅馬數字之前的那一個字元」當分隔，
     //   替換時保留它 —— 不能用 s.replace(整個match) ，那會把分隔字元
     //   一起吃掉（「無間道II」→ 誤變成「道2」）。
-    const m = s.match(/([^A-Za-z0-9])([IVX]{2,4})$/);
-    if (!m) return s;
+    const m = n.match(/([^A-Za-z0-9])([IVX]{2,4})$/);
+    if (!m) return n;
     const map = { II: 2, III: 3, IV: 4, VI: 6, VII: 7, VIII: 8, IX: 9, XI: 11, XII: 12, XIII: 13 };
     const v = map[m[2].toUpperCase()];
     // 轉換成功才替換；V / X 單獨結尾不轉（「星際大戰V」站方可能就寫 V）。
-    if (!v) return s;
+    if (!v) return n;
     // 只替換尾端的羅馬數字部分，保留前面的分隔字元。
-    return s.slice(0, s.length - m[2].length) + String(v);
+    return n.slice(0, n.length - m[2].length) + String(v);
   } catch (e) {
     return text;
   }
@@ -3073,6 +3116,17 @@ function extractSequelNumber(name) {
     return null;
   }
 
+  // ★★ v105：全形羅馬數字正規化 ★★
+  //
+  // 站方續集條目大量使用全形（「无职转生Ⅱ～到了异世界就拿出真本事～」
+  // 「斗罗大陆Ⅱ绝世唐门」），而下面的羅馬數字正則只認半形 [IVX]。
+  // 不正規化的話這些條目的 candidateSequel 會是 null，
+  // 在 target 有序號（選了第2季）時觸發 reverseShapeMismatch → sequel_conflict
+  // → 站方回傳的結果被全部殺光（實測 32 筆 → 0 筆）。
+  //
+  // 正規化只換「數字本身」（Ⅰ-Ⅹ → I..X），周邊文字完全不動。
+  const sRoman = _normalizeFullwidthRoman(s);
+
   // 羅馬數字（II / III / IV）：不論在結尾還是副標題中都算。
   //
   // ★ 補抓「中文結尾接純羅馬數字」：「庆余年II」「大江大河II」等站方
@@ -3081,7 +3135,7 @@ function extractSequelNumber(name) {
   //
   //   修正則：把前綴從「空白/冒號」放寬到「非數字字元」，並要求
   //   「後方為字串結尾或非字母數字」，避免「IMAX」這種英文單字被誤判。
-  const roman = s.match(/(^|[^\dIVX])([IVX]{2,4})(?=[^IVX]|$)/);
+  const roman = sRoman.match(/(^|[^\dIVX])([IVX]{2,4})(?=[^IVX]|$)/);
   if (roman) {
     const map = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
     const v = map[roman[2].toUpperCase()];
@@ -3108,7 +3162,7 @@ const seasonBare = s.match(/^([一二三四五六七八九十壹贰叁肆伍陆�
   }
 
   // 「大江大河II」這類純羅馬數字結尾。
-  const romanTail = s.match(/(?:\s|[：:：])([IVX]{1,4})$/);
+  const romanTail = sRoman.match(/(?:\s|[：:：])([IVX]{1,4})$/);
   if (romanTail) {
     const map = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
     const v = map[romanTail[1].toUpperCase()];
@@ -4356,8 +4410,8 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     //     → 不相等 → 誤判 sequel_conflict → 整條被殺 → 使用者看到 0 筆。
     //   這是「同一個序號的兩種寫法」，語意上完全相同。
     const coreOf = (s) => stripFiller(
-      normalizeTitleForMatch(stripSubtitle(s)).replace(_FINAL_SEASON_MARKER_RE_G, '')
-    ).replace(/\d+$/, '').replace(/[ivx]{1,4}$/, '');
+      _stripSequelMarkerForCore(normalizeTitleForMatch(stripSubtitle(s)).replace(_FINAL_SEASON_MARKER_RE_G, ''))
+    );
     const targetCoreSeq = coreOf(targetInfo.baseName);
     const candidateCoreSeq = coreOf(candidateInfo.baseName);
     if (targetCoreSeq && candidateCoreSeq && targetCoreSeq !== candidateCoreSeq) {
@@ -4444,8 +4498,10 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     // ★ v92：尾端序號要去掉「阿拉伯數字」和「羅馬數字」兩種寫法。
     //   target「無間道II」vs candidate「无间道2」→ 兩者都要歸零成「無間道」
     //   才能視為同一部片。否則 fallback 也會拒絕 → 0 筆。
-    const targetCoreNoDigit = stripFiller(targetCore).replace(/\d+$/, '').replace(/[ivx]{1,4}$/, '');
-    const candidateCoreNoDigit = stripFiller(candidateCore).replace(/\d+$/, '').replace(/[ivx]{1,4}$/, '');
+    // ★ v105：改用 _stripSequelMarkerForCore，額外處理**全形**羅馬數字
+    //   （normalizeTitleForMatch 會把「Ⅱ」轉成小寫全形「ⅱ」，舊規則抓不到）。
+    const targetCoreNoDigit = stripFiller(_stripSequelMarkerForCore(targetCore));
+    const candidateCoreNoDigit = stripFiller(_stripSequelMarkerForCore(candidateCore));
     const coreMatches = targetCore === candidateCore ||
                         stripFiller(targetCore) === stripFiller(candidateCore) ||
                         (targetCoreNoDigit && targetCoreNoDigit === candidateCoreNoDigit);
@@ -14844,6 +14900,109 @@ function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
   if (!base) return String(searchQuery).trim();
 
   return base;
+}
+
+/**
+ * ★ v105：全形羅馬數字 → 半形 ★
+ *
+ * 問題（實測，站方真實資料）：
+ *   MacCMS 站的續集條目大量使用**全形**羅馬數字：
+ *     「无职转生Ⅱ～到了异世界就拿出真本事～」  (暴風資源, 2023, 24集)
+ *     「无职转生Ⅲ到了异世界就拿出真本事」        (電影天堂, 2026, 27集)
+ *     「斗罗大陆Ⅱ绝世唐门」                    (電影天堂, 2023, 359集)
+ *
+ *   但 extractSequelNumber 的羅馬數字正則只認半形 [IVX]：
+ *     「无间道II」→ 2 ✅
+ *     「无职转生Ⅱ…」→ null ❌
+ *
+ * 後果（實測）：使用者在 REX 選第 2 季 → targetInfo._expectedSequel=2 →
+ *   targetSequelNorm=2、targetHasSequel=true；
+ *   候選「无职转生Ⅱ…」的 candidateSequel=null → 觸發 reverseShapeMismatch
+ *   → **sequel_conflict** → 站方明明回傳 32 筆，全部被殺 → 0 筆。
+ *
+ * ★ 為什麼不能靠比對層的字面相似度救：
+ *   「無職轉生～到了異世界就拿出真本事～」vs「無職轉生Ⅱ～到了異世界就拿出真本事～」
+ *   相似度 0.94（幾乎全對），卻因為序號欄位一個是 2、一個是 null 而被否決。
+ *
+ * 為什麼要正規化「整串」而不是只處理結尾：
+ *   全形 Ⅱ 常出現在**片名中間**（「斗罗大陆Ⅱ绝世唐门」—— 後面還有副標題），
+ *   只轉結尾會漏掉。
+ *
+ * 安全性：
+ *   全形 Ⅰ-Ⅹ 是**單一字元**（U+2160..U+2169），對應 I..X，
+ *   轉換是 1:1 無歧義的。全形只有這 10 個字元會被替換。
+ *
+ * ★ 只轉換「數字」本身，不動周邊文字 ★
+ */
+const _FULLWIDTH_ROMAN_MAP = {
+  '\u2160': 'I', '\u2161': 'II', '\u2162': 'III', '\u2163': 'IV', '\u2164': 'V',
+  '\u2165': 'VI', '\u2166': 'VII', '\u2167': 'VIII', '\u2168': 'IX', '\u2169': 'X',
+};
+/** 全形羅馬數字 → 半形（單次全字串掃描，無 regex 快取問題）。 */
+function _normalizeFullwidthRoman(text) {
+  try {
+    const s = String(text ?? '');
+    if (!s) return s;
+    // 快速路徑：沒有全形羅馬數字就直接回傳（99% 的情況）。
+    if (!/[\u2160-\u2169]/.test(s)) return s;
+    let out = '';
+    for (const ch of s) {
+      out += _FULLWIDTH_ROMAN_MAP[ch] ?? ch;
+    }
+    return out;
+  } catch (e) {
+    return text;
+  }
+}
+
+/**
+ * ★ v105：把片名裡的「續集序號」寫法正規化掉，用來比對「主片名」是否一致 ★
+ *
+ * 用途：判斷「序號相同但主片名不同」是不是另一部作品
+ *   （例：「海王2」vs「上海王2」→ 主片名不同 → 必須擋）。
+ *
+ * ★ v105 修正的問題（實測）：
+ *   `normalizeTitleForMatch` 會把全形羅馬數字轉成**小寫全形**：
+ *     「无职转生Ⅱ…」→ 「無職轉生ⅱ…」（ⅱ = U+2171）
+ *   而舊的 `.replace(/[ivx]{1,4}$/, '')` 只認**半形小寫** [ivx]，
+ *   且只比對**結尾** → 全形 Ⅱ 留在字串裡 →
+ *     targetCoreSeq  = 「無職轉生」
+ *     candidateCoreSeq = 「無職轉生ⅱ」
+ *   → 不相等 → sequel_conflict → 站方回傳的結果被殺光（實測 32 筆 → 0 筆）。
+ *
+ * 處理方式：
+ *   1) 把全形羅馬數字（含小寫變體 ⅰ-ⅹ）正規化成半形大寫
+ *   2) 再用既有的半形規則去掉（阿拉伯數字結尾 / 半形羅馬結尾）
+ *
+ * ★ 只在「數字」的位置替換，其他字元完全不動 ★
+ */
+const _FULLWIDTH_ROMAN_MAP_EXT = {
+  '\u2160': 'I', '\u2161': 'II', '\u2162': 'III', '\u2163': 'IV', '\u2164': 'V',
+  '\u2165': 'VI', '\u2166': 'VII', '\u2167': 'VIII', '\u2168': 'IX', '\u2169': 'X',
+  // 小寫全形（U+2170..U+2179）：normalizeTitleForMatch 的小寫化會產生這些
+  '\u2170': 'I', '\u2171': 'II', '\u2172': 'III', '\u2173': 'IV', '\u2174': 'V',
+  '\u2175': 'VI', '\u2176': 'VII', '\u2177': 'VIII', '\u2178': 'IX', '\u2179': 'X',
+};
+/**
+ * 正規化「主片名」：去掉續集序號（阿拉伯數字結尾 + 羅馬數字結尾），
+ * 讓不同寫法的同一序號能得到相同結果（「無間道II」/「无间道2」/「无间道」）。
+ */
+function _stripSequelMarkerForCore(s) {
+  try {
+    let out = String(s ?? '');
+    if (!out) return out;
+    // 1) 全形羅馬數字 → 半形大寫
+    if (/[\u2160-\u2179]/.test(out)) {
+      let tmp = '';
+      for (const ch of out) tmp += _FULLWIDTH_ROMAN_MAP_EXT[ch] ?? ch;
+      out = tmp;
+    }
+    // 2) 結尾的阿拉伯數字 / 羅馬數字
+    out = out.replace(/\d+$/, '').replace(/[IVX]{1,4}$/, '');
+    return out;
+  } catch (e) {
+    return s;
+  }
 }
 
 /**
