@@ -1818,7 +1818,37 @@ const CONFIG = {
   //
   // ★ 必須 bump：舊 cache 裡存的是「未解析的 token」與「網頁退場網址」，
   //   兩者都不是可播網址；不清掉，使用者看到的還是空白的 AGE。
-  WIDGET_VERSION: 101,
+  //
+  // ★★ bump 到 102：修「指定集數時 AGE 整個來源蒸發」 ★★
+  //
+  // 使用者回報「AGE 還是沒有出來」→ 深挖後找到的最後一根稻草。
+  //
+  // 【症狀】season=4 整季搜尋有 AGE 12 筆，但**指定集數**（例如 E9）
+  //   時 AGE 變成 0 筆。
+  //
+  // 【根因】兩段時間限制互相打架：
+  //   1. adapter 的換 URL 鏈上限 RESOLVE_CHAIN_TIMEOUT = 12000ms
+  //   2. AGE 解析服務憑證過期 → _ageFetchText 會依序試：
+  //      正常請求（ADAPTER_RESOLVE_TIMEOUT = 5200ms）
+  //      → 4 組寬容憑證選項（各 5200ms）
+  //      → process.env 寬容（5200ms）
+  //      → 明文 http（5200ms）
+  //      合計可達 **30 秒**
+  //   3. 而 batch 路徑的外層 hard 上限只有 **4500ms**
+  //      （performBatchSearch 的 Promise.race）
+  //
+  //   → 指定集數時走的是「立刻換 URL」的單筆路徑 → 換 URL 還沒回來，
+  //     整個 adapter 管線就被 Promise.race 砍成 [] →
+  //     **AGE 從結果裡完全蒸發**。
+  //   → 連 v100 的退場機制都沒機會跑（退場是在「換 URL 失敗之後」
+  //     才觸發的，而這裡根本還沒走到那一步就被砍了）。
+  //
+  // 【v102 修法】指定集數時也走延遲 token 路徑（延後到 loadResource
+  //   尾端統一解析），列表階段不換 URL → 立刻回傳：
+  //     - 實測 EP=9 的搜尋時間：7712ms → **890ms**（不再等 30 秒）
+  //     - 實測 EP=9 的 AGE 筆數：0 → **1**（E9 正確回報）
+  //     - 整季 EP=（空）維持 12 筆不變
+  WIDGET_VERSION: 102,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2155,7 +2185,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "6.6.0",
+  version: "6.7.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7675,17 +7705,24 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       const token = seg.slice(i + 1);
       // ★★ v101：把「站方原始 token」一起帶出來 ★★
       //
-      // 這裡的 token 是「延遲 token」（{s,v,n,e} 的 JSON），不是站方的
-      // age_xxx。原始 token 藏在 n（nid）裡 —— nid 是
-      //   { e: 集數, s: [{g, gl, v, t}, ...] }
-      // 其中 t 就是 age_xxx。
+      // 這裡的 token 是「延遲 token」（agez: + encodeURIComponent(JSON)），
+      // 不是站方的 age_xxx。原始 token 藏在兩處：
+      //   • payload.t —— v101 新增的欄位
+      //   • payload.n（nid）→ { e, s: [{g, gl, v, t}, ...] } → s[0].t
       //
-      // 為什麼需要它：解析服務掛掉時，退場網址要用原始 token 組出
-      // 「可播的 m3u8 端點」（見 ADAPTER_SITES[].watchUrl）。
-      // 拿不到原始 token 就只能退化成網頁網址 → REX 濾掉 → 沒有退場。
+      // ★★ 關鍵：必須先去掉「agez:」前綴才能 JSON.parse ★★
+      //   延遲 token 的格式是 _ADAPTER_LAZY_PREFIX + encodeURIComponent(JSON)，
+      //   直接 decodeURIComponent 會得到「agez:{...}」→ JSON.parse 直接丟錯
+      //   → rawToken 永遠是空字串 → 退場網址組不出來。
+      //   （這是 v101 的隱性 bug：診斷腳本直接呼叫 _ageEpisodes 拿到的是
+      //     未編碼的原始 token，所以測不出來；只有走完整流水線才會踩到。）
       let rawToken = '';
       try {
-        const payload = JSON.parse(decodeURIComponent(token));
+        const _raw = String(token || '');
+        const _body = _raw.startsWith(_ADAPTER_LAZY_PREFIX)
+          ? _raw.slice(_ADAPTER_LAZY_PREFIX.length)
+          : _raw;
+        const payload = JSON.parse(decodeURIComponent(_body));
         if (payload && payload.t) rawToken = String(payload.t);
         else if (payload && payload.n) {
           const nidObj = JSON.parse(String(payload.n));
@@ -7895,19 +7932,50 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     //     壞掉的只有那一集）。
     //
     // ★ 觸發條件：
-    //   1. wantEp == null（使用者沒指定集數 → 要整季清單）
-    //   2. type === 'tv'（電影本來就只該有一筆）
-    //   3. episodes.length > 1（多集影集）
-    //   4. 不是「多源單集」情境（那由 allAreSources 分支處理）
+    //   1. type === 'tv'（電影本來就只該有一筆）
+    //   2. episodes.length > 1（多集影集）
+    //   3. 不是「多源單集」情境（那由 allAreSources 分支處理）
+    //   ★ v101：wantEp != null（指定集數）也走這條 —— 理由見下方說明。
     //
-    // ★ 指定集數時（wantEp != null）走原本的單筆路徑：
-    //   使用者已經明確要某一集 → 直接換好那一集的 URL（最快），
-    //   不必繞延遲 token。
-    if (type === 'tv' && wantEp == null && episodes.length > 1) {
+    // ★★ v101：指定集數時（wantEp != null）也走延遲 token 路徑 ★★
+    //
+    // 為什麼（這是「AGE 搜得到但播放列表不見」的最後一根稻草）：
+    //   指定集數時原本走「立刻換 URL」的單筆路徑。但 AGE 的換 URL
+    //   鏈要打站外第三方解析服務，最壞 10 秒；解析服務憑證過期時
+    //   會更慢（正常請求 5200ms 逾時 → 再試 4 組寬容選項各 5200ms
+    //   → 再試 process 寬容 → 再試明文 http，合計可達 **30 秒**）。
+    //
+    //   而 batch 路徑的外層 hard 上限只有 **4500ms**
+    //   （見 performBatchSearch 的 Promise.race）→
+    //   換 URL 還沒回來，整個 adapter 管線就被砍成 [] →
+    //   **AGE 這個來源從結果裡完全蒸發**（連 v100 的退場機制都沒機會跑，
+    //   因為退場是在換 URL 失敗之後才觸發的）。
+    //
+    //   改成也走延遲 token：
+    //     - 列表階段不換 URL → 立刻回傳 → 不用等 30 秒
+    //     - loadResource 最後統一解析延遲 token（v101 的 _ageFetchText
+    //       有容忍過期憑證的手腕）→ 換得到就給真實 m3u8，
+    //       換不到就用 watchUrl 組可播的退場網址
+    //     - 使用者看得到 AGE，而且硬性保證「不消失」
+    //
+    // ★ 這不會拖慢正常情況：延遲 token 的解析在 loadResource 尾端，
+    //   而且那裡有 _adapterPool 併發控制（見 _resolveLazyTokens）。
+    if (type === 'tv' && episodes.length > 1) {
       const _lazyOut = _buildAdapterLazyEpisodeResources(
         item, episodes, siteTitle, type, vod_name, vod_remarks, targetInfo
       );
-      if (_lazyOut.length) return _lazyOut;
+      if (_lazyOut.length) {
+        // ★ 指定集數時只留使用者要的那一集。
+        //   （wantEp 未知 → 整季全留，這是詳細頁要的形狀）
+        const _want = wantEp;
+        if (Number.isFinite(_want) && _want > 0) {
+          const _picked = _lazyOut.filter(r => r.episode === _want);
+          if (_picked.length) return _picked;
+          // 站方沒有這集（例如使用者跳到第 9999 集）→ 留全部，
+          // 由下游 filterByEpisode 處理，不要在這裡假裝有。
+        }
+        return _lazyOut;
+      }
       // 建構失敗（拿不到 vod_id 等）→ 落回原本的單筆路徑，不要整個來源消失。
     }
 
