@@ -1767,7 +1767,15 @@ const CONFIG = {
   //   v99 改為列表階段不換 URL（放延遲 token），播放時刻才換成真實 m3u8。
   //   ★ 必須 bump：舊 cache 內的 adapter 資源是「已解析的單集 URL」，
   //     新邏輯要的是延遲 token；不清會出現新舊混雜的結果。
-  WIDGET_VERSION: 99,
+  //
+  // bump 到 100：延遲 token 解析失敗時「保留來源」而不是丟掉。
+  //   實測事故（2026-11-26）：AGE 的換 URL 服務 jx.wuzhoupai.com 的
+  //   TLS 憑證當天到期 → 全部解析在握手階段失敗 → v99 的
+  //   「解不出來就丟」把 AGE 整批丟光 → AGE 整個來源從播放列表消失。
+  //   v100 改成：解不出來時保留該筆，url 換成站方觀看頁
+  //   （https://www.agedm.io/detail/{id}），描述加上「（暫時無法取得播放連結）」。
+  //   ★ 必須 bump：舊 cache 內的 adapter 結果是被丟光後的版本。
+  WIDGET_VERSION: 100,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2104,7 +2112,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "6.4.0",
+  version: "6.5.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7824,7 +7832,36 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     }
 
     const resolved = await _adapterResolvePlay(episodes[idx].token);
-    if (!resolved || resolved.length === 0) return [];
+    if (!resolved || resolved.length === 0) {
+      // ★ v100：解析失敗時「不要讓整個來源消失」。
+      //
+      // 實測事故（2026-11-26）：AGE 的換 URL 服務 jx.wuzhoupai.com 的
+      //   TLS 憑證當天到期 → 全部解析在握手階段失敗 → 這裡直接
+      //   `return []` → **AGE 整個來源從結果裡蒸發**（列表階段與
+      //   單集階段都一樣）。
+      //
+      // 修法：改走延遲 token 路徑 —— 讓這一筆仍以 'agez:' token 的形式
+      //   存在，由 loadResource 在最後統一處理（那裡有退場頁 fallback）。
+      //   這樣：
+      //     - 列表階段 → 12 集都保留
+      //     - 單集階段 → 這一集保留（url 換成站方觀看頁）
+      //   使用者看得到 AGE 這個來源，站方修好憑證後重載即恢復。
+      if (type === 'tv' && episodes.length > 0) {
+        const _lazyFallback = _buildAdapterLazyEpisodeResources(
+          item, episodes, siteTitle, type, vod_name, vod_remarks, targetInfo
+        );
+        if (_lazyFallback.length) {
+          // 只留下使用者要的那一集（wantEp 已知）或全部（wantEp 未知）
+          const _want = wantEp;
+          if (Number.isFinite(_want) && _want > 0) {
+            const _picked = _lazyFallback.filter(r => r.episode === _want);
+            if (_picked.length) return _picked;
+          }
+          return _lazyFallback;
+        }
+      }
+      return [];
+    }
 
     const out = [];
     for (const r of resolved) {
@@ -10390,6 +10427,10 @@ const ADAPTER_SITES = [
     search: _ageSearch,
     episodes: _ageEpisodes,
     playUrls: _agePlayUrls,
+    // ★ v100：解析服務掛掉時的退場網址（讓來源不會整個從清單消失）。
+    //   站方的觀看頁格式：https://www.agedm.io/detail/{id}
+    //   （實測確認：/detail/20120012 → 「零之使魔 第四季 - AGE动漫」）
+    watchBase: 'https://www.agedm.io/detail/',
   },
 ];
 
@@ -14126,7 +14167,22 @@ targetInfo.searchQuery = aliasQ;
   //   - 只換「使用者真的要播的那一集」→ 通常只有 1 次網路往返。
   //
   // ★ 併發上限：同時最多換 N 個（避免一次打十幾個請求觸發站方限流）。
-  // ★ 解不出來的那筆 → 丟掉（寧可少一個源，不要給使用者打不開的連結）。
+  //
+  // ★★ v100：解不出來時「不丟掉」，改成保留這筆 ★★
+  //
+  // 實測事故（2026-11-26）：AGE 的換 URL 服務 jx.wuzhoupai.com 的
+  //   TLS 憑證當天到期（notAfter = Nov 26 12:36:30 GMT）→ 全部請求
+  //   在 TLS 握手階段失敗 → 每筆都「解不出來」→ 舊邏輯整批丟掉 →
+  //   **AGE 整個來源從播放列表裡消失**（使用者看到的正是這個症狀）。
+  //
+  // 為什麼改成保留：
+  //   - 丟掉 = 使用者完全看不到 AGE，以為程式壞了 / 沒有這個站；
+  //   - 保留 = 使用者看得到「AGE動漫」這個來源（附帶無法解析的標記），
+  //     一旦站方換好憑證，重新載入就能恢復。
+  //   這是「寧可顯示一筆暫時打不開的來源，也不要讓來源整個蒸發」。
+  //
+  // ★ 但要注意：保留的 url 不能是 'agez:...' 假字串 —— 播放器拿到會出錯。
+  //   所以改成指向 AGE 自己的詳情頁（該集的可觀看頁），至少是個可點的網址。
   if (finalResults.length > 0) {
     const _lazyIdx = [];
     for (let i = 0; i < finalResults.length; i++) {
@@ -14143,22 +14199,46 @@ targetInfo.searchQuery = aliasQ;
         _lazyLimit,
       );
       const _out = [];
+      let _keptUnresolved = 0;
       for (let i = 0; i < finalResults.length; i++) {
         const r = finalResults[i];
         if (_lazyIdx.includes(i)) {
           const real = _resolvedMap.get(i);
-          if (!real) continue;              // 解不出來 → 丟掉這筆
-          r.url = wrapM3U8WithFilter(real, {
-            site: r.name,
-            name: toDisplayText(r._rawName || r.description || ''),
-            episode: Number.isFinite(r.episode) ? `第${String(r.episode).padStart(2, '0')}集` : '',
-            adapter: true,
-          });
+          if (!real) {
+            // ★ v100：保留這筆，不讓整個來源消失。
+            //   url 換成 AGE 自己的頁面（該集的可觀看入口）——
+            //   至少是可點的網址，不會讓播放器拿到 'agez:' 假字串。
+            const _tok = _adapterParseLazyToken(r.url);
+            const _site = ADAPTER_SITES.find(s => s.id === _tok?.s);
+            const _fallbackUrl = (_site && _tok && _site.watchBase)
+              ? (`${_site.watchBase}${_tok.v}`)
+              : '';
+            if (_fallbackUrl) {
+              r.url = _fallbackUrl;
+              r._adapterUnresolved = true;
+              // 描述加上標記，讓使用者在來源清單裡看得出這筆尚未解析
+              const _mark = '（暫時無法取得播放連結）';
+              if (!String(r.description || '').includes(_mark)) {
+                r.description = `${r.description || ''}${_mark}`;
+              }
+              _keptUnresolved++;
+            } else {
+              continue;   // 連 fallback 都組不出來 → 才真的丟
+            }
+          } else {
+            r.url = wrapM3U8WithFilter(real, {
+              site: r.name,
+              name: toDisplayText(r._rawName || r.description || ''),
+              episode: Number.isFinite(r.episode) ? `第${String(r.episode).padStart(2, '0')}集` : '',
+              adapter: true,
+            });
+          }
         }
         _out.push(r);
       }
       finalResults = _out;
-      console.log(`🔓 [lazy] 延遲 token 解析：${_resolvedMap.size}/${_lazyIdx.length} 成功`);
+      console.log(`🔓 [lazy] 延遲 token 解析：${_resolvedMap.size}/${_lazyIdx.length} 成功`
+        + (_keptUnresolved > 0 ? `，${_keptUnresolved} 筆保留（未取得播放連結）` : ''));
     }
   }
 
