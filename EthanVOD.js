@@ -1760,7 +1760,14 @@ const CONFIG = {
   //   ★ 必須 bump version ★：比對邏輯變了，但舊的搜尋結果 cache 還在
   //     storage 裡（key = vod_batch_*），不清的話使用者還是看到舊結果。
   //     syncWidgetVersion 會在偵測到版本變化時清掉所有 storage key。
-  WIDGET_VERSION: 98,
+  //
+  // bump 到 99：adapter 站（AGE動漫）改用「延遲 token」回傳整季。
+  //   v98 之前 adapter 站在「整季列表」只回 1 筆（落到最後一集），
+  //   症狀：AGE動漫 明明有整季 12 集，播放列表裡卻只有 E12。
+  //   v99 改為列表階段不換 URL（放延遲 token），播放時刻才換成真實 m3u8。
+  //   ★ 必須 bump：舊 cache 內的 adapter 資源是「已解析的單集 URL」，
+  //     新邏輯要的是延遲 token；不清會出現新舊混雜的結果。
+  WIDGET_VERSION: 99,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -1899,6 +1906,17 @@ const CONFIG = {
     //   （實測 jpyy 的 /detail 單跳就 1066ms），候選一多就會排隊。
     //   8 是實測不觸發 429 的上限（32/6/12 那組會回錯）。
     DETAIL_CONCURRENCY: 8,
+    // ★ v99：延遲 token 的解析併發上限（播放時刻換真實 m3u8 用）。
+    //
+    // 場景：整季列表有 12 個延遲 token 要換（使用者點開詳細頁時）。
+    //   - 全開（12）→ 一次打 12 個請求到站外的解析服務，
+    //     實測最慢一集 2890ms，整批 16 秒（冷啟動）。
+    //   - 給 4 → 分 3 批，實測整批約 1 秒（暖）。
+    //
+    // 為什麼不是 1（完全循序）：整季 12 集循序會是 12 × ~1s = 12 秒。
+    // 為什麼不是全開：站方限流很緊（實測 12/6/12 那組會回 429）。
+    // 4 是實測「不觸發限流」與「夠快」的平衡點。
+    LAZY_RESOLVE_CONCURRENCY: 4,
     // 同時查詢幾個 adapter 站。
     //
     // ★ 原本各站是「一站跑完才換下一站」，總時間 = 各站耗時相加
@@ -2086,7 +2104,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "6.3.0",
+  version: "6.4.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7771,6 +7789,40 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
       idx = type === 'movie' ? 0 : episodes.length - 1;
     }
 
+    // ★★ v99：整季列表 → 每一集各一筆（延遲 token，不預先換 URL）★★
+    //
+    // 為什麼需要這一段：
+    //   使用者開詳細頁時**沒有指定集數**（wantEp == null），此時下方
+    //   只會解 episodes[idx] 一個 token —— 而 idx 落到最後一集。
+    //   結果：整季列表裡 adapter 站只有 1 筆（最後一集），
+    //   其他站（MacCMS）卻有整季 N 筆。
+    //   （實測《零之使魔 第四季》：6 個 MacCMS 站各 12 筆，
+    //     AGE動漫 只有 1 筆 E12 → 使用者看到「AGE 不在播放列表裡」。）
+    //
+    // 為什麼用「延遲 token」而不是「一口氣解完 N 集」：
+    //   - token 短效：列表階段簽好的 token，到了播放時可能已過期。
+    //   - AGE 的換 URL 服務是站外第三方，實測延遲最壞 10 秒；
+    //     一次解 12 集會讓首屏多等數秒。
+    //   - 解不掉的集不該讓整個來源蒸發（延遲到播放時才解，
+    //     壞掉的只有那一集）。
+    //
+    // ★ 觸發條件：
+    //   1. wantEp == null（使用者沒指定集數 → 要整季清單）
+    //   2. type === 'tv'（電影本來就只該有一筆）
+    //   3. episodes.length > 1（多集影集）
+    //   4. 不是「多源單集」情境（那由 allAreSources 分支處理）
+    //
+    // ★ 指定集數時（wantEp != null）走原本的單筆路徑：
+    //   使用者已經明確要某一集 → 直接換好那一集的 URL（最快），
+    //   不必繞延遲 token。
+    if (type === 'tv' && wantEp == null && episodes.length > 1) {
+      const _lazyOut = _buildAdapterLazyEpisodeResources(
+        item, episodes, siteTitle, type, vod_name, vod_remarks, targetInfo
+      );
+      if (_lazyOut.length) return _lazyOut;
+      // 建構失敗（拿不到 vod_id 等）→ 落回原本的單筆路徑，不要整個來源消失。
+    }
+
     const resolved = await _adapterResolvePlay(episodes[idx].token);
     if (!resolved || resolved.length === 0) return [];
 
@@ -8036,6 +8088,115 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
           _areaMatch: false,
         });
       }
+    }
+    return out;
+  }
+
+  /**
+   * v99：adapter 站的「整季清單」→ 每一集各一筆（延遲 token）。
+   *
+   * ★ 為什麼需要：
+   *   使用者開詳細頁時通常**沒有指定集數**，此時 adapter 站原本只會
+   *   回 1 筆（落到最後一集）。MacCMS 站則是整季 N 筆。
+   *   症狀：AGE動漫 明明有整季 12 集，播放列表裡卻只有 E12。
+   *
+   * ★ 為什麼用延遲 token：
+   *   token 短效、換 URL 服務慢（AGE 最壞 10 秒）。
+   *   列表階段不換 → 首屏快、token 新鮮；播放時才換 → 只換那一集。
+   *
+   * ★ 每一筆的 url 是一個「延遲 token url」（不是可播的 http），
+   *   會在 loadResource（播放時刻）被 _adapterResolveLazyUrl 換成真實 m3u8。
+   *
+   * @param {object} item        adapter 站回傳的原始 item
+   * @param {Array}  episodes    站方的集數清單（{name, token, ...}）
+   * @param {string} siteTitle   站名（顯示用）
+   * @param {string} type        'tv' | 'movie' | 'variety'
+   * @param {string} vod_name    站方片名
+   * @param {string} vod_remarks 站方更新進度
+   * @param {object} targetInfo  目標片資訊
+   * @returns {Array} 資源陣列
+   */
+  function _buildAdapterLazyEpisodeResources(
+    item, episodes, siteTitle, type, vod_name, vod_remarks, targetInfo
+  ) {
+    const out = [];
+    const siteId = item._adapterSite;
+    const vodId = item.vod_id;
+    if (!siteId || vodId == null || vodId === '') return out;
+
+    // 續集電影（《無間道 II》）不該被顯示成「第2季」。
+    const _aslSeq = (() => {
+      try {
+        return extractSequelNumber(targetInfo?.rawName)
+          ?? targetInfo?._expectedSequel ?? null;
+      } catch { return null; }
+    })();
+    const displayName = _adapterSeasonLabel(vod_name, type, { targetSequel: _aslSeq });
+    const remarkText = _adapterSafeRemark(vod_remarks);
+
+    for (let i = 0; i < episodes.length; i++) {
+      const ep = episodes[i];
+      const epName = String(ep?.name || '').trim();
+      const epNumber = _adapterEpNumber(epName);
+      if (!epName) continue;
+
+      // ★ token 裡存「集號」而不是「陣列索引」。
+      //   播放時 _adapterResolveLazyUrl 會用集號去站方清單裡比對
+      //   （_adapterEpNumber 抽出的集號），比索引可靠 ——
+      //   _ageEpisodes 的 out 陣列是「依集號排序」出來的，索引未必等於集號。
+      //   抽不到集號（單集電影）才退回索引。
+      const lazyToken = _adapterMakeLazyToken(siteId, vodId, epNumber, i);
+      if (!lazyToken) continue;
+
+      // 顯示用描述：片名．第N集（與 MacCMS 站的格式一致）
+      const epLabel = _adapterEpisodeLabel(epName);
+      const tail = [epLabel, remarkText].filter(Boolean).join('．');
+
+      // 清晰度此時未知（延遲到播放時才知道），給中性值避免排序誤判。
+      //
+      // ★ 不能寫 label:'未知'：cleanResourceForOutput 看到 resolution 為空
+      //   會補成 '未知'、resolutionLevel 改成 0、qualityScore 歸零
+      //   → 這筆會被排序到最後，使用者根本看不到這站。
+      //   寫一個合法但不宣稱特定的 level（'x' = 未判定），
+      //   讓 cleanResourceForOutput 的「resolution 為空」分支不觸發。
+      const resInfo = { label: 'x', level: 'x', isHD: false, is4K: false, tags: [], qualityScore: 0 };
+
+      out.push({
+        name: siteTitle,
+        description: tail ? `${displayName}．${tail}` : displayName,
+        // ★ 延遲 token url：播放時刻才換成真實 m3u8。
+        //   刻意**不**包過濾伺服器（wrapM3U8WithFilter）：
+        //   延遲 token 不是 http 網址，包了會讓 isPlayableUrl 判成可播，
+        //   卻在播放時才發現換不了。
+        url: lazyToken,
+        playerType: 'app',
+        customHeaders: { 'X-Forward-Skip-Redirect-Probe': '1' },
+        resolution: resInfo.label,
+        resolutionLevel: resInfo.level,
+        isHD: resInfo.isHD,
+        is4K: resInfo.is4K,
+        qualityTags: resInfo.tags,
+        qualityScore: resInfo.qualityScore,
+        isHttps: true,
+        // ★ 集數：優先用抽到的集號；抽不到（單集電影）→ 1。
+        episode: Number.isFinite(epNumber) ? epNumber : null,
+        _adapterSite: siteId,
+        _adapterLazy: true,
+        _matchType: 'exact',
+        _matchScore: 1,
+        _confidence: 1,
+        _isMainSource: CONFIG.MAIN_SOURCES.includes(siteTitle),
+        _hasEpInfo: true,
+        _rawName: vod_name,
+        _seasonFromItem: extractSequelNumber(vod_name),
+        _year: item.vod_year || null,
+        _area: item.vod_area || null,
+        _ep: Number.isFinite(epNumber) ? epNumber : null,
+        _epActualEp: Number.isFinite(epNumber) ? epNumber : null,
+        _adapterFallbackEp: false,
+        _areaMismatch: false,
+        _areaMatch: false,
+      });
     }
     return out;
   }
@@ -10323,6 +10484,152 @@ function _adapterBuildPlayUrl(site, vodId, episodes, targetEpisode, targetAirDat
     }));
     return `${e.name}$${payload}`;
   }).join('#');
+}
+
+// ==================== 延遲 token（lazy token）====================
+//
+// ★ v99：讓 adapter 站在「整季列表」也回傳「每一集」一筆。
+//
+// 背景（實測《零之使魔 第四季》）：
+//   AGE動漫 的 API 明明有整季 12 集（4 個 m3u8 來源 × 12 集），
+//   但結果裡只有 1 筆（E12），其餘 5 個 MacCMS 站各有 12 筆。
+//
+//   根因：_adapterBuildPlayUrl 產生的 vod_play_url 是「全部 12 集的
+//   token 清單」（# 分隔），但 extractPlayInfoForCache 只解其中
+//   **一格**（episodes[idx].token），其餘 11 個 token 直接被丟掉。
+//   而 idx 在「未指定集數」時會落到最後一集（episodes.length - 1）
+//   → 整季列表只剩 E12。
+//
+// ★ 為什麼當初要「只解一格」：
+//   token 短效 + 一集一 URL，全量預取在 36 集規模下是 36 次請求
+//   （且 AGE 的解析服務是站外第三方，實測延遲最壞 10 秒）。
+//
+// ★ v99 的解法：延遲解析（lazy resolution）。
+//   列表階段**不換 URL**，只把 token 放進資源的 url；
+//   使用者真的播那一集時（loadResource）才現換現簽。
+//   好處：
+//     - 整季列表完整（每一集都有一筆，不用等 12 次網路往返）
+//     - 換 URL 延遲到播放時刻 → token 一定是「剛簽發」的，不會失效
+//     - 解析失敗只影響那一集，不會讓整個來源蒸發
+//
+// ★ token 格式：沿用 _adapterResolvePlay 認得的 {s, v, n, e} 結構，
+//   但把 n（nid）留空、由 e（集索引）指定 —— 播放時才回 detail 頁
+//   取出該集的 token 來換。識別前綴用 _ADAPTER_LAZY_PREFIX，
+//   避免跟「已解析的真實 token」混淆。
+
+const _ADAPTER_LAZY_PREFIX = 'agez:';
+
+/**
+ * 產生一個延遲 token（lazy token）。
+ *
+ * @param {string} siteId   adapter 站 id（agedm / jpyy）
+ * @param {string} vodId    站方影片 id
+ * @param {number} epNo     集號（1-based）；抽不到時傳 0
+ * @param {number} epIndex  集索引（0-based，後備用）
+ * @returns {string} 可放進 url 的 token 字串
+ */
+function _adapterMakeLazyToken(siteId, vodId, epNo, epIndex) {
+  try {
+    return _ADAPTER_LAZY_PREFIX + encodeURIComponent(JSON.stringify({
+      s: siteId, v: String(vodId),
+      e: Number.isFinite(epNo) && epNo > 0 ? epNo : 0,
+      i: Number.isFinite(epIndex) && epIndex >= 0 ? epIndex : 0,
+    }));
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 判斷一個 url 是不是「延遲 token url」，並解析出 token 內容。
+ *
+ * @param {string} url
+ * @returns {{s:string,v:string,e:number,i:number}|null}
+ */
+function _adapterParseLazyToken(url) {
+  const u = String(url || '').trim();
+  if (!u.startsWith(_ADAPTER_LAZY_PREFIX)) return null;
+  try {
+    const obj = JSON.parse(decodeURIComponent(u.slice(_ADAPTER_LAZY_PREFIX.length)));
+    if (!obj || !obj.s || obj.v == null) return null;
+    const e = Number(obj.e);
+    const i = Number(obj.i);
+    return {
+      s: String(obj.s),
+      v: String(obj.v),
+      e: Number.isFinite(e) && e > 0 ? e : 0,
+      i: Number.isFinite(i) && i >= 0 ? i : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把延遲 token url 換成真實可播的 m3u8。
+ *
+ * 流程：detail 頁 → 找到第 e 集 → 換 URL 服務 → 真實 m3u8。
+ * 與 _adapterResolvePlay 走同一條換 URL 鏈，只是「token 從哪來」
+ * 不同（這裡是「當場回 detail 頁拿」，不是「清單階段先簽好的」）。
+ *
+ * @param {string} url  延遲 token url
+ * @returns {Promise<string>} 真實 m3u8 url；失敗回空字串
+ */
+async function _adapterResolveLazyUrl(url) {
+  const tok = _adapterParseLazyToken(url);
+  if (!tok) return '';
+  const site = ADAPTER_SITES.find(s => s.id === tok.s);
+  if (!site) return '';
+  try {
+    // 1. 回 detail 頁拿這一部的完整集數清單
+    const eps = await (site.episodes || _adapterDefaultEpisodes)(site, tok.v);
+    if (!Array.isArray(eps) || !eps.length) return '';
+
+    // ★ 集數的定位方式：優先用「集號」比對。
+    //   _ageEpisodes 的 out 陣列是「依集號排序」出來的（epNo 遞增），
+    //   不是「依 playlists 原始位置」—— 索引未必等於集號。
+    //   所以先用 _adapterEpNumber 抽集號比對，找不到才退回索引。
+    let ep = null;
+    if (tok.e > 0) {
+      for (const e of eps) {
+        const n = _adapterEpNumber(e?.name);
+        if (Number.isFinite(n) && n > 0 && n === tok.e) { ep = e; break; }
+      }
+    }
+    if (!ep && eps[tok.i]) ep = eps[tok.i];
+    if (!ep) return '';
+
+    // 2. 換 URL。
+    //    ★ 必須傳「nid」（站方的 sources JSON），不是 ep.token。
+    //      ep.token 是單一來源的原始 token（age_xxx），
+    //      而 _adapterResolvePlay 認的是 {s,v,n,e} 結構、n = nid。
+    //      傳錯會讓 _agePlayUrls 解析不出 sources → 回傳空陣列。
+    const nid = ep.nid ?? ep.token;
+    if (!nid) return '';
+    // e 是「集號」，_agePlayUrls 用它當 Vurl 快取的 key 之一
+    // （沒有它，不同集會撞在同一個 key → 切集拿到上一集的網址）。
+    // 以實際抽到的集號為準（tok.e 是 0 時代表走的是索引後備）。
+    const epNo = (() => {
+      const n = _adapterEpNumber(ep?.name);
+      if (Number.isFinite(n) && n > 0) return n;
+      return tok.e > 0 ? tok.e : tok.i;
+    })();
+    const payload = encodeURIComponent(JSON.stringify({
+      s: site.id, v: tok.v, n: nid, e: epNo,
+    }));
+    const resolved = await _adapterResolvePlay(payload);
+    if (!resolved || !resolved.length) return '';
+    for (const r of resolved) {
+      const u = r?.url;
+      if (u && isPlayableUrl(u)) return u;
+    }
+    return '';
+  } catch (e) {
+    if (CONFIG.ADAPTERS?.DEBUG) {
+      console.warn(`[adapter:${tok.s}] lazy 解析失敗 v=${tok.v} e=${tok.e}: ${e?.message || e}`);
+    }
+    return '';
+  }
 }
 
 /**
@@ -13803,6 +14110,56 @@ targetInfo.searchQuery = aliasQ;
   console.log(`📤 [loadResource 出口] type=${type} season=${season} episode=${episode ?? '-'} length=${finalResults.length}`);
   if (finalResults.length > 0) {
     console.log(`📤 [loadResource 出口] 第一條物件欄位：${Object.keys(finalResults[0]).join(', ')}`);
+  }
+
+  // ★★ v99：解析「延遲 token」→ 真實 m3u8（播放時刻才換 URL）★★
+  //
+  // 背景：adapter 站（AGE動漫 / 金牌影視）在「整季列表」改用延遲 token
+  //   （見 _buildAdapterLazyEpisodeResources），url 欄位此刻是一個
+  //   「agez:...」的 token，不是可播網址 —— 必須在這裡換掉，
+  //   否則播放器拿到的是垃圾字串。
+  //
+  // ★ 為什麼在這裡換（而不是列表階段）：
+  //   - token 短效：列表階段簽的，到播放時可能已過期。
+  //   - AGE 的換 URL 服務是站外第三方，實測延遲最壞 10 秒；
+  //     整季 12 集一口氣換會讓首屏多等數秒。
+  //   - 只換「使用者真的要播的那一集」→ 通常只有 1 次網路往返。
+  //
+  // ★ 併發上限：同時最多換 N 個（避免一次打十幾個請求觸發站方限流）。
+  // ★ 解不出來的那筆 → 丟掉（寧可少一個源，不要給使用者打不開的連結）。
+  if (finalResults.length > 0) {
+    const _lazyIdx = [];
+    for (let i = 0; i < finalResults.length; i++) {
+      if (_adapterParseLazyToken(finalResults[i]?.url)) _lazyIdx.push(i);
+    }
+    if (_lazyIdx.length > 0) {
+      const _lazyLimit = CONFIG.ADAPTERS?.LAZY_RESOLVE_CONCURRENCY ?? 4;
+      const _resolvedMap = new Map();
+      await _adapterPool(
+        _lazyIdx.map(i => async () => {
+          const real = await _adapterResolveLazyUrl(finalResults[i].url);
+          if (real) _resolvedMap.set(i, real);
+        }),
+        _lazyLimit,
+      );
+      const _out = [];
+      for (let i = 0; i < finalResults.length; i++) {
+        const r = finalResults[i];
+        if (_lazyIdx.includes(i)) {
+          const real = _resolvedMap.get(i);
+          if (!real) continue;              // 解不出來 → 丟掉這筆
+          r.url = wrapM3U8WithFilter(real, {
+            site: r.name,
+            name: toDisplayText(r._rawName || r.description || ''),
+            episode: Number.isFinite(r.episode) ? `第${String(r.episode).padStart(2, '0')}集` : '',
+            adapter: true,
+          });
+        }
+        _out.push(r);
+      }
+      finalResults = _out;
+      console.log(`🔓 [lazy] 延遲 token 解析：${_resolvedMap.size}/${_lazyIdx.length} 成功`);
+    }
   }
 
   return finalResults;
