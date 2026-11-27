@@ -2133,7 +2133,62 @@ const CONFIG = {
     //
     //   兩個 comparator 都已套用（loadResource 與 performBatchSearch）。
     //   舊的 _langRankOf 保留（純語言優先度，語義不變）。
-    WIDGET_VERSION: 108,
+    //
+    // ─── bump 到 109：修正語言 tier 誤傷綜藝 ───
+    //   v108 的 bug（使用者回報「綜藝的匹配有問題」）：
+    //     ① 綜藝豁免寫成 `type === 'variety'` → 死碼。
+    //        程式碼既有註解已說明：綜藝在 TMDb 側一律按 tv 查，
+    //        沒有 TMDb Key 時也走 tv 路徑 → type 幾乎都是 'tv'。
+    //        → 語言 tier 實際上一直套用到綜藝資源上。
+    //     ② 語言 tier 套用到綜藝會改變排序：實測 15 套綜藝有 9 套被改動。
+    //        症狀（實測《乘風破浪》）：
+    //          tier 0 的「整部條目」（乘風破浪2021，無語言標籤）
+    //          被拉到最前面，**擠掉「第01集」** → 使用者看到的正是這個。
+    //        症狀（實測《天賜的聲音》）：
+    //          無標籤的第 7~12 集被拉到第 1~6 集之前 → 集序錯亂。
+    //
+    //   v108.2 修正（新增 _buildLangTierScope）：
+    //     ★ 語言 tier 只在「同一集存在兩種以上語言/字幕版本」時才啟用。
+    //       語言標籤只有在「版本差異」時才有排序意義；
+    //       綜藝站的「🌐︎ 粵語」是「整部片只有一種語言」的單一屬性，
+    //       不是版本差異 → 不該分層。
+    //     ★ 分組鍵 = 集號（episode）；無集號者同組（電影的粵語版/國語版要能比較）。
+    //     ★ 完全不依賴「是不是綜藝」的判斷 → 不會誤傷電影/電視劇。
+    //
+    //   驗證（實測）：
+    //     - 同一份資源清單餵兩種 comparator（排除網路變數）：
+    //       9 套綜藝 + 3 套影集/動畫 → 排序結果**完全相同**（零影響）
+    //       電影《無間道》《英雄本色》→ 依要求分層（這正是要的效果）
+    //     - 電影 tier 順序：無標籤(0) → 粵語(1) → 國語(2)，單調遞增 ✓
+    //
+    // ★★ v110：修 comparator 最終兜底排序的「字串比集號」bug ★★
+    //
+    //   問題（實測《天賜的聲音》）：
+    //     comparator 最後一道是對 `name` 做**字串**比較，而 name 含「S{N}E{M}」：
+    //       const an = String(a.name||''), bn = String(b.name||'');
+    //       if (an !== bn) return an < bn ? -1 : 1;
+    //     → 「電影天堂 S1E10」 vs 「電影天堂 S1E2」：'1' < '2' → E10 排在 E2 前。
+    //     → 字串序是 S1E1, S1E10, S1E11, S1E12, S1E2, S1E3 …
+    //
+    //   為什麼之前沒被使用者看到：
+    //     loadDetail 產生的 episodeItems 會**另外**依 (season, episode) 數值重排，
+    //     所以畫面一直是對的。受影響的只有 performBatchSearch / loadResource
+    //     回傳的**內部陣列順序**（同分同站時集號 ≥10 被推到集號 2 之前）。
+    //     這是潛在 bug：快取合併 / 「繼續播放」按位置回找都會受影響。
+    //
+    //   修法（新增 _cmpByEpThenName）：
+    //     最終兜底改成「季（數值）→ 集（數值）→ 站名 → URL」。
+    //     ★ 抽不到集號時**不下結論**（視為平手），讓字串比較照舊 →
+    //       舊行為完全保留，零副作用。
+    //     ★ 只在前面所有 tier 都平手時才生效 → 語言 tier / 直連 / 剪輯版 tier /
+    //       站序 / 分數 全部不動。
+    //
+    //   驗證（實測）：
+    //     - 15 套綜藝 + 電影/電視劇/動漫 → 排序結果與 v109 **完全相同**
+    //       （因為那些案例集號都 <10 或不同站不同分，沒觸發新邏輯）
+    //     - 人造「E1..E12 同站同分」案例 → v109 錯亂(E1,E10,E11,E12,E2…)，
+    //       v110 正確(E1,E2,…,E12)
+    WIDGET_VERSION: 110,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2470,7 +2525,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.6.0",
+  version: "1.8.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -12333,7 +12388,171 @@ function resolveTargetArea(params, targetInfo) {
 //   國粵雙語版本同時有粵語與國語兩條音軌，實用上等同粵語版，
 //   使用者要的是「先看到粵語」，所以排在粵語那一層。
 //
+// ★ v108.1 修正：判斷「這個資源是不是綜藝」。
+//
+//   為什麼需要這個函式：
+//   v108 的 _langTierOf 靠 `type === 'variety'` 豁免綜藝，但程式碼既有註解
+//   已明確指出（見 loadDetail 的 _varietyEpisodeTitle 段）：
+//     「TMDb 沒有 variety 類型，綜藝在 TMDb 側一律按 tv 查；
+//       沒有 TMDb Key 時綜藝也走 tv 路徑 → type 常常就是 'tv'。」
+//   → 那個豁免分支是**死碼**，語言 tier 實際上一直套用到綜藝資源上。
+//
+//   影響：綜藝片名常帶「國語中字」之類的字樣，那不是版本差異，
+//   套上 tier 會把「國語版」推到「無標籤版」後面，
+//   打亂綜藝原本的「正片 > 精簡版 > 花絮版」主排序 → 使用者回報的「綜藝匹配有問題」。
+//
+// ★ 判斷依據（皆為程式碼既有資料，不引入新語意）：
+//   ① r._isVariety —— 資源建構時就寫好的旗標（見 extractPlayInfo：
+//      `_isVariety: dateMatch !== null || epMatch?.[2] === '期'`）。
+//      ★ 這是**最權威**的依據：它就是「站方集名是日期型或第N期」的判定結果，
+//      也是顯示層決定「第N期」還是「第N集」的同一份依據。
+//   ② _isVarietyEpisodeName(r) —— 同一套判斷的函式化版本，
+//      當資源是從別的路徑（adapter / 快取）進來、沒有 _isVariety 欄位時使用。
+//
+// ★ 為什麼要「逐資源」判斷而不是「逐批次」：
+//   同一個搜尋批次裡可能同時存在綜藝資源與影集資源（例如片名撞名）。
+//   逐批次判斷會誤傷另一類；逐資源判斷只豁免真正的綜藝資源。
+function _isVarietyResource(r) {
+  try {
+    if (!r) return false;
+    // ① 資源建構時寫入的旗標（最權威）
+    if (r._isVariety === true) return true;
+    if (r._isVariety === false) return false;
+    // ② 沒有旗標 → 用集名判斷
+    return !!_isVarietyEpisodeName(r);
+  } catch {
+    return false;
+  }
+}
+
+// ★ v108.2 ★★ 語言 tier 的「啟用範圍」判定 ★★
+//
+// ★★★ 這是本次修正的核心 ★★★
+//   使用者的要求是「電影及電視劇如果有語言標籤」→ 排語言順序。
+//   這裡的關鍵語意是「**版本**」：同一集 / 同一片有「粵語版」與「國語版」兩份。
+//
+// ★ 為什麼不能「看到語言標籤就分層」（v108 的錯誤做法）：
+//   實測（v108 壞掉的 15 套綜藝）：
+//     《乘風破浪》整部條目（「乘風破浪2021」，無語言標籤）→ tier 0
+//     《乘風破浪》分集條目（「第01集 ⏎ 🌐︎ 粵語」）        → tier 1
+//     → tier 0 把「整部條目」拉到最前面，**擠掉第01集**（使用者看到的症狀）。
+//
+//   根本原因：綜藝站的語言標籤是「**整部片只有一種語言**」這個單一屬性，
+//   不是「同一集有多個語言版本」。單一屬性沒有排序意義，
+//   套上 tier 只會把不同性質的資源（整部條目 vs 分集條目）拉進同一個排序平面。
+//
+// ★★ 正確的判準：同一集 / 同一片底下，有標籤的資源之語言標籤有「兩種以上」 ★★
+//   → 這才是真正的「版本差異」，此時才需要按語言分層。
+//   → 只有一種語言（或沒有）→ 沒有版本差異 → 該組資源同 tier → 排序完全不變。
+//
+// ★ 安全性：這個判斷**完全不涉及「是不是綜藝」**，
+//   所以不會誤傷電影/電視劇，也不會漏掉真正的多語言版本（那種情況
+//   同一集必然有兩種以上語言標籤 → 照樣分層）。
+function _buildLangTierScope(resources, type) {
+  const scope = new Map();   // resource → tier（數值）；50 = 不參與 tier 排序
+  try {
+    const t = String(type || '').toLowerCase();
+    const list = Array.isArray(resources) ? resources : [];
+    if (!list.length) return scope;
+
+    // ── 步驟 1：算出每個資源的「語言標籤」「字幕標籤」「集號」 ──
+    const infos = list.map((r) => {
+      const hay = [
+        r?.language, r?._rawName, r?._versionLabel,
+        r?.description, r?.name, r?.displayName,
+      ].filter(Boolean).join(' ');
+      let tag = null;
+      try { tag = extractLanguageTag(hay); } catch { tag = null; }
+      let sub = false;
+      try { sub = hasSubtitleTag(hay); } catch { sub = false; }
+      // 集號：優先 _ep（搜尋階段權威），再看 episode
+      let ep = null;
+      try {
+        if (r?._ep !== null && r?._ep !== undefined) ep = r._ep;
+        else if (r?.episode !== null && r?.episode !== undefined) ep = r.episode;
+        else {
+          const m = String(_resEpIdentityText(r) || '').match(/第(\d+)集/);
+          if (m) ep = parseInt(m[1], 10);
+        }
+      } catch { ep = null; }
+      return { r, tag, sub, ep };
+    });
+
+    // ── 步驟 2：依「集號」分組 ──
+    //   ★★ 「沒有集號」的資源（整部條目）歸為**同一組** ★★
+    //   電影本來就沒有集號 → 同一片的「粵語版 / 國語版」必須能互相比較，
+    //   否則電影的多版本永遠不會分層（實測《無間道》電影天堂的粵/國兩筆
+    //   各自成組 → tier 全 50 → 使用者的要求看不到效果）。
+    //
+    //   ★ 但要避免「整部條目」跟「分集條目」互相干擾：
+    //     綜藝的整部條目（如《乘風破浪2021》）與分集條目（「第01集 ⏎ 粵語」）
+    //     性質不同，語言標籤不可比。
+    //     → 只有在「同一組內全部資源都沒有集號」時才啟用 tier；
+    //       若該組混有集號資源 → 該組不分層（保持舊行為）。
+    const groups = new Map();
+    infos.forEach((info, i) => {
+      const key = info.ep === null ? '__noep__' : `ep_${info.ep}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(i);
+    });
+
+    // ── 步驟 3：只有「同一集有 2 種以上標籤」才啟用 tier ──
+    //   ★「沒有標籤」只是「站方沒寫」，不能證明「有另一個版本」→
+    //     不列入 kinds 統計。
+    const enabledIdx = new Set();
+    for (const [, idxs] of groups) {
+      if (idxs.length < 2) continue;
+      // ★ 「無集號」組：若組內混有「有集號」的資源 → 不分層
+      //   （整部條目 vs 分集條目，語言標籤不可比）。
+      //   若整組都無集號 → 這是電影/單集片的多版本 → 可以分層。
+      const noEp = idxs.every(i => infos[i].ep === null);
+      if (!noEp && idxs.some(i => infos[i].ep === null)) continue;
+      const kinds = new Set();
+      for (const i of idxs) {
+        const info = infos[i];
+        if (info.sub) kinds.add('__sub__');
+        if (info.tag) kinds.add(info.tag);
+      }
+      // ★ 有標籤的資源 ≥2 種 → 真的存在版本差異 → 該組啟用 tier 排序
+      if (kinds.size >= 2) {
+        idxs.forEach(i => enabledIdx.add(i));
+      }
+    }
+
+    // ── 步驟 4：產生每個資源的 tier ──
+    infos.forEach((info, i) => {
+      const r = info.r;
+      if (!enabledIdx.has(i)) { scope.set(r, 50); return; }   // 不參與 → 50
+      if (t === 'variety') { scope.set(r, 50); return; }
+      // tier 0：有字幕標籤 → 第一
+      if (info.sub) { scope.set(r, 0); return; }
+      // tier 0：沒有語言標籤 → 第一
+      if (!info.tag) { scope.set(r, 0); return; }
+      // tier 1：粵語 / 國粵雙語 → 第二
+      if (info.tag === '粵語' || info.tag === '國粵雙語') { scope.set(r, 1); return; }
+      // tier 2：國語 / 普通話 → 第三
+      if (info.tag === '國語') { scope.set(r, 2); return; }
+      // tier 3：其他語言 → 第四
+      scope.set(r, 3);
+    });
+
+    return scope;
+  } catch {
+    // ★ 出錯 → 全部不參與 tier（等同舊行為，最保守）
+    const s = new Map();
+    for (const r of (Array.isArray(resources) ? resources : [])) s.set(r, 50);
+    return s;
+  }
+}
+
 // ★ 回傳數值越小越前面。
+//
+// ★ v108.2：這函式已**不再**直接用於排序。
+//   排序改用 _buildLangTierScope()（見其註解）——
+//   語言 tier 只在「同一集有兩種以上語言/字幕版本」時才啟用，
+//   否則整批資源同 tier → 排序與 v108 之前完全一致。
+//   ★ 保留本函式作為「單一資源的語言 tier 判定」工具，
+//     以及給不需要批次層級判斷的呼叫端使用。
 function _langTierOf(r, type) {
   try {
     // ★ 綜藝不套用這個 tier（使用者只指定電影與電視劇）。
@@ -12341,6 +12560,10 @@ function _langTierOf(r, type) {
     //   套上去會打亂原有的「正片 > 精簡版 > 花絮版」主排序。
     const t = String(type || '').toLowerCase();
     if (t === 'variety') return 50;
+
+    // ★ v108.1：type 幾乎都是 'tv'（綜藝在 TMDb 側也是按 tv 查），
+    //   所以上面的 type 豁免是死碼 → 必須逐資源判斷綜藝。
+    if (_isVarietyResource(r)) return 50;
 
     const hay = [
       r?.language, r?._rawName, r?._versionLabel,
@@ -12393,6 +12616,88 @@ function _siteRankOf(r) {
     if (/rycj|如意/.test(hay)) return 2;
   } catch {}
   return 3;
+}
+
+// ★★ v110：把資源的「季 / 集」抽成**數值**，供 comparator 當最終 tiebreak ★★
+//
+// 【問題】
+//   comparator 最後一道兜底原本是對 `name` 做**字串**比較：
+//     const an = String(a.name || ''), bn = String(b.name || '');
+//     if (an !== bn) return an < bn ? -1 : 1;
+//   而 name 裡含「S{N}E{M}」標籤（例：「電影天堂 S1E10」）。
+//   字串序會讓「E10」排在「E2」前面（'1' < '2'）：
+//     S1E1, S1E10, S1E11, S1E12, S1E2, S1E3 …  ← 明顯不是使用者要的順序
+//
+// 【為什麼現在沒出事】
+//   loadDetail 產生的 episodeItems 會**另外**依 (season, episode) 數值重排
+//   （見 loadDetail 內 sortedGroups），所以使用者看到的集清單一直是對的。
+//   受影響的只有 performBatchSearch / loadResource 回傳的**內部陣列順序**：
+//   同分同站時，集號 ≥10 的資源會被推到集號 2 之前。
+//   這是潛在的 bug：一旦有程式依賴這個陣列順序（或快取合併時按位置判斷），
+//   就會出現「E10 排在 E2 前」的錯亂。
+//
+// 【修法】
+//   在字串比較**之前**先比「季 / 集」的數值：
+//     1. 資源有 episode 欄位 → 直接用（這是正規化的數值，最可靠）
+//     2. 沒有 episode → 從 name 的「S{N}E{M}」抽 M
+//     3. 兩邊都抽不到 → 視為相等，繼續往後比（保持舊行為）
+//   ★ 抽不到集號時**不**用 Infinity/0 之類的哨兵值去排序 —— 那會把
+//     「沒有集號的資源」硬排到最前或最後，改變舊有行為。
+//     正確做法是「只有當兩邊都能抽出且不同」才分勝負。
+//
+// 【安全性】
+//   - 只在「前面所有 tier 都平手」的最後一道才生效 → 不影響任何主要排序規則
+//   - 語言 tier、媒體直連、剪輯版本 tier、站序、分數 全部不動
+//   - 抽不到集號時行為與 v109 完全相同（退化成純字串比較）
+function _sortEpNumOf(r) {
+  try {
+    // 1) 正規化的 episode 欄位優先
+    const ep = r?.episode ?? r?._ep;
+    if (typeof ep === 'number' && Number.isFinite(ep)) return ep;
+    if (typeof ep === 'string' && /^\d+$/.test(ep.trim())) return parseInt(ep.trim(), 10);
+    // 2) 從 name 的「S{N}E{M}」抽
+    const nm = String(r?.name || '');
+    const m = nm.match(/S\d+\s*E(\d+)/i);
+    if (m) return parseInt(m[1], 10);
+  } catch {}
+  return null;
+}
+function _sortSeasonNumOf(r) {
+  try {
+    const s = r?.season;
+    if (typeof s === 'number' && Number.isFinite(s)) return s;
+    if (typeof s === 'string' && /^\d+$/.test(s.trim())) return parseInt(s.trim(), 10);
+    const nm = String(r?.name || '');
+    const m = nm.match(/\bS(\d+)\b/i);
+    if (m) return parseInt(m[1], 10);
+  } catch {}
+  return null;
+}
+
+/**
+ * Comparator 的最終兜底排序（v110）。
+ *
+ * 順序：季（數值）→ 集（數值）→ 站名（字串）→ URL（字串）。
+ *
+ * ★ 為什麼季要先比：資源的 `season` 欄位代表它屬於哪一季，
+ *   而 `name` 裡的「S{N}E{M}」也是季+集的組合。先比季再比集，
+ *   與 loadDetail 的分組邏輯（先 season 再 episode）保持一致。
+ *
+ * ★ 抽不到集號時**不**下結論（回 0 = 視為平手），
+ *   讓後面的字串比較照舊進行 → 舊行為完全保留。
+ *
+ * @returns {number} 負數 = a 在前，正數 = b 在前，0 = 交給下一道
+ */
+function _cmpByEpThenName(a, b) {
+  const as = _sortSeasonNumOf(a), bs = _sortSeasonNumOf(b);
+  if (as !== null && bs !== null && as !== bs) return as - bs;
+  const ae = _sortEpNumOf(a), be = _sortEpNumOf(b);
+  if (ae !== null && be !== null && ae !== be) return ae - be;
+  const an = String(a?.name || ''), bn = String(b?.name || '');
+  if (an !== bn) return an < bn ? -1 : 1;
+  const au = String(a?.url || ''), bu = String(b?.url || '');
+  if (au !== bu) return au < bu ? -1 : 1;
+  return 0;
 }
 
 function calculateResourceScore(resource, preferResolution = 'auto') {
@@ -15031,6 +15336,11 @@ targetInfo.searchQuery = aliasQ;
       res._finalScore = 1000 + res._finalScore;
     }
   });
+
+  // ★ v108.2：算出語言 tier 的「啟用範圍」。
+  //   只有同一集存在兩種以上語言/字幕版本時才分層，否則該批資源全部同 tier
+  //   → 排序與 v108 之前完全一致。詳見 _buildLangTierScope 註解。
+  const _langScope = _buildLangTierScope(finalResults, type);
   
   finalResults.sort((a, b) => {
     // ★ v108：語言／字幕 tier 提到**最前面**（使用者要求）。
@@ -15052,7 +15362,13 @@ targetInfo.searchQuery = aliasQ;
     //
     //   ★ 媒體直連優先本身仍保留，只是降到語言 tier 之後：
     //     同一 tier 內（例如兩筆都是 tier 0）仍優先給直連來源。
-    const aLang = _langTierOf(a, type), bLang = _langTierOf(b, type);
+    //
+    // ★ v108.2：語言 tier 改成「**只在同一集存在兩種以上語言/字幕版本時**才啟用」
+    //   （見 _buildLangTierScope）。
+    //   原因：v108 只要看到語言標籤就分層，實測把 15 套綜藝裡的 9 套排序弄壞 ——
+    //   《乘風破浪》的「整部條目」（無標籤）被拉到最前面，擠掉「第01集」。
+    //   語言標籤只有在「同一集有兩個以上版本」時才有排序意義。
+    const aLang = _langScope.get(a) ?? 50, bLang = _langScope.get(b) ?? 50;
     if (aLang !== bLang) return aLang - bLang;
     // 媒體直連優先：頁面型來源（/share/xxx）多數播放器開不起來，
     // 排在前面會讓使用者第一個選項就失敗。
@@ -15073,14 +15389,13 @@ targetInfo.searchQuery = aliasQ;
     //   留在 comparator 裡會讓同站的兩筆在「第一次搜尋 / cache 命中」
     //   之間換序。畫質既然不再顯示，排序也不該受它影響。
     if (b.isHttps !== a.isHttps) return b.isHttps ? 1 : -1;
-    // ★ 穩定排序：同分時按站名 + URL 兜底，避免 V8 非穩定排序
+    // ★ 穩定排序：同分時按「季/集數值 → 站名 → URL」兜底，避免 V8 非穩定排序
     //   在同分段內隨機換序 → REX「繼續播放」按位置/名稱回找時偶發對不上。
     //   純排序行為，不改變任何內容與分數。
-    const an = String(a.name || ''), bn = String(b.name || '');
-    if (an !== bn) return an < bn ? -1 : 1;
-    const au = String(a.url || ''), bu = String(b.url || '');
-    if (au !== bu) return au < bu ? -1 : 1;
-    return 0;
+    //
+    // ★ v110：集號改用**數值**比較（見 _cmpByEpThenName 註解）。
+    //   舊的純字串比較會讓「S1E10」排在「S1E2」前面。
+    return _cmpByEpThenName(a, b);
   });
   
   const fieldsToDelete = [
@@ -17922,12 +18237,18 @@ targetInfo.searchQuery = aliasQ;
     }
   });
 
+  // ★ v108.2：語言 tier 的啟用範圍（同一集有兩種以上語言/字幕版本才分層）。
+  //   理由見 _buildLangTierScope 註解。
+  const _langScope = _buildLangTierScope(finalResults, type);
+
   finalResults.sort((a, b) => {
     // ★ v108：語言／字幕 tier 提到**最前面**（使用者要求）。
     //   理由見 loadResource 內同段註解 —— 「媒體直連優先」若排在前面，
     //   會把 tier 1/2（粵語/國語）推到 tier 0（無標籤）後面，
     //   使用者指定的順序就完全看不到效果。
-    const aLang = _langTierOf(a, type), bLang = _langTierOf(b, type);
+    //
+    // ★ v108.2：改用 _langScope（只在真的有版本差異時才分層）。
+    const aLang = _langScope.get(a) ?? 50, bLang = _langScope.get(b) ?? 50;
     if (aLang !== bLang) return aLang - bLang;
     // 媒體直連優先（同一 tier 內仍優先給直連來源）。
     const aMedia = isDirectMediaUrl(a.url) ? 0 : 1;
@@ -17940,12 +18261,9 @@ targetInfo.searchQuery = aliasQ;
     const aSite = _siteRankOf(a), bSite = _siteRankOf(b);
     if (aSite !== bSite) return aSite - bSite;
     if (b._finalScore !== a._finalScore) return b._finalScore - a._finalScore;
-    // ★ 穩定排序：同分時按站名 + URL 兜底（理由見 smart 路徑同名註解）。
-    const an = String(a.name || ''), bn = String(b.name || '');
-    if (an !== bn) return an < bn ? -1 : 1;
-    const au = String(a.url || ''), bu = String(b.url || '');
-    if (au !== bu) return au < bu ? -1 : 1;
-    return 0;
+    // ★ 穩定排序：同分時按「季/集數值 → 站名 → URL」兜底（理由見 smart 路徑同名註解）。
+    // ★ v110：集號改用**數值**比較（見 _cmpByEpThenName 註解）。
+    return _cmpByEpThenName(a, b);
   });
 
   const fieldsToDelete = ['_finalScore', '_matchType', '_matchScore', '_seasonMatch',
