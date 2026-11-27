@@ -2188,7 +2188,41 @@ const CONFIG = {
     //       （因為那些案例集號都 <10 或不同站不同分，沒觸發新邏輯）
     //     - 人造「E1..E12 同站同分」案例 → v109 錯亂(E1,E10,E11,E12,E2…)，
     //       v110 正確(E1,E2,…,E12)
-    WIDGET_VERSION: 110,
+    //
+    // ★★★ v111：跨站日期錨定的「多日期歧義」防護 ★★★
+    //
+    //   ★ 症狀（使用者截圖）：《日落時分說愛你》點「第1集」，
+    //     選源面板同時出現「20251222」與「20251225 上」兩個不同日期的內容。
+    //
+    //   ★ 根因：站方（暴風）對**同一集**「第1期上」給了兩個日期：
+    //     「20251222(第1期上)」與「20251225(第1期上)」
+    //     → 跨站日期登錄表變成 20251222上→E1、20251225上→E1
+    //     → 純日期站（電影天堂/樂子/優質）查表時：
+    //         「20251222」(無後綴) → fallback 命中「20251222上」→ E1
+    //         「20251225上」       → 命中「20251225上」   → E1
+    //     → 兩筆都掉進 E1 槽位 → 同一槽混了兩集 ❌
+    //
+    //   ★ 為什麼既有的歧義偵測擋不住：
+    //     既有偵測抓的是「同日期 → 不同集數」（_globalDateEpAmbiguous）。
+    //     本 bug 是**反過來**的「同集數 → 不同日期」→ 現有偵測看不到。
+    //
+    //   ★ 修法（三層）：
+    //     1. 反向索引偵測：同一集數被多個 (日期,後綴) 登錄 → 該集數的所有鍵
+    //        標成「多日期歧義」→ _lookupGlobalDateEp 對這些鍵回 null
+    //        （放棄判定，不給錯集）。
+    //     2. 回溯收回：歧義是**後到的站**才暴露的，先前已綁定的 _ep 收不回
+    //        → 新增 _revokeMultiDateAmbiguousEps()，把「靠跨站錨定補上」
+    //        的誤綁集數收回（**有顯式集數的資源不動** → 影集/綜藝零影響）。
+    //     3. 登錄表隔離：登錄表是 module-level 全域狀態，跨節目累積會
+    //        造成誤判 → 以片名為分區鍵，換節目時清空
+    //        （並行抓多季片名相同 → 不互清，錨定表保持完整）。
+    //
+    //   ★ 驗證（實測）：
+    //     - 《日落時分說愛你》E1：修正前 7 筆混雜 → 修正後 1 筆（「第1期 上」）
+    //     - 播放清單標題：修正前日期型（20251222）→ 修正后期號型（第1期 上）
+    //     - 38 套回歸（電影/電視劇/綜藝/動漫）：改善 4~6 / **退化 0**
+    //     - e2e_v107：失敗項 0
+    WIDGET_VERSION: 111,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -2525,7 +2559,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "1.8.0",
+  version: "1.9.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -7226,6 +7260,183 @@ function _toEpisodeNumber(v) {
 const _globalDateEpRegistry = new Map();   // key: `${dateInt}${suffix}` -> ep
 const _globalDateEpAmbiguous = new Set();  // key: 衝突且無法判定的
 
+// ★★ v111：反向索引「集數 → 日期集合」★★
+//
+// 【要解決的問題】《日落時分說愛你》截圖：點「第1集」，選源面板同時出現
+//   「20251222」與「20251225 上」兩個不同日期的內容。
+//
+// 【根因】
+//   站方（暴風）對**同一集**「第1期上」給了兩個日期：
+//     「20251222(第1期上)」與「20251225(第1期上)」
+//   → 登錄表變成：20251222上 → E1、20251225上 → E1
+//   → 純日期站（電影天堂/樂子）查表時：
+//       「20251222」(無後綴) → fallback 命中「20251222上」→ E1
+//       「20251225上」       → 命中「20251225上」   → E1
+//   → 兩筆都掉進 E1 槽位 → 同一集混了兩個不同日期 ❌
+//
+// 【為什麼現有的歧義偵測擋不住】
+//   _anchorDateOnlySegments 步驟 2 的歧義判定 key 是**只有日期**（dd），
+//   抓的是「同日期 → 不同集數」。
+//   本 bug 是**反過來**：「同集數 → 不同日期」→ 現有偵測完全看不到。
+//
+// 【修法】
+//   維護反向索引 ep → Set(日期)。當某個集數被**兩個以上不同日期**登錄時，
+//   該集數的所有日期鍵都標成「多日期歧義」。
+//   純日期段查表時，若命中的是多日期歧義的集數 → **放棄判定**（回 null）。
+//   → 該段維持「集數未知」→ 被 filterByEpisode 的 hasExact 剪掉 →
+//     不會污染任何槽位（寧可少給也不給錯集）。
+//
+// 【安全性】
+//   - 只影響「有明確期號的站把同一集用多個日期標記」的情況。
+//   - 單日期的集數（99% 的情況）完全不受影響 → 錨定照舊生效。
+//   - 影響方向是「少給」而不是「給錯」→ 與既有設計哲學一致。
+const _globalDateEpMultiDate = new Set();  // key: `${dateInt}${suffix}` -> 該集數對應多個日期
+
+/**
+ * ★★ v111：把「多日期歧義」的集數記錄下來 ★★
+ *
+ * 【為什麼需要】
+ *   多日期歧義是**動態**發現的：站 A 先回，登錄「20251225上 → E1」，
+ *   純日期站立刻查表並綁定 _ep=E1；站 B 後回，登錄「20251222上 → E1」，
+ *   此時才偵測到「同一集被多個日期標記」。
+ *
+ *   → 查表層（_lookupGlobalDateEp）會正確回 null（歧義之後），
+ *     但**站 A 已經綁定的 _ep=E1 收不回** → 該槽位仍混兩集 ❌
+ *
+ * 【修法】
+ *   把歧義集數記下來 → 錨定流程結束後，把這些集數的已綁定 _ep 清掉。
+ *   → 該集的所有純日期段回到「集數未知」→ 被 hasExact 剪掉 → 不污染槽位。
+ *
+ * 【安全性】
+ *   只影響「同一集被多個日期標記」的集數（實測《日落時分說愛你》E1 與 E9）。
+ *   其餘集數完全不受影響。
+ */
+const _globalDateEpMultiDateEps = new Set();  // 被多日期歧義波及的集數
+
+/**
+ * 記錄「日期+後綴 → 集數」，同時維護反向索引。
+ * 同一集數若被不同日期登錄 → 這些鍵全部標成多日期歧義。
+ */
+function _registerGlobalDateEp(dateInt, suffix, ep) {
+  try {
+    const key = _dateEpKeyOf(dateInt, suffix);
+    if (_globalDateEpAmbiguous.has(key)) return;
+    const cur = _globalDateEpRegistry.get(key);
+    if (cur == null) {
+      _globalDateEpRegistry.set(key, ep);
+    } else if (cur !== ep) {
+      // 同日期同後綴卻對應不同集數 → 無法判定，標記歧義。
+      _globalDateEpRegistry.delete(key);
+      _globalDateEpAmbiguous.add(key);
+      return;
+    }
+    // ★ v111：反向索引檢查 —— 這個集數是否已被別的日期登錄過？
+    //   同一集數 = 同一集；不同日期 = 站方對同一集用了多個日期標記
+    //   （首播日 vs 正式播出日、或不同站的日期慣例不同）。
+    //   → 該集的所有日期鍵都無法唯一決定 → 純日期段不該用這組對應。
+    let sameEpDates = null;
+    for (const [k, v] of _globalDateEpRegistry.entries()) {
+      if (v !== ep) continue;
+      if (k === key) continue;
+      if (sameEpDates === null) sameEpDates = [];
+      sameEpDates.push(k);
+    }
+    if (sameEpDates && sameEpDates.length > 0) {
+      _globalDateEpMultiDate.add(key);
+      for (const k of sameEpDates) _globalDateEpMultiDate.add(k);
+      // ★ v111：記下被波及的集數 → 供「回溯清除已綁定 _ep」使用。
+      _globalDateEpMultiDateEps.add(ep);
+    }
+  } catch {}
+}
+
+/**
+ * ★★ v111：清空全域日期登錄表 ★★
+ *
+ * 【為什麼需要】
+ *   登錄表是 module-level 的全域狀態 → 在 widget 實例生命週期內**跨節目累積**。
+ *   《日落時分說愛你》的「20251222上 → E1」會留在表裡，
+ *   下一個節目若也有「同集數 + 不同日期」→ 被誤判成多日期歧義。
+ *   （v110 只是讓錨定偶爾命中錯的集；v111 會據此收回 _ep → 影響更大。）
+ *
+ * 【什麼時候清】
+ *   開始處理**新節目**時清一次（不是每次呼叫都清 ——
+ *   串流路徑是「逐站過濾」，每個站回來都要看到前面站登錄的對照表）。
+ *   → 清在「節目層級」：performBatchSearch / loadResource 的入口。
+ *
+ * ★★ 並行安全 ★★
+ *   loadDetail 會**並行**呼叫 loadResource 抓多季（Promise.all）。
+ *   若每個呼叫都無條件清空 → 彼此互清 → 錨定表被清到不完整。
+ *   → 用「片名」當分區鍵：只有片名變了才清空。
+ *     同一節目的並行多季請求片名相同 → 不清 → 錨定表完整 ✅
+ *     換節目 → 片名不同 → 清空 ✅
+ */
+let _globalDateEpShowKey = null;
+
+function _resetGlobalDateEpRegistry(showKey) {
+  try {
+    // 同一部節目（並行多季請求）→ 不清，保留已累積的錨定對照表。
+    if (showKey != null && showKey === _globalDateEpShowKey) return false;
+    _globalDateEpRegistry.clear();
+    _globalDateEpAmbiguous.clear();
+    _globalDateEpMultiDate.clear();
+    _globalDateEpMultiDateEps.clear();
+    _globalDateEpShowKey = showKey ?? null;
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * ★★ v111：清除「多日期歧義集數」已綁定的集數 ★★
+ *
+ * 多日期歧義是在錨定過程中動態發現的（後到的站才會暴露衝突），
+ * 所以先前的站可能已經把 _ep 綁成那個集數。
+ * 這裡把這些資源的 _ep 收回，讓它們回到「集數未知」。
+ *
+ * @param results  資源陣列
+ * @returns {number} 收回的筆數
+ */
+function _revokeMultiDateAmbiguousEps(results) {
+  try {
+    if (!Array.isArray(results) || !results.length) return 0;
+    if (_globalDateEpMultiDateEps.size === 0) return 0;
+    let n = 0;
+    for (const r of results) {
+      try {
+        const ep = episodeLabelOf(r);
+        if (ep == null) continue;
+        if (!_globalDateEpMultiDateEps.has(ep)) continue;
+        // 只有「本來沒有顯式集數、靠錨定補上」的资源才要收回。
+        // 有顯式集數的資源（例如暴風「第1期上」）保留 —— 它是權威來源。
+        const hasExplicit = _resHasExplicitEpisode(r);
+        if (hasExplicit) continue;
+        if (r._ep !== undefined) { delete r._ep; n++; }
+        else if (r.episode !== undefined && r.episode !== null) { r.episode = null; n++; }
+      } catch {}
+    }
+    if (n > 0) {
+      try {
+        console.log(`📅 多日期歧義回溯: 收回 ${n} 條誤綁的集數（集數 ${[..._globalDateEpMultiDateEps].join(',')}）`);
+      } catch {}
+    }
+    return n;
+  } catch { return 0; }
+}
+
+/**
+ * 判斷資源是否「本來就有顯式集數」（不靠跨站錨定補上）。
+ * 錨定補上的會寫在 _ep；顯式的在 _ep 之外另有來源。
+ */
+function _resHasExplicitEpisode(r) {
+  try {
+    // 顯式集數的來源：站方集名裡的「第N集」或「第N期」。
+    const txt = String(_resEpIdentityText(r) || '');
+    if (/第\s*0*\d+\s*集/.test(txt)) return true;
+    if (/第\s*0*\d+\s*期/.test(txt)) return true;
+    return false;
+  } catch { return false; }
+}
+
 /**
  * 取出資源的日期（YYYYMMDD 整數）。
  * 優先用 _episodeDate，其次從 description / 集名反查。
@@ -7393,18 +7604,31 @@ function _dateEpKeyOf(dateInt, suffix) {
 function _lookupGlobalDateEp(dateInt, suffix) {
   try {
     if (dateInt == null) return null;
+    // ★★ v111：多日期歧義防護 ★★
+    //   若命中的是「同一集被多個日期登錄」的鍵 → 無法唯一決定是哪一集
+    //   → 放棄判定（回 null），寧可讓這段維持未知，也不要污染槽位。
+    //   例：暴風「第1期上」有 20251222 與 20251225 兩個日期，
+    //       純日期站的「20251222」與「20251225上」都會認成 E1 → 同一槽混兩集。
+    //   → 這兩個鍵都標成多日期歧義 → 兩段都維持未知 → 各自被 hasExact 剪掉。
+    const _blocked = (k) => _globalDateEpMultiDate.has(k);
     // 先試精確（上/下），再試無後綴（'?'）。
     if (suffix) {
-      const exact = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, suffix));
-      if (exact != null) return exact;
+      const exactKey = _dateEpKeyOf(dateInt, suffix);
+      if (!_blocked(exactKey)) {
+        const exact = _globalDateEpRegistry.get(exactKey);
+        if (exact != null) return exact;
+      }
     }
-    const loose = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, null));
-    if (loose != null) return loose;
+    const looseKey = _dateEpKeyOf(dateInt, null);
+    if (!_blocked(looseKey)) {
+      const loose = _globalDateEpRegistry.get(looseKey);
+      if (loose != null) return loose;
+    }
     // 反向：'?' 登錄的日期，本段帶上/下 → 若站內只有一個該日期的集，
     // 也算命中（ffzy「第20260116期」對應 dytt「20260116下」）。
     if (suffix) {
-      const v = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, null));
-      if (v != null) return v;
+      const v = _globalDateEpRegistry.get(looseKey);
+      if (v != null && !_blocked(looseKey)) return v;
     }
     // ★★ 同一日期的單一上/下錨定（ffzy「第20260116期」這類無上/下段）
     //
@@ -7420,8 +7644,10 @@ function _lookupGlobalDateEp(dateInt, suffix) {
     //   只有一個錨定 → 不可能是「上與下同時存在卻只登錄一個」的情形，
     //   所以該日期確實只有那一集，取它不會錯。
     if (!suffix) {
-      const up = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, '上'));
-      const dn = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, '下'));
+      const upKey = _dateEpKeyOf(dateInt, '上');
+      const dnKey = _dateEpKeyOf(dateInt, '下');
+      const up = _blocked(upKey) ? null : _globalDateEpRegistry.get(upKey);
+      const dn = _blocked(dnKey) ? null : _globalDateEpRegistry.get(dnKey);
       if (up != null && dn == null) return up;
       if (dn != null && up == null) return dn;
       // 兩者都有 → 該日有上/下兩集，本段沒有上/下 → 無法判定，放棄。
@@ -7457,16 +7683,9 @@ function _anchorDateOnlySegments(results, targetEpisode) {
         const dd = _dOf(r);
         if (dd == null) continue;
         const suf = _resSuffixOf(r);
-        const key = _dateEpKeyOf(dd, suf);
-        if (_globalDateEpAmbiguous.has(key)) continue;
-        const cur = _globalDateEpRegistry.get(key);
-        if (cur == null) {
-          _globalDateEpRegistry.set(key, lab);
-        } else if (cur !== lab) {
-          // 同日期同後綴卻對應不同集數 → 無法判定，標記歧義。
-          _globalDateEpRegistry.delete(key);
-          _globalDateEpAmbiguous.add(key);
-        }
+        // ★ v111：改用 _registerGlobalDateEp（會同時維護反向索引，
+        //   偵測「同一集被多個日期標記」的多日期歧義）。
+        _registerGlobalDateEp(dd, suf, lab);
       }
     } catch {}
     // ★ 步驟 2：用全域登錄表認純日期段。
@@ -7492,8 +7711,11 @@ function _anchorDateOnlySegments(results, targetEpisode) {
           const suf = _resSuffixOf(r);
           const key = _dateEpKeyOf(dd, suf);
           if (_globalDateEpAmbiguous.has(key)) continue;
-          const m = _globalDateEpRegistry.get(key)
-            ?? _globalDateEpRegistry.get(_dateEpKeyOf(dd, null));
+          // ★ v111：多日期歧義 → 該集被多個日期登錄，無法唯一決定 → 放棄。
+          if (_globalDateEpMultiDate.has(key)) continue;
+          const looseKey = _dateEpKeyOf(dd, null);
+          if (_globalDateEpMultiDate.has(looseKey)) continue;
+          const m = _globalDateEpRegistry.get(key) ?? _globalDateEpRegistry.get(looseKey);
           if (m == null) continue;
           dateToEp.set(dd, m);
         } catch {}
@@ -7625,6 +7847,9 @@ function _inferVarietyEpByDateOrder(results, targetEpisode) {
       // 已確認的 (日期 → 集數)
       const _known = new Map();
       for (const [k, v] of _globalDateEpRegistry.entries()) {
+        // ★ v111：多日期歧義的鍵不能用來當座標系基準 ——
+        //   該集被多個日期登錄 → 日期與集數不是一對一 → 偏移量不可信。
+        if (_globalDateEpMultiDate.has(k)) continue;
         const di = parseInt(String(k).slice(0, 8), 10);
         if (!Number.isFinite(di)) continue;
         if (_known.has(di) && _known.get(di) !== v) { _known.delete(di); continue; }
@@ -7822,6 +8047,8 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null, targetAir
       }
     }
   } catch {}
+  // ★ v111：多日期歧義回溯 —— 歧義是後到的站才暴露的，先前綁好的 _ep 要收回。
+  try { _revokeMultiDateAmbiguousEps(results); } catch {}
   try {
     let _needInfer = true;
     try {
@@ -14762,6 +14989,14 @@ async function loadResource(params, onStreamResult = null) {
     return [];
   }
 
+  // ★ v111：清空全域日期登錄表 —— 避免上一個節目的對照表殘留。
+  //   登錄表是 module-level 全域狀態，跨節目累積會造成誤判
+  //   （前一節目的「同集數 + 多日期」被下一個節目繼承）。
+  //   清在「片名確定後」：同一節目的續集請求會重新載入（正常），
+  //   而換節目時一定會清乾淨。
+  //   ★ 用片名當分區鍵：loadDetail 並行抓多季時片名相同 → 不互清 ✅
+  try { _resetGlobalDateEpRegistry(seriesName); } catch {}
+
   // 同步使用者設定到 CONFIG.M3U8_FILTER。
   //
   // cleanResourceForOutput 是純函式(沒接 params),但 m3u8 wrap 需要讀 user 設定。
@@ -16810,7 +17045,11 @@ async function performBatchSearch(params) {
 
   console.log(`🔍 启动批量搜索: ${seriesName}`);
   const startTime = Date.now();
-  
+
+  // ★ v111：清空全域日期登錄表 —— 避免上一個節目的對照表殘留。
+  //   同一節目的並行多季請求片名相同 → 不清（保留完整錨定表）。
+  try { _resetGlobalDateEpRegistry(seriesName); } catch {}
+
   const resourceSites = _filterMacSites(parseResourceSites(VodData), params);
   if (resourceSites.length === 0) {
     return [];
@@ -18005,6 +18244,8 @@ targetInfo.searchQuery = aliasQ;
         const _n = allResults.filter(r => episodeLabelOf(r) != null).length;
         if (_n > 0) console.log(`📅 跨站日期錨定: ${_n} 條已認出集數（整季載入）`);
       } catch {}
+      // ★ v111：多日期歧義回溯 —— 歧義是後到的站才暴露的，先前綁好的 _ep 要收回。
+      try { _revokeMultiDateAmbiguousEps(allResults); } catch {}
     }
   } catch {}
 
@@ -18069,6 +18310,8 @@ targetInfo.searchQuery = aliasQ;
         }
       }
     } catch {}
+    // ★ v111：多日期歧義回溯 —— 歧義是後到的站才暴露的，先前綁好的 _ep 要收回。
+    try { _revokeMultiDateAmbiguousEps(allResults); } catch {}
     const needFilter = allResults.some(res => {
       const label = episodeLabelOf(res);
       if (label === targetEpisode) return false;
