@@ -2613,7 +2613,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.0",
+  version: "2.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -19288,15 +19288,56 @@ async function loadDetail(link) {
     //   → 改成「全部併抓 → 再決定丟不丟」，速度與修前完全一致。
     const _deferSeasonDecision = _seqInTitle && type !== 'movie';
     const _initialSeasons = seasonsToFetch;
+    //
+    // ★★ v113：內層 loadResource 一律 **episode=null** ★★
+    //
+    //   症狀（使用者回報，手機端 REX）：搜《日落時分說愛你》第一季，
+    //   「轉集數」播放列表沒有更新 —— 只有 1 集。
+    //
+    //   根因：外層 link 常帶 episode（搜尋結果每筆的 link 都是
+    //   search:標題?season=N&episode=M），loadDetail 把它透傳給內層
+    //   loadResource → targetEpisode=M → filterByEpisode 把整批結果
+    //   砍到**只剩 M 一集** → 詳情頁的播放清單只剩 1 集可點。
+    //
+    //   實測（場景對照）：
+    //     link 不帶 episode → 頂層 episodeItems 21 集（正常）
+    //     link 帶 episode=1 → 頂層 episodeItems **1 集**（症狀重現）
+    //
+    //   ★ 這也是 v52 changelog 記載的修法（「內層一律 episode=null」），
+    //     但當年只寫進註解、程式碼沒有落實 → 症狀一直存在。
+    //
+    //   ★ 為什麼內層不能帶 episode：loadDetail 的職責是「回傳整季的
+    //     集清單」，不是「回傳某一集」。某一集的播放是 REX 點某個
+    //     episodeItem 時**另外**呼叫 loadResource（那時帶 episode 才對）。
+    //
+    //   ★ 同時要把 link 重建成「不帶 episode 的季連結」：
+    //     loadResource 內部會從 params.link 解析 episode 補回來
+    //     （_metaEpisode），只改 episode 參數不夠。
+    const _innerLink = (() => {
+      try {
+        return buildDetailLink({ title, season: null, episode: null, type, id });
+      } catch { return link; }
+    })();
+    // ★ v113 安全網：id 若剛好是帶 episode 的 search: 連結，
+    //   loadResource 會用 _idMeta 解析出 episode 並補回 params.episode
+    //   → 又把整批砍成單集。id 只該是 TMDb id，不是 search: 連結。
+    const _innerId = (() => {
+      try {
+        if (id && typeof id === 'string' && id.startsWith(DETAIL_LINK_PREFIX)) return null;
+      } catch {}
+      return id;
+    })();
     const batchArrays = await Promise.all(
       _initialSeasons.map((s) => loadResource({
         seriesName: title,
         title,
         type,
         season: s,
-        episode,
-        id,
-        link,
+        // ★ v113：內層不帶 episode（詳情頁要整季清單，不是單集）
+        episode: null,
+        id: _innerId,
+        // ★ v113：link 也不帶 episode（否則 loadResource 會從 link 補回）
+        link: _innerLink,
         searchMode: 'batch',
         matchStrictness: 'standard',
         preferResolution: 'auto',
