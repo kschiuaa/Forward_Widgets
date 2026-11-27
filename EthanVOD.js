@@ -2230,7 +2230,53 @@ const CONFIG = {
     //
     //   舊 cache 是髒結果（顯示名不一致 + E20 混入 E18 的集），
     //   bump 版本讓 syncWidgetVersion 清掉重搜。
-    WIDGET_VERSION: 111,
+    //
+    // ★★ v112：修「先導片被認成第1集」+「錯標資源污染跨站日期對照」★★
+    //
+    //   背景（使用者回報）：《日落時分說愛你》S1 的**第1集**應該是
+    //   **20251225**（第1期上），但舊版 E1 面板顯示的是 **20251222**。
+    //
+    //   ★ 站方實測（v112 全站掃描）：
+    //     電影天堂/樂子/如意: "20251222"（無段序，= 先導片）+ "20251225上"
+    //     暴風/非凡:        "先导片" + "第20251225期"
+    //     優質資源:         "20251222期上"（m3u8 在 **/20251225/**）
+    //   → **20251222 是開播前的先導片，20251225 才是第1期上**。
+    //
+    //   ★★ 污染鏈（為什麼 20251222 會跑進 E1）：
+    //     優質資源把第1期上寫成「20251222期上」→ 在跨站日期登錄表裡
+    //     造出一個假的「20251222上 = E1」鍵 → 其它站的**先導片**
+    //     「20251222」（無段序）查不到自己的鍵時，fallback 去借
+    //     同日期的「上」→ 借到 E1 → **先導片被認成第1集**。
+    //
+    //   ★ 本版實作三個修正：
+    //
+    //   (1) 錯標偵測（_resHasMislabelledDate + _globalCrossSiteDates）
+    //       判準：**該資源的 URL 目錄日期，必須被「其它站的同段序資源」佐證**。
+    //       → 有佐證 = 站方集名寫錯日期（真錯標）
+    //       → 沒佐證 = 上傳延遲 / 批次目錄 → 不動（寧可不抓，不可誤殺）
+    //       ★ 為什麼要「同段序 + 其它站」：
+    //         非凡資源 /20260817/2099_978d7667/ 塞了 3 集（批次目錄）
+    //         優質資源《一飯封神2》「20260819上」在 /20260820/（延遲上傳）
+    //         兩種都會「URL 日期 ≠ 集名日期」，但**集名日期才是對的**。
+    //         單看日期會誤殺 26 筆 + 9 筆；加上「同段序 + 其它站佐證」
+    //         → 只抓真正的錯標（優質資源「20251222期上」/20251225/）。
+    //       ★ 保守條件：**必須帶段序**（無段序的衍生集不判，避免借錯佐證）。
+    //
+    //   (2) 錯標來源不參與「日期 → 集數」對照建立
+    //       dateToEp 只按日期作鍵（同一天所有段共用一個集數），
+    //       若讓錯標來源把 20251222 建成 E1 → 其它站的先導片也拿到 E1。
+    //       → 錯標來源不建對照（它自己仍可被認出：帶段序時走直接命中路徑）。
+    //
+    //   (3) 錯標資源的**顯示日期**修正（_fixMislabelledDisplayDates）
+    //       優質資源那筆原本顯示「20251222 上」→ 改成「20251225 上」，
+    //       讓 E1 群組內各站名稱一致（否則使用者以為 E1 有兩個日期版本）。
+    //       ★ 只改顯示文字，不動 _rawEpName（判定依據）/ url / _ep。
+    //
+    //   ★ 驗證（實測）：
+    //     - E1 標題 = 「日落時分說愛你．第1季．20251225 上」✅
+    //     - 24 組 A/B（電影/劇集/綜藝/動漫）→ 只有本片有差異，其餘 23 組 100% 相同
+    //     - 32 組廣泛抽樣 → 錯標誤判 **0 筆**
+    WIDGET_VERSION: 112,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -7307,6 +7353,37 @@ const _globalDateEpAmbiguous = new Set();  // key: 衝突且無法判定的
 const _globalDateEpMulti = new Map();   // key: `${dateInt}${suffix}` -> Set<ep>
 
 /**
+ * ★★ v112：錯標來源登錄的鍵（集名日期與 URL 路徑日期不一致）★★
+ *
+ * 實測《日落時分說愛你》S1：優質資源把第1期上標成「20251222期上」，
+ * 但 m3u8 路徑是 /20251225/ → 集名日期（20251222）與實際播出日不符。
+ * 這個錯標在 _globalDateEpRegistry 裡造出假的「20251222上 = E1」鍵。
+ *
+ * ★ 這些鍵**不可被無段序段借用**（見 _lookupGlobalDateEp 的 fallback）：
+ *   其它站的先導片「20251222」（無段序）會借到它 → 先導片被認成第1集。
+ *
+ * ★ 這些鍵**本身**仍然有效（優質資源那筆確實是第1期上）——
+ *   只擋「借用」，不擋「直接命中」→ 優質資源自己帶「上」查自己的鍵照樣認得到。
+ */
+const _globalDateEpMislabelled = new Set();   // key: `${dateInt}${suffix}`
+
+/**
+ * ★★ v112.3：跨站同段序佐證表 ★★
+ *
+ * key = `${dateInt}${suffix}` → Map<site, count>（該 (日期,段序) 有幾個站這麼寫）。
+ *
+ * 用途：判斷「某站的某集集名日期是否寫錯」時，用**其它站的一致說法**當旁證。
+ *   例：優質資源寫「20251222期上」，它自己的 m3u8 在 /20251225/，
+ *       而如意／樂子／電影天堂都寫「20251225上」（第1期上），
+ *       暴風寫「20251225(第1期上)」→ 佐證 (20251225, 上) 存在 → 真錯標。
+ *
+ *   例：優質資源寫「20260819上」，m3u8 在 /20260820/，
+ *       但沒有任何一站寫「20260820上」→ 沒佐證
+ *       → 只是「上傳延遲」，不是錯標 → 不動。
+ */
+let _globalCrossSiteDates = new Map();   // `${dateInt}${suffix}` → Map<site, count>
+
+/**
  * ★★ v111：跨片隔離（避免上一部片的日期對照污染下一部）★★
  *
  * 為什麼需要：_globalDateEpRegistry 是**模組級**的，在長駐 runtime 裡
@@ -7325,6 +7402,9 @@ function _resetGlobalDateEpRegistry(showKey) {
     _globalDateEpRegistry.clear();
     _globalDateEpAmbiguous.clear();
     _globalDateEpMulti.clear();
+    _globalDateEpMislabelled.clear();
+    // ★ v112.2：跨站共識表也要跟著清（否則上一部片的日期會替下一部片背書）。
+    _globalCrossSiteDates = new Map();
     _globalDateEpShowKey = showKey ?? null;
     return true;
   } catch { return false; }
@@ -7392,6 +7472,193 @@ function _resSuffixOf(r) {
     }
   } catch {}
   return null;
+}
+
+/**
+ * ★★ v112：偵測「集名日期」與「URL 路徑日期」不一致的資源 ★★
+ *
+ * 背景（實測《日落時分說愛你》S1）：
+ *   優質資源把第1期上標成「20251222期上」，但它的 m3u8 實際路徑是
+ *     https://cdn.yzzy28-play.com/20251225/27821_fbabbe30/index.m3u8
+ *   → 集名寫 20251222（那其實是先導片的日子），URL 卻是 20251225。
+ *   其它站（電影天堂／樂子／如意）的先導片都寫「20251222」且 URL 是
+ *   /20251222/ → 兩邊一致。
+ *
+ * 這個不一致會造成實質危害：
+ *   優質資源的錯標在跨站日期登錄表裡造出一個假的「20251222上 = E1」鍵，
+ *   於是其它站的**先導片**「20251222」（無段序）查不到自己的鍵時，
+ *   會 fallback 去借「同日期的上/下」→ 借到 E1 → 先導片被認成第1集。
+ *
+ * ★ 為什麼不能單靠 URL 日期改寫集名日期：
+ *   非凡資源的「先导片」URL 也是 /20251225/（先導片與第1期上同一天播出），
+ *   單看 URL 日期會把先導片誤判成 20251225 → 反而更糟。
+ *   → 這裡只用來「偵測錯標」，不用來改寫。
+ *
+ * 回傳：URL 路徑日期（YYYYMMDD 整數），或 null（取不到 / 一致 / 不是 URL）。
+ */
+function _resUrlPathDate(r) {
+  try {
+    const url = String(r?.url ?? '');
+    if (!url) return null;
+    // URL 可能已被 wrapM3U8WithFilter 包成 filter 網址，原始 m3u8 在 query 裡
+    // （url=https%3A%2F%2F...%2F20251225%2F...）→ 先試整串，再試解碼後。
+    const pick = (s) => {
+      const m = String(s ?? '').match(/\/((?:19|20)\d{6})\//);
+      return m ? parseInt(m[1], 10) : null;
+    };
+    let d = pick(url);
+    if (d == null) {
+      // 找 query 參數 url= 的值（含 percent-encoding）
+      const q = url.match(/[?&]url=([^&]+)/);
+      if (q) {
+        let dec = q[1];
+        try { dec = decodeURIComponent(dec); } catch {}
+        d = pick(dec);
+        if (d == null) d = pick(decodeURIComponent(q[1]));
+      }
+    }
+    return (d != null && Number.isFinite(d)) ? d : null;
+  } catch { return null; }
+}
+
+/**
+ * 資源的「集名日期」是否被站方標錯（URL 路徑日期與集名日期不一致）。
+ *
+ * ★ 只在兩者**都存在且不同**時才回 true。
+ *   - 都取不到 → false（沒有證據，不動）
+ *   - 相同 → false（正常）
+ *   - URL 沒有日期路徑（如 /share/xxx）→ false（無法判斷，不動）
+ *
+ * ★★ v112.3：必須有「跨站同段序佐證」當證據 ★★
+ *   判錯標不能只看「URL 日期 ≠ 集名日期」，因為兩種正常情況也會不一致：
+ *
+ *   (1) 打包批次目錄（非凡資源）：
+ *       /20260817/2099_978d7667/ 裡塞了 3 集（20260814/15/16），
+ *       先導片也在 /20251225/ → 該站 47 筆裡 26 筆不一致（一致率 45%）。
+ *       → 該站 URL 日期**沒有語意**，不能拿來判錯標。
+ *
+ *   (2) 上傳延遲（優質資源《一飯封神2》）：
+ *       「20260819上」在 /20260820/ → 差 1 天，共 9 筆（9.9%）。
+ *       站方延遲上傳，目錄用上傳日 → **集名日期才是對的**。
+ *       → 不能動。
+ *
+ *   ★ 真正的錯標（優質資源《日落時分說愛你》S1）：
+ *       「20251222期上」在 /20251225/ → 差 3 天，全站只有這 1 筆。
+ *       如意／樂子／電影天堂都寫「20251225上」（第1期上），
+ *       暴風寫「20251225(第1期上)」→ 佐證 = 20251225 = 該資源的 URL 日期。
+ *
+ *   → 判準（v112.3，最終版）：
+ *     該資源的 **URL 日期** 必須被「**其它站的同段序（上/中/下）資源**」佐證，
+ *     而且該佐證必須**唯一**（不能有歧義）→ 否則可能是上傳延遲 / 批次目錄。
+ *
+ *   ★ 為什麼要「同段序」：單看「該日期有沒有其它站用過」不夠 ——
+ *     一飯封神2 的「20260819上」在 /20260820/，而優質資源自己也有
+ *     「20260820下」→ 日期 20260820 有「共識」，但那其實是**隔天的另一集**。
+ *     要求「同段序 + 同一天」才排除了這種情況。
+ */
+function _resHasMislabelledDate(r) {
+  try {
+    const nameDate = _resDateIntOf(r);
+    if (nameDate == null) return false;
+    const urlDate = _resUrlPathDate(r);
+    if (urlDate == null) return false;
+    if (urlDate === nameDate) return false;
+    const site = String(r?.name ?? '').split(' ')[0];
+    if (!site) return false;
+    const suffix = _resSuffixOf(r);
+    // ★★ v112.3：**必須帶段序**才判錯標 ★★
+    //   沒有段序（上/中/下）的資源無法用「同段序佐證」比對
+    //   （佐證表的 '?' 鍵會混入同日其它集：正片、衍生集共用日期）。
+    //   例：優質資源「20260820」（一飯小館）在 /20260821/，
+    //       而 20260820? 的佐證其實來自同日的「20260820下」正片 → 借錯佐證。
+    //   → 無段序 → 一律不判錯標（保守：寧可不抓，不可誤殺）。
+    if (!suffix) return false;
+    // ★ 跨站同段序佐證：該 URL 日期 + 該段序，有沒有**其它站**這麼寫？
+    const key = _dateEpKeyOf(urlDate, suffix);
+    const sites = _globalCrossSiteDates.get(key);
+    if (!sites || sites.size < 2) return false;   // 沒有旁證 → 不判錯標
+    let corroborating = 0;
+    for (const [otherSite, cnt] of sites) {
+      if (otherSite === site) continue;
+      if (cnt > 0) corroborating++;
+    }
+    if (corroborating < 1) return false;           // 只有自己站 → 不判錯標
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * ★★ v112.3：把當前結果集的「日期+段序 → 站 → 次數」建起來 ★★
+ *
+ * 這是**跨站同段序佐證表**：某個 (日期, 段序) 有幾個站這麼寫。
+ * 判錯標時用它當旁證（該資源的 URL 日期 + 段序有沒有其它站佐證）。
+ *
+ * ★ **累積**而非覆蓋：串流路徑（filterByEpisode 逐站過濾）會多次呼叫，
+ *   每次只帶一站的結果 → 必須累積才能跨站形成佐證。
+ *   跨片隔離由 _resetGlobalDateEpRegistry 負責（見該函式）。
+ */
+function _buildCrossSiteDateTable(results) {
+  try {
+    if (!Array.isArray(results)) return;
+    for (const r of results) {
+      try {
+        const site = String(r?.name ?? '').split(' ')[0];
+        if (!site) continue;
+        const dd = _resDateIntOf(r);
+        if (dd == null) continue;
+        const key = _dateEpKeyOf(dd, _resSuffixOf(r));
+        let m = _globalCrossSiteDates.get(key);
+        if (!m) { m = new Map(); _globalCrossSiteDates.set(key, m); }
+        m.set(site, (m.get(site) || 0) + 1);
+      } catch {}
+    }
+  } catch { /* 保持原狀 */ }
+}
+
+/**
+ * ★★ v112.3：修正「錯標資源」的顯示日期 ★★
+ *
+ * 優質資源《日落時分說愛你》S1 把第1期上寫成「20251222期上」，
+ * 但它的 m3u8 在 /20251225/ → 那其實就是 **20251225 上**（第1期上）。
+ *
+ * ★ 為什麼要修：E1 群組裡會同時出現
+ *   「20251225 上」（電影天堂/樂子/暴風）與「20251222 上」（優質資源）
+ *   → 使用者會以為 E1 有兩個日期版本。
+ *   修完 → 全部一致顯示「20251225 上」。
+ *
+ * ★ 只改**顯示文字**（description），不動：
+ *   - _rawEpName（下游判定依據，必須保留站方原文）
+ *   - url（播放目標本來就是對的）
+ *   - _ep / _episodeDate（集數判定已完成）
+ *
+ * ★ 為什麼要放在錨定「之後」：判錯標需要「跨站同段序佐證」，
+ *   那張表是在 _anchorDateOnlySegments 期間才建起來的，
+ *   資源建立當下還沒有其它站的資料可比對。
+ *
+ * @param {Array} results  已完成錨定的結果集
+ * @returns {number} 修正筆數
+ */
+function _fixMislabelledDisplayDates(results) {
+  try {
+    if (!Array.isArray(results) || results.length < 2) return 0;
+    let n = 0;
+    for (const r of results) {
+      try {
+        if (!_resHasMislabelledDate(r)) continue;
+        const wrongDate = _resDateIntOf(r);
+        const rightDate = _resUrlPathDate(r);
+        if (wrongDate == null || rightDate == null) continue;
+        const wrongStr = String(wrongDate);
+        const rightStr = String(rightDate);
+        if (wrongStr === rightStr) continue;
+        const desc = String(r?.description ?? '');
+        if (!desc.includes(wrongStr)) continue;
+        r.description = desc.split(wrongStr).join(rightStr);
+        n++;
+      } catch {}
+    }
+    return n;
+  } catch { return 0; }
 }
 
 /**
@@ -7576,12 +7843,28 @@ function _lookupGlobalDateEp(dateInt, suffix, targetEpisode) {
     //   安全做法：**同一天、且該日的上/下錨定只有一個**時直接採用。
     //   只有一個錨定 → 不可能是「上與下同時存在卻只登錄一個」的情形，
     //   所以該日期確實只有那一集，取它不會錯。
+    //
+    // ★★ v112：錯標來源登錄的鍵**不可借用** ★★
+    //   實測《日落時分說愛你》S1：
+    //     優質資源把第1期上標成「20251222期上」，URL 卻是 /20251225/ → 錯標。
+    //     這個錯標在登錄表裡造出假的「20251222上 = E1」鍵。
+    //     其它站的先導片「20251222」（無段序）查不到自己的鍵 →
+    //     借到「20251222上」→ 先導片被認成第1集。
+    //   → 錯標產生的鍵不列入可借用清單。
+    //     （錯標本身仍可被認成它真正的集 —— 但那需要另外的依據，
+    //       見 _globalDateEpMislabelled 的處理。）
     if (!suffix) {
-      const up = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, '上'));
-      const dn = _globalDateEpRegistry.get(_dateEpKeyOf(dateInt, '下'));
-      if (up != null && dn == null) return up;
-      if (dn != null && up == null) return dn;
+      const upKey = _dateEpKeyOf(dateInt, '上');
+      const dnKey = _dateEpKeyOf(dateInt, '下');
+      const up = _globalDateEpRegistry.get(upKey);
+      const dn = _globalDateEpRegistry.get(dnKey);
+      // ★ 錯標來源登錄的鍵不借（否則先導片會被誤認成第1集）。
+      const upBad = _globalDateEpMislabelled.has(upKey);
+      const dnBad = _globalDateEpMislabelled.has(dnKey);
+      if (up != null && dn == null && !upBad) return up;
+      if (dn != null && up == null && !dnBad) return dn;
       // 兩者都有 → 該日有上/下兩集，本段沒有上/下 → 無法判定，放棄。
+      // ★ 其中一個是錯標來源 → 同樣無法判定（該日期的真實結構不明）→ 放棄。
     }
     return null;
   } catch { return null; }
@@ -7598,6 +7881,12 @@ function _anchorDateOnlySegments(results, targetEpisode) {
   try {
     if (!Array.isArray(results) || results.length < 2) return 0;
     const _dOf = _resDateIntOf;
+    // ★★ v112.2：先建立「跨站日期共識表」★★
+    //   某個日期有幾個站用它當集名日期。
+    //   判錯標時用它當旁證：該資源的 URL 日期有沒有其它站佐證？
+    //   → 有旁證 → 該站的集名日期寫錯了（真錯標）
+    //   → 沒旁證 → 只是上傳延遲 / 批次目錄 → 不動（寧可不抓，不可誤殺）
+    try { _buildCrossSiteDateTable(results); } catch {}
     // ★ 步驟 1：把「顯式集數 + 日期」的組合寫進全域登錄表。
     //   這一步是跨站錨定的關鍵 —— bfzy 的「20260116(第4期下)」= E8 會讓
     //   dytt/lzi/ffzy/1080zyku 的「20260116下」「第20260116期」全被認成 E8。
@@ -7615,6 +7904,13 @@ function _anchorDateOnlySegments(results, targetEpisode) {
         if (dd == null) continue;
         const suf = _resSuffixOf(r);
         const key = _dateEpKeyOf(dd, suf);
+        // ★★ v112：標記「集名日期與 URL 路徑日期不一致」的錯標來源。
+        //   這些鍵不可被無段序段借用（否則先導片會被誤認成第1集）。
+        //   見 _globalDateEpMislabelled 註解。
+        try {
+          if (_resHasMislabelledDate(r)) _globalDateEpMislabelled.add(key);
+          else _globalDateEpMislabelled.delete(key);
+        } catch {}
         if (_globalDateEpAmbiguous.has(key)) continue;
         const cur = _globalDateEpRegistry.get(key);
         if (cur == null) {
@@ -7654,6 +7950,16 @@ function _anchorDateOnlySegments(results, targetEpisode) {
       const dd = _dOf(r);
       if (dd == null) continue;
       if (ambiguous.has(dd)) continue;
+      // ★★ v112：錯標來源（集名日期 ≠ URL 路徑日期）**不建立**日期對照 ★★
+      //   實測《日落時分說愛你》S1：優質資源把第1期上標成「20251222期上」，
+      //   但 m3u8 路徑是 /20251225/ → 它對應的日期其實是 20251225。
+      //   dateToEp 只按「日期」作鍵（同一天的所有段共用一個集數），
+      //   若讓它把 20251222 建成 E1 → 其它站的先導片「20251222」（無段序）
+      //   在步驟 3 也會拿到 E1 → 先導片被認成第1集。
+      //   → 錯標來源不參與「站內日期 → 集數」的對照建立。
+      //     （它自己仍可被認出：帶著明確段序時走 _lookupGlobalDateEp 的
+      //       直接命中路徑，不受此限制。）
+      try { if (_resHasMislabelledDate(r)) continue; } catch {}
       if (dateToEp.has(dd)) {
         if (dateToEp.get(dd) !== lab) { dateToEp.delete(dd); ambiguous.add(dd); }
       } else dateToEp.set(dd, lab);
@@ -7668,6 +7974,8 @@ function _anchorDateOnlySegments(results, targetEpisode) {
           const suf = _resSuffixOf(r);
           const key = _dateEpKeyOf(dd, suf);
           if (_globalDateEpAmbiguous.has(key)) continue;
+          // ★★ v112：錯標來源的鍵不拿來建立對照（見上方說明）。
+          if (_globalDateEpMislabelled.has(key)) continue;
           const m = _globalDateEpRegistry.get(key)
             ?? _globalDateEpRegistry.get(_dateEpKeyOf(dd, null));
           if (m == null) continue;
@@ -7977,6 +8285,10 @@ function filterByEpisode(results, targetEpisode, targetAirDate = null, targetAir
   // ★ 跨站日期锚定：纯日期段（dytt「20260116下」）若与其它站同日期显式集
   //   （bfzy「20260116(第4期下)」= E8）同日，直接认成那一集，后续按显式集过滤。
   try { _anchorDateOnlySegments(results, targetEpisode); } catch {}
+
+  // ★★ v112.3：修正錯標資源的顯示日期 ★★
+  //   判錯標需要「跨站同段序佐證」，那張表在錨定期間才建好 → 必須錨定後才修。
+  try { _fixMislabelledDisplayDates(results); } catch {}
 
   // ★ 全域登錄表補錨：站內完全沒有显式集時（ffzy 整站「第YYYYMMDD期」），
   //   _anchorDateOnlySegments 內部的 dateToEp 會是空的，但全域登錄表裡
@@ -18168,6 +18480,11 @@ targetInfo.searchQuery = aliasQ;
     if (type === 'tv' && allResults.length > 1) {
       // 步驟 1：把「顯式集數 + 日期」寫進全域登錄表（跨站錨定的來源）。
       _anchorDateOnlySegments(allResults, targetEpisode ?? null);
+      // ★★ v112.3：修正錯標資源的顯示日期（判錯標需跨站佐證 → 錨定後才做）
+      //   優質資源《日落時分說愛你》S1 把第1期上寫成「20251222期上」，
+      //   但 m3u8 在 /20251225/ → 顯示時改成「20251225 上」，
+      //   讓 E1 群組裡各站的名稱一致（否則使用者會以為 E1 有兩個日期版本）。
+      try { _fixMislabelledDisplayDates(allResults); } catch {}
       // 步驟 2：用全域登錄表補錨純日期段。
       //   這裡只補「已知集數」的項（_ep 會被 clean 提升成頂層 episode），
       //   補錯比不補更糟：寧可讓純日期段留著由「未知組」剪枝規則處理。
@@ -18235,6 +18552,8 @@ targetInfo.searchQuery = aliasQ;
     //   bfzy 的「20260116(第4期下)」= E8 会让 dytt/ffzy/1080zyku 的
     //   「20260116下」「第20260116期」全被认成 E8。
     try { _anchorDateOnlySegments(allResults, targetEpisode); } catch {}
+    // ★★ v112.3：修正錯標資源的顯示日期（判錯標需跨站佐證 → 錨定後才做）
+    try { _fixMislabelledDisplayDates(allResults); } catch {}
     try {
       if (targetEpisode != null) {
         for (const res of allResults) {
