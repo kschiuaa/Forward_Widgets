@@ -2729,7 +2729,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.0",
+  version: "2.7.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -5210,8 +5210,65 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
         const targetCoreForSub = normalizeTitleForMatch(
           stripSubtitle(targetInfo.baseName).replace(_FINAL_SEASON_MARKER_RE_G, '')
         );
+        //
+        // ★★ v115：target 的序號來自 season 參數時，片名裡沒有數字 ★★
+        //
+        // 問題（實測）：
+        //   使用者在 Forward 選「溏心風暴 第二季」→ seriesName=「溏心風暴」，
+        //   targetInfo.baseName=「溏心風暴」（**沒有「2」**），但
+        //   targetInfo._expectedSequel=2。
+        //   站方的第二季檔名是「溏心风暴2：家好月圆国语」/「溏心风暴2：家好月圆粤语」
+        //   （電影天堂 / 非凡 / 如意 / 優質資源四站都是這個寫法），
+        //   剝掉副標題後的 core 是「溏心风暴2」。
+        //   → candidateCoreForSub（「溏心风暴2」）≠ targetCoreForSub（「溏心风暴」）
+        //   → sameWorkWithSubtitle=false → 被判 spin_off → **第二季在 5 個站
+        //     全部消失**，只剩站名剛好寫「溏心风暴2」的樂子。
+        //
+        // 對照既有案例（這是本條規則原本要放行的）：
+        //   target「海王2」 vs candidate「海王2：失落的王国」
+        //     → target 序號寫在**片名**裡 → targetCoreForSub=「海王2」
+        //     → 與 candidateCoreForSub 一致 → 原本就能放行 ✓
+        //
+        // 差異只在於「序號的來源」：
+        //   - 序號寫在 target 片名裡 → baseName 已含數字 → 現有判準適用
+        //   - 序號由 season= 帶進來 → baseName 不含數字 → 現有判準誤殺
+        //
+        // 修法：target 的片名**不含**自己的序號時（序號只來自 season=），
+        //   把 target 的期望序號補回 core 再比 → 「溏心風暴」+序號2
+        //   → 「溏心风暴2」→ 與 candidate 一致 → 放行。
+        //
+        // ★ 為什麼不直接用 _stripSequelMarkerForCore 剝掉候選的數字？
+        //   因為那會把「溏心风暴3」（第三季）也剝成「溏心风暴」→ 與 target
+        //   一致 → 第三季的片源混進第二季結果。序號必須「補」而不是「剝」。
+        //
+        // ★ 為什麼仍然要求 candidateSequel === targetSequelNorm？
+        //   這是關鍵守門員：序號不一致時（target 要 S2、候選是 S3），
+        //   candidateCoreForSub（「溏心风暴3」）與補上序號的 target core
+        //  （「溏心风暴2」）自然不等 → 擋掉。同時保留原本的序號相等檢查，
+        //   兩道防線並存。
+        //
+        // ★ 為什麼不影響其它作品？
+        //   - target 片名**有**序號（海王2 / 无间道II / 仁醫2）：
+        //     走原本分支，行為逐字相同。
+        //   - target 序號為 null（S1）：targetSequelNorm === null → 走原本分支。
+        //   - target 序號只來自 season= 且候選序號相同：這正是本 bug 情境，
+        //     原本 0 筆 → 修正後才有結果（只會「多」放行正確片源）。
+        //   - target 序號只來自 season= 但候選序號不同：序號檢查擋掉，不變。
+        const _targetOwnSeq = extractSequelNumber(targetInfo.baseName || '');
+        // target 片名有自帶序號（海王2 / 无间道II / 仁醫2）
+        const targetNameHasOwnSequel =
+          targetSequelNorm !== null && _targetOwnSeq !== null && _targetOwnSeq === targetSequelNorm;
+        // target 片名沒有自帶序號（序號純粹由 season= 帶進來）
+        const targetSequelFromSeasonOnly =
+          targetSequelNorm !== null && !targetNameHasOwnSequel;
+        // 把 target 的期望序號補回 core（用阿拉伯數字，與站方寫法一致）
+        const targetCoreWithSequel = targetSequelFromSeasonOnly
+          ? normalizeTitleForMatch(`${targetCoreForSub}${targetSequelNorm}`)
+          : targetCoreForSub;
+
         const sameWorkWithSubtitle =
-          candidateCoreForSub === targetCoreForSub &&
+          (candidateCoreForSub === targetCoreForSub ||
+           candidateCoreForSub === targetCoreWithSequel) &&
           targetSequelNorm !== null && candidateSequel !== null &&
           targetSequelNorm === candidateSequel;
 
