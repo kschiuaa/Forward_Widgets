@@ -497,7 +497,14 @@ function normalizeForMatching(text) {
   // ★ v106：異體字折疊 —— 空結果安全網用字元重疊率比對，
   //   「咒術迴戰」vs「咒術回戰」差一個字會讓重疊率掉到 0.8（剛好過門檻），
   //   折疊後兩邊完全一致 → 0.8 變 1.0，比對更準。
+  //
+  // ★★ v124：全形／半形冒號統一 ★★
+  //   實測 bug：「Re:從零開始的異世界生活 2」（半形 :）的 TMDB 別名是
+  //   「Re：从零开始的异世界生活」（全形 ：）→ 正規化後兩者開頭不同
+  //   → startsWith 判斷失效 → 別名被誤判成「另一部作品」→ 0 筆。
+  //   ★ 只影響「比對」，不影響顯示（顯示走原始字串）。
   return _foldVariants(convertChinese(String(text), true)
+    .replace(/[:：]/g, ':')
     .replace(/\s+/g, ''))
     .toLowerCase();
 }
@@ -1068,12 +1075,29 @@ const TMDB_FALLBACK_MIN_SCORE = 0.10;
  *   ★ 例外：查詢詞的序號是「片名的一部分」而非「續集序號」時不擋。
  *     「請回答1988」的「1988」不是續集序號 → 「请回答」不算另一部。
  *     （_looksLikeSequelMarker 只認真正的序號標記，這點已內建。）
+ *
+ * ★★ v124：型別感知（電影 vs 電視劇）★★
+ *
+ *   上面「查詢詞帶序號、別名沒帶 → 另一部作品」這條規則
+ *   **只適用於電影**。對電視劇／動漫／綜藝，序號是「季」而不是「部」：
+ *     查「Re:從零開始的異世界生活 2」→ TMDB 條目就是「Re：从零开始的异世界生活」
+ *       （TMDB 用**一部條目**涵蓋所有季，季別不寫在片名裡）
+ *       → 別名把「2」拿掉是**正確的** → 若擋掉 → 別名橋接失效 → 0 筆
+ *     查「咒術迴戰 第五季」→ 同理，條目是「咒术回战」
+ *
+ *   電影則相反：每一部續集是**獨立條目**，序號不可丟。
+ *     查「寒戰II」→ 條目「寒战2」→ 別名若變成「寒战」就是第一部 → 必須擋
+ *
+ * @param {'movie'|'tv'|'variety'} [type] 型別（未給則視為 movie，保守起見）
  */
-function _aliasIntroducesDifferentWork(baseName, alias) {
+function _aliasIntroducesDifferentWork(baseName, alias, type) {
   const q = normalizeForMatching(String(baseName || '').trim());
   const a = normalizeForMatching(String(alias || '').trim());
   if (!q || !a) return false;
   if (a === q) return false;
+
+  // ★★ v124：非電影（劇集 / 動漫 / 綜藝）→ 序號是「季」，可以丟 → 不擋。
+  const isMovie = !type || type === 'movie';
 
   // 別名以查詢詞開頭 → 看多出來的那段
   if (a.startsWith(q)) {
@@ -1088,7 +1112,7 @@ function _aliasIntroducesDifferentWork(baseName, alias) {
     // ★★ v123：查詢詞自己帶序號（「寒战II」「沙丘2」）而別名把序號拿掉了
     //   → 別名指向同系列的**前一部** → 是另一部作品 → 必須擋。
     //   舊邏輯這裡兩條路徑都 return false → 閘門形同虛設 → 拿到第一部。
-    if (_looksLikeSequelMarker(extra)) return true;
+    if (isMovie && _looksLikeSequelMarker(extra)) return true;
     return false;
   }
 
@@ -3875,7 +3899,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.0",
+  version: "2.1.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -18442,7 +18466,12 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
     // 判準：把「查詢詞」與「別名」正規化後相比，別名多出來的那一段
     //   若帶續集標記（羅馬數字 / 序號 / 冒號副標題 / 續集前傳用語）
     //   → 這是**另一部作品**，不能當別名用 → 跳過，繼續找下一個。
-    if (_aliasIntroducesDifferentWork(baseName, aTrim)) {
+    //
+    // ★★ v124：把型別傳進去 —— 電影的序號是「部」（不可丟），
+    //   劇集/動漫/綜藝的序號是「季」（可以丟）。
+    //   實測：查「Re:從零開始的異世界生活 2」→ 別名「Re：从零开始的异世界生活」
+    //   （TMDB 一條目涵蓋所有季）→ 對 tv 不能擋 → 否則 0 筆。
+    if (_aliasIntroducesDifferentWork(baseName, aTrim, type)) {
       console.log(`[TMDB-diag] tryExpand: 跳過續集別名 "${aTrim}"（查詢 "${baseName}"）`);
       continue;
     }
@@ -20576,41 +20605,81 @@ async function performBatchSearch(params) {
     if (allResults.length === 0 && Number.isFinite(targetSeason) && targetSeason > 1 && type !== 'movie') {
       try {
         const bareBase = String(targetInfo.searchQuery || targetInfo.baseName || '').trim();
-        const suffixedQ = bareBase ? `${bareBase}${targetSeason}` : '';
+        // ★★ v124：多格式帶季重查 ★★
+        //
+        //   舊版只試「裸名 + 阿拉伯數字」（`咒术回战5`），
+        //   但中文站命名季別的方式很多：
+        //     · 「咒术回战第二季」（中文數字）  ← 最常見
+        //     · 「咒术回战 2」「咒术回战2」（阿拉伯數字 + 可能有空格）
+        //     · 「咒术回战 第5季」
+        //   只試一種 → 大部分站 0 筆 → 使用者看到「明明有這部劇卻搜不到」。
+        //
+        //   ★ 一次把幾種格式並行送給站方（成本相同，因為本來就要重打一次），
+        //     命中任何一種即採用。
+        const cnNum = (() => {
+          const map = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+          const n = Number(targetSeason);
+          if (!Number.isFinite(n) || n < 1) return null;
+          if (n <= 10) return map[n];
+          if (n < 20) return '十' + map[n - 10];
+          if (n < 100) {
+            const t = Math.floor(n / 10), o = n % 10;
+            return map[t] + '十' + (o ? map[o] : '');
+          }
+          return null;
+        })();
+        const sufCandidates = [];
+        const addSuf = (s) => {
+          const t = String(s || '').trim();
+          if (t && !sufCandidates.includes(t)) sufCandidates.push(t);
+        };
+        if (bareBase) {
+          if (cnNum) {
+            addSuf(`${bareBase}第${cnNum}季`);   // 最常見：「咒术回战第二季」
+            addSuf(`${bareBase}${cnNum}季`);     // 少見：「咒术回战二季」
+          }
+          addSuf(`${bareBase} 第${targetSeason}季`); // 「咒术回战 第5季」
+          addSuf(`${bareBase}${targetSeason}`);      // 舊版行為：「咒术回战5」
+          addSuf(`${bareBase} ${targetSeason}`);     // 「咒术回战 5」
+        }
         // 後綴已存在（如裸名尾本來就是數字）就不重查，避免同字串再打一次。
-        if (suffixedQ && suffixedQ !== bareBase) {
-          console.log(`🆘 [fallback] S${targetSeason} 仍 0 筆，用帶季字串重查一次: "${suffixedQ}"`);
+        const usable = sufCandidates.filter(q => q && q !== bareBase);
+        if (usable.length) {
+          console.log(`🆘 [fallback] S${targetSeason} 仍 0 筆，用帶季字串重查: ${usable.map(q => `"${q}"`).join(', ')}`);
           const sufTasks = resourceSites.map(site => async () => {
-            try {
-              const resp = await fetchWithSmartRetry(
-                site.value,
-                { params: { ac: 'detail', wd: suffixedQ } },
-                0, site.title);
-              if (!resp?.list?.length) return [];
-              const eligible = [];
-              for (const it of resp.list) {
-                if (!it?.vod_name) continue;
-                if (/剧场版|劇場版|外传|外傳|总集篇|總集篇|番外|＊|∽/u.test(it.vod_name)) continue;
-                if (isNarrativeCut(it.vod_name, it.vod_remarks)) continue;   // ★ v91 解說版直接篩掉
-                const ci = extractEnhancedInfo(it.vod_name, it);
-                const mr = isSmartSeriesMatch(targetInfo, ci, matchStrictness, { items: resp.list });
-                if (!mr.match) continue;
-                eligible.push({ item: it, matchResult: mr });
-              }
-              if (eligible.length === 0) return [];
-              const sufLimit = CONFIG.MAC?.DETAIL_CONCURRENCY ?? 4;
-              const detailResults = await _adapterPool(
-                eligible.map(({ item: it, matchResult: mr }) => async () =>
-                  await extractPlayInfoForCache(it, site.title, type, mr, targetInfo)
-                ),
-                sufLimit
-              );
-              const out = [];
-              for (const res of detailResults) {
-                if (res) out.push(...res);
-              }
-              return out;
-            } catch { return []; }
+            const perQuery = await Promise.all(usable.map(async (suffixedQ) => {
+              try {
+                const resp = await fetchWithSmartRetry(
+                  site.value,
+                  { params: { ac: 'detail', wd: suffixedQ } },
+                  0, site.title);
+                if (!resp?.list?.length) return [];
+                const eligible = [];
+                for (const it of resp.list) {
+                  if (!it?.vod_name) continue;
+                  if (/剧场版|劇場版|外传|外傳|总集篇|總集篇|番外|＊|∽/u.test(it.vod_name)) continue;
+                  if (isNarrativeCut(it.vod_name, it.vod_remarks)) continue;   // ★ v91 解說版直接篩掉
+                  const ci = extractEnhancedInfo(it.vod_name, it);
+                  const mr = isSmartSeriesMatch(targetInfo, ci, matchStrictness, { items: resp.list });
+                  if (!mr.match) continue;
+                  eligible.push({ item: it, matchResult: mr });
+                }
+                if (eligible.length === 0) return [];
+                const sufLimit = CONFIG.MAC?.DETAIL_CONCURRENCY ?? 4;
+                const detailResults = await _adapterPool(
+                  eligible.map(({ item: it, matchResult: mr }) => async () =>
+                    await extractPlayInfoForCache(it, site.title, type, mr, targetInfo)
+                  ),
+                  sufLimit
+                );
+                const out = [];
+                for (const res of detailResults) {
+                  if (res) out.push(...res);
+                }
+                return out;
+              } catch { return []; }
+            }));
+            return perQuery.flat();
           });
           const sufResults = await Promise.allSettled(sufTasks.map(t => t()));
           const sufFlat = sufResults.filter(r => r.status === 'fulfilled').flatMap(r => r.value || []);
