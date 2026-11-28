@@ -2719,7 +2719,124 @@ const CONFIG = {
     //      ★ 代理對安全性保留（𠀾 不會被切成 \uD840\uDFFE）。
     //   3) 單位測試 221/221 全過、6 站實機 A/B 26 個片名零回歸、
     //      3,221 組繁簡字對收斂率 100%（回歸 0 / 改善 621）。
-    WIDGET_VERSION: 117,
+    //
+    // ★ v118：修「綜藝（type='variety'）多集條目回 0 筆」★
+    //   症狀（實測 2026-11-28）：搜「披荊斬棘」「中國好聲音」「聲生不息」
+    //   等綜藝一律 0 筆，但站方明明有 18~20 筆（電影天堂/暴風/樂子…），
+    //   且比對層已判 exact（confidence 0.95）、進了 eligible 清單。
+    //
+    //   根因（extractPlayInfoForCache 的分支條件寫死 type === 'tv'）：
+    //     if      (type === 'tv'    && isTV) { ...多集... }
+    //     else if (type === 'movie' || (!isTV && !playSource.includes('#'))) { ...單檔... }
+    //     type='variety' + isTV=true（幾乎所有綜藝條目都是多集形狀）：
+    //       分支1 → type!=='tv'                     → false
+    //       分支2 → type!=='movie' 且 !isTV 為 false → false
+    //       → 兩個分支都不進 → 整個 playSource 被跳過 → 0 筆
+    //
+    //   最小重現（_test/diag_variety4.js，同一筆站方資料）：
+    //     type='tv'      → 3 筆 ✅
+    //     type='variety' → 0 筆 ❌
+    //     type='movie'   → 3 筆 ✅
+    //
+    //   修法：多集分支的條件改成 `(type === 'tv' || type === 'variety')`。
+    //     該分支內部對綜藝本來就有專門處理（_macEpNumber 的「第N期上/中/下」
+    //     期號換算、_isVarietyExtraSeg 衍生段判斷、_resolvePeriodToEpisode
+    //     期結構對照表、日期序列推導），設計上就是給 tv 與 variety 共用的。
+    //     ★ 綜藝不能改走電影分支：電影分支只取第一個 m3u8、
+    //       「披荊斬棘第五季」的 147 段會只剩 1 段。
+    //     ★ 單檔綜藝條目（無 '#'）本來就走 `!isTV` 那條 fallback，不受影響。
+    //
+    //   ★ 必須 bump：舊 cache 內的綜藝結果是「0 筆」的髒資料，
+    //     不清的話使用者還是看到空列表。
+    //
+    // ★ v119：修「去重鍵粒度不足 → 合法資源被吃掉」★
+    //
+    //   症狀（實測 2026-11-28）：《披荊斬棘》去重前 341 筆、去重後 272 筆，
+    //   19 筆**可播放的不同節目**被靜靜丟掉，使用者看到「20260821 上」
+    //   只有一個可選來源；《中國好聲音》的「世界巡演澳門首站」與
+    //   「“巅峰之夜”總決賽」兩場特別節目**整節消失**。
+    //
+    //   根因：去重鍵 generateContentKey 的「集數」維度只有三種值 ——
+    //     ep${N}（有集數）/ date:${YYYYMMDD}（有日期）/ 'no-ep'（都沒有）
+    //   而這三種在綜藝都不夠細：
+    //     (a) 同一集槽裡有多個**節目**（一公观演区 / 一公挑战赛 / 一公预热直播
+    //         都對應到 ep3）→ 鍵撞 → 只留一個。
+    //     (b) 同一天的**上/下半段**是不同影片檔（超前企划上 / 超前企划下）
+    //         → date: 鍵撞 → 下一半段被丟。
+    //     (c) 'no-ep' 是**常數** → 同一站所有抽不出集數的資源全部撞成一個鍵
+    //         → 特別節目（特別篇 / 總決賽 / 巡演場次）整批被吃掉。
+    //     (d) 同一站的**多個播放源**（vod_play_url 以 $$$ 分組）在 MacCMS
+    //         TV 分支裡不寫進 description → playSourceKeyOf 全部拿到 'src'
+    //         → 同一集的多個來源互相吃掉（《慶餘年》實測 37 組 / 74 筆）。
+    //
+    //   修法（三處補維度，見 episodeKeyOf / varietySegmentKeyOf /
+    //        playSourceKeyOf）：
+    //     (a)(b) 集數鍵補「綜藝段落識別碼」：取站方原文集名去掉日期後的
+    //         節目標籤（「一公观演区上」「超前企划下」），段序字保留。
+    //     (c) 無集數無日期 → 用「站方原文集名」當識別碼（raw:${原始集名}），
+    //         取代常數 'no-ep'。
+    //     (d) 播放源名存成 _playSourceName 欄位，直接進去重鍵。
+    //
+    //   ★ 效果（實測）：
+    //     《披荊斬棘》撞鍵 18 組 / 37 筆 → **0 組 / 0 筆**，去重零損失。
+    //     《中國好聲音》撞鍵 2 組 / 4 筆 → **0 組 / 0 筆**，
+    //       結果數 70 → **72**（兩場特別節目回來了）。
+    //     《慶餘年》播放源維度 1 → 6 種，同集多源不再互相吃掉。
+    //
+  //   ★ 必須 bump：舊 cache 是用舊鍵去重的結果（已少掉一批資源），
+  //     不清的話使用者還是看到缺資源的舊清單。
+  //
+  // ★ v120：修「同鍵多清晰度 → 留下次佳畫質」★
+  //
+  //   症狀（實測 2026-11-28）：《披荊斬棘 第五季》在 jpyy（金牌影視）
+  //   同一集、同一站、同一播放源有**三筆多清晰度條目**
+  //   （1080P / 720P / 480P，URL 的 V id 不同 → 是三個不同的影片檔）。
+  //   去重鍵完全相同（片名/年份/語言/集數/播放源皆同）→ 只留一筆。
+  //
+  //   根因：v88 把 RESOLUTION_BONUS 從 calculateResourceScore 拿掉
+  //   （因為 resolutionLevel 的來源不統一 → 排序在兩次載入間跳動）。
+  //   那個判斷對「排序」是對的，但**對去重取捨是錯的**：
+  //   分數三者相同 → 排序是 stable → 留哪一筆取決於上游陣列順序。
+  //   實測留下的是 **720P**，1080P 被丟掉 → 使用者拿到次佳畫質。
+  //
+  //   修法（見 smartDeduplicate 的 betterThan）：
+  //   同 contentKey 取捨時，分數相同就看清晰度，取最高。
+  //   ★ **不**改 calculateResourceScore → 排序行為完全不變（v88 的穩定性保留）。
+  //   ★ 分數仍優先於畫質：跨站比較時分數差代表語言/站序/版本等更重要的差異，
+  //     不能被畫質蓋掉（否則粵語 720P 會贏過國語 1080P → 使用者要的粵語不見）。
+  //
+  // ★ v120：補「綜藝期號」識別碼（配合上面，見 varietySegmentKeyOf）
+  //   症狀（實測《聲生不息》）：集號槽位是「期號 → 集號」換算來的，
+  //   而換算表是從**有日期的站**推導的，跟「只有期號的站」對不上 →
+  //   第02期被算成槽位 3 → 跟第03期撞車 → 第03期被整筆吃掉。
+  //   修法：站方原文的「第N期」直接進識別碼（期號比任何換算出的槽位可靠），
+  //   並支援「第01期01」這種「期號 + 段序數字」（實測第01期 = 3 段）。
+  //   效果：《聲生不息》撞鍵 199 筆 → **0 組 / 0 筆**，零損失。
+  //
+  // ★ v121：修「同一路串流被包裝兩次 → 選單出現重複項」★
+  //
+  //   症狀（實測 2026-11-28）：《零之使魔 第四季》暴風資源
+  //   同一集以**兩種形式**出現在結果裡：
+  //     A: https://c1.rrcdnbf4.com/video/lingzhishimoFINAL/第10集/index.m3u8
+  //     B: https://m3u8-adfliter.kschiuaa.com/filter?mode=filter&rewrite=hybrid
+  //        &url=https%3A%2F%2Fc1.rrcdnbf4.com%2Fvideo%2F...%2Findex.m3u8
+  //   兩者指向**同一個 m3u8**，只是 B 被過濾廣告伺服器包了一層。
+  //   使用者在選單裡看到「零之使魔 FINAL」與「零之使魔FINAL」兩筆，
+  //   點下去其實是同一個串流。
+  //
+  //   根因：smartDeduplicate 的 URL 去重鍵直接用 resource.url（字面），
+  //   A 與 B 字面不同 → 兩筆都留下。
+  //
+  //   修法（見 _dedupUrlKey）：URL 去重鍵改用「去包裝 + 去簽名 + 去 query」
+  //   的**內層路徑**（沿用 _stablePlaybackPath）。同一路串流的兩種包裝
+  //   → 同一個鍵 → 只留分數與畫質較好的那一筆。
+  //
+  //   ★ 只影響「URL 完全同源」的情況：不同 CDN、不同集數路徑 → 內層路徑不同
+  //     → 不會被誤合併。站名/版本/語言維度仍由 contentKey 獨立區分。
+  //   ★ 只改「去重鍵」，不動 resource.url 本身 —— 使用者點的仍是原本那一筆。
+  //   ★ 必須 bump：舊 cache 是用舊鍵去重的結果（同一路串流留了兩份），
+  //     不清的話使用者還是看到重複選項。
+  WIDGET_VERSION: 121,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -3056,7 +3173,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.0",
+  version: "3.0.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -3646,6 +3763,51 @@ function toDisplayText(text) {
 }
 
 /**
+ * ★★ v120：片名裡的年份是「版本標記」還是「片名的一部分」？★★
+ *
+ * 問題（實測 2026-11-28）：《請回答1988》
+ *   站方檔名就是「请回答1988」（韓劇），但 deepCleanSeriesName 與
+ *   buildSearchQuery 都把「1988」當年份剝掉 →
+ *     target.baseName = 「請回答」、searchQuery = 「请回答」
+ *   → (a) 送去站方的查詢字串缺了年份 → 站方回「请回答1997」「请回答1994」
+ *        「请回答1988之野鸡变凤凰」… → 真正的那部根本沒被查
+ *     → (b) 就算「请回答1988」被比對到，因為**雙方**的年份都被剝掉，
+ *        「请回答1997」跟「請回答1988」比對結果是 sim=1.00 exact
+ *        → **另一部作品被當成完全命中**
+ *
+ * ★ 判準：年份前若是**文字**（中英數字皆算）→ 年份是片名的一部分
+ *   （「請回答1988」「螢火蟲之墓1988」「銀翼殺手2099」）；
+ *   年份前若是**空白／開頭**或年份被括號包住 → 年份是版本標記
+ *   （「仁醫 2009」「仁醫（2009）」「追龍2017」）。
+ *
+ *   ★ 為什麼「銀翼殺手2099」也算片名的一部分：
+ *   它跟「銀翼殺手」（1982）對比是**另一部作品**（續作），
+ *   而且站方確實有「银翼杀手2099」這個檔名 → 剝掉會搜不到。
+ *
+ * @param {string} name 原始片名
+ * @returns {number|null} 片名**內嵌**的年份；不是內嵌則回 null
+ */
+function _embeddedTitleYear(name) {
+  const s = String(name ?? '');
+  if (!s) return null;
+  // ★ 逐個找出所有年份，並看它前面是不是文字。
+  //   （只抓第一個年份不夠：「銀翼殺手1982 重製版」之類的情況要能分辨。）
+  const re = /(?:19|20)\d{2}/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const before = s.slice(0, m.index);
+    const after = s.slice(m.index + m[0].length);
+    // 年份被括號包住 → 版本標記（「仁醫（2009）」）
+    if (/[（(【\[]\s*$/.test(before) && /^\s*[）)】\]]/.test(after)) continue;
+    // 年份前面是文字 → 片名的一部分
+    if (/[\p{L}\p{N}]/u.test(before.slice(-1))) return parseInt(m[0], 10);
+    // 年份後面緊接文字（「1988年」不算，但「1988MHz」算）—— 保守視為片名一部分
+    if (/^[\p{L}]/u.test(after)) return parseInt(m[0], 10);
+  }
+  return null;
+}
+
+/**
  * 把 Widget.http 的回應正規化成可直接取用 list 的物件。
  * 需處理三種情況：
  *   1. data 已是物件
@@ -3699,7 +3861,22 @@ function deepCleanSeriesName(name) {
     cleaned = cleaned.replace(pattern, '');
   });
 
-  cleaned = cleaned.replace(/\s*(?:19|20)\d{2}\s*/g, ' ');
+  // ★★ v120：年份要不要剝，必須看它是「版本標記」還是「片名的一部分」★★
+  //
+  // 舊版無條件剝掉任何 4 位年份 → 《請回答1988》被剝成「請回答」。
+  // 後果（實測 2026-11-28）：
+  //   (a) 送去站方的查詢字串缺年份 → 站方回「请回答1997」「请回答1994」
+  //       「请回答1988之野鸡变凤凰」… → 真正的那部根本沒被查到 → 0 筆。
+  //   (b) 更糟：比對時**雙方**年份都被剝掉 → 「请回答1997」跟
+  //       「請回答1988」算出 sim=1.00 exact → **另一部作品被當成完全命中**。
+  //
+  // ★ 判準見 _embeddedTitleYear：年份前是文字 → 是片名的一部分 → **不剝**。
+  //   「請回答1988」「銀翼殺手2099」保留；
+  //   「仁醫 2009」「仁醫（2009）」「追龍2017」照舊剝（那是版本標記）。
+  const _embedYear = _embeddedTitleYear(cleaned);
+  if (_embedYear == null) {
+    cleaned = cleaned.replace(/\s*(?:19|20)\d{2}\s*/g, ' ');
+  }
   cleaned = cleaned.replace(/第\d+[集话]/g, '');
   cleaned = cleaned.replace(/[\.\-\s]+$/g, '');
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
@@ -5469,6 +5646,32 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     }
   }
 
+  // ★★ v120：雙方的「片名內嵌年份」不同 → 必定是不同作品 ★★
+  //
+  // 實測（2026-11-28）《請回答》系列：
+  //   target「請回答1988」vs candidate「请回答1987」
+  //   → 只差一個數字 → 相似度 0.83 → 過了 SIMILARITY_LOOSE(0.75)
+  //   → 以 loose(70) 命中 → **另一部作品混進結果**。
+  //
+  // ★ 為什麼字面相似度救不了：「請回答1988」與「请回答1987」字元集
+  //   幾乎完全相同（相似度 > 0.8），但它們是**兩部不同的劇**。
+  //   → 年份是唯一能分辨的訊號，必須當硬性條件。
+  //
+  // ★ 只在「雙方都有內嵌年份」時才啟用：
+  //   「請回答1988」vs「請回答1994」→ 擋 ✓（兩部不同的劇）
+  //   「仁醫2009」vs「仁医」        → 不擋（對方沒年份 → 由版本機制處理）
+  const _tEmbedYear = _embeddedTitleYear(targetInfo.rawName || '');
+  const _cEmbedYear = _embeddedTitleYear(candidateInfo.rawName || '');
+  if (_tEmbedYear != null && _cEmbedYear != null && _tEmbedYear !== _cEmbedYear) {
+    return {
+      match: false, type: 'title_year_conflict', score: 0,
+      similarity, seasonMatch: false,
+      targetYear: _tEmbedYear, candidateYear: _cEmbedYear,
+      candidateRaw: candidateInfo.rawName,
+      confidence: 0
+    };
+  }
+
   let thresholds = CONFIG.MATCH_THRESHOLDS;
   if (matchStrictness === 'strict') {
     thresholds = { 
@@ -5750,12 +5953,150 @@ function episodeLabelOf(resource) {
 /**
  * 去重用的集數標識。抽不出集數的來源（綜藝日期集、單集電影）給一個穩定的
  * 佔位值，讓它們彼此仍可去重，但永遠不會跟有集數的來源互相合併。
+ *
+ * ★★ v119：補「綜藝段落識別碼」★★
+ *
+ * 問題（實測《披荊斬棘》variety 搜尋）：
+ *   原本的鍵只有「集數槽」或「日期」兩個粒度，但綜藝的**同一集槽裡
+ *   有多個不同節目**，且**同一天的上下半段是不同影片檔**：
+ *     「20260809超前企划上」/「20260809超前企划下」 → 都沒集數
+ *        → 鍵都是 date:20260809 → 後到者被丟（19 筆實測損失）
+ *     「20260821一公观演区上」/「20260821一公挑战赛上」/「20260821一公预热直播上」
+ *        → 都對應到同一個集數槽 ep3
+ *        → 鍵都是 ep3 → 三個不同節目只留一個
+ *
+ *   後果：使用者在選源面板看到「20260821 上」只有一個可選來源，
+ *   點下去才知道少了一個節目；日期型更是上/下段被吃掉一半。
+ *
+ * 解法：在集數鍵後面補一段**段落識別碼**。
+ *   識別碼來源（依可靠度）：
+ *     (1) 站方原文集名去掉日期後剩下的「節目段標籤」
+ *         （「一公观演区上」「舞台纯享版」「超前企划下」…）
+ *     (2) 段落序（上/中/下）—— 從原文抓
+ *     (3) 抓不到 → 不補（維持舊鍵，避免把不同站的同一集拆開）
+ *
+ * ★ 只在**同一站內**需要區分：站名本來就在去重鍵裡，所以補識別碼
+ *   不會把「同集不同站」拆成兩筆（那是使用者想要的選源）。
+ *
+ * ★ 為什麼不用 _rawEpName 全文當識別碼：
+ *   同一集在不同站的原文寫法不同（「20260821一公观演区上」vs
+ *   「20260821(第4期上)」），用全文會讓**同一集**在跨站比對時撞成不同鍵
+ *   → 去重失效，每站都留一份（使用者看到一堆重複的同名集）。
+ *   只取「日期以外的節目標籤」能跨站對上。
  */
 function episodeKeyOf(resource) {
   const label = episodeLabelOf(resource);
-  if (label !== null && label !== undefined) return `ep${label}`;
-  if (resource?._episodeDate) return `date:${resource._episodeDate}`;
+  const segKey = varietySegmentKeyOf(resource);
+  const suffix = segKey ? `#${segKey}` : '';
+  if (label !== null && label !== undefined) return `ep${label}${suffix}`;
+  if (resource?._episodeDate) return `date:${resource._episodeDate}${suffix}`;
+  // ★★ v119：無集數、無日期 → 用「站方原文集名」當識別碼 ★★
+  //
+  // 舊版回 'no-ep'，那是一個**常數**：同一站所有抽不出集數的資源
+  // 全部撞成同一個鍵 → 後到的全被丟。實測《中國好聲音》：
+  //   非凡資源「“巅峰之夜”总决赛」與「世界巡演澳门首站」
+  //     → 鍵都是 非凡資源|2012|x|no-ep|src
+  //     → 「世界巡演澳門首站」被整筆吃掉（暴風資源同樣，整節消失）
+  //   使用者看到的選源清單裡**完全沒有這兩場特別節目**。
+  //
+  // ★ 為什麼用原文集名：那是站方對這一集的唯一稱呼（「世界巡演澳门首站」
+  //   「“巅峰之夜”总决赛」），同一站不可能有兩個同名同集數的條目
+  //   （與 _rawName 在 versionKey 的用法同一道理）。
+  //
+  // ★ 跨站一致性：不同站的同一特別節目通常同名 → 鍵相同 → 跨站仍能對上；
+  //   不同名時退化成不同鍵 → 該集在兩站各留一份（使用者看到兩個來源，
+  //   比被吃掉一個好）。
+  const rawEp = String(resource?._rawEpName ?? '').trim();
+  if (rawEp) return `raw:${rawEp}${suffix}`;
+  const descEp = String(_resEpIdentityText(resource) ?? '').trim();
+  if (descEp) return `raw:${descEp}${suffix}`;
+
+  // 真的什麼都沒有 → 才用佔位值（此時同站同年的資源本就無法區分，
+  // 維持舊行為，不製造新的差異）。
   return 'no-ep';
+}
+
+/**
+ * 綜藝段落識別碼：把「同一集槽裡的不同節目」與「同一天的上下段」分開。
+ *
+ * ★ 回傳 null 表示「抓不到識別碼」→ 呼叫端維持舊鍵（不拆開）。
+ *
+ * 抓取順序：
+ *   (1) 站方原文集名裡的**節目段標籤**（去掉日期、去掉段序字後剩下的字）
+ *   (2) 只有段序（上/中/下）時，用段序當識別碼
+ *
+ * 例：
+ *   「20260821一公观演区上」 → 「一公观演区上」 → 一公观演区
+ *   「20260809超前企划下」   → 「超前企划下」   → 超前企划
+ *   「20260816舞台纯享版」   → 「舞台纯享版」   → 舞台纯享版
+ *
+ * ★ 跨站一致性：不同站的同一節目原文寫法通常一致（都是站方抄來的節目名），
+ *   所以識別碼能跨站對上；真正不一致時退化成不同識別碼 → 該集在兩站各留一份
+ *   （使用者看到兩個來源，而不是被吃掉一個）。
+ */
+function varietySegmentKeyOf(resource) {
+  try {
+    const raw = String(_resEpIdentityText(resource) ?? '').trim();
+    if (!raw) return null;
+
+    // ★ 段序（上/中/下）必須**保留**：同一天的「超前企划上」與「超前企划下」
+    //   是兩個不同的影片檔，若把段序字剝掉兩者會撞成同一鍵（實測仍剩 1 組）。
+    //   所以先抓段序，再剝掉段序字取節目標籤，最後把段序接回去。
+    const seg = _resSuffixOf(resource);
+
+    // ★★ v119：站方原文的**期號**是最可靠的識別碼 ★★
+    //
+    // 問題（實測《聲生不息》）：集號槽位是「期號 → 集號」換算來的，
+    // 而換算表是從**有日期的站**（如意/樂子/優質，日期型）推導的，
+    // 跟「只有期號的站」（非凡/暴風，「第01期」「第02期」…）對不上：
+    //   第01期 = 3 段（第01期01/02/03）→ 占槽位 1~3
+    //   第02期 → 槽位 4、第03期 → 槽位 5
+    //   但換算表只認得「第01期」有 3 段、其餘期各 1 段時，
+    //   跨站合併後第02期被算成槽位 3 → 跟第03期撞車
+    //   → 去重時第03期被整筆吃掉（使用者少了整整一期）。
+    //
+    // 解法：期號直接進識別碼。原文寫「第N期」時，N 本身就是
+    // 「這是第幾期」的唯一權威依據，比任何換算出的槽位都可靠。
+    // ★ 跨站一致性：不同站的同一期通常都寫「第N期」→ 識別碼一致；
+    //   一個寫「第02期」、另一個寫「20220424」時會分裂成兩筆
+    //   （使用者看到兩個來源，比被吃掉一個好）。
+    const pm = raw.match(/第\s*0*(\d{1,4})\s*期/);
+    if (pm) {
+      const pNo = parseInt(pm[1], 10);
+      if (Number.isFinite(pNo) && pNo >= 1 && pNo < 1000 && !_isDateNumberStr(pm[1])) {
+        // ★ 期號後面**還可以再跟一段序數字**：「第01期01」「第01期02」
+        //   → 同一期的 3 個不同影片檔（實測《聲生不息》第01期 = 3 段）。
+        //   → 只抓「第N期」會把它們壓成同一鍵 → 3 段吃掉 2 段。
+        //   → 期號 + 段序數字一起進識別碼。
+        const sub = raw.slice(pm.index + pm[0].length).match(/^\s*0*(\d{1,3})/);
+        const subNo = sub ? parseInt(sub[1], 10) : null;
+        if (subNo !== null && Number.isFinite(subNo) && subNo >= 1 && subNo <= 99) {
+          return `P${pNo}.${subNo}${seg ? seg : ''}`;
+        }
+        // 期號 + 段序（「第2期上」「第2期下」是不同段）
+        return `P${pNo}${seg ? seg : ''}`;
+      }
+    }
+
+    // 先把日期殼去掉：「20260821」「第20260821期」「20260821(第4期上)」
+    let s = raw.replace(/(?:19|20)\d{6}/g, '');
+    // 再去掉期號殼「第N期」／「(第4期)」／「第4期上」
+    s = s.replace(/第\s*\d+\s*期/g, '');
+    // 去掉括號殼與常見雜訊
+    s = s.replace(/[()（）\[\]【】]/g, '');
+    // ★ 段序字先記下來、暫時不剝（下方統一處理）
+    s = s.replace(/[\s\-—_.、,，·・:：]/g, '');
+
+    if (s) {
+      // 節目標籤本身含段序（「超前企划上」）→ 原樣即可區分
+      return s;
+    }
+    // 只剩段序（「20260809上」）：段序本身就是識別碼
+    if (seg) return seg;
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -5764,6 +6105,14 @@ function episodeKeyOf(resource) {
  * [xxx] 括號中。
  */
 function playSourceKeyOf(resource) {
+  // ★ v119：優先用站方播放源名（_playSourceName）。
+  //   MacCMS 的 vod_play_url 以 $$$ 分成多組播放源、vod_play_from 平行對應，
+  //   同一集在每組各有一條資源（不同 CDN、不同 URL）。使用者要的是
+  //   「能挑來源」，所以來源名必須是去重鍵的獨立維度。
+  //   舊版只能從 description 的方括號找來源名，但 MacCMS TV 分支的
+  //   description 不寫來源名 → 所有來源都拿到 'src' → 同集多源互相吃掉
+  //   （實測《慶餘年》暴風資源 37 組被丟）。
+  if (resource?._playSourceName) return String(resource._playSourceName);
   // 必須取最後一個括號。描述尾端依序是「畫質」與「版本標註」兩個方括號
   // （「仁醫 - 第01集 - 已完結 - [wjm3u8] [2012 · 韓國]」），來源名在中間。
   const all = String(resource?.description || '').match(/\[([^\]]+)\]/g);
@@ -10131,7 +10480,44 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
     const sourceName = sourceNames[i] || '預設源';
     const isTV = playSource.includes('#');
 
-    if (type === 'tv' && isTV) {
+    // ★★★ v113：variety 也必須走「多集」分支 ★★★
+    //
+    // 症狀（實測 2026-11-28）：搜「披荊斬棘」（type='variety'）回 0 筆，
+    // 但站方明明有 18 筆（電影天堂/暴風/樂子…），且比對層已判 exact（confidence 0.95）。
+    //
+    // 根因（分支條件寫死 type === 'tv'）：
+    //   if      (type === 'tv'    && isTV) { ...多集... }
+    //   else if (type === 'movie' || (!isTV && !playSource.includes('#'))) { ...單檔... }
+    //
+    //   type='variety' + isTV=true（站方多集條目，幾乎所有綜藝都是這個形狀）：
+    //     分支1 → type!=='tv'                          → false
+    //     分支2 → type!=='movie' 且 !isTV 為 false      → false
+    //     → **兩個分支都不進 → 整個 playSource 被跳過 → 0 筆**
+    //
+    // 最小重現（_test/diag_variety4.js，同一筆站方資料）：
+    //   type='tv'      → 3 筆 ✅
+    //   type='variety' → 0 筆 ❌
+    //   type='movie'   → 3 筆 ✅
+    //
+    // ★ 為什麼直接讓 variety 走多集分支是安全的 ★
+    //   綜藝的集名是「第N期上/中/下」「20250806」這類，**正是**多集分支
+    //   裡 _macEpNumber / _isVarietyExtraSeg / _resolvePeriodToEpisode
+    //   這套「期號 ↔ 集號」換算邏輯要處理的形式。該分支內部對綜藝
+    //   有專門處理（_isVariety flag、期結構對照表、日期序列推導），
+    //   設計上就是給 type='tv' 與 type='variety' 共用的。
+    //
+    //   反過來說：綜藝**不可能**是電影分支的正確去處 —— 電影分支只取
+    //   第一個 m3u8、其餘版本全丟（見下方 movie 分支註解），
+    //   那會讓「披荊斬棘第五季」的 147 段只剩 1 段。
+    //
+    // ★ 為什麼之前沒被發現 ★
+    //   綜藝在別的層就被擋掉了（isSmartSeriesMatch 的 season_conflict：
+    //   站方「披荆斩棘第五季」的 seasonNumber=5 vs target S1），
+    //   所以「披荊斬棘」這種**不帶季別**的查詢才會暴露此 bug ——
+    //   而那正是使用者最常見的搜尋方式。
+    const _isMultiEpisodeType = (type === 'tv' || type === 'variety');
+
+    if (_isMultiEpisodeType && isTV) {
       const episodes = playSource.split('#').filter(Boolean);
       // ★ 站方推導「期號 → 集號」對照（沒有 TMDb Key 也能對準）。
       //   集名裡帶「第N期上/中/下」時，數一數各期有幾段 → 累計出
@@ -10451,6 +10837,16 @@ async function extractPlayInfoForCache(item, siteTitle, type, matchInfo, targetI
             _area: itemArea,
             // 站方原始片名，去重要用它分辨「同名但不同版本」。
             _rawName: vod_name,
+            // ★★ v119：站方播放源名（vod_play_from 的對應段）★★
+            //   同一站常有多個播放源（vod_play_url 以 $$$ 分組、
+            //   vod_play_from 以 $$$ 平行對應）。同一集在兩個源各有一條
+            //   資源（不同 CDN、不同 URL），使用者要的是「能挑來源」。
+            //   舊版 playSourceKeyOf 從 description 的方括號找來源名，
+            //   但 MacCMS TV 分支的 description **從來不寫來源名**
+            //   → 兩條資源的鍵完全相同 → 後到者被丟（實測《慶餘年》
+            //   暴風資源 37 組 / 74 筆被吃掉）。
+            //   → 來源名直接存成欄位，讓去重鍵能分辨。
+            _playSourceName: sourceName,
             // 所屬 VOD item 推論出的季別（sequel 序號）。
             // loadDetail 內會用這個欄位把來自多季的資源分組到正確的 season。
             // 不寫進 finalResults（fieldsToDelete 會清掉）以免影響排序邏輯。
@@ -13132,8 +13528,29 @@ async function fetchWithSmartRetry(url, params, retries, siteTitle) {
         return normalized;
       }
 
-        // 仍為空：去掉 t 分類參數再試一次，涵蓋分類 ID 不同的站台
-        if (searchParams.params.t !== undefined) {
+      // ★★ v120：查詢字串帶著「片名內嵌年份」但站方回 0 筆 → 剝掉年份再試 ★★
+      //   （理由與 SmartSearchExecutor.fetchWithSmartRetry 的同名回退相同：
+      //     「年份是版本標記」還是「片名的一部分」因片而異，
+      //     「請回答1988」站方檔名帶年份、「仁醫2009」站方檔名不帶。）
+      //   只在原本就帶內嵌年份時才走 → 一般查詢零額外請求。
+      const _kw = String(params?.params?.wd ?? '');
+      if (_embeddedTitleYear(_kw) != null) {
+        const _strippedKw = _kw.replace(/(?:19|20)\d{2}/, '').trim();
+        if (_strippedKw && _strippedKw !== _kw) {
+          const _p2 = { ...params, params: { ...params.params, wd: _strippedKw } };
+          delete _p2.params.t;
+          delete _p2.params.y;
+          const r2 = await httpGetApi(url, _p2.params);
+          const fb2 = normalizeHttpResponse(r2);
+          if (fb2?.list && fb2.list.length > 0) {
+            console.log(`🔁 ${siteTitle || url}: 「${_kw}」0 筆，改用「${_strippedKw}」重試 → ${fb2.list.length} 筆`);
+            return fb2;
+          }
+        }
+      }
+
+      // 仍為空：去掉 t 分類參數再試一次，涵蓋分類 ID 不同的站台
+      if (searchParams.params.t !== undefined) {
           delete searchParams.params.t;
           const fallbackResponse = await httpGetApi(url, searchParams.params);
           const fallback = normalizeHttpResponse(fallbackResponse);
@@ -14481,6 +14898,37 @@ class SmartSearchExecutor {
           return normalized;
         }
 
+        // ★★ v120：查詢字串裡帶著「片名內嵌的年份」但站方回 0 筆時，
+        //   改用「剝掉該年份」的查詢字串再試一次。
+        //
+        // 背景（實測 2026-11-28）：
+        //   《請回答1988》→ 查詢字串「请回答1988」→ 站方**有**這個檔名 → 命中 ✓
+        //   《仁醫2009》  → 查詢字串「仁医2009」→ 站方檔名是「仁医」（沒有年份）
+        //                  → 站方回 0 筆 → 使用者看不到《仁醫》→ ✗
+        //
+        //   「年份是版本標記」還是「片名的一部分」**因片而異**，
+        //   沒有辦法事先判斷（實測「追龍2017」站方檔名就帶年份、
+        //   「仁醫」站方檔名就不帶）。
+        //   → 兩種都試：先試帶年份的（命中就停），沒命中再試剝掉年份的。
+        //
+        // ★ 只在「原本就帶內嵌年份」時才走這條回退 → 一般查詢零額外請求。
+        // ★ 回退查詢**不帶 y 參數**：那個參數是給站方做版本過濾用的，
+        //   已經由 matchesTargetVersion 在結果階段處理。
+        if (_embeddedTitleYear(keyword) != null) {
+          const _strippedKw = String(keyword).replace(/(?:19|20)\d{2}/, '').trim();
+          if (_strippedKw && _strippedKw !== keyword) {
+            const _p2 = { ...params, wd: _strippedKw };
+            if (_p2.t !== undefined) delete _p2.t;
+            if (_p2.y !== undefined) delete _p2.y;
+            const retry2 = await httpGetApi(site.value, _p2);
+            const fb2 = normalizeHttpResponse(retry2);
+            if (fb2?.list && fb2.list.length > 0) {
+              console.log(`🔁 ${site.title}: 「${keyword}」0 筆，改用「${_strippedKw}」重試 → ${fb2.list.length} 筆`);
+              return fb2;
+            }
+          }
+        }
+
         // 結果為空時改用不帶 t 的請求再試一次
         if (params.t !== undefined) {
           delete params.t;
@@ -14533,6 +14981,11 @@ class SmartSearchExecutor {
   // 候選沒有年份就放行 —— 無法判斷不等於是錯的版本。
   matchesTargetVersion(resource) {
     if (!this.targetInfo.year) return true;
+    // ★★ v120：片名**內嵌**的年份不是發行年份 ★★
+    //   《請回答1988》是韓劇（2015 首播），片名裡的 1988 是片名的一部分。
+    //   拿 1988 去比 vod_year（2015）→ 每一筆都被殺 → 0 筆。
+    //   → 內嵌年份時不做事後版本硬過濾（理由見 filterByTargetVersion）。
+    if (_embeddedTitleYear(this.targetInfo.rawName || '') != null) return true;
     const candYear = resource._year;
     if (!candYear) return true;
     return String(candYear) === String(this.targetInfo.year);
@@ -14699,10 +15152,27 @@ class SmartSearchExecutor {
     //   抽不到語言標記時回 'x'，維持既有行為 —— 沒有語言維度的站
     //   （幾乎所有 MacCMS 站）不會因為多了一個鍵而被拆開。
     const versionKey = resource._year || resource._rawName || 'x';
+    // ★★ v119：同年但**不同版本**的條目也要分開 ★★
+    //   實測《聲生不息》：電影天堂同時有「声生不息」與
+    //   「声生不息 舞台纯享版」兩個條目，_year 同為 2022、
+    //   集數（第二期）與播放源（dyttm3u8）也相同 →
+    //   versionKey 取 _year 就撞成同一個鍵 → 精簡版被整批吃掉。
+    //
+    //   ★ 為什麼同年還要再看原始片名：
+    //   「同一個站不可能有兩個同名同集數的片子」是原本的前提，但
+    //   站方確實會把**同一節目的不同剪輯版本**存成兩條條目
+    //   （正片 / 純享版 / 舞台版），兩者年份必然相同。
+    //   使用者要的是「能挑版本」，被吃掉的那一版就看不到了。
+    //
+    //   ★ 只在「原始片名與顯示片名不同」時才補，避免把
+    //   同一個條目的兩筆資源（不同 CDN）誤拆成兩筆。
+    const rawNameK = resource._rawName ? String(resource._rawName) : '';
+    const dispNameK = String(resource.name || '');
+    const versionK2 = rawNameK && rawNameK !== dispNameK ? `${versionKey}~${rawNameK}` : versionKey;
     const langKey = extractLanguageTag(resource._rawName || resource._versionLabel) || 'x';
     return [
       resource.name,
-      versionKey,
+      versionK2,
       langKey,
       episodeKeyOf(resource),
       playSourceKeyOf(resource)
@@ -14746,19 +15216,55 @@ class SmartSearchExecutor {
       return scoreCache.get(r);
     };
 
+    // ★★ v120：清晰度只當「同鍵取捨」的 tiebreak，不進排序分數 ★★
+    //
+    // 背景：v88 把 RESOLUTION_BONUS 從 calculateResourceScore 拿掉，
+    //   原因是 resolutionLevel 的來源不統一（金牌影視有站方標註、
+    //   MacCMS 站抽不到畫質字眼）→ 同一集的排序在兩次載入間跳動。
+    //   這個判斷對「排序」是對的，但**對去重取捨是錯的**。
+    //
+    // 實測《披荊斬棘 第五季》jpyy（金牌影視）：
+    //   同一集、同一站、同一來源的三筆多清晰度條目
+    //   （1080P / 720P / 480P，URL 的 V id 不同 → 是三個不同的影片檔）
+    //   → 去重鍵完全相同 → 只留一筆。
+    //   ★ 但分數三者相同（畫質不計分）→ 排序是 stable → **留哪一筆
+    //     取決於上游陣列順序**。實測留下的是 **720P**，
+    //     1080P 被丟掉 → 使用者拿到的是**次佳畫質**。
+    //
+    // 解法：同 contentKey 取捨時，分數相同就看清晰度，取最高。
+    //   ★ 不改 calculateResourceScore → 排序行為完全不變（v88 的穩定性保留）。
+    //   ★ 排序因為 stable，分數相同時順序不變 → 但**去重**這一步
+    //     會把低畫質那筆替換成高畫質那筆。
+    const resLevelOf = (r) => {
+      const v = Number(r?.resolutionLevel);
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    };
+    // ★ 比較兩筆：分數高的勝；同分則清晰度高的勝。
+    //   ★ 分數優先：跨站比較時分數差異代表語言/站序/版本等**更重要**的差異，
+    //     不能被畫質蓋掉（否則粵語 720P 會贏過國語 1080P → 使用者要的粵語不見了）。
+    const betterThan = (a, b) => {
+      const sa = scoreOf(a), sb = scoreOf(b);
+      if (sa !== sb) return sa > sb;
+      return resLevelOf(a) > resLevelOf(b);
+    };
+
     results.sort((a, b) => scoreOf(b) - scoreOf(a));
     
     for (const resource of results) {
       const url = resource.url;
-      
-      if (urlMap.has(url)) {
-        const existing = urlMap.get(url);
-        if (scoreOf(resource) > scoreOf(existing)) {
+      // ★★ v121：去重鍵用「去包裝、去簽名的內層路徑」 ★★
+      //   同一路串流被過濾廣告伺服器包過與沒包過 → 同一個鍵 → 只留一筆。
+      //   （實測《零之使魔 第四季》會同時出現裸 CDN 與 /filter?url= 兩種形式）
+      const urlKey = _dedupUrlKey(url);
+
+      if (urlMap.has(urlKey)) {
+        const existing = urlMap.get(urlKey);
+        if (betterThan(resource, existing)) {
           const index = uniqueResults.indexOf(existing);
           if (index > -1) {
             uniqueResults.splice(index, 1);
           }
-          urlMap.set(url, resource);
+          urlMap.set(urlKey, resource);
           uniqueResults.push(resource);
         }
         continue;
@@ -14770,12 +15276,20 @@ class SmartSearchExecutor {
       // 複雜度由 O(n²) 降為 O(n)。
       const existingByContent = contentMap.get(contentKey);
       if (existingByContent !== undefined) {
-        // 同鍵已存在即重複；因上游已按分數降序排列，後到者分數必然 ≤ 先到者，
-        // 保留原「高分留、低分丟」語義，不做任何替換（與原行為一致）。
+        // 同鍵已存在即重複；原本「高分留、低分丟」。
+        // ★ v120：同分時改比清晰度，把低畫質那筆換成高畫質那筆。
+        //   （否則實測會留下 720P、丟掉 1080P）
+        if (betterThan(resource, existingByContent)) {
+          const index = uniqueResults.indexOf(existingByContent);
+          if (index > -1) uniqueResults.splice(index, 1);
+          urlMap.set(urlKey, resource);
+          contentMap.set(contentKey, resource);
+          uniqueResults.push(resource);
+        }
         continue;
       }
 
-      urlMap.set(url, resource);
+      urlMap.set(urlKey, resource);
       contentMap.set(contentKey, resource);
       uniqueResults.push(resource);
     }
@@ -14837,6 +15351,42 @@ function _stablePlaybackPath(url) {
   if (!inner) return '';
   const cut = inner.split(/[?#]/)[0].trim();
   return cut;
+}
+
+/**
+ * ★★ v121：去重用的 URL 鍵（把「同一路串流的不同包裝」收斂成同一筆）★★
+ *
+ * 背景（實測《零之使魔 第四季》暴風資源）：
+ *   同一集會以**兩種形式**出現在結果裡：
+ *     A: https://c1.rrcdnbf4.com/video/lingzhishimoFINAL/第10集/index.m3u8
+ *     B: https://m3u8-adfliter.kschiuaa.com/filter?mode=filter&rewrite=hybrid
+ *        &url=https%3A%2F%2Fc1.rrcdnbf4.com%2Fvideo%2FlingzhishimoFINAL%2F第10集%2Findex.m3u8
+ *   兩者指向**同一個 m3u8**，差別只在 B 被過濾廣告伺服器包了一層。
+ *
+ * 舊的去重鍵直接用 resource.url → A 與 B 字面不同 → 兩筆都留下
+ *   → 使用者在選單裡看到「零之使魔 FINAL」與「零之使魔FINAL」兩筆，
+ *     點下去其實是同一個串流 → 選項重複、看起來像站方多給了一份。
+ *
+ * 解法：去重鍵改用「去包裝 + 去簽名 + 去 query」的內層路徑
+ *   （_stablePlaybackPath）。同站/同語言/同集數/同源的兩種包裝
+ *   → 同一個鍵 → 只留分數與畫質較好的那一筆。
+ *
+ * ★ 為什麼安全（不會誤殺合法來源）：
+ *   1. 只影響「同一路串流」——內層路徑完全相同才會撞鍵。
+ *      不同 CDN、不同集數路徑 → 內層路徑不同 → 不會被合併。
+ *   2. 不同站/不同語言/不同版本仍由 contentKey（站名+版本+語言+集數+源）
+ *      獨立區分 —— 這裡只處理「URL 完全同源」的情況。
+ *   3. 沒有 url= 參數的普通 URL 原樣回傳，行為完全不變。
+ *
+ * ★ 保留原始 url：只影響「去重鍵」，不動 resource.url 本身，
+ *   使用者點的仍然是原本那一筆（可能是包裝過、可過濾廣告的那筆）。
+ */
+function _dedupUrlKey(url) {
+  const raw = String(url || '');
+  if (!raw) return '';
+  const path = _stablePlaybackPath(raw);
+  // 內層路徑拿不到（裸 token / 非 http）→ 原樣當鍵，維持舊行為。
+  return path || raw;
 }
 
 function _stableSourceId(resource, clean) {
@@ -15004,6 +15554,8 @@ function cleanResourceForOutput(resource, type = 'tv', context = {}) {
     // ★ 站方原始集名（判定用）。顯示層已用乾淨版 description，
     //   這份原文只供下游判定，不該送到客戶端。
     '_rawEpName',
+    // ★ 站方播放源名（v119）。去重鍵用，不該送到客戶端。
+    '_playSourceName',
     // ★ 剪輯版本標記（v84，內部欄位，供 _versionTierOf 排序用）。
     '_versionTag',
     // ★ adapter 內部除錯欄位（v87）。不該送到客戶端。
@@ -16481,6 +17033,8 @@ targetInfo.searchQuery = aliasQ;
     '_s4FallbackBoost', '_seasonFromItem',
     // ★ 剪輯版本標記（v84，內部欄位）。排序用完即可刪，不送到客戶端。
     '_versionTag',
+    // ★ 站方播放源名（v119）。去重鍵用，不該送到客戶端。
+    '_playSourceName',
     // ★ adapter 內部除錯欄位（v87）。不該送到客戶端。
     '_adapterFallbackEp', '_adapterUnairedEp', '_epActualEp'
   ];
@@ -16748,8 +17302,24 @@ async function _resolveLazyTokens(list) {
 // 「零之使魔」，讓所有站都回出全部季別，再由比對層挑出第四季。
 // 否則同一個作品會因為「怎麼打字」而拿到完全不同的站點集合。
 function buildSearchQuery(searchQuery, targetInfo, targetSeason) {
-  let base = String(searchQuery)
-    .replace(/(?:19|20)\d{2}\s*$/, '')  // 年份交給結果階段，這裡不帶
+  let base = String(searchQuery);
+
+  // ★★ v120：年份要不要從查詢字串裡拿掉，看它是「版本標記」還是「片名的一部分」★★
+  //
+  // 舊版無條件剝掉尾端 4 位年份 → 《請回答1988》送出去的查詢字串是
+  // 「请回答」→ 站方回「请回答1997」「请回答1994」… 而真正的那部沒被查到
+  // → 使用者看到 0 筆（實測 2026-11-28）。
+  //
+  // ★ 判準見 _embeddedTitleYear：年份前是文字 → 是片名的一部分 → **保留**。
+  //   「請回答1988」→ 查詢字串「请回答1988」→ 站方直接命中 ✓
+  //   「仁醫 2009」  → 年份是版本標記 → 剝掉 → 「仁医」（維持舊行為）
+  //
+  // ★ 為什麼版本標記仍要剝：站方的檔名是「仁医」，年份只存在於
+  //   vod_year 欄位 → 要求站台比對它手上沒有的東西 → 搜不到。
+  if (_embeddedTitleYear(base) == null) {
+    base = base.replace(/(?:19|20)\d{2}\s*$/, '');
+  }
+  base = base
     .replace(/\s+$/, '')
     .trim();
 
@@ -17677,6 +18247,21 @@ function filterBySequel(results, targetInfo) {
 }
 
 function filterByTargetVersion(results, targetInfo) {
+  // ★★ v120：目標年份是「片名內嵌的年份」時，它**不是**發行年份 ★★
+  //
+  // 實測（2026-11-28）《請回答1988》：
+  //   片名裡的「1988」是**片名的一部分**（韓劇，2015 年首播），
+  //   站方 vod_year = 2015。
+  //   但 targetInfo.year 被從片名抓成 1988 → 這裡拿 1988 去比 2015
+  //   → **每一筆候選都被殺光** → 使用者看到 0 筆。
+  //
+  // ★ 判準見 _embeddedTitleYear：年份前面是文字 → 是片名的一部分
+  //   → 不能當發行年份用 → 跳過整個年份硬過濾。
+  //   「仁醫 2009」「仁醫（2009）」「追龍2017」→ 年份是版本標記 → 照舊過濾。
+  if (targetInfo.year && _embeddedTitleYear(targetInfo.rawName || '') != null) {
+    return results;
+  }
+
   // 目標帶年份：只留同年份與無年份的候選。
   if (targetInfo.year) {
     // ★ 電影不做年份硬過濾（TV 維持原行為）。
