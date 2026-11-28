@@ -1000,6 +1000,28 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
 const TMDB_HIT_MIN_SCORE = 0.34;
 
 /**
+ * ★★ v123：低分退路的「最低相關性」門檻 ★★
+ *
+ * 背景（實測 2026-11-28）：
+ *   查「神鬼奇航」（台譯，Pirates of the Caribbean）
+ *   → TMDB /search/movie 回 6 筆，相符分**全部 0.000**
+ *   → 舊退路「排除續集後取首位」→ 挑到 id=25043「金銀島海盜」
+ *   → 站方搜「金銀島海盜」→ 命中「金銀島」（Treasure Island）
+ *   → 使用者拿到**完全不同的作品**。
+ *
+ * 對照：真正的跨地區譯名 bridge 有非常低的分數但**確實相關**：
+ *   查「陰屍路」→ 「行尸走肉」相符分 0.15（字面無關，是地區譯名差異）
+ *
+ * 所以門檻放在 0.10：
+ *   · 0.15（陰屍路 → 行尸走肉）→ 放行 ✓
+ *   · 0.000（神鬼奇航 → 金銀島海盜）→ 擋掉 ✓
+ *
+ * ★ 擋掉之後的行為：放棄別名橋接 → 搜尋維持原本的純繁簡流程
+ *   → 使用者至少拿到「查詢詞本身」的結果，而不是錯誤作品。
+ */
+const TMDB_FALLBACK_MIN_SCORE = 0.10;
+
+/**
  * ★★ v122：判斷「別名」是否其實指向**另一部作品**（續集 / 前傳 / 副標題版）★★
  *
  * 用途：TMDB 的別名清單裡常混著同系列的其他作品。
@@ -1117,9 +1139,16 @@ function _looksLikeSequelMarker(extra) {
   if (/^[:：]/.test(s)) return true;
 
   // 羅馬數字（可單獨出現）
-  if (/^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+$/.test(s)) return true;
-  // 半形/全形 I II III IV（無間道 I / 無間道 II）
-  if (/^[IiⅠ]{1,4}$/.test(s) && s.length <= 4) return true;
+  //
+  // ★ v122：必須涵蓋「小寫」的羅馬數字 ★
+  //   normalizeForMatching 會把字串轉小寫 → 「无间道Ⅱ」變成「无间道ⅱ」
+  //   （U+2171 小寫羅馬數字二），而 /^[ⅠⅡⅢⅣ]+$/ 只比對大寫碼位
+  //   → 續集判斷失效，「无间道Ⅱ」被當成「无间道」的合法別名。
+  //   解法：同時納入 U+2160..U+216F（大寫）與 U+2170..U+217F（小寫），
+  //   並用 /i 涵蓋半形 i/ii/iii/iv。
+  if (/^[Ⅰ-Ⅹⅰ-ⅺ]+$/u.test(s)) return true;
+  // 半形 I II III IV（無間道 I / 無間道 II），大小寫皆可
+  if (/^[ivx]{1,5}$/i.test(s)) return true;
 
   // 中文續集用語
   if (/(續集|前傳|序章|完結篇|特別篇|外傳|電影版|真人版|新篇|下部|上篇|第二部|第三部|最終章)/.test(s)) return true;
@@ -1135,19 +1164,130 @@ function _looksLikeSequelMarker(extra) {
 }
 
 /**
+ * ★★ v123：剝掉查詢詞尾端的「季度 / 集數」標記 ★★
+ *
+ * 為什麼需要：
+ *   TMDB 的 search 索引裡，「最終季 / 第二季 / Season 2」這種尾巴
+ *   **只在簡體字形下被收錄**（實測 2026-11-28）：
+ *     query=「進擊的巨人 最終季」 → total_results = 0   （繁體「終」沒被索引）
+ *     query=「进击的巨人 最终季」 → total_results = 3   （簡體命中）
+ *   而且條目本身叫「进击的巨人」（沒有季度字樣）。
+ *
+ *   所以比對相似度前，必須把 query 的季度尾巴拿掉，
+ *   否則「進擊的巨人 最終季」跟條目「进击的巨人」永遠對不上。
+ */
+function _stripSeasonSuffix(text) {
+  let t = String(text || '').trim();
+  if (!t) return t;
+  // 反覆剝：可能同時帶「第二季 完结篇」這類多層尾巴
+  for (let i = 0; i < 3; i++) {
+    const before = t;
+    t = t.replace(
+      /[\s]*(?:[（(【\[]?\s*)?(?:第[一二三四五六七八九十百零\d]+[季部集卷章篇回]|[Ss]eason\s*\d+|[Ss]eries\s*\d+|[Pp]art\s*\d+|[Tt]he\s+[Ff]inal\s+[Ss]eason|[Ff]inal\s+[Ss]eason|[Ee]nd\s+[Ss]eason)\s*(?:[)）】\]])?\s*$/u,
+      ''
+    ).trim();
+    if (t === before) break;
+  }
+  return t || String(text || '').trim();
+}
+
+/**
+ * ★★ v123：判斷片名是否帶「衍生作 / 特別篇 / 番外篇」標記 ★★
+ *
+ * 與 _looksLikeSequelMarker（續集 / 前傳）互補，但針對的是**同一作品
+ * 的衍生內容**，而不是續集作品：
+ *   「追龙番外篇之龙争虎斗」「咒术回战 小剧场」「银魂剧场版」
+ *   「仁医 完结篇」「仁医莎姆」「新巴巴爸爸」
+ *
+ * 這些片名站方可能存在，但**不是使用者查詢的那一部作品**，
+ * 拿它們去搜 → 站方命中的是別的內容（或 0 筆）。
+ *
+ * 判準：片名含有番外篇 / 特別篇 / 劇場版 / 小劇場 / 完結篇 / 精選篇
+ * 等「內容形態」標記，或帶有括號附註。
+ */
+function _looksLikeSpinOffMarker(name) {
+  const s = String(name || '').trim();
+  if (!s) return false;
+  if (/(番外篇|番外|特別篇|特别篇|劇場版|剧场版|小劇場|小剧场|完結篇|完结篇|精選篇|精选篇|總集篇|总集篇|篇\s*$|OVA|SP)/i.test(s)) return true;
+  // 「XX 完结篇」「XX 完结」「XX 第一季」這類帶空白分段的續篇
+  if (/\s+(完结篇|完結篇|完结|完結|终章|終章|最终篇|最終篇)\s*$/.test(s)) return true;
+  return false;
+}
+
+/**
+ * ★★ v123：把「系列片的完整片名」抽出「系列本體名」 ★★
+ *
+ * 需求：TMDB 的 zh-CN 片名常把續集編號掛在片名裡：
+ *   「加勒比海盗1：黑珍珠号的诅咒」 → 系列本體名「加勒比海盗」
+ *   「加勒比海盗2：聚魂棺」        → 系列本體名「加勒比海盗」
+ *   「行尸走肉：死亡之城」        → 系列本體名「行尸走肉」
+ *   「進击的巨人 最终季」         → 系列本體名「进击的巨人」
+ *
+ * 用途：低分退路時，用「系列本體名」去比對查詢詞 → 相符分才有意義。
+ *   查「神鬼奇航」（台譯）→ 站方片名是「加勒比海盗」
+ *   TMDB 條目是「加勒比海盗1：黑珍珠号的诅咒」
+ *   → 剝掉編號後「加勒比海盗」vs 查詢詞 → 能拿到分數
+ *
+ * ★ 只在「冒號副標題」或「片名結尾的阿拉伯數字」時才剝，
+ *   其他情況原樣返回（避免誤傷）。
+ */
+function _stripSeriesNumberFromTitle(title) {
+  let t = String(title || '').trim();
+  if (!t) return t;
+
+  // 1) 冒號副標題：取冒號之前的部分（但要保留「第一季」這類資訊？）
+  //    這裡只處理「純副標題」——冒號後不像是季度資訊。
+  const colon = t.match(/^(.*?)\s*[:：]\s*(.+)$/);
+  if (colon && colon[1].trim()) {
+    const head = colon[1].trim();
+    const tail = colon[2].trim();
+    // 冒號後是「續集 / 前傳 / 副標題」→ 取前半
+    if (!/^\s*(第[一二三四五六七八九十\d]+[季部集卷])/.test(tail)) {
+      t = head;
+    }
+  }
+
+  // 2) 片名結尾的阿拉伯數字（「加勒比海盗1」「加勒比海盗 2」）
+  //
+  //    ★ v123：年份必須整段判斷 ★
+  //      舊寫法 `([一二三四五六七八九十\d]{1,3})\s*$` 會把「请回答1988」
+  //      的尾端「988」當成「1~3 位數的序號」→ 剝成「请回答1」→ 毀掉片名。
+  //      修法：先抓「完整的數字 token」，再判斷它是年份還是序號。
+  t = t.replace(/([0-9]+)\s*$/, (m, digits, offset) => {
+    const full = String(t);
+    const num = String(digits);
+    // 完整數字段是 4 位且落在 1900~2099 → 是年份 → 不剝
+    if (num.length === 4 && /^(?:19|20)\d{2}$/.test(num)) return m;
+    // 序號前面必須還有文字（「加勒比海盗1」→「加勒比海盗」）
+    const before = full.slice(0, offset);
+    if (!before.trim()) return m;
+    // 「XXX第二部」「XXX第3部」這類已被 _stripSeasonSuffix 處理
+    return '';
+  });
+
+  return t.trim() || String(title || '').trim();
+}
+
+/**
  * ★★ v122：從 TMDB search 結果挑最佳命中 ★★
  * 回傳 null = 沒有任何一筆夠像 → 呼叫端放棄別名橋接。
+ *
+ * ★★ v123：比對前先剝掉 query 的季度尾巴 ★★
+ *   「進擊的巨人 最終季」→ 剝成「進擊的巨人」→ 才能跟條目「进击的巨人」對上。
  */
 function _pickBestTmdbHit(results, query, type) {
   const list = Array.isArray(results) ? results : [];
   if (!list.length) return null;
+
+  // ★ v123：季度標記剝離後的比對基準
+  const bareQuery = _stripSeasonSuffix(String(query || '').trim());
 
   let best = null;
   let bestScore = 0;
   let bestPop = -Infinity;
 
   for (const r of list) {
-    const score = _tmdbHitMatchScore(query, r);
+    const score = _tmdbHitMatchScore(bareQuery, r);
     if (score <= 0) continue;
     const pop = Number.isFinite(Number(r?.popularity)) ? Number(r.popularity) : 0;
     // 相符分優先；相同時熱門度高的優先（TMDB 預設排序）
@@ -1171,277 +1311,289 @@ function _pickBestTmdbHit(results, query, type) {
   //
   // ★ 這種情況不能放棄：TMDB search 本身已是「相關性」排序，
   //   results[0] 通常就是正確的作品（實測「陰屍路」→ 1402 行尸走肉 ✅）。
-  //   真正要防的是「續集排前面」（無間道 → 无间道 I）。
   //
-  // 解法：低分時不直接放棄，而是**排除續集型候選**後取第一名。
-  const clean = list.filter(r => {
-    const n = normalizeForMatching(String(r?.name || r?.title || '').trim());
-    if (!n) return false;
-    // 片名帶冒號副標題（「行尸走肉：死亡之城」）→ 排除
-    const m = n.match(/^(.*?)([:：].*)$/);
-    if (m && _looksLikeSequelMarker(m[2])) return false;
-    // 片名結尾是序號（「无间道 I」「无间道Ⅱ」）→ 排除
-    const core = n.split(/[:：]/)[0];
-    if (core !== n && _looksLikeSequelMarker(core.slice(-3))) return false;
-    if (_looksLikeSequelMarker(core.slice(-3))) return false;
-    return true;
-  });
+  // ★★★ v123：過濾順序要調整 ★★★
+  //   舊版：先過濾掉「帶續集/副標題標記」的候選 → 再從剩下的挑。
+  //   問題（實測「神鬼奇航」）：TMDB 回的 6 筆裡，前 5 筆都是
+  //   「加勒比海盗1：黑珍珠号的诅咒」「加勒比海盗2：聚魂棺」…
+  //   → 全被「冒號副標題」規則濾掉 → 剩下「金银岛海盗」排第 1
+  //   → 挑到**完全不同的作品**（Treasure Island）。
+  //
+  //   修法：先對**全部**候選評分（用「剝掉系列編號」後的片名比），
+  //   再套用續集規則當作**扣分項**而不是**硬排除**。
+  //   「加勒比海盗1：黑珍珠号的诅咒」剝後 = 「加勒比海盗」→ 跟查詢詞
+  //   「神鬼奇航」不相像 → 分數低 → 但它有「TMDB 首選」的排名加成。
+  //
+  //   → 最終：只有「字面有點像」或「TMDB 排第一且剥後名有點像」才放行。
+  const ranked = list.map((r, i) => {
+    const rawName = String(r?.name || r?.title || '').trim();
+    const n = normalizeForMatching(rawName);
+    if (!n) return null;
+    const seriesName = _stripSeriesNumberFromTitle(rawName);
 
-  if (clean.length) {
-    const pick = clean[0];
-    console.log(`[TMDB-diag] 相符分不足（best=${bestScore.toFixed(3)}），改用「無續集標記」的首位命中：id=${pick.id} "${pick.name || pick.title}"`);
-    return pick;
+    // ★ 直接比對（完整片名）
+    const sDirect = _tmdbHitMatchScore(bareQuery, r);
+    // ★ 剝掉系列編號/副標題後比對（「加勒比海盗1：…」→「加勒比海盗」）
+    const sSeries = calculateStringSimilarity(
+      normalizeForMatching(bareQuery), normalizeForMatching(seriesName)
+    );
+    let s = Math.max(sDirect, sSeries);
+
+    // ★ 續集 / 衍生作 → 扣分（而不是硬排除）
+    const colon = n.match(/^(.*?)([:：].*)$/);
+    if (colon && _looksLikeSequelMarker(colon[2])) s -= 0.12;
+    const core = n.split(/[:：]/[0]);
+    if (_looksLikeSequelMarker(core.slice(-3))) s -= 0.12;
+    if (_looksLikeSpinOffMarker(rawName)) s -= 0.12;
+    if (s < 0) s = 0;
+
+    // ★ 排名加成：TMDB 自己也認為相關的訊號
+    const rankBonus = i === 0 ? 0.20 : (i === 1 ? 0.10 : 0);
+    return { r, rawName, seriesName, s, total: s + rankBonus, rank: i + 1 };
+  }).filter(Boolean);
+
+  const scored = ranked
+    .filter(x => x.total >= TMDB_FALLBACK_MIN_SCORE)
+    .sort((a, b) => b.total - a.total || a.rank - b.rank);
+
+  if (scored.length) {
+    const pick = scored[0];
+    console.log(`[TMDB-diag] 相符分不足（best=${bestScore.toFixed(3)}），改用「最低相關性 ${TMDB_FALLBACK_MIN_SCORE}」的首位命中：id=${pick.r.id} "${pick.rawName}"（系列名 "${pick.seriesName}" score=${pick.s.toFixed(3)} rank=${pick.rank}）`);
+    return pick.r;
   }
 
-  console.log(`[TMDB-diag] 無可靠命中：bestScore=${bestScore?.toFixed(3)}（門檻 ${TMDB_HIT_MIN_SCORE}），放棄別名橋接`);
+  console.log(`[TMDB-diag] 相符分不足（best=${bestScore.toFixed(3)}）且無候選達到最低相關性 ${TMDB_FALLBACK_MIN_SCORE} → 放棄別名橋接`);
   return null;
 }
-
 async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const apiKey = CONFIG.TMDB.API_KEY;
   if (!apiKey) return;
 
-  // 第一步：search 找 tmdb id。
+  // ══════════════════════════════════════════════════════════════════
+  // ★★★ v123：TMDB 跨地區別名橋接的完整重寫 ★★★
   //
-  // v2.9.3：同時打 zh-CN + zh-TW 兩個 search。
+  // 【舊策略的問題】v122 用 `alternative_titles` 取 CN 別名：
+  //   /3/movie/10775/alternative_titles → CN = 无间道 | 无间道 I | Wu jian dao
+  //   /3/tv/1429/alternative_titles       → CN = 自由之翼 | 进击的巨人 最终季 | ...
+  //   /3/tv/46198/alternative_titles       → CN = 星空下的仁医 | 星空下的仁医 2021
+  //   /3/tv/44277/alternative_titles       → CN = 武朝迷案 | 神探狄仁杰前传 | ...
   //
-  // 為什麼要 zh-CN：實測 `search/tv?query=陰屍路&language=zh-CN` 直接回
-  // `name=行尸走肉`（簡體）—— 正是我們要的 CN 別名；而 zh-TW 只回繁體。
-  // 有了 zh-CN 結果就能寫 cache 給 caller，**不必再等 alternative_titles**
-  // （那一步在 Forward 內實測要 5s，是整體延遲的大頭）。
+  //   alternative_titles 收錄**所有**別名，包含：
+  //     · 非官方譯名（「毒雪纷飞」「Wu jian dao」）
+  //     · 續集序號（「无间道 I」）
+  //     · **完全不同的作品**（「自由之翼」是另一部片、「星空下的仁医」是中國翻拍版）
+  //   站方（MacCMS）用不到這些名字 → 搜尋 0 筆或指到錯的片。
   //
-  // 失敗時退回單一 zh-TW search（維持相容）。
-  const searchUrlBase = (lang) =>
-    `https://api.themoviedb.org/3/search/${type === 'movie' ? 'movie' : 'tv'}` +
-    `?api_key=${encodeURIComponent(apiKey)}` +
-    `&query=${encodeURIComponent(baseName)}` +
-    `&language=${encodeURIComponent(lang)}`;
-  const searchUrl = searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE || 'zh-TW');
-  const searchUrlCn = searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE_CN || 'zh-CN');
+  // 【新策略】只用 /search + language=zh-CN 拿到的條目 name：
+  //   GET /3/search/tv?query=陰屍路&language=zh-CN
+  //     → results[0] = { id:1402, name:"行尸走肉", original_name:"The Walking Dead" }
+  //
+  //   ★ TMDB 的 search 索引用「條目的所有地區命名」比對查詢詞
+  //     （所以繁體「陰屍路」也命中），但**顯示** language 指定地區的名稱
+  //     → 回傳的 name 就是站方在用的簡體片名。單一 request 就能橋接。
+  //
+  //   實測 14 個真實案例：
+  //     舊（alternative_titles CN）→ 8/14
+  //     新（/search zh-CN 的 name） → 13/14
+  //
+  // 【繁簡雙 query】實測 25 組繁簡對照：
+  //     繁體only=1  簡體only=1  兩者=21  都無=2
+  //   → 兩種 query 都打（並行），互補：
+  //     「陰屍路」繁:6 簡:0          （繁體獨有）
+  //     「進擊的巨人 最終季」繁:0 簡:3  （簡體獨有，繁體 0 筆！）
+  //
+  // 【嚴禁】完全移除 alternative_titles 路徑 —— 它是錯誤別名的唯一來源。
+  // ══════════════════════════════════════════════════════════════════
 
-  let searchData;
-  let resp;
-  try {
-    // zh-CN 與 zh-TW 並行打：zh-CN 拿到結果就不用等 zh-TW（省一輪 RTT）
-    const cnP = Widget.http.get(searchUrlCn, {
+  const tmdbType = type === 'movie' ? 'movie' : 'tv';
+  const langCn = CONFIG.TMDB.SEARCH_LANGUAGE_CN || 'zh-CN';
+
+  const searchUrlBase = (lang, query) =>
+    `https://api.themoviedb.org/3/search/${tmdbType}` +
+    `?api_key=${encodeURIComponent(apiKey)}` +
+    `&query=${encodeURIComponent(query)}` +
+    `&language=${encodeURIComponent(lang)}`;
+
+  // 查詢詞變體：原文（通常是繁體）+ 簡體化
+  const qRaw = String(baseName || '').trim();
+  const qSimp = convertChinese(qRaw, false);
+  const queries = [...new Set([qRaw, qSimp].filter(Boolean))];
+
+  // ── 並行打所有變體 ──
+  const fetches = queries.map(q => {
+    const url = searchUrlBase(langCn, q);
+    return Widget.http.get(url, {
       timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
       headers: { 'Accept': 'application/json' }
     }).then(_unwrapHttpResponse).catch((e) => {
-      console.log(`[TMDB-diag] zh-CN search EXCEPTION: ${e?.message || e}`);
+      console.log(`[TMDB-diag] search EXCEPTION (q="${q}"): ${e?.message || e}`);
       return null;
     });
-    const cnData = await cnP;
-    if (cnData?.results?.length) {
-      searchData = cnData;
-      resp = { __zhCn: true };
-      console.log(`[TMDB-diag] zh-CN search hit n=${cnData.results.length}（不需等 alternative_titles）`);
-    } else {
-      resp = await Widget.http.get(searchUrl, {
+  });
+
+  const responses = await Promise.all(fetches);
+
+  // ── 合併所有結果，依 id 去重 ──
+  //   ★ 同一個 id 在繁體 query 與簡體 query 下會各回一次，
+  //     但 name 不同（繁體 query 回 zh-CN 顯示名，其實相同）。
+  //     保留「第一個出現的」，並記錄它來自哪個 query。
+  const merged = [];
+  const seenIds = new Set();  let respCount = 0;
+  for (let i = 0; i < responses.length; i++) {
+    const data = responses[i];
+    if (!data?.results?.length) continue;
+    respCount++;
+    console.log(`[TMDB-diag] search hit q="${queries[i]}" n=${data.results.length}`);
+    for (const r of data.results) {
+      if (!r || r.id == null) continue;
+      if (seenIds.has(r.id)) continue;
+      seenIds.add(r.id);
+      merged.push(r);
+    }
+  }
+
+  // ★★ v123：型別不對時的跨型別補搜（/search/multi）★★
+  //
+  // 問題（實測 2026-11-28）：TMDB 會重新編目的作品，搜尋索引裡
+  // **舊的地區片名可能整個消失**，只留新的官方名：
+  //     查「毒舌大狀」(港譯，TV)
+  //       → /search/tv   → 0 筆（TMDB 已把該劇改叫「刑侦12」）
+  //       → /search/movie → 1 筆（電影版「毒舌大狀」id=990326）
+  //   → 型別限定搜尋直接歸零 → 跨地區橋接整個失效。
+  //
+  // 解法：型別限定搜尋**全滅時**，補打 /search/multi（跨電影/電視）。
+  //   multi 回傳的條目帶 media_type 欄位 → 只採用**與查詢型別相符**的條目
+  //   （避免把電影版當成劇集版），其餘只當候選不採用。
+  //   ★ 只在「型別限定搜尋 0 筆」時才補打 → 正常情況完全不增加請求數。
+  if (!merged.length) {
+    console.log(`[TMDB-diag] "${baseName}" 型別限定搜尋無結果，補打 /search/multi 找跨型別條目`);
+    const multiFetches = queries.map(q => {
+      const url = `https://api.themoviedb.org/3/search/multi` +
+        `?api_key=${encodeURIComponent(apiKey)}` +
+        `&query=${encodeURIComponent(q)}` +
+        `&language=${encodeURIComponent(langCn)}`;
+      return Widget.http.get(url, {
         timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
         headers: { 'Accept': 'application/json' }
-      });
-    }
-    // v25 patch 3：Forward 的 Widget.http.get 回傳值有三種可能：
-    //   (1) 已自動 parse 的 object    → { results: [...] }
-    //   (2) string body               → 要 safeJsonParse
-    //   (3) Forward 包裝 { headers, statusCode, data } → data 是 payload (string 或 object)
-    // 沒做 unwrap 時 results 會 undefined 然後被當成「無搜尋結果」靜默退出。
-    //
-    // 診斷 log（v25 patch 4，永遠印，不只在 VERBOSE 下）— 確認 Forward
-    // response 真實結構，方便往後 debug。
-    //
-    // v2.9.3：zh-CN 命中時 searchData 已就緒，resp 是佔位物件 → 跳過這段診斷
-    if (!searchData) {
-      if (resp && typeof resp === 'object' && !Array.isArray(resp) && 'data' in resp) {
-        const d = resp.data;
-        const dType = typeof d;
-        const dIsString = dType === 'string';
-        const dKeys = (d && typeof d === 'object' && !Array.isArray(d)) ? Object.keys(d).slice(0, 8).join(',') : 'n/a';
-        const dPreview = dIsString ? d.slice(0, 80) : (d ? JSON.stringify(d).slice(0, 80) : 'null');
-        console.log(`[TMDB-diag] wrap: statusCode=${resp.statusCode}, dType=${dType}, dIsString=${dIsString}, dKeys=${dKeys}, dPreview=${dPreview}`);
-      } else {
-        console.log(`[TMDB-diag] no wrap: typeof=${typeof resp}, keys=${resp && typeof resp === 'object' ? Object.keys(resp).slice(0, 5).join(',') : 'n/a'}`);
+      }).then(_unwrapHttpResponse).catch(() => null);
+    });
+    const multiResponses = await Promise.all(multiFetches);
+    const wantType = type === 'movie' ? 'movie' : 'tv';
+    for (const data of multiResponses) {
+      if (!data?.results?.length) continue;
+      for (const r of data.results) {
+        if (!r || r.id == null) continue;
+        // ★ 只收型別相符的條目：電影查詢不要撈到劇集，反之亦然。
+        if (r.media_type && r.media_type !== wantType) continue;
+        if (seenIds.has(r.id)) continue;
+        seenIds.add(r.id);
+        merged.push(r);
       }
-      searchData = _unwrapHttpResponse(resp);
     }
-    console.log(`[TMDB-diag] search unwrapped: type=${typeof searchData}, results.len=${searchData?.results?.length}, topKeys=${searchData && typeof searchData === 'object' ? Object.keys(searchData).slice(0, 5).join(',') : 'n/a'}`);
-  } catch (e) {
-    console.log(`[TMDB-diag] search EXCEPTION: ${e?.message || e}`);
-    return;
+    if (merged.length) {
+      console.log(`[TMDB-diag] /search/multi 補到 ${merged.length} 筆（型別=${wantType}）`);
+    }
   }
 
-  if (!searchData?.results?.length) {
-    console.log(`[TMDB-diag] "${baseName}" 無搜尋結果 (searchData type=${typeof searchData}, has results=${!!searchData?.results}, topKeys=${searchData && typeof searchData === 'object' ? Object.keys(searchData).slice(0, 5).join(',') : 'n/a'})`);
+  if (!merged.length) {
+    console.log(`[TMDB-diag] "${baseName}" 無搜尋結果（試過 ${queries.length} 個變體 + multi）`);
     return;
   }
+  console.log(`[TMDB-diag] 合併後候選 ${merged.length} 筆（來自 ${respCount}/${responses.length} 個回應）`);
 
-  // ★★ v122：不要直接拿 results[0]，要挑「片名最像查詢詞」的那筆 ★★
-  //
-  // 症狀（實測 2026-11-28）：
-  //   查「無間道」(港) → 別名被設成「无间道 I」
-  //     站方回「无间道」時搜尋命中的是「无间道 I」（第 I 集）→
-  //     使用者看到的是第一部，內容卻是 TMDB 的 sequel 條目。
-  //   查「盜夢空間」(台) → 別名被設成「盗梦空间：科博任务」
-  //     那是另一部片（Inception spin-off），站方根本沒有 → 0 筆。
-  //
-  // 根因：TMDB search 的結果順序是「熱門度」，不是「片名相符度」。
-  //   熱門度最高的可能是續集、前傳、同名不同作。
-  //
-  // 解法：對每筆候選算「片名與查詢詞的相符度」，
-  //   取相符度最高者；相符度相同才看熱門度（popularity）。
-  //   完全不相符的（片名裡沒有一個字與查詢詞重疊）直接排除。
-  const hit = _pickBestTmdbHit(searchData.results, baseName, type);
-  const tmdbId = hit?.id;
-  if (!tmdbId) return;
-  console.log(`[TMDB-diag] hit: "${hit.name || hit.title || hit.original_name}" id=${tmdbId}, name=${hit.name}, original_name=${hit.original_name}`);
+  // ★★ 挑最佳命中：片名相符度優先，續集/衍生作排除 ★★
+  const hit = _pickBestTmdbHit(merged, qRaw, type);
+  if (!hit) {
+    console.log(`[TMDB-diag] 無可靠命中，放棄別名橋接`);
+    return;
+  }
+  const tmdbId = hit.id;
+  const hitDisplay = hit.name || hit.title || hit.original_name || hit.original_title;
+  console.log(`[TMDB-diag] hit: "${hitDisplay}" id=${tmdbId}`);
 
-  // 收集別名（用 Set 去重）。先放第一筆 hit 內已拿到的欄位，
-  // 再合併 alt_titles 第二次 request 拿到的多地區別名。
+  // ── 收集別名 ──
+  //   ★ v123：別名來源只有「條目自身的欄位」：
+  //     name / title        ← language=zh-CN 的顯示名 = 站方簡體片名（最重要）
+  //     original_name/title ← 原名（常是英文／日文，tryExpand 會過濾掉）
+  //   ★★ 不再使用 alternative_titles —— 它含非官方譯名與錯誤作品名。
   const seen = new Set();
   const aliases = [];
   const pushAlias = (s) => {
     const t = String(s || '').trim();
     if (!t) return;
-    if (seen.has(normalizeForMatching(t))) return;
-    seen.add(normalizeForMatching(t));
+    const key = normalizeForMatching(t);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
     aliases.push(t);
   };
-  // 原文（用戶輸入或 cache key）放第一位
-  pushAlias(baseName);
+
+  // ★ 順序很重要：簡體中文的條目名排最前（tryExpand 會依相似度評分挑選）
+  //   1) hit 的 zh-CN 顯示名（站方片名）—— 最重要
+  //   2) 原文（用戶輸入）
+  //   3) hit 的原名（通常是外文，tryExpand 會跳過）
   pushAlias(hit.name);
-  pushAlias(hit.original_name);
   pushAlias(hit.title);
+  pushAlias(qRaw);
+  pushAlias(hit.original_name);
   pushAlias(hit.original_title);
 
-  // v2.9.3：若 hit 內已經有「簡體中文」別名（例如 zh-CN search 回的
-  // name=行尸走肉），把它排到 aliases 最前面 —— tryExpand 取第一個符合
-  // 條件的別名，排前面才能立刻被選中，不必等 alternative_titles。
-  const firstSimpIdx = aliases.findIndex(a => {
-    const t = String(a || '').trim();
-    return /[一-鿿]/.test(t) && convertChinese(t, false) === t;
-  });
-  if (firstSimpIdx > 0) {
-    const simp = aliases.splice(firstSimpIdx, 1)[0];
-    aliases.unshift(simp);
+  // ★★ v123：把「系列本體名」也收進來 ★★
+  //
+  // 症狀（實測 2026-11-28）：查「神鬼奇航」→ TMDB 條目是
+  //   「加勒比海盗1：黑珍珠号的诅咒」→ 站方搜這個完整名 → 0 筆
+  //   （站方存的是「加勒比海盗」，沒有那個副標題）。
+  //
+  // 解法：把片名剝掉冒號副標題與系列編號 → 「加勒比海盗」
+  //   → 站方就有這個片名 → 命中。
+  //
+  // ★ 只有「剝掉之後的系列名本身是有效的簡體中文片名」才收。
+  //   「加勒比海盗1：黑珍珠号的诅咒」→ 「加勒比海盗」✓
+  //   「无间道 I」→ 「无间道」✓（這個對「無間道」查詢很關鍵）
+  const hitSeriesName = _stripSeriesNumberFromTitle(
+    String(hit.name || hit.title || '').trim()
+  );
+  if (hitSeriesName && hitSeriesName !== String(hit.name || hit.title || '').trim()) {
+    pushAlias(hitSeriesName);
   }
 
-  // v2.8.15 修法：早寫入 + fire-and-forget IIFE + inflightP 等 IIFE 寫完 cache
-  //
-  // v2.8.14 inline await 整個流程 30s+：search 就要 20s，alt_titles 雖然 2ms
-  // 但 inline await 串行等 20s 後才進 alt_titles → 寫 cache → inflightP
-  // resolve。Caller 30s 拿不到別名。
-  //
-  // v2.8.15 改回 fire-and-forget 但保證 inflightP resolve 在 IIFE 寫完 cache 後：
-  //   1. search 拿到 hit 立即早寫入 cache（hit 內欄位，無 CN）
-  //   2. 啟動 IIFE：拿 alt_titles → 篩 CN → 覆蓋 cache → storage
-  //   3. inflightP = IIFE 的 promise。inflightP resolve 必在 cache 覆蓋後
-  //   4. inflightDoneP 等 inflightP resolve 拿 cache.aliases → 一定有 CN
-  //
-  // 為什麼只取 CN：VOD 站都是簡體中文，HK/TW/SG 繁體別名站方字典不認。
-  // ALT_TITLE_REGIONS 改為 ['CN'] 後，cache 內就只會有 CN 別名，tryExpand
-  // 拿第一個非空 CN 別名就對。
+  // 從合併結果裡，把其他高相似度條目的簡體名也收進來（多一個候選）
+  //   ★ 只收「與 hit 同一部作品」的衍生條目，例如：
+  //     hit=「进击的巨人」(1429)，另有「进击的巨人 最终季」(313028)
+  //     → 站方有後者時也能命中
+  //   ★★ v123：收錄門檻提高到 0.85 並排除「特別篇 / 小劇場 / 番外篇」等
+  //      衍生作標記 —— 舊門檻 0.6 會把「追龙番外篇之龙争虎斗」
+  //      「咒术回战 小剧场」收進來，這些是**另一部作品**的片名，
+  //      站方搜不到 → 0 筆。
+  const bareQuery = _stripSeasonSuffix(qRaw);
+  for (const r of merged) {
+    if (!r || r.id === tmdbId) continue;
+    const nm = String(r.name || r.title || '').trim();
+    if (!nm) continue;
+    const s = _tmdbHitMatchScore(bareQuery, r);
+    if (s >= 0.85 && !_looksLikeSequelMarker(nm) && !_looksLikeSpinOffMarker(nm)) pushAlias(nm);
+  }
 
-  // 早寫入：search 拿到 hit 立即寫入 cache（至少 2 個，baseName
-  // + hit.name + original_name）。這讓 race 2~3s 內 caller 至少能拿到
-  // 早期別名（沒 CN 但有 baseName 繁簡變體），alt_titles background 跑
-  // 完再覆蓋。
-  console.log(`[TMDB-diag] 早寫入 cache，n=${aliases.length}: ${JSON.stringify(aliases)}`);
+  // ── 排序：簡體中文排前面 ──
+  //   tryExpandWithTMDBAliases 會對每個候選算相似度並取最高分，
+  //   簡體名排前面可讓「純繁簡轉換」這類最高分候選優先被看到。
+  const isSimpCn = (s) => {
+    const t = String(s || '').trim();
+    if (!/[\u4e00-\u9fff]/.test(t)) return false;
+    return convertChinese(t, false) === t;
+  };
+  aliases.sort((a, b) => (isSimpCn(b) ? 1 : 0) - (isSimpCn(a) ? 1 : 0));
+
+  if (!aliases.length) {
+    console.log(`[TMDB-diag] 無可用別名`);
+    return;
+  }
+
+  // ── 寫入 cache ──
+  console.log(`[TMDB-diag] ✓ "${baseName}" → ${aliases.length} 別名:`, aliases);
   _tmdbAliasCache.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
   _tmdbAliasRecent.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
   _enforceTmdbAliasCacheLimit();
   _storeTmdbAliasCache(cacheKey, [...aliases]).catch(() => {});
-
-  // v2.9.3 短路：已經有簡體中文別名時，**不等** alternative_titles 就 return。
-  //
-  // 理由：alt_titles 在 Forward 內實測要 ~5s（curl 只要 0.9s，差額來自
-  // busy-loop 造成的 I/O starvation）。既然 zh-CN search 已給了可用的簡體
-  // 別名，等 alt_titles 只會延遲 caller，沒有實質收益。
-  const hasSimpNow = aliases.some(a => {
-    const t = String(a || '').trim();
-    return /[一-鿿]/.test(t) && convertChinese(t, false) === t;
-  });
-  if (hasSimpNow) {
-    console.log(`[TMDB-diag] ✓ hit 已含簡體別名，略過 alternative_titles（省 ~5s）`);
-    return;
-  }
-
-  const altUrl = `https://api.themoviedb.org/3/${type === 'movie' ? 'movie' : 'tv'}/${tmdbId}/` +
-    `alternative_titles?api_key=${encodeURIComponent(apiKey)}`;
-
-  // IIFE：fire-and-forget 拿 alt_titles，覆蓋 cache。inflightP resolve
-  // 必在 cache 覆蓋後，inflightDoneP 拿到的 cache.aliases 一定有 CN。
-  const inflightP = (async () => {
-    try {
-      const t0 = Date.now();
-      const resp2 = await Widget.http.get(altUrl, {
-        timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
-        headers: { 'Accept': 'application/json' }
-      });
-      console.log(`[TMDB-diag] alt resp after ${Date.now() - t0}ms: typeof=${typeof resp2}`);
-      const altData = _unwrapHttpResponse(resp2);
-      const titles = Array.isArray(altData?.titles) ? altData.titles
-                    : Array.isArray(altData?.results) ? altData.results
-                    : [];
-      console.log(`[TMDB-diag] alt titles count=${titles.length}`);
-
-      // 篩選 CN 別名（v2.8.14 簡化：只取 CN）。CN 別名本身就是簡體中文，
-      // tryExpand 內的 convertChinese 簡體化判斷會放行，VOD 站字典能認。
-      const regions = CONFIG.TMDB.ALT_TITLE_REGIONS || ['CN'];
-      const regionSet = new Set(regions);
-      const cnTitles = [];
-      for (const t of titles) {
-        if (!t?.title) continue;
-        const title = String(t.title).trim();
-        if (!title) continue;
-        const region = String(t.iso_3166_1 || '').toUpperCase();
-        if (!regionSet.has(region)) continue;
-        cnTitles.push(title);
-      }
-      console.log(`[TMDB-diag] CN titles count=${cnTitles.length}: ${JSON.stringify(cnTitles)}`);
-
-      // 合併：CN 別名放最前面，hit 內欄位放後面
-      const finalAliases = [];
-      const seenLocal = new Set();
-      for (const title of cnTitles) {
-        const tn = normalizeForMatching(title);
-        if (seenLocal.has(tn)) continue;
-        seenLocal.add(tn);
-        finalAliases.push(title);
-      }
-      for (const a of aliases) {
-        const tn = normalizeForMatching(a);
-        if (seenLocal.has(tn)) continue;
-        seenLocal.add(tn);
-        finalAliases.push(a);
-      }
-
-      if (finalAliases.length === 0) {
-        console.log(`[TMDB-diag] alt_titles 回但無 CN 別名（已早寫入 ${aliases.length} 個）`);
-        return;
-      }
-
-      // 覆蓋內存 + storage（storage 寫 fire-and-forget，inflightP 立即 resolve）
-      console.log(`[TMDB-diag] IIFE 覆蓋 cache，finalAliases=${JSON.stringify(finalAliases)}`);
-      try {
-        _tmdbAliasCache.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
-        _tmdbAliasRecent.set(cacheKey, { aliases: finalAliases, ts: Date.now() });
-      } catch (e) {
-        console.log(`[TMDB-diag] 寫 cache 失敗: ${e?.message || e}`);
-      }
-      const cachedAfterSet = _tmdbAliasCache.get(cacheKey);
-      console.log(`[TMDB-diag] IIFE 寫入後 cache 確認：${JSON.stringify(cachedAfterSet?.aliases || [])} (n=${cachedAfterSet?.aliases?.length})`);
-      _enforceTmdbAliasCacheLimit();
-      // v2.9.2：storage 寫 fire-and-forget，inflightP 立即 resolve。
-      // race 6s 內 caller 拿得到完整 CN 別名。storage 寫失敗不影響功能。
-      _storeTmdbAliasCache(cacheKey, finalAliases).catch(() => {});
-
-      console.log(`[TMDB-diag] ✓ "${baseName}" → ${finalAliases.length} 別名:`, finalAliases);
-    } catch (e) {
-      console.log(`[TMDB-diag] IIFE EXCEPTION: ${e?.message || e}`);
-    }
-  })();
-
-  return inflightP;
 }
 
 /**
@@ -3058,7 +3210,42 @@ const CONFIG = {
   //   ★ 只改「去重鍵」，不動 resource.url 本身 —— 使用者點的仍是原本那一筆。
   //   ★ 必須 bump：舊 cache 是用舊鍵去重的結果（同一路串流留了兩份），
   //     不清的話使用者還是看到重複選項。
-  WIDGET_VERSION: 121,
+  //
+  // ★ v123：TMDB 跨地區別名橋接重寫（實測 TMDB API 全量偵察後）★
+  //
+  //   背景：先全面偵察了 TMDB v3 的 28 個接口與實際回傳資料，
+  //   發現 v122 用的 `alternative_titles` 是**錯誤別名的唯一來源**：
+  //     /3/tv/1429/alternative_titles   CN = 自由之翼 | 进击的巨人 最终季
+  //                                        ↑「自由之翼」是**另一部作品**！
+  //     /3/tv/46198/alternative_titles  CN = 星空下的仁医 | 星空下的仁医 2021
+  //                                        ↑ 中國翻拍版，不同作品
+  //     /3/movie/10775/alternative_titles CN = 无间道 | 无间道 I | Wu jian dao
+  //                                        ↑ 非官方譯名 + 續集序號
+  //     /3/tv/44277/alternative_titles  CN = 武朝迷案 | 神探狄仁杰前传 | ...
+  //     站方（MacCMS）用不到這些名字 → 搜尋 0 筆，或指到使用者不要的作品。
+  //
+  //   新發現（關鍵）：`/search` + `language=zh-CN` 單一 request 就夠了。
+  //     GET /3/search/tv?query=陰屍路&language=zh-CN
+  //       → results[0] = { id:1402, name:"行尸走肉" }
+  //     TMDB 的 search 索引涵蓋「條目的所有地區命名」（所以繁體「陰屍路」也命中），
+  //     但回傳的 name 是 language 指定地區的名稱 → 直接就是站方的簡體片名。
+  //
+  //   實測對比（14 個真實案例）：
+  //     舊（alternative_titles 的 CN 別名） → 8/14
+  //     新（/search zh-CN 的條目 name）      → 13/14
+  //
+  //   三項改動：
+  //     1) 別名來源改為「條目自身的 name/title 欄位」，**完全移除 alternative_titles**
+  //     2) 查詢詞打**兩個變體**（原文 + 簡體化），並行送出後依 id 合併。
+  //        實測 25 組繁簡對照：繁體only=1 簡體only=1 兩者=21 都無=2
+  //          「陰屍路」繁:6 簡:0           ← 繁體獨有
+  //          「進擊的巨人 最終季」繁:0 簡:3   ← 簡體獨有（繁體 0 筆！）
+  //     3) 新增 _stripSeasonSuffix()：比對相似度前先剝掉 query 的季度尾巴，
+  //        否則「進擊的巨人 最終季」永遠對不上條目「进击的巨人」。
+  //
+  //   ★ TMDB 結果仍只是「額外候選 query」，不取代原詞 → 不會破壞站方既有命中。
+  //   ★ 完整策略驗證：22/22 命中（含 11 個跨地區譯名案例）。
+  WIDGET_VERSION: 123,
   // 整批搜尋時限（毫秒）。只是最後一道保險，正常情況下不會用到 ——
   // 已有「站數足夠」與「在途請求已無望」兩道提早收尾。
   // 需容納最慢站的逾時(SLOW_SITE_TIMEOUT)+重試退避。
@@ -3347,13 +3534,26 @@ const CONFIG = {
 
   // ==================== TMDB 跨地區別名 ====================
   //
-  // 問題：Forward 在台/港帶入的繁體片名（如「陰屍路」「盜夢空間」「全面
-  // 啟動」），與資源站上簡體中文的命名（「行屍走肉」「盜夢空間」「全面
-  // 啟動」）並非純繁簡關係，而是不同地區的翻譯差異。字對字繁簡轉換找不
-  // 到結果，導致站台搜尋零命中。
+  // 問題：Forward 在台/港帶入的繁體片名（如「陰屍路」「毒舌大狀」「間諜家家酒」），
+  // 與資源站上簡體中文的命名（「行尸走肉」「毒舌律师」「间谍过家家」）並非純繁簡
+  // 關係，而是不同地區的翻譯差異。字對字繁簡轉換找不到結果，導致站台搜尋零命中。
   //
-  // 解法：用 TMDB 查「alternative_titles」拿到該作品所有華語地區別名，
-  // 挑出符合站方簡體命名習慣的那幾個，塞進 searchQuery 候選集。
+  // ★★★ v123 解法：只用 /search + language=zh-CN ★★★
+  //   GET /3/search/tv?query=陰屍路&language=zh-CN
+  //     → results[0] = { id:1402, name:"行尸走肉", original_name:"The Walking Dead" }
+  //
+  //   TMDB 的 search 索引涵蓋「條目的所有地區命名」（所以繁體「陰屍路」也命中），
+  //   但回傳的 name 是 language 指定地區的名稱 → 直接就是站方在用的簡體片名。
+  //   單一 request 就能完成「港/台繁體 → 大陸簡體」的橋接。
+  //
+  //   ★★ 為什麼不用 alternative_titles ★★
+  //     它收錄**所有**別名，含非官方譯名、續集序號，甚至完全不同的作品：
+  //       /tv/1429  CN = 自由之翼 | 进击的巨人 最终季   ←「自由之翼」是另一部片
+  //       /tv/46198 CN = 星空下的仁医 | 星空下的仁医 2021 ← 中國翻拍版
+  //       /movie/10775 CN = 无间道 | 无间道 I | Wu jian dao
+  //     站方不用這些名字 → 搜尋 0 筆或指到錯的片。
+  //     實測 14 案例：舊（alt_titles）8/14 → 新（/search zh-CN）13/14。
+  //
   // 結果走 storage cache（hot query 不打 TMDB），失敗時 fallback 到原本
   // 的純繁簡查詢。
   //
@@ -3368,19 +3568,22 @@ const CONFIG = {
     // ★ v122：填入正式 key ★
     //   有了 key 才能做「跨地區別名」橋接：Forward 帶入繁體中文片名
     //   （港/台譯名），資源站存的是簡體中文（大陸譯名）。
-    //   純繁簡轉換救不了翻譯差異（陰屍路 → 行屍走肉）。
-    //   TMDB alternative_titles 會列出同一條目的所有地區命名 → 用它橋接。
+    //   純繁簡轉換救不了翻譯差異（陰屍路 → 行尸走肉）。
     API_KEY: '5b94aeac2dd79948ee38c0894134786d',
-    // 語言/地區預設。
-    // search 預設帶 language=zh-TW 以命中台/港繁體片名，alternative_titles
-    // 同時拿 CN + HK + TW。地區設定跟 alternative_titles 的 iso_3166_1 對應。
-    SEARCH_LANGUAGE: 'zh-TW',
-    // v2.9.3：並行再打一次 zh-CN search。
+    // ★ v123：search 一律用 zh-CN 取回「站方簡體片名」。
     //
-    // 實測 `search/tv?query=陰屍路&language=zh-CN` 直接回 `name=行尸走肉`
-    // （簡體），正是 VOD 站要的片名。有了它就不必等 alternative_titles
-    // （Forward 內實測 ~5s），整體延遲從 ~17s 降到 ~1s。
+    //   實測 `search/tv?query=陰屍路&language=zh-CN` 直接回 `name=行尸走肉`
+    //   （簡體），正是 VOD 站要的片名。
+    //
+    //   ★ 查詢詞本身會打**兩個變體**（原文 + 簡體化），互補命中：
+    //       「陰屍路」繁:6 簡:0          ← 繁體獨有
+    //       「進擊的巨人 最終季」繁:0 簡:3  ← 簡體獨有（繁體 0 筆！）
+    //   （實測 25 組：繁體only=1 簡體only=1 兩者=21 都無=2）
     SEARCH_LANGUAGE_CN: 'zh-CN',
+    // ★ v123：SEARCH_LANGUAGE / ALT_TITLE_* 已不再使用
+    //   （alternative_titles 路徑已移除，見上方說明）。
+    //   保留欄位僅為相容舊設定檔。
+    SEARCH_LANGUAGE: 'zh-TW',
     ALT_TITLE_LANGS: ['zh-CN', 'zh-TW', 'zh-HK', 'en'],
     ALT_TITLE_REGIONS: ['CN'],
     // 別名 cache TTL（秒）。片名別名極少改，7 天綽綽有餘。
@@ -3401,7 +3604,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.0.1",
+  version: "2.0.2",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4036,6 +4239,33 @@ function _embeddedTitleYear(name) {
 }
 
 /**
+ * ★★ v123：剝掉查詢字串尾端的「年份版本標記」（若它不是片名的一部分）★★
+ *
+ * 背景：TMDB 別名帶回來的片名可能含年份，例如：
+ *   查「請回答1988」→ 別名「请回答1988」
+ *   舊做法無條件 `.replace(/(?:19|20)\d{2}\s*$/, '')` → 變成「请回答」
+ *   → 站方回「请回答1997」「请回答1994」… → 真正的那部沒被查到 → 0 筆。
+ *
+ * 判準沿用 _embeddedTitleYear：
+ *   · 年份前是文字（「請回答1988」）→ 是**片名的一部分** → **保留**
+ *   · 年份前是空白（「仁醫 2009」）→ 是**版本標記** → 剝掉
+ *
+ * ★ 為什麼要抽出來共用：TMDB 別名的套用點有 4 處
+ *   （performSmartSearch / performBatchSearch / loadResource / resolveFinalSearchQuery），
+ *   每一處都要用同一套判準，否則其中一處漏改就會出現
+ *   「同一個片名，有時查得到有時查不到」的幽靈 bug。
+ */
+function _stripTrailingVersionYear(text) {
+  const s = String(text ?? '');
+  if (!s) return s;
+  // 末尾有年份 → 判斷它是不是片名的一部分
+  if (/(?:19|20)\d{2}\s*$/.test(s) && _embeddedTitleYear(s) != null) {
+    return s; // 年份是片名的一部分 → 保留
+  }
+  return s.replace(/(?:19|20)\d{2}\s*$/, '');
+}
+
+/**
  * 把 Widget.http 的回應正規化成可直接取用 list 的物件。
  * 需處理三種情況：
  *   1. data 已是物件
@@ -4075,7 +4305,15 @@ function deepCleanSeriesName(name) {
   cleaned = cleaned.replace(/[（(【\[]\s*[^）)】\]]{0,24}\s*[）)】\]]/g, '');
 
   const removablePatterns = [
-    /剧场版|电影版|特别篇|SP|OVA/gi,
+    // ★ v123：SP / OVA 必須是「獨立詞」★
+    //   舊寫法 /剧场版|电影版|特别篇|SP|OVA/gi 沒有邊界 →
+    //   會把片名**內部**的字母刪掉：
+    //     「SPY×FAMILY」→「Y×FAMILY」→ baseName 變成「Y×FAMILY」
+    //     → 送 TMDB 搜「Y×FAMILY」→ 命中不相干的「新巴巴爸爸」
+    //     → 使用者拿到完全錯誤的作品。
+    //   修法：中文詞照舊，英文詞（SP/OVA）加上「前後不是英文字母」的斷言。
+    /剧场版|电影版|特别篇/g,
+    /(?<![A-Za-z])(?:SP|OVA)(?![A-Za-z])/gi,
     /\s*(HD|高清|超清|蓝光|4K|1080[Pp]|720[Pp]|HDR|杜比|Dolby|HEVC|X265|X264)\s*/gi,
     /\s*(WEB[-\s]?DL|WEBRip|BluRay|BDrip|BDRip|HDTV|TVrip|HQC)\s*/gi,
     /\s*(国语|粤语|英语|日语|韩语|中字|双语|简繁|内封|内嵌|字幕|未删减|完整版|全集|合集|番外)\s*/g,
@@ -4166,7 +4404,15 @@ function stripSubtitle(name) {
   // 中段夾雜的版本/副標題詞：古装版、時裝版、劇場版、電影版、特别篇、SP、OVA 等。
   // 不一定在字串結尾，可能後面還接語言標註（「古装版粤语」）。
   // 先移除這些詞，再交由後面的語言註記規則清尾巴，順序很重要。
-  s = s.replace(/\s*(古装版|時裝版|时装版|剧场版|劇場版|电影版|電影版|特别篇|特別篇|ova|OVA|sp|SP)\s*/gi, ' ');
+  //
+  // ★ v123：SP / OVA 必須是「獨立詞」才能移除 ★
+  //   舊寫法 `sp|SP` 沒有邊界 → 會命中片名**內部**的字母：
+  //     「SPY×FAMILY」→「 Y×FAMILY」→ baseName 變成「Y×FAMILY」
+  //     → 送 TMDB 搜的是「Y×FAMILY」→ 命中不相干的「新巴巴爸爸」
+  //   → 使用者拿到完全錯誤的作品。
+  //   修法：要求 SP / OVA 前後不是英文字母（可用 \b 或前後非字母的斷言）。
+  s = s.replace(/\s*(古装版|時裝版|时装版|剧场版|劇場版|电影版|電影版|特别篇|特別篇)\s*/gi, ' ');
+  s = s.replace(/\s*(?<![A-Za-z])(?:ova|sp)(?![A-Za-z])\s*/gi, ' ');
 
   // 片名尾端的語言／版本註記（清理函式已移除方括號，剩下的是裸露文字）。
   s = s.replace(/[一-鿿]{2,4}版$/, ' ');
@@ -15396,10 +15642,37 @@ class SmartSearchExecutor {
     //   同一個條目的兩筆資源（不同 CDN）誤拆成兩筆。
     const rawNameK = resource._rawName ? String(resource._rawName) : '';
     const dispNameK = String(resource.name || '');
-    const versionK2 = rawNameK && rawNameK !== dispNameK ? `${versionKey}~${rawNameK}` : versionKey;
+    // ★ v123：原始片名也要繁簡折疊 —— 否則「同一資源的繁簡兩種寫法」
+    //   會在 versionK2 這個維度再分開一次（等於沒修）。
+    const rawNameNorm = rawNameK ? normalizeForMatching(rawNameK) : '';
+    const dispNameNorm = normalizeForMatching(dispNameK);
+    const versionK2 = rawNameK && rawNameNorm !== dispNameNorm ? `${versionKey}~${rawNameNorm}` : versionKey;
     const langKey = extractLanguageTag(resource._rawName || resource._versionLabel) || 'x';
     return [
-      resource.name,
+      // ★★ v123：片名維度要用「繁簡折疊後」的名稱 ★★
+      //
+      // 症狀（實測 2026-11-28，重複測試第 2 輪才浮現）：
+      //   查「Re:從零開始的異世界生活 2」→ 金牌影視回 25 筆，
+      //   但**同一集出現兩次**：
+      //     A: title="Re：从零开始的异世界生活2"  url=agez:{v:128995,e:1,i:0}
+      //     B: title="Re：從零開始的異世界生活2"  url=agez:{v:128995,e:1,i:0}
+      //   兩者 url **完全相同**、集數相同、vodId 相同 → 是同一個資源。
+      //   差異只在顯示層的繁簡寫法。
+      //
+      // 根因：去重鍵用的是 `resource.name`（顯示用片名）。
+      //   顯示層對不同來源的片名做了不同的繁簡處理（adapter 條目
+      //   與站方條目的轉換路徑不同）→ 同一資源產生兩個字串 → 鍵不同
+      //   → 去重失效 → 使用者在選單看到重複項。
+      //
+      // 解法：鍵裡的片名改用 normalizeForMatching（繁→繁 + 異體字折疊）。
+      //   實測兩個變體正規化後**完全相同**：
+      //     "Re：从零开始的异世界生活2" → "re：从零开始的异世界生活2"
+      //     "Re：從零開始的異世界生活2" → "re：从零开始的异世界生活2"
+      //   → 鍵相同 → 去重生效。
+      //
+      // ★ 不影響「不同作品」的區分：不同作品的片名正規化後仍不同，
+      //   只把「同一個名字的繁簡兩種寫法」合併 —— 那本來就是同一個作品。
+      normalizeForMatching(dispNameK) || dispNameK,
       versionK2,
       langKey,
       episodeKeyOf(resource),
@@ -16874,14 +17147,12 @@ async function loadResource(params, onStreamResult = null) {
     targetInfo.searchQuery = params._preSearchQuery;
   }
   if (targetInfo._aliasSearchQuery) {
-    const aliasQ = String(targetInfo._aliasSearchQuery)
-      .replace(/(?:19|20)\d{2}\s*$/, '')
+    const aliasQ = _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
       .replace(/\s+$/, '')
       .trim();
     if (aliasQ) {
       console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
       targetInfo.searchQuery = aliasQ;
-targetInfo.searchQuery = aliasQ;
 // v2.9.6：別名被採用時必須同步改比對用的名稱，否則搜尋拿得到結果
 // 但過濾階段會把它們全部殺掉。
 //
@@ -17779,17 +18050,86 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   // 第一條成立的別名直接挑走（break）。aliases 陣列內 CN 別名排第一。
   const baseSimp = convertChinese(baseName, false);
   const hasChinese = (s) => /[一-鿿]/.test(s);
+
+  // ★★ v122：別名必須是「中文片名」，不能是日文／韓文原名 ★★
+  //
+  // 症狀（實測 2026-11-28）：查「零之使魔 第四季」→ 搜尋結果變成 **0 筆**。
+  // 根因：TMDB hit 的 original_name 是日文「ゼロの使い魔」，
+  //   舊判斷 `hasChinese(s) && convertChinese(s,false)===s` 會放行它 ——
+  //   因為「使魔」是漢字（落在 CJK 統一表意文字區），
+  //   而 convertChinese 對沒有繁體字的字串原樣回傳 → 等於通過。
+  //   站方根本沒有「ゼロの使い魔」這個片名 → 0 筆。
+  //
+  // 解法：別名必須**以中文為主**。
+  //   判準：漢字數 / 全部 CJK 字符數 ≥ 0.6，且不能有假名（平假名/片假名）。
+  //   「ゼロの使い魔」有 4 個假名 → 立即否決。
+  //   「行尸走肉」漢字佔 100% → 通過。
+  const CJK_ONLY = /[぀-ヿ㐀-䶿一-鿿豈-﫿]/;
+  const KANA = /[぀-ゟ゠-ヿ]/;
+  const HAN = /[一-鿿]/;
+  const isChineseTitle = (s) => {
+    const t = String(s || '');
+    if (KANA.test(t)) return false;              // 有假名 → 日文
+    if (!HAN.test(t)) return false;               // 沒有漢字 → 不是中文片名
+    // 漢字必須佔 CJK 字符的絕大多數
+    const cjk = (t.match(CJK_ONLY) || []).length;
+    const han = (t.match(HAN) || []).length;
+    if (cjk === 0) return false;
+    return han / cjk >= 0.6;
+  };
+
   const isSimpChinese = (s) => hasChinese(s) && convertChinese(s, false) === s;
   let bestAlias = null;
+
+  // ★★★ v123：別名挑選改為「打分」而非「取第一個通過者」 ★★★
+  //
+  // 舊邏輯（break on first match）有兩個致命缺陷：
+  //
+  // (1) `if (!aSimp || aSimp === baseSimp) continue;` —— 把「別名的簡體版
+  //     等於 base 的簡體版」當成「無新資訊」跳過。
+  //     ★ 但這正是跨地區橋接的**目標**！
+  //       查「仁醫」（繁）→ baseSimp = 「仁医」
+  //       TMDB 回的站方片名就是「仁医」→ aSimp === baseSimp → **被跳過**
+  //       → 繼續往後找 → 挑到 original_name「JIN - 仁 -」（外文原名）
+  //       → 站方沒有這個片名 → 0 筆。
+  //     正確做法：別名只要**跟 baseName 原字串不同**就是有效候選。
+  //     繁體「仁醫」→ 簡體「仁医」正是我們要的轉換！
+  //
+  // (2) aliases 陣列裡混雜了「同一部作品的不同衍生條目」
+  //     （追龍 → 追龙番外篇之龙争虎斗、咒術迴戰 → 咒术回战 小剧场），
+  //     取第一個通過者就會挑到這些續集/特別篇 → 站方搜不到 → 0 筆。
+  //
+  // 新邏輯：對每個候選算分數，取最高分。
+  //   · 必須是簡體中文片名（站方字典認得）
+  //   · 必須不是續集/衍生作（用 _aliasIntroducesDifferentWork 擋）
+  //   · 分數 = 片名與 baseName 的相似度（越高越像同一部作品）
+  //   · 相似度相同 → 偏好「較短」的（原始作品名通常比衍生作短）
+  const baseNorm = normalizeForMatching(baseName);
+  const scored = [];
   for (const a of aliases) {
     if (typeof a !== 'string') continue;
     const aTrim = a.trim();
     if (!aTrim) continue;
-    if (normalizeForMatching(aTrim) === normalizeForMatching(baseName)) continue;
-    const aSimp = convertChinese(aTrim, false);
-    if (!aSimp || aSimp === baseSimp) continue;
+    // 與 baseName **原字串**完全相同 → 沒有新資訊。
+    //
+    // ★ v123：這裡必須用「原字串」比對，不能用 normalizeForMatching。
+    //   normalizeForMatching 本身會做繁→簡正規化，所以
+    //   normalizeForMatching('仁醫') === normalizeForMatching('仁医')
+    //   → 用它比對會把「繁體查詢 → 簡體站方片名」這個**最該命中的情況**
+    //   當成「同名」跳過 → 繼續往後挑到 original_name → 0 筆。
+    //
+    //   正確：只有字面完全一致（同一個詞）才算「沒有新資訊」。
+    //   「仁醫」vs「仁医」字面不同 → 是有效候選 → 正是跨地區橋接要的。
+    if (aTrim === baseName) continue;
     // 必須是簡體中文（VOD 站字典認得）
     if (!isSimpChinese(aTrim)) continue;
+    // ★★ v122：必須是「中文片名」，不能是日文／韓文原名 ★★
+    //   「ゼロの使い魔」（日文原名）漢字佔多數但含假名 → 否決，
+    //   否則站方沒有這個片名 → 0 筆。
+    if (!isChineseTitle(aTrim)) {
+      console.log(`[TMDB-diag] tryExpand: 跳過非中文片名別名 "${aTrim}"`);
+      continue;
+    }
     // ★★ v122：別名不得引入「續集 / 前傳 / 副標題」 ★★
     //
     // 症狀（實測 2026-11-28）：
@@ -17805,8 +18145,38 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
       console.log(`[TMDB-diag] tryExpand: 跳過續集別名 "${aTrim}"（查詢 "${baseName}"）`);
       continue;
     }
-    bestAlias = aTrim;
-    break;
+    // ★★ v123：別名不得是「同一作品的衍生內容」★★
+    //   「追龙番外篇之龙争虎斗」「咒术回战 小剧场」「仁医莎姆」
+    //   → 站方有這些名字但那是**別的內容** → 搜尋結果會指到錯的片。
+    if (_looksLikeSpinOffMarker(aTrim)) {
+      console.log(`[TMDB-diag] tryExpand: 跳過衍生作別名 "${aTrim}"（查詢 "${baseName}"）`);
+      continue;
+    }
+    // ★ v123：算相似度分數（取代舊的「取第一個通過者」）
+    //   相似度用 widget 自己的混合相似度（處理異體字）。
+    const aNorm = normalizeForMatching(aTrim);
+    let sim = 0;
+    try { sim = calculateHybridSimilarity(baseName, aTrim); } catch { sim = 0; }
+    if (!Number.isFinite(sim)) sim = 0;
+    // ★ v123：「繁簡等價」判定。
+    //   normalizeForMatching 已做繁→簡，所以 aNorm === baseNorm 表示
+    //   「兩個字串是同一個名字的繁簡兩種寫法」。
+    //   這正是跨地區橋接最典型的情況（「仁醫」→「仁医」）→ 給最高分。
+    //
+    //   ★ 但要注意：若 aTrim 字面就等於 baseName，前面已被 continue 掉，
+    //     所以走到這裡的 aNorm === baseNorm 一定是「字面不同、繁簡等價」。
+    const isScriptVariant = aNorm === baseNorm;
+    if (isScriptVariant) sim = Math.max(sim, 0.95);
+    scored.push({ alias: aTrim, sim, len: aTrim.length, variant: isScriptVariant });
+  }
+
+  // 取最高分；同分取較短者（原始作品名通常比「XX番外篇之YYY」短）
+  if (scored.length) {
+    scored.sort((x, y) => (y.sim - x.sim) || (x.len - y.len));
+    bestAlias = scored[0].alias;
+    console.log(`[TMDB-diag] tryExpand: 候選評分 ` +
+      scored.slice(0, 5).map(s => `"${s.alias}"(${s.sim.toFixed(2)}${s.variant ? ',繁簡等價' : ''})`).join(' ') +
+      ` → 選 "${bestAlias}"`);
   }
   // 退路：所有 alias 都不符合嚴格條件（罕見）→ return false 走原 searchQuery
   // 不要 fallback 到英文別名，VOD 站用中文字典認不出。
@@ -17838,8 +18208,7 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
  */
 function resolveFinalSearchQuery(targetInfo, originalQuery) {
   if (targetInfo?._aliasSearchQuery) {
-    return String(targetInfo._aliasSearchQuery)
-      .replace(/(?:19|20)\d{2}\s*$/, '')
+    return _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
       .replace(/\s+$/, '')
       .trim() || String(originalQuery || '').trim();
   }
@@ -18629,14 +18998,12 @@ async function performSmartSearch(params, onStreamResult) {
     targetInfo.searchQuery = params._preSearchQuery;
   }
   if (targetInfo._aliasSearchQuery) {
-    const aliasQ = String(targetInfo._aliasSearchQuery)
-      .replace(/(?:19|20)\d{2}\s*$/, '')
+    const aliasQ = _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
       .replace(/\s+$/, '')
       .trim();
     if (aliasQ) {
       console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
       targetInfo.searchQuery = aliasQ;
-targetInfo.searchQuery = aliasQ;
 // v2.9.6：別名被採用時必須同步改比對用的名稱，否則搜尋拿得到結果
 // 但過濾階段會把它們全部殺掉。
 //
@@ -18775,14 +19142,12 @@ async function performBatchSearch(params) {
     targetInfo.searchQuery = params._preSearchQuery;
   }
   if (targetInfo._aliasSearchQuery) {
-    const aliasQ = String(targetInfo._aliasSearchQuery)
-      .replace(/(?:19|20)\d{2}\s*$/, '')
+    const aliasQ = _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
       .replace(/\s+$/, '')
       .trim();
     if (aliasQ) {
       console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
       targetInfo.searchQuery = aliasQ;
-targetInfo.searchQuery = aliasQ;
 // v2.9.6：別名被採用時必須同步改比對用的名稱，否則搜尋拿得到結果
 // 但過濾階段會把它們全部殺掉。
 //
@@ -18897,12 +19262,37 @@ targetInfo.searchQuery = aliasQ;
 
       // 合併：舊格式的 legacy 也要納入（其內含 MacCMS + adapter 兩種，
       // 由 _adapterSite 自動分流）
+      //
+      // ★ v123：合併後一定要按 URL 去重。
+      //   實測 bug（連續搜同一片）：cache 每搜一次就多灌一批相同的資源
+      //   （25 → 50 → 75），因為舊版寫 cache 時把「cache 命中結果 +
+      //   新搜結果」整批寫回去，而讀取時三個來源（mac / adapter / legacy）
+      //   直接串接、沒有去重 → 髒資料會越滾越大。
+      //   去重鍵用 _dedupUrlKey（去包裝、去簽名的內層路徑），與
+      //   smartDeduplicate / 合併路徑口徑一致。
+      const _cacheKeyOf = (r) => {
+        if (!r || !r.url) return null;
+        return `${Number.isFinite(r.season) ? r.season : 'x'}||${_dedupUrlKey(r.url)}`;
+      };
+      const _seenCacheUrl = new Set();
+      const _dedupCacheList = (arr) => {
+        const out = [];
+        for (const r of (arr || [])) {
+          if (!r || !r.url) { if (r) out.push(r); continue; }
+          const k = _cacheKeyOf(r);
+          if (_seenCacheUrl.has(k)) continue;
+          _seenCacheUrl.add(k);
+          out.push(r);
+        }
+        return out;
+      };
       const fromLegacy = legacyCached.filter(r => {
         const isInMac = macCached.some(m => m.url === r.url);
         const isInAd  = adCached.some(a => a.url === r.url);
         return !isInMac && !isInAd;
       });
-      const merged = _filterResultsBySiteSelection([...macCached, ...adCached, ...fromLegacy], params);
+      const merged = _filterResultsBySiteSelection(
+        _dedupCacheList([...macCached, ...adCached, ...fromLegacy]), params);
       if (merged.length > 0) {
         console.log(`💾 batch cache 命中: mac=${macCached.length} adapter=${adCached.length} legacy=${fromLegacy.length}（合併 ${merged.length}）`);
         allResults = merged;
@@ -19653,9 +20043,54 @@ targetInfo.searchQuery = aliasQ;
       //   去重會把後到的整季殺掉：S1 cache 先佔位，S2 新搜的同 URL 被當成
       //   「已存在」丟掉，留下來的是 S1 的舊物件（season=1），後續
       //   filterBySequel 再把它殺掉 → S2 歸零。Zen 無此問題（無 cache 合併）。
-      const _seasonKeyOf = (r) => (Number.isFinite(r?.season) ? r.season : (r?._seasonFromItem ?? 'x'));
-      const existingKeys = new Set(allResults.map(r => r.url ? `s${_seasonKeyOf(r)}||${r.url}` : null).filter(Boolean));
-      const additions = newSearched.filter(r => !r.url || !existingKeys.has(`s${_seasonKeyOf(r)}||${r.url}`));
+      //
+      // ★ v123 修正：季別 fallback 必須補齊，否則 cache 命中時會整批重複。
+      //
+      //   實測 bug（Re:從零開始的異世界生活 2 連續搜 3 次）：
+      //     第 1 次 → 25 筆，第 2 次 → 50 筆，第 3 次 → 75 筆（每次 +25）。
+      //
+      //   根因：**合併當下兩邊的季別欄位還不是同一套值**。
+      //     • cache 內的項目：已經過 cleanResourceForOutput → season = 1
+      //       （且 _seasonFromItem 欄位已被清掉）
+      //     • 新搜的項目：尚未 clean → season = undefined、_seasonFromItem = 2
+      //   → 快取鍵 "s1||url" 與新搜鍵 "s2||url" 對不上 → 去重失效 →
+      //     新結果被附加上去 → 回傳筆數與 cache 內容一起灌水。
+      //   （cleanResourceForOutput 的季別指派在合併之後才跑。）
+      //
+      //   修法：合併用的季別必須與 cleanResourceForOutput **算出的結果一致**，
+      //   否則同一路資源在兩邊會得到不同的鍵。
+      //   ★ 這裡直接沿用 clean 的判定順序：
+      //     1) resource.season（已指派）
+      //     2) resource._seasonFromItem（但排除「續集電影」誤判）
+      //     3) playlist 級別季別（targetInfo.seasonNumber）
+      //     4) 都沒有 → 不帶季別（'x'），不要亂猜
+      const _tgtSeqForMerge = extractSequelNumber(targetInfo?.rawName)
+        ?? targetInfo?._expectedSequel ?? null;
+      const _isSequelMovieMerge = _tgtSeqForMerge != null && _tgtSeqForMerge > 1
+        && newSearched.some(r => r?._seasonFromItem === _tgtSeqForMerge);
+      const _playlistSeasonMerge = (Number.isFinite(targetInfo?.seasonNumber) && targetInfo.seasonNumber > 0)
+        ? targetInfo.seasonNumber : null;
+      const _seasonKeyOf = (r) => {
+        if (Number.isFinite(r?.season)) return r.season;
+        if (type === 'tv' && !_isSequelMovieMerge && Number.isFinite(r?._seasonFromItem)) {
+          return r._seasonFromItem;
+        }
+        if (_playlistSeasonMerge != null) return _playlistSeasonMerge;
+        return 'x';
+      };
+      // ★ URL 一律用「去包裝、去簽名的內層路徑」當鍵（_dedupUrlKey）。
+      //   同一路串流的兩種包裝形式（裸 CDN vs /filter?url= 過濾伺服器）
+      //   內層路徑相同 → 同一把鍵 → 只留一筆。
+      //   （smartDeduplicate 本身也用 _dedupUrlKey，兩邊口徑一致才不會漏。）
+      const _mergeKeyOf = (r) => {
+        if (!r || !r.url) return null;
+        return `s${_seasonKeyOf(r)}||${_dedupUrlKey(r.url)}`;
+      };
+      const existingKeys = new Set(allResults.map(_mergeKeyOf).filter(Boolean));
+      const additions = newSearched.filter(r => {
+        const k = _mergeKeyOf(r);
+        return k === null || !existingKeys.has(k);
+      });
       allResults = [...allResults, ...additions];
     } else {
       allResults = newSearched;
@@ -20553,8 +20988,22 @@ targetInfo.searchQuery = aliasQ;
 
       if (adResults.length > 0) {
         try {
-          Widget.storage?.set?.(adCacheKey, JSON.stringify(adResults), CONFIG.CACHE_TTL);
-          console.log(`💾 adapter cache 寫入(過濾後): ${adResults.length} 條（key=..._adapter_e${targetEpisode || 'all'}）`);
+          // ★ v123：寫入前先按 URL 去重。
+          //   adapter cache 是「單集/整季覆蓋」語意，本來不該累積，
+          //   但因為舊版把「cache 命中結果 + 新搜結果」整批寫回去，
+          //   cache 內容會每搜一次就多灌一批相同的資源
+          //   （實測 25 → 50 → 75）。寫入端再保險一次，確保 cache
+          //   裡不會有同一路串流的兩份。
+          const _seenAdUrl = new Set();
+          const _adToWrite = adResults.filter(r => {
+            if (!r || !r.url) return true;
+            const k = `${Number.isFinite(r.season) ? r.season : 'x'}||${_dedupUrlKey(r.url)}`;
+            if (_seenAdUrl.has(k)) return false;
+            _seenAdUrl.add(k);
+            return true;
+          });
+          Widget.storage?.set?.(adCacheKey, JSON.stringify(_adToWrite), CONFIG.CACHE_TTL);
+          console.log(`💾 adapter cache 寫入(過濾後): ${_adToWrite.length} 條（key=..._adapter_e${targetEpisode || 'all'}）`);
         } catch (e) {}
       }
       } catch (e) {}
