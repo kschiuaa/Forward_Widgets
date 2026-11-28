@@ -1668,6 +1668,40 @@ async function _fetchTmdbRegionTitles(tmdbId, tmdbType) {
   return titles;
 }
 
+/**
+ * ★★ v125.2：把「主片名 + 空白分隔的 arc 副標題」拆開 ★★
+ *
+ * 背景（實測 2026-11-29）：
+ *   「多罗罗 十六夜」→ TMDb 沒有這個條目（十六夜是篇目不是作品）
+ *   「鬼滅之刃 柱練編」→ TMDb **有**這個條目
+ *   「JOJO的奇妙冒險 黃金之風」→ TMDb **有**這個條目
+ *   → 判斷依據不是「副標題是什麼」，而是「**完整片名能不能查到**」。
+ *     所以這個函式只負責**拆**，能不能退回去由呼叫端看搜尋結果決定。
+ *
+ * 拆分規則（保守）：
+ *   - 用**最後一個**空白切分 → 「JOJO的奇妙冒險 黃金之風」→ base=「JOJO的奇妙冒險」
+ *   - base 至少要有 2 個字 → 避免「A 片名」這種單字被切掉
+ *   - base 不得含「季/集/話/部」等季別標記（那是季別不是 arc 副標題，
+ *     季別由 stripSeasonMarker 處理）
+ *
+ * @param {string} name
+ * @returns {{base: string, hasArc: boolean}}
+ */
+function _splitTrailingArcSubtitle(name) {
+  const s = String(name ?? '').trim();
+  if (!s) return { base: '', hasArc: false };
+  const m = s.match(/^(.+?)\s+(\S+)$/);
+  if (!m) return { base: s, hasArc: false };
+  const base = m[1].trim();
+  const tail = m[2].trim();
+  if (!base || base.length < 2) return { base: s, hasArc: false };
+  // base 含季別標記 → 不是 arc 副標題，是「主片名 + 季別」
+  if (/[第季集话話部季]/.test(base)) return { base: s, hasArc: false };
+  // tail 是純數字 → 續集序號（「無間道 2」），不是 arc 副標題
+  if (/^\d+$/.test(tail)) return { base: s, hasArc: false };
+  return { base, hasArc: true };
+}
+
 async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const apiKey = CONFIG.TMDB.API_KEY;
   if (!apiKey) return;
@@ -1726,6 +1760,30 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const qRaw = String(baseName || '').trim();
   const qSimp = convertChinese(qRaw, false);
   const queries = [...new Set([qRaw, qSimp].filter(Boolean))];
+
+  // ★★ v125.2：片名帶「空白分隔的副標題」時，補搜**主片名** ★★
+  //
+  // 問題（實測 2026-11-29）：查「多罗罗 十六夜」
+  //   → TMDB /search/tv 「多罗罗 十六夜」→ **0 筆**（TMDb 沒有這個條目）
+  //   → /search/multi 也 0 筆 → 別名橋接完全失效
+  //   → 站方搜「多罗罗 十六夜」也 0 筆（站方只索引「多罗罗」）
+  //   → 使用者明明看得到《多罗罗》，卻拿到 0 筆。
+  //
+  // ★ 為什麼副標題查不到是正常的：
+  //   「十六夜」是《多罗罗》的一個**篇目（arc）**，不是獨立作品 → TMDb 不會
+  //   為它建條目；站方也只存主片名。Rex 收到這種「主片名 + arc 副標題」時
+  //   應當**退到主片名**去找。
+  //
+  // ★ 對照組（已正常，不用動）：
+  //   「鬼滅之刃 柱練編」→ TMDb **有**「鬼滅之刃 柱練編」條目 → 正常命中。
+  //   「JOJO的奇妙冒險 黃金之風」→ TMDb 有獨立條目 → 正常命中。
+  //   → 所以這裡只在「完整片名 0 命中」時才補搜主片名 → 零額外請求（正常情況）。
+  //
+  // ★ 安全性：主片名是使用者輸入的**前綴**，必然屬於同一部作品 → 退到主片名
+  //   不會引入別的作品。這也讓 baseName 之後的比對有東西可比。
+  const _subSplit = _splitTrailingArcSubtitle(qRaw);
+  const _baseOnly = _subSplit.base;
+  const _hasArcSubtitle = _subSplit.hasArc;
 
   // ── 並行打所有變體 ──
   const fetches = queries.map(q => {
@@ -1833,6 +1891,40 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     }
   }
 
+  // ★★ v125.2：完整片名 0 命中且帶 arc 副標題 → 補搜「主片名」 ★★
+  //
+  // 場景：查「多罗罗 十六夜」
+  //   → 完整片名在 TMDb 0 命中 → 用主片名「多罗罗」再搜一次 → id=83100 ✅
+  //   → 取得站方在用的簡體名「多罗罗」→ 站方命中 ✅
+  //
+  // ★ 只在「前兩種搜尋都 0 命中」時才補打 → 正常情況請求數不變。
+  if (!merged.length && !crossTypeHits.length && _hasArcSubtitle && _baseOnly) {
+    const _baseQueries = [...new Set([_baseOnly, convertChinese(_baseOnly, false)].filter(Boolean))];
+    console.log(`[TMDB-diag] 完整片名 0 命中，改用主片名 "${_baseOnly}" 補搜`);
+    const _baseFetches = _baseQueries.map(q => {
+      const url = searchUrlBase(langCn, q);
+      return Widget.http.get(url, {
+        timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+        headers: { 'Accept': 'application/json' }
+      }).then(_unwrapHttpResponse).catch(() => null);
+    });
+    const _baseResponses = await Promise.all(_baseFetches);
+    for (const data of _baseResponses) {
+      if (!data?.results?.length) continue;
+      respCount++;
+      console.log(`[TMDB-diag] 主片名 search hit q="${_baseOnly}" n=${data.results.length}`);
+      for (const r of data.results) {
+        if (!r || r.id == null) continue;
+        if (seenIds.has(r.id)) continue;
+        seenIds.add(r.id);
+        merged.push(r);
+      }
+    }
+    if (merged.length) {
+      console.log(`[TMDB-diag] 主片名補搜命中 ${merged.length} 筆 → 續行別名橋接`);
+    }
+  }
+
   // ★★ v124：型別相符的命中為主；只有它全滅時才用跨型別條目 ★★
   //
   //   「毒舌大狀」：TMDB /search/tv → 0 筆（該劇改名「刑侦12」）
@@ -1846,7 +1938,8 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   //   且比對時用的是**站方實際片名** → 不會把電影版誤當劇集版。
   const primaryPool = merged.length ? merged : crossTypeHits;
   if (!primaryPool.length) {
-    console.log(`[TMDB-diag] "${baseName}" 無搜尋結果（試過 ${queries.length} 個變體 + multi）`);
+    console.log(`[TMDB-diag] "${baseName}" 無搜尋結果（試過 ${queries.length} 個變體 + multi` +
+      `${_hasArcSubtitle ? ' + 主片名' : ''}）`);
     return;
   }
   if (!merged.length && crossTypeHits.length) {
@@ -4123,7 +4216,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.5",
+  version: "1.2.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
