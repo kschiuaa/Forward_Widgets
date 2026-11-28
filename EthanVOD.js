@@ -3604,7 +3604,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.2",
+  version: "2.0.3",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -17146,6 +17146,18 @@ async function loadResource(params, onStreamResult = null) {
     //   直接沿用，不要再跑一次整段 TMDB 流程。
     targetInfo.searchQuery = params._preSearchQuery;
   }
+  // ★ v123：上游傳下來的別名要套用到**這一份** targetInfo。
+  //
+  //   為什麼需要：performSmartSearch / performBatchSearch 會各自 rebuild
+  //   一份 targetInfo（extractEnhancedInfo(seriesName)）→ 那份物件沒有
+  //   上游的 _aliasSearchQuery → 結果是「拿別名去搜、拿原名去篩」
+  //   → isSmartSeriesMatch 判 type=none → 搜得到卻篩光 → 0 筆。
+  //   （實測「毒雪紛飛」港譯 → TMDB 別名「白粉飞」→ 0 筆。）
+  //
+  //   ★ 必須在下面的 applyAliasNameToTarget 之前設好。
+  if (!targetInfo._aliasSearchQuery && params?._aliasSearchQuery) {
+    targetInfo._aliasSearchQuery = params._aliasSearchQuery;
+  }
   if (targetInfo._aliasSearchQuery) {
     const aliasQ = _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
       .replace(/\s+$/, '')
@@ -17395,6 +17407,24 @@ async function loadResource(params, onStreamResult = null) {
     ...params,
     seriesName,
     _preSearchQuery: targetInfo.searchQuery,
+    // ★ v123：把「已採用的別名」一起傳下去。
+    //
+    //   問題（實測「毒雪紛飛」港譯 → TMDB 別名「白粉飞」）：
+    //     loadResource 拿到別名 → targetInfo.searchQuery = 「白粉飞」→ 傳給
+    //     performBatchSearch 的 _preSearchQuery 也是「白粉飞」（搜尋用對了）。
+    //     但 performBatchSearch 會**自己 rebuild 一份 targetInfo**
+    //     （extractEnhancedInfo(seriesName)）→ 那份物件沒有 _aliasSearchQuery
+    //     → `if (targetInfo._aliasSearchQuery)` 不成立
+    //     → applyAliasNameToTarget 沒被呼叫
+    //     → targetInfo.baseName 還是「毒雪紛飛」。
+    //   結果：拿「白粉飞」去搜、拿「毒雪紛飛」去篩 → isSmartSeriesMatch
+    //   判 type=none → **搜得到卻篩光 → 0 筆**。
+    //
+    //   ★ 這正是 v2.9.6 想修的那個 bug 的變種：搜尋名與比對名必須同一個。
+    //
+    //   修法：把別名一併傳下去，performBatchSearch / performSmartSearch
+    //   收到後用它同步自己的 baseName（applyAliasNameToTarget）。
+    _aliasSearchQuery: targetInfo._aliasSearchQuery || null,
     _targetAirDate: targetInfo._targetAirDate ?? null,
     _targetEpisode: targetEpisode ?? null,
     // 設定頁已移除搜尋模式 / 清晰度偏好：鎖死批次搜尋 + 最清晰排序，
@@ -18997,6 +19027,18 @@ async function performSmartSearch(params, onStreamResult) {
     //   直接沿用，不要再跑一次整段 TMDB 流程。
     targetInfo.searchQuery = params._preSearchQuery;
   }
+  // ★ v123：上游傳下來的別名要套用到**這一份** targetInfo。
+  //
+  //   為什麼需要：performSmartSearch / performBatchSearch 會各自 rebuild
+  //   一份 targetInfo（extractEnhancedInfo(seriesName)）→ 那份物件沒有
+  //   上游的 _aliasSearchQuery → 結果是「拿別名去搜、拿原名去篩」
+  //   → isSmartSeriesMatch 判 type=none → 搜得到卻篩光 → 0 筆。
+  //   （實測「毒雪紛飛」港譯 → TMDB 別名「白粉飞」→ 0 筆。）
+  //
+  //   ★ 必須在下面的 applyAliasNameToTarget 之前設好。
+  if (!targetInfo._aliasSearchQuery && params?._aliasSearchQuery) {
+    targetInfo._aliasSearchQuery = params._aliasSearchQuery;
+  }
   if (targetInfo._aliasSearchQuery) {
     const aliasQ = _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
       .replace(/\s+$/, '')
@@ -19140,6 +19182,18 @@ async function performBatchSearch(params) {
     // ★ 上游（loadResource）已完成 TMDB 擴充並把最終 query 傳下來，
     //   直接沿用，不要再跑一次整段 TMDB 流程。
     targetInfo.searchQuery = params._preSearchQuery;
+  }
+  // ★ v123：上游傳下來的別名要套用到**這一份** targetInfo。
+  //
+  //   為什麼需要：performSmartSearch / performBatchSearch 會各自 rebuild
+  //   一份 targetInfo（extractEnhancedInfo(seriesName)）→ 那份物件沒有
+  //   上游的 _aliasSearchQuery → 結果是「拿別名去搜、拿原名去篩」
+  //   → isSmartSeriesMatch 判 type=none → 搜得到卻篩光 → 0 筆。
+  //   （實測「毒雪紛飛」港譯 → TMDB 別名「白粉飞」→ 0 筆。）
+  //
+  //   ★ 必須在下面的 applyAliasNameToTarget 之前設好。
+  if (!targetInfo._aliasSearchQuery && params?._aliasSearchQuery) {
+    targetInfo._aliasSearchQuery = params._aliasSearchQuery;
   }
   if (targetInfo._aliasSearchQuery) {
     const aliasQ = _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
