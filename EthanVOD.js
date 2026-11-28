@@ -4123,7 +4123,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.5.1",
+  version: "2.5.5",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -4751,6 +4751,21 @@ function _embeddedTitleYear(name) {
     if (/[（(【\[]\s*$/.test(before) && /^\s*[）)】\]]/.test(after)) continue;
     // 年份前面是文字 → 片名的一部分
     if (/[\p{L}\p{N}]/u.test(before.slice(-1))) return parseInt(m[0], 10);
+    // ★★ v125.2（修正）：年份前面是**標點** → 也要當成片名的一部分 ★★
+    //
+    // 實測（2026-11-29）：TMDb 別名「回答吧！1988」（《請回答1988》的
+    //   大陸官方譯名）→ 年份前是「！」→ 舊規則判成「版本標記」→ 剝掉年份
+    //   → 查詢詞變成「回答吧！」→ 站方根本沒有這個片名 → 0 筆。
+    //   → 但「回答吧！1988」的 1988 **確實是片名的一部分**。
+    //
+    // ★ 判準（比「非空白」更嚴，避免誤傷版本標記）：
+    //   年份前面是**標點符號**（非空白、非文字）→ 視為片名的一部分。
+    //     「回答吧！1988」→ 前面「！」是標點 → 保留 ✓
+    //   年份前面只有空白（「仁醫 2009」）→ 版本標記 → 剝掉 ✓
+    //   年份被括號包住（「仁醫（2009）」）→ 版本標記 → 剝掉 ✓
+    if (before.length > 0 && /[\p{P}\p{S}]/u.test(before.slice(-1))) {
+      return parseInt(m[0], 10);
+    }
     // 年份後面緊接文字（「1988年」不算，但「1988MHz」算）—— 保守視為片名一部分
     if (/^[\p{L}]/u.test(after)) return parseInt(m[0], 10);
   }
@@ -8406,6 +8421,57 @@ function _storeTmdbArcToStorage(cacheKey, base, type, season, data) {
 const _TMDB_ARC_GAP_DAYS = 90;
 
 /**
+ * ★★ v125.1（效能 + 正確性）：非正片條目的判定正則 ★★
+ *
+ * 【原來的 bug】
+ *   舊正則用 `\bOVA\b` / `\bSP\b`。但中文與英文字母相接時**沒有單詞邊界**
+ *   （「名侦探柯南OVA3」裡「探」和「O」都是 word char → \b 不成立）
+ *   → 這個條目**沒有被當成劇場版排除** → extractSequelNumber 讀出 OVA3 的「3」
+ *   → 守門員會把 OVA 條目誤認為「第 3 季」條目。
+ *
+ *   實測（《名偵探柯南》站方清單）：站方回 120 筆，其中有
+ *     「名侦探柯南OVA3：柯南、平次与消失的少年」
+ *     「名侦探柯南OVA10：怪盗基德孤岛决战」
+ *   → 這兩個是 OVA，**不是**分季條目。
+ *
+ * 【修法】
+ *   1. OVA / SP 不再要求單詞邊界 → `OVA` / `SP` 直接比對（中英混排也命中）。
+ *   2. 但要避免誤傷 → 要求 OVA/SP **後面不是數字以外的東西**？
+ *      不行：「OVA3」「OVA10」都要命中。
+ *      → 改成：OVA / SP 只要出現在片名中就排除（OVA/SP 在中文片名裡
+ *        本來就是「特別篇」的意思，不會是正規季別）。
+ *   3. 同時保留原本的邊界版本 → 兩者並列，涵蓋所有寫法。
+ *
+ * ★ 這是**修正既有誤判**，不是新增限制：
+ *   原本就該排除 OVA 條目，只是正則沒生效。
+ *   → 只會讓守門員更嚴格，不會放行更多條目 → 搜尋結果不會變差。
+ *
+ * ★★ 為什麼**不含** OP / ED / PV / CM ★★
+ *   這四個是英文字母，會命中片名裡的**子字串**：
+ *     「OPERATION」含 OP、「EDEN」含 ED、「PVP」含 PV
+ *   → 會把正常片名誤判成非正片 → 反而擋掉合法條目。
+ *   → 只保留中文字面（劇場版/特別篇/花絮…）+ OVA（中文片名裡 OVA 一定是特別篇）。
+ *
+ * ★ 註：「名侦探柯南：战栗的乐谱」這類**電影副標題**不含「剧场版」字樣，
+ *   所以本正則不會命中它。但它也不會被誤判成「第 N 季」條目
+ *   （extractSequelNumber 回 null）→ 守門員自然排除它。
+ */
+const _ARC_NON_EPISODE_RE = /剧场版|劇場版|电影版|電影版|OVA|Ova|ova|外传|外傳|特別篇|特别篇|总集篇|總集篇|特別篇集|预告|預告|精彩|花絮|花絮|片頭|片尾|预告版|先行版|抢先版|搶先版/;
+
+/**
+ * ★ 純「SP」判定（單獨出現，避免誤傷「SPY×FAMILY」之類的片名）★
+ */
+function _isArcNonEpisodeTitle(name) {
+  const nm = String(name || '').trim();
+  if (!nm) return true;
+  if (_ARC_NON_EPISODE_RE.test(nm)) return true;
+  // SP 要獨立出現：前面不是英文字母、後面不是英文字母。
+  // 「名侦探柯南SP」→ 命中；「SPY×FAMILY」→ 不命中（SP 後接 Y）。
+  if (/(?:^|[^A-Za-z])SP(?:[^A-Za-z]|$)/i.test(nm)) return true;
+  return false;
+}
+
+/**
  * ★★ v125.1（效能）：arc 路徑专用的 TMDb id 解析（含共用 cache）★★
  *
  * 【原本的問題】
@@ -8759,7 +8825,8 @@ function _stationSupportsArcRemap(items, remap, baseName) {
       const nm = String(it?.vod_name || '').trim();
       if (!nm) continue;
       // (3) 排除非正片條目
-      if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇|总集篇|總集篇/.test(nm)) continue;
+      // ★ v125.1：改用 _isArcNonEpisodeTitle（修好「名侦探柯南OVA3」的漏判）
+      if (_isArcNonEpisodeTitle(nm)) continue;
       // (1) 條目必須宣告自己是第 N 季
       const seq = extractSequelNumber(nm);
       if (seq !== wantSeason) continue;
@@ -21239,26 +21306,47 @@ async function performBatchSearch(params) {
     //     _macCacheHit（MacCMS 快取命中）或非 tv 類型 → 完全跳過。
     if (type === 'tv' && !_macCacheHit && targetInfo._arcPromise) {
       try {
-        const _mapped = await _resolveArcRemapCandidate(
-          targetInfo._arcPromise,
-          targetEpisode,
-          targetInfo.seasonNumber,
-          ''
-        );
-        targetInfo._arcRemap = _mapped;
-        if (_mapped) {
-          const _allStationItems = _macSearches.flatMap(x => (Array.isArray(x?.list) ? x.list : []));
-          if (_stationSupportsArcRemap(_allStationItems, _mapped, targetInfo.baseName)) {
-            const _from = `S${targetInfo.seasonNumber}E${targetEpisode}`;
-            targetInfo.seasonNumber = _mapped.season;
-            targetInfo._expectedSequel = _mapped.season;
-            targetEpisode = _mapped.episode;
-            targetInfo._targetEpisode = targetEpisode;
-            console.log(`🔀 TMDb 連續集數換算: ${_from} → 站方 S${targetInfo.seasonNumber}E${targetEpisode}` +
-              `（站方確認有第${targetInfo.seasonNumber}季）`);
-          } else {
-            console.log(`🔀 TMDb 連續集數換算略過: 站方沒有獨立的第${_mapped.season}季條目（維持原查詢）`);
-            targetInfo._arcRemap = null;
+        // ★★ v125.1（效能）：**先做零成本的站方預檢** ★★
+        //   守門員 _stationSupportsArcRemap 要求站方有「明確宣告第 N 季」的條目。
+        //   若站方清單裡**根本沒有任何帶季號的條目**（例如《名偵探柯南》
+        //   只有單一連續條目），那麼**不管 arc 怎麼切都不可能通過守門員**
+        //   → 這時根本不必等 arc 偵測結果，直接跳過。
+        //   → 省下整段 TMDb 等待（連續長篇番的高價值優化）。
+        //   ★ 判斷完全沿用守門員的同一套條件 → 不改變任何搜尋結果。
+        const _allStationItems = _macSearches.flatMap(x => (Array.isArray(x?.list) ? x.list : []));
+        const _stationHasSeasonMarker = _allStationItems.some((it) => {
+          const nm = String(it?.vod_name || '').trim();
+          if (!nm) return false;
+          // ★ v125.1：同一套非正片判定（含 OVA 修正）
+          if (_isArcNonEpisodeTitle(nm)) return false;
+          return extractSequelNumber(nm) != null;
+        });
+        if (!_stationHasSeasonMarker) {
+          // 站方沒有任何分季條目 → arc 換算不可能被套用 → 不等 arc 了。
+          console.log(`🔀 TMDb 連續集數換算略過: 站方沒有任何分季條目（維持原查詢）`);
+          targetInfo._arcRemap = null;
+          targetInfo._arcPromise = null;
+        } else {
+          const _mapped = await _resolveArcRemapCandidate(
+            targetInfo._arcPromise,
+            targetEpisode,
+            targetInfo.seasonNumber,
+            ''
+          );
+          targetInfo._arcRemap = _mapped;
+          if (_mapped) {
+            if (_stationSupportsArcRemap(_allStationItems, _mapped, targetInfo.baseName)) {
+              const _from = `S${targetInfo.seasonNumber}E${targetEpisode}`;
+              targetInfo.seasonNumber = _mapped.season;
+              targetInfo._expectedSequel = _mapped.season;
+              targetEpisode = _mapped.episode;
+              targetInfo._targetEpisode = targetEpisode;
+              console.log(`🔀 TMDb 連續集數換算: ${_from} → 站方 S${targetInfo.seasonNumber}E${targetEpisode}` +
+                `（站方確認有第${targetInfo.seasonNumber}季）`);
+            } else {
+              console.log(`🔀 TMDb 連續集數換算略過: 站方沒有獨立的第${_mapped.season}季條目（維持原查詢）`);
+              targetInfo._arcRemap = null;
+            }
           }
         }
       } catch { targetInfo._arcRemap = null; }
