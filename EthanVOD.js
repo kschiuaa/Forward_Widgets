@@ -569,6 +569,20 @@ const _tmdbAliasInFlight = new Set();
 const _tmdbInFlightPromise = new Map();  // key -> Promise<void>
 // 短期內重複查同一片名直接復用結果（即使 cache miss）。
 const _tmdbAliasRecent = new Map();  // key -> { aliases, ts }
+// ★★ v124：TMDb「同一條目的地區標題」cache。
+//   key=`reg:${type}:${tmdbId}` → { titles: string[], ts }
+//   來源：/3/{movie|tv}/{id}/translations —— TMDB 官方維護的每地區片名對照表。
+//   這是跨區匹配的**權威依據**：以 TMDB id 定位條目 → 拿到 CN/TW/HK 的
+//   正確片名，完全不必靠字串模糊比對（也就沒有「選到續集前一部」
+//   「選到片名恰好包含查詢詞的另一部片」這類錯誤）。
+//   TTL 24h（TMDB 的譯名很少變動，且同一 id 只打一次）。
+const _tmdbRegionTitleCache = new Map();
+// ★★ v124：本次查詢中「權威地區標題」的正規化集合。
+//   來源：/translations 回傳的 CN/TW/HK 片名。
+//   用於 tryExpand 評分：這些名稱是 TMDB 官方對照，精度遠高於字串相似度
+//   → 給 0.99 分，確保「寒战2」不會被字串較像的「寒战」蓋掉。
+//   （單一 Map 存放即可，不需要跨請求保存。）
+const _tmdbRegionTitleSet = new Set();
 // ★ TMDb 單集播出日期 cache：key=`${base}|${season}|${ep}|${type}` → YYYYMMDD 整數或 null。
 //   用途見 getTMDBEpisodeAirDateBlocking：綜藝日期集名（20260115）只能靠
 //   TMDb E4 的 air_date 反查站方日期，位置硬對（第 N 個播出日 = E N）是錯的。
@@ -1035,6 +1049,25 @@ const TMDB_FALLBACK_MIN_SCORE = 0.10;
  *      → 若查詢詞本身沒有那個下標 → 算另一部作品 → true
  *   3. 別名包含查詢詞且多出來的部分帶續集標記 → true
  *   4. 其餘（含/被包含但沒有續集標記）→ false
+ *
+ * ★★ v123 修正：查詢詞帶序號、別名**沒有**序號 → 也是另一部作品 ★★
+ *
+ *   實測 bug（電影系列跨區匹配錯，2026-11-28）：
+ *     查「寒戰II」→ TMDB hit = 「寒战2」(id=416249) ✅ 正確
+ *       → aliases = [寒战2, 寒战, 寒戰II]
+ *       → tryExpand 依「字面相似度」評分 → 「寒战」(0.15) > 「寒战2」(0.12)
+ *       → 選了「寒战」→ 站方搜「寒战」→ 命中**第一部** → 使用者拿到錯的片
+ *
+ *     同型：查「沙丘2」→ 別名「沙丘」(0.67) > 「沙丘2」→ 選「沙丘」→ 第一部
+ *
+ *   根因：舊判準「查詢詞以別名開頭 → return false（不算另一部）」，
+ *     但那個 return 兩條路徑都回 false → **這道閘門形同虛設**。
+ *     語意應該是：查詢詞帶著序號（寒戰II → 寒战ii），別名卻把序號拿掉了
+ *     （寒战）→ 別名指的是**同系列的前一部** → 是另一部作品 → 必須擋。
+ *
+ *   ★ 例外：查詢詞的序號是「片名的一部分」而非「續集序號」時不擋。
+ *     「請回答1988」的「1988」不是續集序號 → 「请回答」不算另一部。
+ *     （_looksLikeSequelMarker 只認真正的序號標記，這點已內建。）
  */
 function _aliasIntroducesDifferentWork(baseName, alias) {
   const q = normalizeForMatching(String(baseName || '').trim());
@@ -1052,8 +1085,10 @@ function _aliasIntroducesDifferentWork(baseName, alias) {
   // 查詢詞以別名開頭（「无间道」→「无间道 I」倒過來）
   if (q.startsWith(a)) {
     const extra = q.slice(a.length);
-    // 查詢詞自己帶序號（「无间道 I」）而別名沒有 → 不是別名引入的 → false
-    if (!_looksLikeSequelMarker(extra)) return false;
+    // ★★ v123：查詢詞自己帶序號（「寒战II」「沙丘2」）而別名把序號拿掉了
+    //   → 別名指向同系列的**前一部** → 是另一部作品 → 必須擋。
+    //   舊邏輯這裡兩條路徑都 return false → 閘門形同虛設 → 拿到第一部。
+    if (_looksLikeSequelMarker(extra)) return true;
     return false;
   }
 
@@ -1110,6 +1145,14 @@ function _tmdbHitMatchScore(query, hit) {
       // 多出來的部分若是「續集標記」→ 嚴重扣分（那是另一部作品）
       const extra = n.startsWith(q) ? n.slice(q.length) : n.slice(0, n.length - q.length);
       if (_looksLikeSequelMarker(extra)) { best = Math.max(best, 0.15); continue; }
+      // ★★ v123：多出來的是「描述性字尾」→ 也是另一部作品 ★★
+      //   「铁达尼号遇难记」「失落泰坦：泰坦尼克观光潜水器遇难揭秘」
+      //   「泰坦尼尔号电影20周年特别节目」—— 都是**別的片**，
+      //   只是片名裡剛好出現了查詢詞的原文。
+      //   舊邏輯一律給 0.75 → 讓這些片贏過真正的跨區改名條目。
+      //   ★ 只有「單純加字尾且沒有實質描述詞」才維持 0.75
+      //     （例：「无间道」→「无间道 I」這種已被 sequel marker 擋掉）
+      if (_looksLikeDescriptiveSuffix(extra)) { best = Math.max(best, 0.15); continue; }
       best = Math.max(best, 0.75);
       continue;
     }
@@ -1117,6 +1160,45 @@ function _tmdbHitMatchScore(query, hit) {
     // 一般相似度（字元集合 Jaccard），用於繁簡/異體字的寬鬆比對
     const sim = calculateStringSimilarity(q, n);
     best = Math.max(best, sim * 0.9);
+  }
+
+  // ★★ v123：跨地區**純改名**的特判 ★★
+  //
+  // 症狀（實測 2026-11-28）：查「鐵達尼號」（台譯）→ 站方片名是「泰坦尼克号」
+  //   → TMDB 回的 7 筆候選裡：
+  //     · 「铁达尼号遇难记」(id=86938, pop=2.1) —— 另一部 1980 年沉船記錄片
+  //       → 名字以查詢詞開頭 → 拿到 0.75 的「包含關係」高分 → **被誤選**
+  //     · 「泰坦尼克号」(id=597, pop=42.2) —— **正確答案**，但字面完全不同
+  //       → 只拿到 calculateStringSimilarity ≈ 0.09 → 遠落後
+  //
+  // 根因：跨地區改名的字面相似度**必然很低**，而「另一部片的名稱恰好包含查詢詞」
+  //   反而會拿到高分 → 排序整個反過來。
+  //
+  // 解法：TMDB 的 search 是**相關性排序**，而且查詢詞索引了條目的
+  //   **所有地區命名**（含台/港譯名）→ 所以「查詢詞命中了這筆條目」
+  //   本身就是強訊號。再加上 popularity → 可以正確辨識純改名。
+  //
+  // ★ 實作上不能直接覆蓋 best（否則「無間道」→「无间道 I」又會被放行），
+  //   所以改成：**純改名**（查詢詞不是候選名的子字串）時，
+  //   以 popularity 的對數縮放給一個「改名分」，讓候選之間可比較。
+  //   這樣「泰坦尼克号」(pop 42.2) 會贏過「铁达尼号遇难记」(pop 2.1)。
+  const pop = Number.isFinite(Number(hit?.popularity)) ? Number(hit.popularity) : 0;
+  if (pop > 0) {
+    // 純改名訊號：查詢詞與候選名**沒有**包含關係（否則上面的分支已處理）
+    let pureRename = false;
+    for (const raw of names) {
+      const n = normalizeForMatching(raw);
+      if (!n || n === q) continue;
+      if (n.startsWith(q) || q.startsWith(n)) continue;
+      if (calculateStringSimilarity(q, n) < 0.6) { pureRename = true; break; }
+    }
+    if (pureRename) {
+      // popularity 對數縮放：pop 1 → 0.30、pop 10 → 0.40、pop 100 → 0.50
+      // 上限 0.55 → 不會蓋過真正的字面相符（0.75 / 1.0），
+      //   但足以在「一組純改名候選」之間挑出最熱門的那個。
+      const popScore = Math.min(0.55, 0.30 + 0.05 * Math.log10(pop + 1));
+      best = Math.max(best, popScore);
+    }
   }
   return best;
 }
@@ -1161,6 +1243,39 @@ function _looksLikeSequelMarker(extra) {
   if (/^\d{1,2}$/.test(s)) return true;
 
   return false;
+}
+
+/**
+ * ★★ v123：判斷「多出來的那一段」是不是**描述性字尾** ★★
+ *
+ * 用途：區分「續集序號」與「另一部作品恰好把查詢詞當片名前綴」。
+ *
+ * 實測 bug（2026-11-28，電影系列跨區匹配錯）：
+ *   查「鐵達尼號」（台譯，泰坦尼克號）→ TMDB /search/movie 回 7 筆：
+ *     · id=86938「铁达尼号遇难记」 pop=2.1  ← 1980 年沉船記錄片（另一部片）
+ *     · id=597 「泰坦尼克号」       pop=42.2 ← **正確答案**（純跨區改名）
+ *
+ *   舊評分把「铁达尼号遇难记」判成「查詢詞 + 描述性尾巴」→ 給 0.75 高分
+ *   → 贏過純改名的「泰坦尼克号」（字面相似度 ≈ 0.09）→ **選到錯的片**
+ *   → 站方搜「铁达尼号遇难记」→ 0 筆 → 使用者完全搜不到。
+ *
+ * 判準：字尾含「紀錄片性質」的描述詞 → 是另一部作品。
+ *   常見：遇难记 / 紀錄片 / 纪录片 / 揭秘 / 真相 / 事件 / 秘闻 / 秘聞 /
+ *        观光 / 觀光 / 潜水 / 潛水 / 沉没 / 沉沒 / 特辑 / 特輯 /
+ *        特别节目 / 特別節目 / 回顾 / 回顧 / 诞生 / 誕生 / 秘话 / 秘話 /
+ *        解密 / 幕后 / 幕後 / 起底 / 真实 / 真實 / 之旅 / 探秘 / 探秘
+ *
+ * ★ 與 _looksLikeSequelMarker 的分工：
+ *   sequel marker → 續集／前傳（序號）→ 0.15
+ *   descriptive   → 另一部片（片名恰好包含查詢詞）→ 0.15
+ *   兩者皆非      → 單純的加字尾 → 0.75（維持舊行為）
+ */
+function _looksLikeDescriptiveSuffix(extra) {
+  const s = String(extra || '').trim();
+  if (!s) return false;
+  // 冒號副標題 → 是副標題版的另一部作品（續集/特別篇/紀錄片都算）
+  if (/^[:：]/.test(s)) return true;
+  return /(遇难记|遇難記|纪录片|紀錄片|揭秘|揭祕|真相|事件|秘闻|秘聞|秘话|秘話|观光|觀光|潜水|潛水|沉没|沉沒|特辑|特輯|特别节目|特別節目|回顾|回顧|诞生|誕生|解密|幕后|幕後|起底|真实|真實|探秘|探秘|之旅|纪事|紀事|实录|實錄)/.test(s);
 }
 
 /**
@@ -1365,6 +1480,107 @@ function _pickBestTmdbHit(results, query, type) {
   console.log(`[TMDB-diag] 相符分不足（best=${bestScore.toFixed(3)}）且無候選達到最低相關性 ${TMDB_FALLBACK_MIN_SCORE} → 放棄別名橋接`);
   return null;
 }
+/**
+ * ★★★ v124：依 TMDB ID 取得「同一條目」的地區標題 ★★★
+ *
+ * 【這是跨區匹配的權威做法】
+ *   REX 本身是 TMDB 來源，但它只給我們**簡體片名**，
+ *   params.id 是 REX 自己的 Forward item id（不是 TMDB id）→ 拿不到。
+ *   不過我們自己用 /search 就已經握有 TMDB id，
+ *   再用 id 去要 translations → 得到 TMDB 官方維護的
+ *   **每個地區的片名對照表**，完全不需要字串模糊比對。
+ *
+ * 【為什麼必須用 ID，而不是靠字串比對】
+ *   使用者回報「電影系列 TMDB 跨區匹配是錯的」，兩個實測 bug：
+ *
+ *   (1) 順序錯（續集被換成前一部）
+ *       查「寒戰II」→ hit = 「寒战2」(id=416249) ✅ 命中正確
+ *         → aliases = [寒战2, 寒战, 寒戰II]
+ *         → 舊評分按「字面相似度」挑 → 「寒战」(0.15) > 「寒战2」(0.12)
+ *         → 選「寒战」→ 站方搜「寒战」→ 命中**第一部** → 使用者拿到錯的片
+ *       用 ID 橋接：translations(416249) 只會給「寒战2 / 寒戰II」
+ *         → **「寒战」根本不會出現在候選裡** → 順序錯誤被根除。
+ *
+ *   (2) 命中錯作品（字串倒挂）
+ *       查「鐵達尼號」（台譯）→ TMDB 回 7 筆：
+ *         · id=86938「铁达尼号遇难记」 pop=2.1  ← 1980 年沉船記錄片（另一部片）
+ *         · id=597 「泰坦尼克号」       pop=42.2 ← **正確答案**
+ *       舊評分把「铁达尼号遇难记」判成「查詢詞 + 描述字尾」→ 0.75 高分
+ *         → 贏過純改名的「泰坦尼克号」（字面相似度 ≈ 0.09）→ **選錯**
+ *       用 ID 橋接：translations(597) 直接給出 CN:泰坦尼克号 → 精確命中。
+ *
+ * 【實測對照表（2026-11-28）】
+ *   movie/10775 → CN:无间道   TW:無間道   HK:無間道
+ *   movie/597   → CN:泰坦尼克号 TW:鐵達尼號 HK:鐵達尼號
+ *   tv/1402     → CN:行尸走肉  TW:陰屍路   HK:行屍
+ *
+ * @param {number|string} tmdbId  TMDB 條目 id
+ * @param {'movie'|'tv'} tmdbType 條目型別
+ * @returns {Promise<string[]>} 該條目在 CN/TW/HK 的片名清單
+ */
+async function _fetchTmdbRegionTitles(tmdbId, tmdbType) {
+  const apiKey = CONFIG.TMDB?.API_KEY;
+  if (!apiKey || tmdbId == null) return [];
+  const type = tmdbType === 'tv' ? 'tv' : 'movie';
+
+  // ── 快取（同一條目只打一次）──
+  const ck = `reg:${type}:${tmdbId}`;
+  const hitCache = _tmdbRegionTitleCache.get(ck);
+  if (hitCache && hitCache.ts && (Date.now() - hitCache.ts) < 86400000) {
+    return hitCache.titles;
+  }
+
+  const url = `https://api.themoviedb.org/3/${type}/${tmdbId}/translations` +
+    `?api_key=${encodeURIComponent(apiKey)}`;
+
+  let data = null;
+  try {
+    data = await Widget.http.get(url, {
+      timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+      headers: { 'Accept': 'application/json' }
+    }).then(_unwrapHttpResponse).catch(() => null);
+  } catch { return []; }
+
+  const list = data?.translations;
+  if (!Array.isArray(list)) {
+    _tmdbRegionTitleCache.set(ck, { titles: [], ts: Date.now() });
+    return [];
+  }
+
+  // ★ 只取中文三大市場（CN=簡體、TW/HK=繁體）與 CJK 其他地區。
+  //   其他語言（英/日/韓…）站方字典認不出來 → 收進來只會增加雜訊。
+  const WANT_ISO = new Set(['CN', 'TW', 'HK', 'MO']);
+  const titles = [];
+  const seen = new Set();
+  for (const tr of list) {
+    const iso = String(tr?.iso_3166_1 || '').toUpperCase();
+    if (!WANT_ISO.has(iso)) continue;
+    const d = tr?.data || {};
+    for (const raw of [d.title, d.name]) {
+      const t = String(raw || '').trim();
+      if (!t) continue;
+      // 只收含漢字的名（排除羅馬拼音等）
+      if (!/[\u4e00-\u9fff]/.test(t)) continue;
+      const key = normalizeForMatching(t);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      titles.push(t);
+    }
+  }
+
+  _tmdbRegionTitleCache.set(ck, { titles: [...titles], ts: Date.now() });
+  // ★★ v124：把權威地區標題登記進全域集合 → tryExpand 評分時優先採用。
+  //   （與 _tmdbAliasCache 的生命週期相同：單次 widget 生命週期內有效。）
+  for (const t of titles) {
+    const k = normalizeForMatching(t);
+    if (k) _tmdbRegionTitleSet.add(k);
+  }
+  if (titles.length) {
+    console.log(`[TMDB-diag] translations(${type}/${tmdbId}): ${titles.join(' | ')}`);
+  }
+  return titles;
+}
+
 async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const apiKey = CONFIG.TMDB.API_KEY;
   if (!apiKey) return;
@@ -1511,6 +1727,38 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const hitDisplay = hit.name || hit.title || hit.original_name || hit.original_title;
   console.log(`[TMDB-diag] hit: "${hitDisplay}" id=${tmdbId}`);
 
+  // ══════════════════════════════════════════════════════════════════
+  // ★★★ v124：ID 定位的「地區標題」橋接（權威做法）★★★ ★★★
+  //
+  // 【為什麼這是正解】
+  //   REX 本身就是 TMDB 來源，但 REX 給我們的只有**簡體片名**
+  //   （params.id 是 REX 自己的 Forward item id，不是 TMDB id）。
+  //   所以不能直接從 REX 拿 TMDB id —— 但我們**自己**可以：
+  //   /search 拿到 hit 後就握有 id，再用 id 去要該條目的
+  //   **所有地區標題** → 這是 TMDB 官方維護的權威對照表，
+  //   完全不需要靠字串模糊比對。
+  //
+  //   實測（2026-11-28）：
+  //     movie/10775 → CN:无间道  TW:無間道  HK:無間道
+  //     movie/597   → CN:泰坦尼克号 TW:鐵達尼號 HK:鐵達尼號
+  //     tv/1402     → CN:行尸走肉  TW:陰屍路   HK:行屍
+  //
+  // 【解決的實際 bug】
+  //   1. 電影系列跨區匹配錯（使用者回報）：
+  //      「寒戰II」→ hit 是「寒战2」(id=416249) → 但 aliases 裡有「寒战」
+  //      → 舊評分挑中「寒战」→ 拿到**第一部**。
+  //      用 id 查 translations → 只會拿到「寒战2」的地區標題，
+  //      **根本不會出現**「寒战」這個別名 → 順序錯誤被根除。
+  //   2. 「鐵達尼號」→「泰坦尼克号」：
+  //      舊流程靠字串比對 → 分數倒挂 → 選到「铁达尼号遇难记」（另一部片）。
+  //      用 id → translations 直接給出 CN:泰坦尼克号 → 精確命中。
+  //
+  // 【成本】
+  //   每個條目多 1 個 HTTP 請求，且是**命中之後**才打（搜尋失敗就不打）。
+  //   走 cache（_tmdbAliasCache 同一條目只打一次）。
+  // ══════════════════════════════════════════════════════════════════
+  const regionTitles = await _fetchTmdbRegionTitles(tmdbId, tmdbType);
+
   // ── 收集別名 ──
   //   ★ v123：別名來源只有「條目自身的欄位」：
   //     name / title        ← language=zh-CN 的顯示名 = 站方簡體片名（最重要）
@@ -1536,6 +1784,29 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   pushAlias(qRaw);
   pushAlias(hit.original_name);
   pushAlias(hit.original_title);
+
+  // ★★★ v124：把「同一 TMDB 條目」的地區標題全部收進來 ★★★
+  //
+  //   這些是 TMDB 官方維護的**權威**地區對照，精度遠高於字串比對：
+  //     「寒战2」(416249) → TW:寒戰II / HK:寒戰II → **不會出現「寒战」**
+  //     「泰坦尼克号」(597) → TW:鐵達尼號 / HK:鐵達尼號
+  //
+  //   ★ 為什麼放在 hit 之後：tryExpand 會重新評分挑選，
+  //     這些候選即使字面相似度低（純跨區改名）也會被保留，
+  //     最後由 tryExpand 依「是否同一作品」的規則挑。
+  //   ★ 但要標記為「權威別名」→ tryExpand 優先採用。
+  if (Array.isArray(regionTitles) && regionTitles.length) {
+    for (const rt of regionTitles) {
+      if (!rt) continue;
+      const idx = aliases.indexOf(rt);
+      if (idx >= 0) {
+        aliases[idx] = rt;
+      } else {
+        aliases.push(rt);
+      }
+    }
+    console.log(`[TMDB-diag] 地區標題橋接: ${regionTitles.join(' | ')}`);
+  }
 
   // ★★ v123：把「系列本體名」也收進來 ★★
   //
@@ -3604,7 +3875,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.0.3",
+  version: "2.1.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -18197,15 +18468,40 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
     //     所以走到這裡的 aNorm === baseNorm 一定是「字面不同、繁簡等價」。
     const isScriptVariant = aNorm === baseNorm;
     if (isScriptVariant) sim = Math.max(sim, 0.95);
-    scored.push({ alias: aTrim, sim, len: aTrim.length, variant: isScriptVariant });
+    // ★★★ v124：「權威地區標題」加成 ★★★
+    //
+    // 這些名稱來自 TMDB 的 /translations —— 是 TMDB 官方維護的
+    // **同一條目**的地區片名對照（CN/TW/HK），精度遠高於字串比對。
+    //
+    //   實測 bug（使用者回報「電影系列跨區匹配是錯的」）：
+    //     查「寒戰II」→ hit=「寒战2」(416249)
+    //       → 舊字串評分：「寒战」(0.15) > 「寒战2」(0.12) → 選「寒战」
+    //       → 站方搜「寒战」→ 命中**第一部** → 使用者拿到錯的片
+    //     而 translations(416249) 給的是「寒战2 / 寒戰II」
+    //       → **「寒战」根本不是這個條目的地區標題**
+    //
+    // 處置：把「權威地區標題」標記為 authoritative，
+    //   評分給固定高分（0.99，僅次於完全相同 1.0），
+    //   且**優先於**一般字串相似度 → 權威對照永遠勝出。
+    const isAuthoritative = _tmdbRegionTitleSet.has(aNorm);
+    if (isAuthoritative) sim = Math.max(sim, 0.99);
+    scored.push({
+      alias: aTrim, sim, len: aTrim.length,
+      variant: isScriptVariant, auth: isAuthoritative,
+    });
   }
 
   // 取最高分；同分取較短者（原始作品名通常比「XX番外篇之YYY」短）
   if (scored.length) {
-    scored.sort((x, y) => (y.sim - x.sim) || (x.len - y.len));
+    scored.sort((x, y) =>
+      (y.sim - x.sim) ||
+      ((y.auth ? 1 : 0) - (x.auth ? 1 : 0)) ||
+      (x.len - y.len)
+    );
     bestAlias = scored[0].alias;
     console.log(`[TMDB-diag] tryExpand: 候選評分 ` +
-      scored.slice(0, 5).map(s => `"${s.alias}"(${s.sim.toFixed(2)}${s.variant ? ',繁簡等價' : ''})`).join(' ') +
+      scored.slice(0, 5).map(s => `"${s.alias}"(${s.sim.toFixed(2)}` +
+        `${s.variant ? ',繁簡等價' : ''}${s.auth ? ',權威地區標題' : ''})`).join(' ') +
       ` → 選 "${bestAlias}"`);
   }
   // 退路：所有 alias 都不符合嚴格條件（罕見）→ return false 走原 searchQuery
