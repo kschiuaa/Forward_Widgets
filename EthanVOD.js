@@ -989,6 +989,214 @@ async function getTMDBAliasesBlocking(baseName, type, maxWaitMs = 1500) {
   return (result && result.aliases) || [];
 }
 
+/**
+ * ★★ v122：TMDB search 命中的「相符分」門檻 ★★
+ *
+ * 相符分 = 查詢詞與候選片名的相似度（1.0 = 完全相同）。
+ * 低於門檻表示「沒有任何一筆候選的片名長得像查詢詞」——
+ * 這在跨地區情境下是**正常**的（查「陰屍路」回「行尸走肉」），
+ * 會走「排除續集後取首位」的退路。
+ */
+const TMDB_HIT_MIN_SCORE = 0.34;
+
+/**
+ * ★★ v122：判斷「別名」是否其實指向**另一部作品**（續集 / 前傳 / 副標題版）★★
+ *
+ * 用途：TMDB 的別名清單裡常混著同系列的其他作品。
+ *   「无间道」→ 別名可能給「无间道 I」「无间道Ⅱ」「无间道Ⅲ：终极无间」
+ *   「盗梦空间」→ 別名可能給「盗梦空间：科博任务」（另一部片）
+ * 這些拿來當搜尋 query，會讓使用者拿到**不對的片**。
+ *
+ * 判準：
+ *   1. 正規化後完全相同 → 同一個作品 → false（不是另一部）
+ *   2. 別名去掉「續集標記」後與查詢詞相同 → 是同一系列但**加了下標**
+ *      → 若查詢詞本身沒有那個下標 → 算另一部作品 → true
+ *   3. 別名包含查詢詞且多出來的部分帶續集標記 → true
+ *   4. 其餘（含/被包含但沒有續集標記）→ false
+ */
+function _aliasIntroducesDifferentWork(baseName, alias) {
+  const q = normalizeForMatching(String(baseName || '').trim());
+  const a = normalizeForMatching(String(alias || '').trim());
+  if (!q || !a) return false;
+  if (a === q) return false;
+
+  // 別名以查詢詞開頭 → 看多出來的那段
+  if (a.startsWith(q)) {
+    const extra = a.slice(q.length);
+    if (!extra) return false;
+    return _looksLikeSequelMarker(extra);
+  }
+
+  // 查詢詞以別名開頭（「无间道」→「无间道 I」倒過來）
+  if (q.startsWith(a)) {
+    const extra = q.slice(a.length);
+    // 查詢詞自己帶序號（「无间道 I」）而別名沒有 → 不是別名引入的 → false
+    if (!_looksLikeSequelMarker(extra)) return false;
+    return false;
+  }
+
+  // 別名含冒號副標題 → 一律視為另一部作品（TMDB 的衍生作慣例）
+  if (/[:：]/.test(String(alias || ''))) return true;
+
+  return false;
+}
+
+/**
+ * ★★ v122：從 TMDB search 結果裡挑「片名最符合查詢詞」的那筆 ★★
+ *
+ * 為什麼不能直接用 results[0]：
+ *   TMDB search 的排序是**熱門度**（popularity），不是「片名相符度」。
+ *   實測（2026-11-28）：
+ *     查「無間道」→ results[0] 是「无间道 I」（第 I 集條目）
+ *     查「盜夢空間」→ results[0] 是「盗梦空间：科博任务」（另一部片）
+ *   兩者都會讓別名橋接指向**錯誤的作品** → 使用者搜不到想看的片。
+ *
+ * 挑選規則（依序）：
+ *   1. 算每筆候選的「相符分」：查詢詞與候選片名（name/original_name/
+ *      title/original_title）之間的相似度，取最高者。
+ *      - 完全相同（正規化後）→ 分數最高。
+ *      - 一個包含另一個（「无间道」vs「无间道Ⅱ」）→ 次高，但要扣分。
+ *   2. 相符分相同 → 看 popularity（熱門度高的優先）。
+ *   3. 分數低於門檻 → 視為「沒有可用的對應條目」→ 回 null
+ *      （讓呼叫端放棄別名，走原本的純繁簡搜尋）。
+ *
+ * ★ 續集/前傳的識別：
+ *   「无间道 I」「无间道Ⅱ」「盗梦空间：科博任务」這種帶序號或副標題的
+ *   條目，若查詢詞本身**沒有**這些標記，就不算相符 → 分數被扣。
+ *   純字串相似度算不出這個，需要明確的「多出來的續集標記」判斷。
+ */
+function _tmdbHitMatchScore(query, hit) {
+  if (!hit) return 0;
+  const q = normalizeForMatching(String(query || '').trim());
+  if (!q) return 0;
+
+  // 候選的所有可能片名
+  const names = [
+    hit.name, hit.original_name, hit.title, hit.original_title,
+  ].map(v => String(v || '').trim()).filter(Boolean);
+
+  let best = 0;
+  for (const raw of names) {
+    const n = normalizeForMatching(raw);
+    if (!n) continue;
+
+    // 完全相同 → 滿分
+    if (n === q) { best = Math.max(best, 1.0); continue; }
+
+    // 包含關係：候選比查詢多出東西（續集/副標題）→ 扣分
+    if (n.startsWith(q) || q.startsWith(n)) {
+      // 多出來的部分若是「續集標記」→ 嚴重扣分（那是另一部作品）
+      const extra = n.startsWith(q) ? n.slice(q.length) : n.slice(0, n.length - q.length);
+      if (_looksLikeSequelMarker(extra)) { best = Math.max(best, 0.15); continue; }
+      best = Math.max(best, 0.75);
+      continue;
+    }
+
+    // 一般相似度（字元集合 Jaccard），用於繁簡/異體字的寬鬆比對
+    const sim = calculateStringSimilarity(q, n);
+    best = Math.max(best, sim * 0.9);
+  }
+  return best;
+}
+
+/**
+ * 判斷「多出來的那一段」是不是續集 / 前傳 / 副標題標記。
+ *
+ * 涵蓋：
+ *   - 羅馬數字：Ⅰ Ⅱ Ⅲ Ⅳ II III IV（TMDB 的「无间道 I」用半形 I）
+ *   - 阿拉伯數字：2 3（但「2」單獨出現很容易誤判 → 要求有分隔符或字）
+ *   - 中文序號：第二部 / 下集 / 續集 / 前傳 / 序章 / 特別篇
+ *   - 冒號副標題：「：科博任务」「: The Kid」
+ *   - 英文 sequel/prequel/remake
+ */
+function _looksLikeSequelMarker(extra) {
+  const s = String(extra || '').trim();
+  if (!s) return false;
+
+  // 冒號副標題（TMDB 條目最常見的續集/衍生作寫法）
+  if (/^[:：]/.test(s)) return true;
+
+  // 羅馬數字（可單獨出現）
+  if (/^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+$/.test(s)) return true;
+  // 半形/全形 I II III IV（無間道 I / 無間道 II）
+  if (/^[IiⅠ]{1,4}$/.test(s) && s.length <= 4) return true;
+
+  // 中文續集用語
+  if (/(續集|前傳|序章|完結篇|特別篇|外傳|電影版|真人版|新篇|下部|上篇|第二部|第三部|最終章)/.test(s)) return true;
+  if (/^(第[一二三四五六七八九十\d]+[部集章篇部曲])/.test(s)) return true;
+
+  // 英文 sequel / prequel / remake
+  if (/^(sequel|prequel|remake|part\s*\d+)\b/i.test(s)) return true;
+
+  // 阿拉伯數字序號：必須是獨立的數字 token，且後面還有東西或前面有分隔
+  if (/^\d{1,2}$/.test(s)) return true;
+
+  return false;
+}
+
+/**
+ * ★★ v122：從 TMDB search 結果挑最佳命中 ★★
+ * 回傳 null = 沒有任何一筆夠像 → 呼叫端放棄別名橋接。
+ */
+function _pickBestTmdbHit(results, query, type) {
+  const list = Array.isArray(results) ? results : [];
+  if (!list.length) return null;
+
+  let best = null;
+  let bestScore = 0;
+  let bestPop = -Infinity;
+
+  for (const r of list) {
+    const score = _tmdbHitMatchScore(query, r);
+    if (score <= 0) continue;
+    const pop = Number.isFinite(Number(r?.popularity)) ? Number(r.popularity) : 0;
+    // 相符分優先；相同時熱門度高的優先（TMDB 預設排序）
+    if (score > bestScore + 1e-9 || (Math.abs(score - bestScore) <= 1e-9 && pop > bestPop)) {
+      best = r; bestScore = score; bestPop = pop;
+    }
+  }
+
+  // ★★ v122：相符分達標 → 用它 ★★
+  if (best && bestScore >= TMDB_HIT_MIN_SCORE) {
+    console.log(`[TMDB-diag] 挑選命中：score=${bestScore.toFixed(3)} id=${best.id} "${best.name || best.title}"（原本 results[0]="${list[0]?.name || list[0]?.title}"）`);
+    return best;
+  }
+
+  // ★★ v122：沒有任何一筆的片名與查詢詞相符 ★★
+  //
+  // 這種情況很常見，而且是**正常**的：TMDB 的 search 索引用「條目的
+  // 所有地區命名」比對查詢詞，所以查「陰屍路」(港譯) 會回一串結果，
+  // 但**顯示片名**是 zh-CN 的「行尸走肉」「行尸走肉：死亡之城」…
+  // 字面完全不像查詢詞 → 相符分全部偏低。
+  //
+  // ★ 這種情況不能放棄：TMDB search 本身已是「相關性」排序，
+  //   results[0] 通常就是正確的作品（實測「陰屍路」→ 1402 行尸走肉 ✅）。
+  //   真正要防的是「續集排前面」（無間道 → 无间道 I）。
+  //
+  // 解法：低分時不直接放棄，而是**排除續集型候選**後取第一名。
+  const clean = list.filter(r => {
+    const n = normalizeForMatching(String(r?.name || r?.title || '').trim());
+    if (!n) return false;
+    // 片名帶冒號副標題（「行尸走肉：死亡之城」）→ 排除
+    const m = n.match(/^(.*?)([:：].*)$/);
+    if (m && _looksLikeSequelMarker(m[2])) return false;
+    // 片名結尾是序號（「无间道 I」「无间道Ⅱ」）→ 排除
+    const core = n.split(/[:：]/)[0];
+    if (core !== n && _looksLikeSequelMarker(core.slice(-3))) return false;
+    if (_looksLikeSequelMarker(core.slice(-3))) return false;
+    return true;
+  });
+
+  if (clean.length) {
+    const pick = clean[0];
+    console.log(`[TMDB-diag] 相符分不足（best=${bestScore.toFixed(3)}），改用「無續集標記」的首位命中：id=${pick.id} "${pick.name || pick.title}"`);
+    return pick;
+  }
+
+  console.log(`[TMDB-diag] 無可靠命中：bestScore=${bestScore?.toFixed(3)}（門檻 ${TMDB_HIT_MIN_SCORE}），放棄別名橋接`);
+  return null;
+}
+
 async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const apiKey = CONFIG.TMDB.API_KEY;
   if (!apiKey) return;
@@ -1067,8 +1275,22 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     return;
   }
 
-  // 取第一筆（Forward 帶入的片名通常足夠精準，第一筆就是對的）
-  const hit = searchData.results[0];
+  // ★★ v122：不要直接拿 results[0]，要挑「片名最像查詢詞」的那筆 ★★
+  //
+  // 症狀（實測 2026-11-28）：
+  //   查「無間道」(港) → 別名被設成「无间道 I」
+  //     站方回「无间道」時搜尋命中的是「无间道 I」（第 I 集）→
+  //     使用者看到的是第一部，內容卻是 TMDB 的 sequel 條目。
+  //   查「盜夢空間」(台) → 別名被設成「盗梦空间：科博任务」
+  //     那是另一部片（Inception spin-off），站方根本沒有 → 0 筆。
+  //
+  // 根因：TMDB search 的結果順序是「熱門度」，不是「片名相符度」。
+  //   熱門度最高的可能是續集、前傳、同名不同作。
+  //
+  // 解法：對每筆候選算「片名與查詢詞的相符度」，
+  //   取相符度最高者；相符度相同才看熱門度（popularity）。
+  //   完全不相符的（片名裡沒有一個字與查詢詞重疊）直接排除。
+  const hit = _pickBestTmdbHit(searchData.results, baseName, type);
   const tmdbId = hit?.id;
   if (!tmdbId) return;
   console.log(`[TMDB-diag] hit: "${hit.name || hit.title || hit.original_name}" id=${tmdbId}, name=${hit.name}, original_name=${hit.original_name}`);
@@ -3142,7 +3364,13 @@ const CONFIG = {
     ENABLED: true,
     // TMDB v3 API key（必填，否則走 fallback 路徑）。
     // 申請：https://www.themoviedb.org/settings/api
-    API_KEY: '',
+    //
+    // ★ v122：填入正式 key ★
+    //   有了 key 才能做「跨地區別名」橋接：Forward 帶入繁體中文片名
+    //   （港/台譯名），資源站存的是簡體中文（大陸譯名）。
+    //   純繁簡轉換救不了翻譯差異（陰屍路 → 行屍走肉）。
+    //   TMDB alternative_titles 會列出同一條目的所有地區命名 → 用它橋接。
+    API_KEY: '5b94aeac2dd79948ee38c0894134786d',
     // 語言/地區預設。
     // search 預設帶 language=zh-TW 以命中台/港繁體片名，alternative_titles
     // 同時拿 CN + HK + TW。地區設定跟 alternative_titles 的 iso_3166_1 對應。
@@ -3173,7 +3401,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "3.0.0",
+  version: "3.0.1",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -17562,6 +17790,21 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
     if (!aSimp || aSimp === baseSimp) continue;
     // 必須是簡體中文（VOD 站字典認得）
     if (!isSimpChinese(aTrim)) continue;
+    // ★★ v122：別名不得引入「續集 / 前傳 / 副標題」 ★★
+    //
+    // 症狀（實測 2026-11-28）：
+    //   查「無間道」→ 別名被設成「无间道 I」→ 站方搜「无间道 I」命中的是
+    //     第一部的「第一部」標記條目 → 使用者拿到的是不對的版本。
+    //   查「盜夢空間」→ 別名被設成「盗梦空间：科博任务」→ 那是另一部片，
+    //     站方沒有 → 0 筆。
+    //
+    // 判準：把「查詢詞」與「別名」正規化後相比，別名多出來的那一段
+    //   若帶續集標記（羅馬數字 / 序號 / 冒號副標題 / 續集前傳用語）
+    //   → 這是**另一部作品**，不能當別名用 → 跳過，繼續找下一個。
+    if (_aliasIntroducesDifferentWork(baseName, aTrim)) {
+      console.log(`[TMDB-diag] tryExpand: 跳過續集別名 "${aTrim}"（查詢 "${baseName}"）`);
+      continue;
+    }
     bestAlias = aTrim;
     break;
   }
