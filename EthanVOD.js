@@ -589,7 +589,30 @@ const _tmdbRegionTitleCache = new Map();
 //   用於 tryExpand 評分：這些名稱是 TMDB 官方對照，精度遠高於字串相似度
 //   → 給 0.99 分，確保「寒战2」不會被字串較像的「寒战」蓋掉。
 //   （單一 Map 存放即可，不需要跨請求保存。）
-const _tmdbRegionTitleSet = new Set();
+// ★★ v124：查詢詞作用域的「權威地區標題」集合。
+//   來源：/translations 回傳的 CN/TW/HK 片名。
+//   用於 tryExpand 評分：這些名稱是 TMDB 官方對照，精度遠高於字串相似度
+//   → 給 0.99 分，確保「寒战2」不會被字串較像的「寒战」蓋掉。
+//
+//   ★★ 關鍵：權威性是**相對於查詢詞**的，必須分作用域存放 ★★
+//   「寒战」對查「寒戰」是權威的；對查「寒戰II」它是另一部作品（第一部）
+//   → 用全域集合會讓「寒戰II」誤選第一部（實測 2026-11-28）。
+//
+//   key = `_tmdbAliasKey(baseName, type)` → Set<string>
+const _tmdbRegionTitleSetByScope = new Map();
+// ★★ v124：目前 _fetchTmdbRegionTitles 的作用域（由呼叫端設定）。
+let _tmdbRegionTitleScope = '';
+// ★★ v124：主命中條目自己的顯示名（作用域化）。
+//   key = `_tmdbAliasKey(baseName, type)` → Set<string>
+//   用途：多條目同名時（如「鬼滅之刃 無限城篇」Part.1/2/3），
+//   別名排序要優先選主命中條目的名字。
+const _tmdbPrimaryTitleMap = new Map();
+// ★★ v124：同名其他條目的地區標題（次順位候選）。
+//   key=`${base}|${type}` → string[]
+//   ★ 這是「同一片名、不同作品」的別名（實測：「水行俠」同時是
+//     2006 版（水行侠）與 2018 版（海王）的 HK 名）
+//   → 必須排在主候選之後，只在主候選全部搜不到時才依序試。
+const _tmdbSiblingAliasMap = new Map();
 // ★ TMDb 單集播出日期 cache：key=`${base}|${season}|${ep}|${type}` → YYYYMMDD 整數或 null。
 //   用途見 getTMDBEpisodeAirDateBlocking：綜藝日期集名（20260115）只能靠
 //   TMDb E4 的 air_date 反查站方日期，位置硬對（第 N 個播出日 = E N）是錯的。
@@ -1299,7 +1322,31 @@ function _looksLikeDescriptiveSuffix(extra) {
   if (!s) return false;
   // 冒號副標題 → 是副標題版的另一部作品（續集/特別篇/紀錄片都算）
   if (/^[:：]/.test(s)) return true;
-  return /(遇难记|遇難記|纪录片|紀錄片|揭秘|揭祕|真相|事件|秘闻|秘聞|秘话|秘話|观光|觀光|潜水|潛水|沉没|沉沒|特辑|特輯|特别节目|特別節目|回顾|回顧|诞生|誕生|解密|幕后|幕後|起底|真实|真實|探秘|探秘|之旅|纪事|紀事|实录|實錄)/.test(s);
+  if (/(遇难记|遇難記|纪录片|紀錄片|揭秘|揭祕|真相|事件|秘闻|秘聞|秘话|秘話|观光|觀光|潜水|潛水|沉没|沉沒|特辑|特輯|特别节目|特別節目|回顾|回顧|诞生|誕生|解密|幕后|幕後|起底|真实|真實|探秘|探秘|之旅|纪事|紀事|实录|實錄|历险记|歷險記|冒险记|冒險記|奇遇记|奇遇記|历险|歷險|奇遇)/.test(s)) return true;
+
+  // ★★ v124：單字「身分修飾」→ 也是**另一部作品** ★★
+  //
+  // 實測 bug（使用者回報 2026-11-28）：查「海賊王」
+  //   TMDB /search/tv 回 7 筆，相符分：
+  //     id=203923「海賊王子」  0.750  ← extra = 「子」
+  //     id=106480「海賊王女」  0.750  ← extra = 「女」
+  //     id=37854 「航海王」    0.450  ← ★**正確答案**（One Piece，pop=317.7）
+  //   → 0.750 > 0.450 → 挑到「海賊王子」→ 站方沒有 → 0 筆。
+  //
+  // 根因：「海賊王子」「海賊王女」是**另一部作品**，只是片名恰好以
+  //   查詢詞開頭。extra 只有一個字（子／女／篇／記／傳／奇…）
+  //   → 舊規則沒認出來 → 給了 0.75 的高分。
+  //
+  // ★ 判準：extra 是「單一個字」且該字是常見的**身分／性質修飾** →
+  //   視為另一部作品 → 0.15（跟描述性字尾同級）。
+  //   涵蓋：子 女 記 傳 篇 版 奇 說 話 演 錄 集 曲 王 帝 后 君 郎 娘
+  //         姬 騎 團 隊 幫 派 風 雲 冒 險 誌 戰 本 紀 實 遊 詩 詞
+  //         影 視 劇 數 章 節 卷 冊 記
+  //   ★ 不涵蓋純序號（2 / II / 第三部）→ 那由 _looksLikeSequelMarker 處理。
+  if (s.length <= 2 && /^[子女記傳篇版奇說話演錄集曲王帝后君郎娘姬騎團隊幫派風雲冒險誌戰本紀實遊詩詞影視劇數章節卷冊記]$/.test(s)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -1593,11 +1640,27 @@ async function _fetchTmdbRegionTitles(tmdbId, tmdbType) {
   }
 
   _tmdbRegionTitleCache.set(ck, { titles: [...titles], ts: Date.now() });
-  // ★★ v124：把權威地區標題登記進全域集合 → tryExpand 評分時優先採用。
+  // ★★ v124：把權威地區標題登記進集合 → tryExpand 評分時優先採用。
   //   （與 _tmdbAliasCache 的生命週期相同：單次 widget 生命週期內有效。）
-  for (const t of titles) {
-    const k = normalizeForMatching(t);
-    if (k) _tmdbRegionTitleSet.add(k);
+  //
+  // ★★ v124 修正：這個集合**必須綁定查詢詞** ★★
+  //
+  // 症狀（實測 2026-11-28）：連續搜「寒戰」再搜「寒戰II」
+  //   → 搜「寒戰」時 translations(movie/416248) 把「寒战」登記進全域集合
+  //   → 搜「寒戰II」時「寒战」**仍在集合裡** → 被當成「權威地區標題」
+  //     → 繞過「續集別名」閘門 → 選了「寒战」（第一部）→ 錯！
+  //
+  // 根因：權威性是**相對於查詢詞**的。
+  //   「寒战」對查「寒戰」是權威的；對查「寒戰II」它是**另一部作品**。
+  // → 集合改成「查詢詞 → 該詞的權威標題集合」，互不干擾。
+  const _scope = _tmdbRegionTitleScope || '';
+  if (_scope) {
+    let _set = _tmdbRegionTitleSetByScope.get(_scope);
+    if (!_set) { _set = new Set(); _tmdbRegionTitleSetByScope.set(_scope, _set); }
+    for (const t of titles) {
+      const k = normalizeForMatching(t);
+      if (k) _set.add(k);
+    }
   }
   if (titles.length) {
     console.log(`[TMDB-diag] translations(${type}/${tmdbId}): ${titles.join(' | ')}`);
@@ -1608,6 +1671,11 @@ async function _fetchTmdbRegionTitles(tmdbId, tmdbType) {
 async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const apiKey = CONFIG.TMDB.API_KEY;
   if (!apiKey) return;
+
+  // ★★ v124：設定「權威地區標題」的作用域 = 本次查詢詞 ★★
+  //   權威性是相對於查詢詞的（「寒战」對「寒戰」權威、對「寒戰II」是另一部片）
+  //   → 必須綁在查詢詞上，不能用全域集合。
+  _tmdbRegionTitleScope = cacheKey || _tmdbAliasKey(baseName, type);
 
   // ══════════════════════════════════════════════════════════════════
   // ★★★ v123：TMDB 跨地區別名橋接的完整重寫 ★★★
@@ -1679,6 +1747,8 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   //     保留「第一個出現的」，並記錄它來自哪個 query。
   const merged = [];
   const seenIds = new Set();  let respCount = 0;
+  // ★★ v124：跨型別條目（型別不符但可能是站方在用的另一個型別片名來源）。
+  const crossTypeHits = [];
   for (let i = 0; i < responses.length; i++) {
     const data = responses[i];
     if (!data?.results?.length) continue;
@@ -1719,12 +1789,35 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     });
     const multiResponses = await Promise.all(multiFetches);
     const wantType = type === 'movie' ? 'movie' : 'tv';
+    // ★★ v124：跨型別條目「只取名稱，不當主命中」★★
+    //
+    // 問題（實測 2026-11-28）：「毒舌大狀」同時是電影（2013）與劇集（2014）。
+    //   TMDB 的現況：
+    //     /search/movie 「毒舌大狀」→ id=990326「毒舌律师」✅ 有
+    //     /search/tv    「毒舌大狀」→ 0 筆（該劇已被改名為「刑侦12」id=284763）
+    //   站方現況：兩版都有（「毒舌律師」13 筆、「刑偵12」100 筆）
+    //
+    //   舊邏輯：multi 結果只收 media_type === wantType
+    //     → tv 查詢時電影版被丟掉 → 連「毒舌大狀」這個**站方片名**都拿不到
+    //     → 0 筆。
+    //
+    //   新邏輯：型別不符的條目**也保留**，但只當作「名稱來源」——
+    //     它們的 translations 裡往往就是站方在用的另一個型別片名
+    //     （電影條目 990326 的 TW/HK 名就是「毒舌大狀」）。
+    //     ★ 主命中仍優先取**型別相符**的條目（避免把電影版當劇集版）。
+    const crossTypeHitsLocal = [];
     for (const data of multiResponses) {
       if (!data?.results?.length) continue;
       for (const r of data.results) {
         if (!r || r.id == null) continue;
-        // ★ 只收型別相符的條目：電影查詢不要撈到劇集，反之亦然。
-        if (r.media_type && r.media_type !== wantType) continue;
+        const mt = r.media_type || null;
+        if (mt && mt !== wantType) {
+          if (!seenIds.has(r.id)) {
+            seenIds.add(r.id);
+            crossTypeHitsLocal.push(r);
+          }
+          continue;
+        }
         if (seenIds.has(r.id)) continue;
         seenIds.add(r.id);
         merged.push(r);
@@ -1733,16 +1826,36 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     if (merged.length) {
       console.log(`[TMDB-diag] /search/multi 補到 ${merged.length} 筆（型別=${wantType}）`);
     }
+    if (crossTypeHitsLocal.length) {
+      crossTypeHits.push(...crossTypeHitsLocal);
+      console.log(`[TMDB-diag] /search/multi 另有 ${crossTypeHitsLocal.length} 筆跨型別條目（只取名稱）: ` +
+        crossTypeHitsLocal.map(r => `${r.media_type}/${r.id}"${r.title || r.name}"`).join(', '));
+    }
   }
 
-  if (!merged.length) {
+  // ★★ v124：型別相符的命中為主；只有它全滅時才用跨型別條目 ★★
+  //
+  //   「毒舌大狀」：TMDB /search/tv → 0 筆（該劇改名「刑侦12」）
+  //                 TMDB /search/movie → id=990326（電影版）
+  //     → 沒有型別相符的條目 → 用跨型別條目當主命中，
+  //       它的 translations 提供站方在用的片名：
+  //         movie/990326 → CN:毒舌律师  TW/HK:毒舌大狀
+  //       → 別名「毒舌律师」→ 站方命中 ✅
+  //
+  // ★ 跨型別條目的別名仍會經過 tryExpand 的嚴格過濾，
+  //   且比對時用的是**站方實際片名** → 不會把電影版誤當劇集版。
+  const primaryPool = merged.length ? merged : crossTypeHits;
+  if (!primaryPool.length) {
     console.log(`[TMDB-diag] "${baseName}" 無搜尋結果（試過 ${queries.length} 個變體 + multi）`);
     return;
   }
-  console.log(`[TMDB-diag] 合併後候選 ${merged.length} 筆（來自 ${respCount}/${responses.length} 個回應）`);
+  if (!merged.length && crossTypeHits.length) {
+    console.log(`[TMDB-diag] 型別相符條目為 0，改用 ${crossTypeHits.length} 筆跨型別條目當名稱來源`);
+  }
+  console.log(`[TMDB-diag] 合併後候選 ${primaryPool.length} 筆（來自 ${respCount}/${responses.length} 個回應）`);
 
   // ★★ 挑最佳命中：片名相符度優先，續集/衍生作排除 ★★
-  const hit = _pickBestTmdbHit(merged, qRaw, type);
+  const hit = _pickBestTmdbHit(primaryPool, qRaw, type);
   if (!hit) {
     console.log(`[TMDB-diag] 無可靠命中，放棄別名橋接`);
     return;
@@ -1750,6 +1863,18 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   const tmdbId = hit.id;
   const hitDisplay = hit.name || hit.title || hit.original_name || hit.original_title;
   console.log(`[TMDB-diag] hit: "${hitDisplay}" id=${tmdbId}`);
+
+  // ★★ v124：記下「主命中條目自己的顯示名」★★
+  //   用途：多個 TMDB 條目都有權威地區標題時（例如「鬼滅之刃 無限城篇」
+  //   有 Part.1/2/3 三個條目），別名排序必須優先選主命中條目的名字。
+  //   → 存在作用域 map（tryExpand 用相同 key 讀取）。
+  const _primaryNames = new Set();
+  for (const _nm of [hit.name, hit.title, hit.original_name, hit.original_title]) {
+    const _t = String(_nm || '').trim();
+    if (!_t) continue;
+    _primaryNames.add(normalizeForMatching(_t));
+  }
+  _tmdbPrimaryTitleMap.set(cacheKey || _tmdbAliasKey(baseName, type), _primaryNames);
 
   // ══════════════════════════════════════════════════════════════════
   // ★★★ v124：ID 定位的「地區標題」橋接（權威做法）★★★ ★★★
@@ -1781,7 +1906,12 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
   //   每個條目多 1 個 HTTP 請求，且是**命中之後**才打（搜尋失敗就不打）。
   //   走 cache（_tmdbAliasCache 同一條目只打一次）。
   // ══════════════════════════════════════════════════════════════════
-  const regionTitles = await _fetchTmdbRegionTitles(tmdbId, tmdbType);
+  // ★★ v124：hit 可能是跨型別條目 → translations 要打對型別的 endpoint。
+  //   movie/990326 與 tv/990326 是不同的資源 → 打錯會 404 → 拿不到標題。
+  const hitType = (hit.media_type === 'movie' || hit.media_type === 'tv')
+    ? hit.media_type
+    : tmdbType;
+  const regionTitles = await _fetchTmdbRegionTitles(tmdbId, hitType);
 
   // ── 收集別名 ──
   //   ★ v123：別名來源只有「條目自身的欄位」：
@@ -1832,6 +1962,31 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     console.log(`[TMDB-diag] 地區標題橋接: ${regionTitles.join(' | ')}`);
   }
 
+  // ★★ v124：跨型別條目的地區標題也收進來 ★★
+  //
+  // 用途：「毒舌大狀」同時是電影與劇集。
+  //   TMDB /search/tv「毒舌大狀」→ 0 筆（該劇已改名「刑侦12」）
+  //   TMDB /search/movie「毒舌大狀」→ id=990326「毒舌律师」
+  //     → 該電影條目的 TW/HK 地區標題就是「毒舌大狀」← **站方在用的名字**
+  //   → 站方搜「毒舌大狀」→ 命中劇集版 ✅
+  //
+  // ★ 這些名稱只是「搜尋字串」，不是主命中 → 不會把電影版當成劇集版。
+  //   最終型別仍由站方回傳的內容決定（站方搜「毒舌大狀」回的是劇集條目）。
+  for (const ct of crossTypeHits) {
+    if (!ct || ct.id == null) continue;
+    const ctType = ct.media_type === 'movie' ? 'movie' : 'tv';
+    const ctTitles = await _fetchTmdbRegionTitles(ct.id, ctType);
+    for (const t of ctTitles) {
+      const key = normalizeForMatching(t);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      aliases.push(t);
+    }
+    // 跨型別條目自己的顯示名也收（可能已是站方片名）
+    pushAlias(ct.title);
+    pushAlias(ct.name);
+  }
+
   // ★★ v123：把「系列本體名」也收進來 ★★
   //
   // 症狀（實測 2026-11-28）：查「神鬼奇航」→ TMDB 條目是
@@ -1868,6 +2023,52 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
     if (s >= 0.85 && !_looksLikeSequelMarker(nm) && !_looksLikeSpinOffMarker(nm)) pushAlias(nm);
   }
 
+  // ★★ v124：同片名的「其他 TMDB 條目」也把地區標題收進候選清單 ★★
+  //
+  // 實測 bug（使用者回報 2026-11-28）：查「水行俠」(HK, Aquaman)
+  //   TMDB 有**兩部**同名條目（HK 名都是「水行俠」）：
+  //     id=65584  (2006) CN:水行侠  HK:水行俠   pop=1.3
+  //     id=297802 (2018) CN:海王    HK:水行俠   pop=9.7  ← ★站方索引的是這個
+  //   → 命中 65584（繁體完全相同 → 分數 1.0）→ 別名「水行侠」
+  //     → **站方沒有「水行侠」**（站方存的是 2018 年那部的「海王」）→ 0 筆
+  //   → 使用者明明有這部片卻搜不到。
+  //
+  // ★★ 關鍵：這些名稱是**「其他條目」的**片名 → 屬於「同一片名、不同作品」
+  //   的情況 → **絕對不能排在本條目的地區標題之前**。
+  //
+  //   反例（實測）：查「海王」(電影) → 若把「海扁王」(另一部片)排前面
+  //     → 站方搜「海扁王」→ 命中**另一部電影** → 使用者拿到錯的片。
+  //   反例：查「水行俠與失落王國」→ 若把 2018 那部（水行俠）的「海王」排前面
+  //     → 站方搜「海王」→ 命中**第一部** → 錯。
+  //
+  // → 處置：另存一份 `_siblingAliases`，**排在主候選之後**，
+  //   只在主候選全部搜不到時才依序試。
+  const _siblingAliases = [];
+  for (const r of merged) {
+    if (!r || r.id === tmdbId || r.id == null) continue;
+    const nm = String(r.name || r.title || '').trim();
+    if (!nm) continue;
+    // ★ 只收「與查詢詞相關」的條目 → 避免把不相干的熱門片塞進候選
+    const s = _tmdbHitMatchScore(bareQuery, r);
+    const sSeries = calculateStringSimilarity(
+      normalizeForMatching(bareQuery),
+      normalizeForMatching(_stripSeriesNumberFromTitle(nm))
+    );
+    if (Math.max(s, sSeries) < 0.30) continue;
+    const sibType = (r.media_type === 'movie' || r.media_type === 'tv')
+      ? r.media_type : tmdbType;
+    const t2 = await _fetchTmdbRegionTitles(r.id, sibType);
+    for (const t of t2) {
+      const key = normalizeForMatching(t);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      _siblingAliases.push(t);
+    }
+  }
+  if (_siblingAliases.length) {
+    console.log(`[TMDB-diag] 同名其他條目的地區標題（次順位）: ${_siblingAliases.join(' | ')}`);
+  }
+
   // ── 排序：簡體中文排前面 ──
   //   tryExpandWithTMDBAliases 會對每個候選算相似度並取最高分，
   //   簡體名排前面可讓「純繁簡轉換」這類最高分候選優先被看到。
@@ -1885,10 +2086,18 @@ async function _fetchTMDBAliasesAsync(baseName, type, cacheKey) {
 
   // ── 寫入 cache ──
   console.log(`[TMDB-diag] ✓ "${baseName}" → ${aliases.length} 別名:`, aliases);
-  _tmdbAliasCache.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
-  _tmdbAliasRecent.set(cacheKey, { aliases: [...aliases], ts: Date.now() });
+  // ★★ v124：同名其他條目的地區標題**另存**（次順位候選）★★
+  //   這些是「同一片名、不同作品」的別名 → 必須排在主候選之後，
+  //   只在主候選全部搜不到時才試。否則會把「海王」跟「海扁王」搞混。
+  const _allAliases = [...aliases, ..._siblingAliases];
+  // ★ v124：次順位候選另存 map（給 tryExpand 排「主候選之後」用）
+  if (_siblingAliases.length) {
+    _tmdbSiblingAliasMap.set(cacheKey, [..._siblingAliases]);
+  }
+  _tmdbAliasCache.set(cacheKey, { aliases: [...aliases], siblings: [..._siblingAliases], ts: Date.now() });
+  _tmdbAliasRecent.set(cacheKey, { aliases: [...aliases], siblings: [..._siblingAliases], ts: Date.now() });
   _enforceTmdbAliasCacheLimit();
-  _storeTmdbAliasCache(cacheKey, [...aliases]).catch(() => {});
+  _storeTmdbAliasCache(cacheKey, [..._allAliases]).catch(() => {});
 }
 
 /**
@@ -3899,7 +4108,7 @@ WidgetMetadata = {
   id: "EthanVOD",
   title: "EthanVOD",
   icon: "",
-  version: "2.1.1",
+  version: "2.5.0",
   requiredVersion: "0.0.1",
   description: "聚合搜尋",
   author: "Ethan",
@@ -5632,7 +5841,17 @@ function extractResolutionInfo(vodName, epName) {
 const _ENHANCED_INFO_CACHE = new Map();
 const _ENHANCED_INFO_CACHE_MAX = 2000;
 
-function extractEnhancedInfo(seriesName, srcItem = null) {
+/**
+ * 解析片名 → 基準片名 / 季別 / 年份 / 地區 ……
+ *
+ * @param {string} seriesName 站方或使用者輸入的片名
+ * @param {object|null} srcItem 站方原始條目（提供 remarks / 類型訊號）
+ * @param {'movie'|'tv'|'variety'|null} [mediaType] ★★ v124：型別
+ *   ★ 用來區分「尾端數字」是**電影續集序號**還是**電視劇季別**：
+ *     「Re:從零開始的異世界生活 2」→ tv → 尾端「2」是第 2 季
+ *     「無間道2」                  → movie → 尾端「2」是續集序號
+ */
+function extractEnhancedInfo(seriesName, srcItem = null, mediaType = null) {
   // 無損加速：同一次搜尋內同一 vod_name 會被解析 2~3 遍
   //（_adapterSearch 第一階段 + extractPlayInfoForCache + 串流路徑），
   // 且跨季 S1~S6 同名反覆出現。用 Map 快取純解析結果，命中直接回傳淺拷貝。
@@ -5646,6 +5865,9 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
   const _cacheKey = seriesName
     ? String(seriesName) + '|' + String(srcItem?._siteTypeName || '')
       + '|' + String(srcItem?.vod_remarks ?? srcItem?.vodRemarks ?? '')
+      // ★★ v124：型別會影響「尾端數字是季別還是續集序號」→ 必須進 cache key，
+      //   否則同一個片名以 movie 與 tv 兩種型別解析會互相污染。
+      + '|' + String(mediaType || '')
     : null;
   if (_cacheKey) {
     const _hit = _ENHANCED_INFO_CACHE.get(_cacheKey);
@@ -5731,6 +5953,36 @@ function extractEnhancedInfo(seriesName, srcItem = null) {
     if (englishMatch) {
       seasonNumber = parseInt(englishMatch[1]) || 1;
       baseName = rawName.replace(/[Ss]eason\s*\d+/i, '').replace(/[Ss]\d+/, '');
+    } else {
+      // ★★ v124：尾端「數字」當作季別（**限非電影**）★★
+      //
+      // 實測 bug：「Re:從零開始的異世界生活 2」→ season 被解析成 1
+      //   → 使用者要第 2 季，卻拿到 97 筆第 1 季 + 3 筆第 2 季。
+      //
+      // 為什麼以前不認：因為「无间道2」的「2」是**電影續集序號**，
+      //   認成季別會剝掉序號 → 命中第一部 → 拿錯片。
+      //   → 所以這裡必須**看型別**：電影不認，非電影（劇集/動漫/綜藝）認。
+      //
+      // ★ 判準細節（避免誤判）：
+      //   · 數字必須是 2~99（1 不算季別，因為「X1」通常是第一部）
+      //   · 前面必須還有文字（「请回答1988」的 1988 是 4 位 → 不算）
+      //   · **數字前面有空格** → 一定是季別（「...生活 2」）
+      //     沒空格（「零之使魔4」「无间道2」）→ 語意不明 → 不認
+      //     ★ 這樣「零之使魔4」維持舊行為（不剝、仍能命中同名站方條目），
+      //       而「Re:... 2」「仁醫 2」這種明確寫法能正確認成季別。
+      const _isMovieType = String(mediaType || '') === 'movie'
+        || String(srcItem?.type || '') === 'movie'
+        || String(srcItem?._mediaType || '') === 'movie';
+      if (!_isMovieType) {
+        const _spaced = rawName.match(/^(.*?[^\s\d])\s+(\d{1,2})$/);
+        if (_spaced) {
+          const _n = parseInt(_spaced[2], 10);
+          if (Number.isFinite(_n) && _n >= 2 && _n <= 99) {
+            seasonNumber = _n;
+            baseName = _spaced[1];
+          }
+        }
+      }
     }
   }
 
@@ -6231,7 +6483,26 @@ function isSmartSeriesMatch(targetInfo, candidateInfo, matchStrictness = 'standa
     };
   }
 
-  const similarity = calculateHybridSimilarity(targetName, candidateName);
+  // ★★ v124：別名橋接時的「原始片名」也算有效目標名 ★★
+  //
+  // 場景：查「海賊王」(HK, One Piece)
+  //   → TMDB 的 CN 名 = 「航海王」→ applyAliasNameToTarget 把 target.baseName
+  //     改成「航海王」→ 站方比對時拿「航海王」去對。
+  //   → 但站方索引的是**繁體**「海賊王」→ 用「航海王」比對 → 不命中。
+  //   → 結果：明明有 100 筆，卻只回 7 筆（樂高/特別篇）。
+  //
+  // ★ 解法：把「原始片名」保留成**等價的目標名**（_altBaseNames）。
+  //   比對時取「主名 / 原始名」中**較高**的相似度 → 兩種命名都認。
+  //   ★ 只影響跨區別名橋接（沒有 _altBaseNames 時行為完全不變）→ 零回歸風險。
+  let similarity = calculateHybridSimilarity(targetName, candidateName);
+  if (Array.isArray(targetInfo._altBaseNames) && targetInfo._altBaseNames.length) {
+    for (const alt of targetInfo._altBaseNames) {
+      const altName = normalizeTitleForMatch(alt);
+      if (!altName || altName === targetName) continue;
+      const altSim = calculateHybridSimilarity(altName, candidateName);
+      if (altSim > similarity) similarity = altSim;
+    }
+  }
 
   // 相似度完全命中也可能是續集誤判（清理後同名），序號衝突時一律否決。
   if (sequelConflict) {
@@ -7931,6 +8202,302 @@ async function getTMDBSeasonDateOrder(baseName, type, season, maxWaitMs = 3000) 
       return r;
     }
     return await inflight;
+  } catch { return null; }
+}
+
+// ★★ v125：TMDb「單季連續集數」→ 大陸「多季切分」的對照表 cache ★★
+//   key=`${base}|${type}` → { arcs: Array<{first, last, airFrom, airTo}>, ts }
+//   arcs = TMDb 那一季裡「每一個連續播出段」的集號區間。
+//   用途見 getTMDBArcBoundariesBlocking 的註解。
+const _tmdbArcBoundariesCache = new Map();
+const _tmdbArcBoundariesInFlight = new Map();
+
+/**
+ * ★★ v125：算出 TMDb「單一季」裡的**連續播出段（arc）**邊界 ★★
+ *
+ * 【要解決的問題】（使用者回報 2026-11-28）
+ *   香港 TMDb 把《咒術迴戰》整部放成**一季 59 集**（連續集數）：
+ *     E1–E24 = 第一季（2020-10-03 ～ 2021-03-27）
+ *     E25–E47 = 第二季「死滅遊行」（2023-07-06 ～ 2024-01-04）
+ *     E48–E59 = 第三季（2024-01-13 起）
+ *   大陸資源站則拆成**三個獨立條目**：
+ *     「咒术回战」24 集 / 「咒术回战第二季」23 集 / 「咒术回战第三季」12 集
+ *
+ *   → 使用者在香港 TMDb 介面點「第 1 季 第 25 集」，送到 Rex 的是
+ *     season=1, episode=25。但站方的 S1 只有 24 集 → **0 筆**。
+ *     使用者要看的其實是站方的「咒术回战第二季」第 1 集。
+ *
+ * 【解法】
+ *   TMDb 的單季集列表裡，每集的 **air_date** 是分界線：
+ *   同一個「連續播出段」的集數 air_date 連續遞增，段與段之間有明顯的
+ *   停播間隔（1 年以上）。用這個間隔切出 arc 邊界，得到
+ *     「TMDB 絕對集號 → 大陸切分後的 (季, 該季內集號)」對照。
+ *
+ *   對《咒術迴戰》實測切出：
+ *     arc1 = E1–E24（連續每週）  arc2 = E25–E47  arc3 = E48–E59
+ *   → E25 落在 arc2 的第 1 位 → 大陸 S2 E1 ✓
+ *
+ * 【為什麼用 air_date 而不是季別欄位】
+ *   TMDb 對這部作品**只有一個 season 條目**（zh-HK / zh-CN 都一樣，
+ *   S1 共 59 集），沒有季別欄位可用。air_date 是唯一能還原「大陸怎麼切季」
+ *   的線索 —— 因為大陸切季的依據本來就是「播完一段、停一段、再開一段」。
+ *
+ * 【邊界判定】
+ *   兩集之間的 air_date 間隔 > _TMDB_ARC_GAP_DAYS 天 → 視為不同 arc。
+ *   門檻取 90 天：長篇週番一週一集（7 天），停播通常隔季（90+ 天）；
+ *   90 天以下算「同一段連續播出」，避免把「冬季暫停 3 個月」誤切。
+ *
+ * 【失敗一律回 null】
+ *   呼叫端退回原本行為（找不到就 0 筆），不會比現況更差。
+ */
+const _TMDB_ARC_GAP_DAYS = 90;
+
+async function getTMDBArcBoundariesBlocking(baseName, type, season, maxWaitMs = 3000) {
+  if (!CONFIG.TMDB?.ENABLED || !CONFIG.TMDB.API_KEY) return null;
+  const base = String(baseName || '').trim();
+  const sNum = Number(season);
+  if (!base || base.length < 2) return null;
+  if (!Number.isFinite(sNum) || sNum < 1) return null;
+  const tmdbType = 'tv';
+  const cacheKey = `${base}|${sNum}|${tmdbType}`;
+  const cached = _tmdbArcBoundariesCache.get(cacheKey);
+  if (cached && cached.data !== undefined) return cached.data;
+  let inflight = _tmdbArcBoundariesInFlight.get(cacheKey);
+  if (!inflight) {
+    inflight = (async () => {
+      try {
+        const apiKey = CONFIG.TMDB.API_KEY;
+        const searchUrlBase = (lang) =>
+          `https://api.themoviedb.org/3/search/${tmdbType}` +
+          `?api_key=${encodeURIComponent(apiKey)}` +
+          `&query=${encodeURIComponent(base)}` +
+          `&language=${encodeURIComponent(lang)}`;
+        let tmdbId = null;
+        try {
+          const cnResp = await Widget.http.get(searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE_CN || 'zh-CN'), {
+            timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+            headers: { 'Accept': 'application/json' }
+          }).then(_unwrapHttpResponse).catch(() => null);
+          if (cnResp?.results?.length) tmdbId = cnResp.results[0]?.id || null;
+          if (!tmdbId) {
+            const twResp = await Widget.http.get(searchUrlBase(CONFIG.TMDB.SEARCH_LANGUAGE || 'zh-TW'), {
+              timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+              headers: { 'Accept': 'application/json' }
+            }).then(_unwrapHttpResponse).catch(() => null);
+            if (twResp?.results?.length) tmdbId = twResp.results[0]?.id || null;
+          }
+        } catch {}
+        if (!tmdbId) {
+          _tmdbArcBoundariesCache.set(cacheKey, { data: null, ts: Date.now() });
+          return null;
+        }
+        const listUrl = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${sNum}` +
+          `?api_key=${encodeURIComponent(apiKey)}&language=${encodeURIComponent(CONFIG.TMDB.SEARCH_LANGUAGE_CN || 'zh-CN')}`;
+        let listData = null;
+        try {
+          const listResp = await Widget.http.get(listUrl, {
+            timeout: CONFIG.TMDB.REQUEST_TIMEOUT,
+            headers: { 'Accept': 'application/json' }
+          });
+          listData = _unwrapHttpResponse(listResp);
+        } catch {}
+        const eps = Array.isArray(listData?.episodes) ? listData.episodes : null;
+        if (!eps || eps.length === 0) {
+          _tmdbArcBoundariesCache.set(cacheKey, { data: null, ts: Date.now() });
+          return null;
+        }
+        // 收集 (episode_number, air_date 整數)，依集號升冪。
+        const rows = [];
+        for (const ep of eps) {
+          const n = Number(ep?.episode_number);
+          if (!Number.isFinite(n) || n < 1) continue;
+          const di = _normalizeAirDateToInt(ep?.air_date);
+          rows.push({ n, di });
+        }
+        rows.sort((a, b) => a.n - b.n);
+        if (rows.length === 0) {
+          _tmdbArcBoundariesCache.set(cacheKey, { data: null, ts: Date.now() });
+          return null;
+        }
+        // 依 air_date 間隔切 arc。沒有 air_date 的集沿用前一個已知日期
+        // （少數集沒填播出日期，不影響分界）。
+        //
+        // ★ 日期單位：_normalizeAirDateToInt 回的是 YYYYMMDD 整數
+        //   （如 20201003），**不是** timestamp → 不能直接相減除以 86400。
+        //   這裡用「閏年安全的 UTC 天數」換算：把 YYYYMMDD 轉成 epoch 天。
+        const _ymdToEpochDay = (v) => {
+          try {
+            const n = Number(v);
+            if (!Number.isFinite(n) || n < 19000101 || n > 29991231) return null;
+            const y = Math.floor(n / 10000);
+            const mo = Math.floor((n % 10000) / 100);
+            const d = n % 100;
+            if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+            return Math.floor(Date.UTC(y, mo - 1, d) / 86400000);
+          } catch { return null; }
+        };
+        const arcs = [];
+        let cur = { first: rows[0].n, last: rows[0].n, airFrom: rows[0].di, airTo: rows[0].di };
+        let lastKnownDay = _ymdToEpochDay(rows[0].di);
+        for (let i = 1; i < rows.length; i++) {
+          const r = rows[i];
+          const di = r.di;
+          const day = _ymdToEpochDay(di);
+          if (day != null && lastKnownDay != null) {
+            const gapDays = day - lastKnownDay;
+            if (gapDays > _TMDB_ARC_GAP_DAYS) {
+              // 間隔過大 → 開新 arc。
+              arcs.push(cur);
+              cur = { first: r.n, last: r.n, airFrom: di, airTo: di };
+            } else {
+              cur.last = r.n;
+              cur.airTo = di;
+            }
+            lastKnownDay = day;
+          } else {
+            cur.last = r.n;
+            if (di != null) cur.airTo = di;
+          }
+        }
+        arcs.push(cur);
+        // ★ 只有切成 2 段以上才有「跨季」的意義（單段 = 普通的一季）。
+        //   單段時回 null，呼叫端完全走舊路徑（零行為變化）。
+        const data = arcs.length >= 2
+          ? { arcs, totalEps: rows.length }
+          : null;
+        _tmdbArcBoundariesCache.set(cacheKey, { data, ts: Date.now() });
+        return data;
+      } catch {
+        _tmdbArcBoundariesCache.set(cacheKey, { data: null, ts: Date.now() });
+        return null;
+      } finally {
+        _tmdbArcBoundariesInFlight.delete(cacheKey);
+      }
+    })();
+    _tmdbArcBoundariesInFlight.set(cacheKey, inflight);
+  }
+  try {
+    if (typeof setTimeout === 'function') {
+      const timeoutP = new Promise((resolve) => {
+        try { setTimeout(() => resolve('__timeout__'), maxWaitMs); } catch { resolve('__timeout__'); }
+      });
+      const r = await Promise.race([inflight, timeoutP]);
+      if (r === '__timeout__') {
+        try { const c = _tmdbArcBoundariesCache.get(cacheKey); if (c) return c.data; } catch {}
+        return null;
+      }
+      return r;
+    }
+    return await inflight;
+  } catch { return null; }
+}
+
+/**
+ * ★★ v125：把 TMDb「單季絕對集號」換算成「大陸切分後的 (季, 季內集號)」 ★★
+ *
+ * 回傳 null 代表「不需要換算」（單段 arc → TMDB 的季別跟站方一致）。
+ * 回傳 { season, episode } 代表「使用者要的第 N 集其實在別的季」。
+ *
+ * 判準：arcIndex = 使用者要的絕對集號落在第幾個 arc（0-based）。
+ *   arcIndex 0 → 季別 = 原本的 season、季內集號 = 原樣（不需要換算）。
+ *   arcIndex ≥ 1 → 季別 = season + arcIndex、季內集號 = 絕對集號 − arc.first + 1。
+ *
+ * ★ 只在 arcIndex ≥ 1 時才回傳換算結果（arcIndex 0 時回 null 代表
+ *   「照舊」，讓呼叫端完全不用改變既有流程）。
+ */
+function _mapAbsoluteEpToArcSeason(absEp, arcData, baseSeason) {
+  try {
+    if (!arcData || !Array.isArray(arcData.arcs) || arcData.arcs.length < 2) return null;
+    const ep = Number(absEp);
+    if (!Number.isFinite(ep) || ep < 1) return null;
+    const arcs = arcData.arcs;
+    let idx = -1;
+    for (let i = 0; i < arcs.length; i++) {
+      if (ep >= arcs[i].first && ep <= arcs[i].last) { idx = i; break; }
+    }
+    if (idx < 0) return null;          // 集號落在 arc 之外 → 不猜
+    if (idx === 0) return null;        // 第一個 arc 就是原季 → 不需要換算
+    const a = arcs[idx];
+    const season = Number(baseSeason) + idx;
+    const episode = ep - a.first + 1;
+    if (!Number.isFinite(season) || season < 1) return null;
+    if (!Number.isFinite(episode) || episode < 1) return null;
+    return { season, episode, arcIndex: idx, arcFirst: a.first, arcLast: a.last };
+  } catch { return null; }
+}
+
+/**
+ * ★★ v125：確認站方**真的有那一季**，才允許套用 arc 換算 ★★
+ *
+ * 【為什麼需要這個守門員】
+ *   TMDb 的 arc 切法 ≠ 站方的切法。只有當站方也把作品拆成多個條目時，
+ *   兩者才對得上。實測反例（《名偵探柯南》）：
+ *     TMDb：單季 1222 集 → arc 切成 2 段（E974→E975 之間有 4 年停播 gap）
+ *     站方：**只有一個條目**「名侦探柯南」共 1281 集（連續編號，從不分季）
+ *   → 若照 arc 換算，E975 會被導成「S2E1」→ 站方沒有 S2
+ *     → 使用者拿到的是《名侦探柯南：世纪末的魔术师》（一部電影）→ 完全錯的片。
+ *
+ * 【判準：站方條目必須同時滿足三條件】
+ *   (1) 條目片名宣告自己是第 N 季（extractSequelNumber == 目標季）
+ *   (2) 條目的集數**足夠涵蓋**換算後的目標集號
+ *   (3) 條目不是「電影 / 劇場版 / 特別篇」這類非正片條目
+ *
+ * 【為什麼 (2) 重要】
+ *   站方有時同名條目存在但集數不對（例如 S2 只有 3 集而我們要第 20 集）
+ *   → 寧可不換算（維持原行為 → 0 筆），也不要導到別的集。
+ *
+ * @param items      站方回傳的原始條目陣列（{vod_name, vod_play_url,...}）
+ * @param remap      _mapAbsoluteEpToArcSeason 的結果
+ * @param baseName   目標片名（用來比對條目是否同一作品）
+ * @returns {boolean} true = 可以安全套用換算
+ */
+function _stationSupportsArcRemap(items, remap, baseName) {
+  try {
+    if (!remap || !Array.isArray(items) || items.length === 0) return false;
+    const wantSeason = Number(remap.season);
+    const wantEp = Number(remap.episode);
+    if (!Number.isFinite(wantSeason) || !Number.isFinite(wantEp)) return false;
+    if (wantEp < 1) return false;
+
+    const tgtCore = normalizeTitleForMatch(stripSubtitle(String(baseName || '')).trim());
+
+    for (const it of items) {
+      const nm = String(it?.vod_name || '').trim();
+      if (!nm) continue;
+      // (3) 排除非正片條目
+      if (/剧场版|劇場版|电影版|電影版|\bOVA\b|\bSP\b|外传|外傳|特別篇|特别篇|总集篇|總集篇/.test(nm)) continue;
+      // (1) 條目必須宣告自己是第 N 季
+      const seq = extractSequelNumber(nm);
+      if (seq !== wantSeason) continue;
+      // 條目必須是同一作品（核心名相同）
+      const itCore = normalizeTitleForMatch(stripSubtitle(nm).trim());
+      if (tgtCore && itCore && tgtCore !== itCore) continue;
+      // (2) 條目集數必須涵蓋目標集號
+      const eps = _stationEpisodeCount(it);
+      if (eps != null && eps < wantEp) continue;
+      // ★ 集數抽不出來時（少數站不給 vod_play_url）→ 保守起見不放行。
+      //   沒有集數佐證就無法證明那一季存在 → 不換算。
+      if (eps == null) continue;
+      return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
+/**
+ * 站方條目的集數（從 vod_play_url 的第一段算）。
+ * 回傳 null 表示抽不出（站方沒給播放清單）。
+ */
+function _stationEpisodeCount(item) {
+  try {
+    const url = String(item?.vod_play_url || '');
+    if (!url) return null;
+    const firstSeg = url.split('$$$')[0] || '';
+    if (!firstSeg) return null;
+    const parts = firstSeg.split('#').filter(Boolean);
+    if (parts.length === 0) return null;
+    // 單檔（沒有 '#'）= 一集
+    return parts.length;
   } catch { return null; }
 }
 
@@ -17377,7 +17944,7 @@ async function loadResource(params, onStreamResult = null) {
     return [];
   }
 
-  const targetInfo = extractEnhancedInfo(seriesName);
+  const targetInfo = extractEnhancedInfo(seriesName, null, type);
   // ★ 把 type 帶進 targetInfo（jpyy 劇場版守門員要用）。
   // 條件：type 只在有效值之一時帶入，避免無效值污染。
   if (type === 'tv' || type === 'movie' || type === 'variety') {
@@ -17388,7 +17955,41 @@ async function loadResource(params, onStreamResult = null) {
   let targetSeason = resolveRexSeason(season, seriesName, targetInfo.seasonNumber);
   // ★ episode 必須走 _toEpisodeNumber（見其註解）：舊寫法對「第5集」
   //   這類輸入得 NaN，下游 smart 路徑用 !== null 判斷會把整批結果殺光。
-  const targetEpisode = _toEpisodeNumber(episode);
+  let targetEpisode = _toEpisodeNumber(episode);
+
+  // ★★ v125：TMDb「單季連續集數」→ 大陸「多季切分」的候選換算 ★★
+  //
+  // 場景（使用者回報 2026-11-28）：《咒術迴戰》
+  //   香港 TMDb：單一季、59 集連續編號（E1–E24 = S1、E25–E47 = S2、E48+ = S3）
+  //   大陸站方：三個獨立條目（咒术回战 24 集 / 咒术回战第二季 23 集 / 咒术回战第三季 12 集）
+  //   → 使用者點香港 TMDb 的「S1 第 25 集」→ Rex 收到 season=1, episode=25
+  //     → 站方 S1 只有 24 集 → **0 筆**（空白頁）
+  //   → 實際上 E25 是站方的「咒术回战第二季」第 1 集。
+  //
+  // 解法：用 TMDb 該季各集的 air_date 切出「連續播出段（arc）」，
+  //   得出「絕對集號 → (站方季, 該季內集號)」的候選換算。
+  //
+  // ★★★ 為什麼**不在這裡**直接換季 ★★★
+  //   TMDb 的 arc 切法**不等於**站方的切法。兩者只有在「站方也切成多季」時
+  //   才對得上。實測反例（必須避免的誤導）：
+  //     《名偵探柯南》TMDb 單季 1222 集 → arc 切成 2 段（E975 有 4 年停播 gap）
+  //     但站方只有**一個**條目「名侦探柯南」共 1281 集（連續編號，沒有分季）
+  //     → 若照 arc 換算，E975 會被改成「S2E1」→ 站方沒有 S2 → 拿到別的片。
+  //   所以換算**必須**先確認站方真的有那一季 → 見 _applyStationAwareArcRemap。
+  //
+  // ★ 這裡只算出「候選換算」，實際套用留到搜尋結果出來之後。
+  targetInfo._arcRemap = null;
+  if (type === 'tv' && Number.isFinite(targetEpisode) && targetEpisode > 0) {
+    try {
+      const _arcs = await getTMDBArcBoundariesBlocking(targetInfo.baseName, type, targetSeason, 3000);
+      const _mapped = _mapAbsoluteEpToArcSeason(targetEpisode, _arcs, targetSeason);
+      if (_mapped) {
+        targetInfo._arcRemap = _mapped;
+        console.log(`🔀 TMDb 連續集數換算候選: S${targetSeason}E${targetEpisode} → 站方 S${_mapped.season}E${_mapped.episode}` +
+          `（arc #${_mapped.arcIndex}: TMDb E${_mapped.arcFirst}–E${_mapped.arcLast}）`);
+      }
+    } catch { targetInfo._arcRemap = null; }
+  }
 
   // 修正「仁医 / season=第二季」情境（targetSeason 已由 resolveRexSeason 解出，
   // 此處只負責把「明確要第 N 季」的語意餵給 sequel 比對）。
@@ -17453,11 +18054,30 @@ async function loadResource(params, onStreamResult = null) {
   if (!targetInfo._aliasSearchQuery && params?._aliasSearchQuery) {
     targetInfo._aliasSearchQuery = params._aliasSearchQuery;
   }
+  // ★★ v124：別名候選清單（0 筆時依序試其他站方片名）★★
+  if (!targetInfo._aliasCandidates && Array.isArray(params?._aliasCandidates)) {
+    targetInfo._aliasCandidates = [...params._aliasCandidates];
+  }
+  // ★★ v124：原始查詢詞（與別名並行搜尋取聯集）★★
+  if (!targetInfo._originalSearchQuery && params?._originalSearchQuery) {
+    targetInfo._originalSearchQuery = params._originalSearchQuery;
+  }
+  // ★★ v124：等價目標名（原始片名）★★
+  if (!targetInfo._altBaseNames && Array.isArray(params?._altBaseNames)) {
+    targetInfo._altBaseNames = [...params._altBaseNames];
+  }
   if (targetInfo._aliasSearchQuery) {
     const aliasQ = _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
       .replace(/\s+$/, '')
       .trim();
     if (aliasQ) {
+      // ★★ v124：記下**原始查詢詞** ★★
+      //   別名與原詞是互補的：站方可能用繁體索引原詞、簡體索引別名。
+      //   實測「海賊王」→ 別名「航海王」站方沒有；原詞「海賊王」有 100 筆。
+      //   → 兩者都要搜（並行）→ 取聯集。
+      if (!targetInfo._originalSearchQuery) {
+        targetInfo._originalSearchQuery = String(targetInfo.searchQuery || '').trim();
+      }
       console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
       targetInfo.searchQuery = aliasQ;
 // v2.9.6：別名被採用時必須同步改比對用的名稱，否則搜尋拿得到結果
@@ -17494,6 +18114,11 @@ async function loadResource(params, onStreamResult = null) {
     targetInfo._targetAirDate = _ad;
     if (_ad) console.log(`📅 TMDb air_date 對齊: S${targetSeason}E${targetEpisode} → ${_ad}`);
   } catch { targetInfo._targetAirDate = null; }
+  // ★★ v125：TMDb「單季連續集數」→ 大陸「多季切分」的換算 ★★
+  //   已在搜尋之前完成（見上方「先於搜尋」區塊），這裡只沿用結果。
+  //   實際換算後的 season/episode 已寫回 targetSeason / targetEpisode，
+  //   所以這裡的 air_date 查詢用的是「站方那一季那一集」→ 正確。
+
   // ★★ 同日多集的序位（《一飯封神》S1 E23/E24/E25 都是 20250912、S2
   //   E19/E20/E21 都是 20260924）。
   //   只有 air_date 時，這幾集會被對到同一段資源（三集結果一模一樣）。
@@ -17720,6 +18345,14 @@ async function loadResource(params, onStreamResult = null) {
     //   修法：把別名一併傳下去，performBatchSearch / performSmartSearch
     //   收到後用它同步自己的 baseName（applyAliasNameToTarget）。
     _aliasSearchQuery: targetInfo._aliasSearchQuery || null,
+    // ★★ v124：別名候選清單一併傳下去 → 0 筆時可依序試其他站方片名。
+    _aliasCandidates: Array.isArray(targetInfo._aliasCandidates)
+      ? [...targetInfo._aliasCandidates] : null,
+    // ★★ v124：原始查詢詞 → 與別名並行搜尋取聯集（站方可能用繁體索引原詞）。
+    _originalSearchQuery: targetInfo._originalSearchQuery || null,
+    // ★★ v124：等價目標名（原始片名）→ 比對時兩種命名都認。
+    _altBaseNames: Array.isArray(targetInfo._altBaseNames)
+      ? [...targetInfo._altBaseNames] : null,
     _targetAirDate: targetInfo._targetAirDate ?? null,
     _targetEpisode: targetEpisode ?? null,
     // 設定頁已移除搜尋模式 / 清晰度偏好：鎖死批次搜尋 + 最清晰排序，
@@ -18335,6 +18968,25 @@ function applyAliasNameToTarget(targetInfo, aliasQ) {
   const alias = String(aliasQ || '').trim();
   if (!alias) return;
 
+  // ★★ v124：保留「原始片名」為等價目標名 ★★
+  //
+  // 場景：查「海賊王」(HK, One Piece)
+  //   → TMDB 的 CN 名 = 「航海王」→ baseName 改成「航海王」
+  //   → 但站方索引的是繁體「海賊王」→ 只用「航海王」比對 → 不命中
+  //   → 明明有 100 筆卻只回 7 筆（樂高/特別篇）。
+  //
+  // ★ 跨區橋接的兩種命名（繁體原名 / 簡體別名）**都是正確的目標名**
+  //   → 兩個都保留 → 比對時取較高的相似度 → 兩邊都認。
+  // ★ 只有在「兩者真的是同一作品的不同地區命名」時才會同時存在
+  //   （別名來自同一個 TMDB 條目的 /translations）→ 安全。
+  const _origBase = String(targetInfo.baseName || '').trim();
+  if (_origBase && _origBase !== alias) {
+    const _alt = Array.isArray(targetInfo._altBaseNames) ? targetInfo._altBaseNames : [];
+    if (!_alt.includes(_origBase)) {
+      targetInfo._altBaseNames = [..._alt, _origBase];
+    }
+  }
+
   // 別名本身可能帶季度（「行尸走肉第十一季」），baseName 要去掉季度，
   // 否則跟候選「行尸走肉第十一季」比對時 baseName 不一致。
   const parsed = extractEnhancedInfo(alias);
@@ -18363,6 +19015,23 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
   // 6s 只是網路異常時的保險上限，逾時就走 fallback（不影響正確性）。
   const aliases = await getTMDBAliasesBlocking(baseName, type, 6000);
   if (!Array.isArray(aliases) || aliases.length === 0) return false;
+
+  // ★★ v124：本次查詢的「權威地區標題」集合（作用域化）★★
+  //   權威性是相對於查詢詞的：
+  //     「寒战」對查「寒戰」是權威的；
+  //     對查「寒戰II」它是**另一部作品**（第一部）→ 不能當權威別名。
+  //   → 用「查詢詞 → 權威標題集合」的 map，避免跨查詢污染。
+  //
+  // ★ 註：找不到作用域時回傳**空集合**（不要回退到全域集合）。
+  //   全域集合若被填過，會讓「寒战」在查「寒戰II」時也被當權威 → 選到第一部。
+  const _scopeKey = _tmdbAliasKey(baseName, type);
+  const _authScopeSet = _tmdbRegionTitleSetByScope.get(_scopeKey) || new Set();
+
+  // ★★ v124：主命中條目自己的顯示名 ★★
+  //   當同一批搜尋結果裡有多個條目都有權威地區標題時
+  //   （實測「鬼滅之刃 無限城篇」有 Part.1/2/3 三個條目）
+  //   → 別名排序必須優先選**主命中條目**的名字（最貼近查詢詞的那筆）。
+  const _primaryHitTitles = _tmdbPrimaryTitleMap.get(_scopeKey) || new Set();
 
   // v2.8.14 簡化：aliases 內現在只有 CN 簡體別名 + hit 內原名。
   // 不需要「aSimp === aTrim」複雜判斷，簡體化後跟 baseSimp 不同就挑。
@@ -18471,14 +19140,36 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
     //   劇集/動漫/綜藝的序號是「季」（可以丟）。
     //   實測：查「Re:從零開始的異世界生活 2」→ 別名「Re：从零开始的异世界生活」
     //   （TMDB 一條目涵蓋所有季）→ 對 tv 不能擋 → 否則 0 筆。
-    if (_aliasIntroducesDifferentWork(baseName, aTrim, type)) {
+    //
+    // ★★ v124 重大修正：**權威地區標題不受這兩道閘門限制** ★★
+    //
+    // 這兩個名稱來自**同一個 TMDB 條目**的 /translations → 它們**必然**
+    // 是同一部作品的地區命名 → 不可能有「續集」或「衍生作」問題。
+    //
+    // 實測 bug（使用者回報 2026-11-28）：
+    //   查「水行俠與失落王國」(HK, id=572802 = 海王2：失落的王国)
+    //     → 別名「海王2：失落的王国」被「續集別名」閘門擋掉
+    //        （因為查詢詞是繁體、沒有數字，看起來像「別名多了序號」）
+    //     → 退而求其次選「海王」(0.07 分) → 拿到**第一部** → 使用者看到錯的片
+    //
+    //   根因：這道閘門用「字串前綴比較」判斷續集，但跨區命名時
+    //     查詢詞與別名**根本沒有共同前綴**（繁體 vs 簡體、港譯 vs 大陸譯）
+    //     → 前綴比較在跨區情境下毫無意義 → 閘門誤殺正確答案。
+    //
+    // 解法：權威地區標題（作用域集合命中）**直接跳過這兩道閘門**。
+    const _aNormEarly = normalizeForMatching(aTrim);
+    // ★ v124：權威性**相對於查詢詞** → 用作用域集合，不用全域集合。
+    //   （全域集合會讓「寒战」在查「寒戰II」時也被當權威 → 選到第一部。）
+    const _isAuthRegion = _authScopeSet.has(_aNormEarly);
+    if (!_isAuthRegion && _aliasIntroducesDifferentWork(baseName, aTrim, type)) {
       console.log(`[TMDB-diag] tryExpand: 跳過續集別名 "${aTrim}"（查詢 "${baseName}"）`);
       continue;
     }
     // ★★ v123：別名不得是「同一作品的衍生內容」★★
     //   「追龙番外篇之龙争虎斗」「咒术回战 小剧场」「仁医莎姆」
     //   → 站方有這些名字但那是**別的內容** → 搜尋結果會指到錯的片。
-    if (_looksLikeSpinOffMarker(aTrim)) {
+    //   ★ v124：權威地區標題不受此限（同一部作品的官方地區命名）。
+    if (!_isAuthRegion && _looksLikeSpinOffMarker(aTrim)) {
       console.log(`[TMDB-diag] tryExpand: 跳過衍生作別名 "${aTrim}"（查詢 "${baseName}"）`);
       continue;
     }
@@ -18512,26 +19203,103 @@ async function tryExpandWithTMDBAliases(targetInfo, type) {
     // 處置：把「權威地區標題」標記為 authoritative，
     //   評分給固定高分（0.99，僅次於完全相同 1.0），
     //   且**優先於**一般字串相似度 → 權威對照永遠勝出。
-    const isAuthoritative = _tmdbRegionTitleSet.has(aNorm);
+    const isAuthoritative = _authScopeSet.has(aNorm);
     if (isAuthoritative) sim = Math.max(sim, 0.99);
+    // ★★ v124：權威地區標題的「優先序」★★
+    //
+    // 同一個 TMDB 條目會有多個地區名（CN/TW/HK）。
+    // 站方（MacCMS）索引的是**簡體**片名 → CN 那一個最可能直接命中。
+    //
+    //   實測（2026-11-28）：查「水行俠與失落王國」(HK)
+    //     → 權威標題 = {海王2：失落的王国(CN), 水行俠 失落王國(TW), 水行俠與失落王國(HK)}
+    //     → 三者分數都是 0.99 → 需要額外排序依據
+    //     → 站方存的是「海王2：失落的王國」→ 必須選 **CN 簡體**那個
+    //
+    // ★ 判準：是不是「簡體中文」。繁體的權威標題與查詢詞同地區，
+    //   搜尋價值較低（原始繁體查詢詞本來就能搜到繁體站），
+    //   簡體那個才是跨區橋接的真正目的。
+    const _authSimp = isAuthoritative && isSimpChinese(aTrim);
+    if (_authSimp) sim = Math.max(sim, 1.0);
+    // ★★ v124：這個別名是否就是「主命中條目自己的顯示名」★★
+    //
+    // 為什麼需要這個訊號：
+    //   查「鬼滅之刃 無限城篇」(tv) → TMDB 命中 id=1311031
+    //     「鬼灭之刃：无限城篇 第一章 猗窝座再袭」
+    //   但同一次搜尋裡還有 id=1311034 (Part.2) / id=1311035 (Part.3)
+    //   → 三個都是「權威簡體」→ 分數都是 1.00 → 靠「較短」排序
+    //     → 選了 **Part.2**（較短）→ 站方沒有 → 0 筆
+    //   → 正確答案是**主命中條目**自己的名字（第一章）。
+    //
+    // ★ 「主命中條目」= _pickBestTmdbHit 選出來的那一筆
+    //   → 它的顯示名最貼近查詢詞（那個分數就是按它算出來的）。
+    const _isPrimaryHitTitle = _primaryHitTitles.has(normalizeForMatching(aTrim));
     scored.push({
       alias: aTrim, sim, len: aTrim.length,
       variant: isScriptVariant, auth: isAuthoritative,
+      authSimp: _authSimp, primary: _isPrimaryHitTitle,
     });
   }
 
   // 取最高分；同分取較短者（原始作品名通常比「XX番外篇之YYY」短）
+  //
+  // ★ v124 排序優先序：
+  //   1. 分數（權威簡體 = 1.0 > 權威地區標題 = 0.99 > 繁簡等價 = 0.95 > 一般相似度）
+  //   2. **主命中條目自己的顯示名 > 其他條目**（避免選到 Part.2/Part.3）
+  //   3. 權威簡體 > 權威地區標題 > 非權威
+  //   4. 較短者（原始作品名通常比「XX番外篇之YYY」短）
   if (scored.length) {
     scored.sort((x, y) =>
       (y.sim - x.sim) ||
+      ((y.primary ? 1 : 0) - (x.primary ? 1 : 0)) ||
+      ((y.authSimp ? 1 : 0) - (x.authSimp ? 1 : 0)) ||
       ((y.auth ? 1 : 0) - (x.auth ? 1 : 0)) ||
       (x.len - y.len)
     );
     bestAlias = scored[0].alias;
+    // ★★ v124：把整個排序後的候選清單一併保存 ★★
+    //
+    // ★ 為什麼要存整份清單（而不是只留第一名）：
+    //   「水行俠」(HK, Aquaman 2018) → TMDB 的 CN 名是「水行侠」
+    //     → 但**站方索引的是「海王」**（大陸通用名），TMDB 的 CN 欄位
+    //       在這裡反而不是站方片名。
+    //   → 只用第一名 → 站方搜「水行侠」→ 0 筆 → 使用者看不到這部片。
+    //   → 保留清單 → 搜不到第一名時**依序試下一個**（「海王」）→ 命中。
+    //
+    // ★ 這是「多候選 + 逐個試」的策略：別名橋接的本質是
+    //   「多猜幾個站方可能用的名字」，而不是「猜一個最像的」。
+    //
+    // ★★ 最後再接上「同名其他條目」的地區標題（次順位）★★
+    //   這些是**不同作品**的片名（「水行俠」的 2006 版 vs 2018 版）
+    //   → 必須排最後，只在前面全部落空時才試。
+    const _sib = _tmdbSiblingAliasMap.get(_tmdbAliasKey(baseName, type)) || [];
+    const _candList = scored
+      .map(s => s.alias)
+      .filter((v, i, arr) => arr.indexOf(v) === i)
+      .slice(0, 6);
+    for (const st of _sib) {
+      if (!_candList.includes(st)) _candList.push(st);
+    }
+    targetInfo._aliasCandidates = _candList.slice(0, 9);
+    // ★★ v124：把「原始查詢詞」也放進候選（**最後一位**）★★
+    //
+    // ★ 為什麼必須保留原始查詢詞：
+    //   實測（2026-11-28）：查「海賊王」(HK, One Piece)
+    //     → TMDB 的 CN 名 = 「航海王」→ 別名被採用 → 站方搜「航海王」
+    //     → 站方**沒有**這個片名（站方存的是「海賊王」100 筆）
+    //     → 原本能搜到的片被別名**弄丟了** → 7 筆（只剩樂高/特別篇）
+    //   → 原始繁體查詢詞在站方往往**本來就對** → 不能被別名取代。
+    //
+    // ★ 順序很重要：原始查詢詞放**最後** → 只在前面的別名都落空時才試。
+    //   （別名是為了「查詢詞搜不到」而存在的保險，不是取代品。）
+    const _origQ = String(targetInfo.searchQuery || baseName || '').trim();
+    if (_origQ && !targetInfo._aliasCandidates.includes(_origQ)) {
+      targetInfo._aliasCandidates.push(_origQ);
+    }
     console.log(`[TMDB-diag] tryExpand: 候選評分 ` +
       scored.slice(0, 5).map(s => `"${s.alias}"(${s.sim.toFixed(2)}` +
-        `${s.variant ? ',繁簡等價' : ''}${s.auth ? ',權威地區標題' : ''})`).join(' ') +
-      ` → 選 "${bestAlias}"`);
+        `${s.variant ? ',繁簡等價' : ''}${s.authSimp ? ',權威簡體' : ''}` +
+        `${s.auth && !s.authSimp ? ',權威地區標題' : ''})`).join(' ') +
+      ` → 選 "${bestAlias}"（備用 ${targetInfo._aliasCandidates.length} 個）`);
   }
   // 退路：所有 alias 都不符合嚴格條件（罕見）→ return false 走原 searchQuery
   // 不要 fallback 到英文別名，VOD 站用中文字典認不出。
@@ -19284,19 +20052,35 @@ async function performSmartSearch(params, onStreamResult) {
     season
   } = params;
 
-  const targetEpisode = _toEpisodeNumber(episode);
+  let targetEpisode = _toEpisodeNumber(episode);
   const startTime = Date.now();
 
   const siteManager = new SiteManager();
   const resourceSites = _filterMacSites(parseResourceSites(VodData), params);
   const sortedSites = siteManager.initializeSites(resourceSites);
 
-  const targetInfo = extractEnhancedInfo(seriesName);
+  const targetInfo = extractEnhancedInfo(seriesName, null, type);
 
   // season 參數不會出現在 seriesName 裡，必須在這裡套用，否則搜尋字串
   // 永遠是裸片名。使用者切換季別時拿到的是第一季的內容，畫面看起來
   // 就完全沒有刷新。★ 統一走 resolveRexSeason（見其註解），與 loadResource 一致。
   let targetSeason = resolveRexSeason(season, seriesName, targetInfo.seasonNumber);
+  // ★★ v125：TMDb「單季連續集數」→ 大陸「多季切分」的換算候選 ★★
+  //   詳見 loadResource 內同名區塊的註解（《咒術迴戰》E25 → 站方 S2E1）。
+  //   ★ 這裡只算「候選」；實際套用必須等站方結果回來、確認站方真的有
+  //     那一季之後（見 performBatchSearch 的 _stationSupportsArcRemap 守門員）。
+  //     否則《名偵探柯南》這種「站方只有一個連續條目」的長篇會被誤導。
+  targetInfo._arcRemap = null;
+  if (type === 'tv' && Number.isFinite(targetEpisode) && targetEpisode > 0) {
+    try {
+      const _arcs = await getTMDBArcBoundariesBlocking(targetInfo.baseName, type, targetSeason, 3000);
+      const _mapped = _mapAbsoluteEpToArcSeason(targetEpisode, _arcs, targetSeason);
+      if (_mapped) {
+        targetInfo._arcRemap = _mapped;
+        console.log(`🔀 TMDb 連續集數換算候選(smart): S${targetSeason}E${targetEpisode} → 站方 S${_mapped.season}E${_mapped.episode}（arc #${_mapped.arcIndex}）`);
+      }
+    } catch { targetInfo._arcRemap = null; }
+  }
   if (Number.isFinite(targetSeason) && targetSeason > 1) {
     targetInfo._expectedSequel = targetSeason;
   }
@@ -19364,11 +20148,30 @@ async function performSmartSearch(params, onStreamResult) {
   if (!targetInfo._aliasSearchQuery && params?._aliasSearchQuery) {
     targetInfo._aliasSearchQuery = params._aliasSearchQuery;
   }
+  // ★★ v124：別名候選清單（0 筆時依序試其他站方片名）★★
+  if (!targetInfo._aliasCandidates && Array.isArray(params?._aliasCandidates)) {
+    targetInfo._aliasCandidates = [...params._aliasCandidates];
+  }
+  // ★★ v124：原始查詢詞（與別名並行搜尋取聯集）★★
+  if (!targetInfo._originalSearchQuery && params?._originalSearchQuery) {
+    targetInfo._originalSearchQuery = params._originalSearchQuery;
+  }
+  // ★★ v124：等價目標名（原始片名）★★
+  if (!targetInfo._altBaseNames && Array.isArray(params?._altBaseNames)) {
+    targetInfo._altBaseNames = [...params._altBaseNames];
+  }
   if (targetInfo._aliasSearchQuery) {
     const aliasQ = _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
       .replace(/\s+$/, '')
       .trim();
     if (aliasQ) {
+      // ★★ v124：記下**原始查詢詞** ★★
+      //   別名與原詞是互補的：站方可能用繁體索引原詞、簡體索引別名。
+      //   實測「海賊王」→ 別名「航海王」站方沒有；原詞「海賊王」有 100 筆。
+      //   → 兩者都要搜（並行）→ 取聯集。
+      if (!targetInfo._originalSearchQuery) {
+        targetInfo._originalSearchQuery = String(targetInfo.searchQuery || '').trim();
+      }
       console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
       targetInfo.searchQuery = aliasQ;
 // v2.9.6：別名被採用時必須同步改比對用的名稱，否則搜尋拿得到結果
@@ -19457,7 +20260,7 @@ async function performBatchSearch(params) {
     return [];
   }
 
-  const targetInfo = extractEnhancedInfo(seriesName);
+  const targetInfo = extractEnhancedInfo(seriesName, null, type);
   // ★ 把 type 帶進 targetInfo（jpyy 劇場版守門員要用）。
   if (type === 'tv' || type === 'movie' || type === 'variety') {
     targetInfo.type = type;
@@ -19465,7 +20268,22 @@ async function performBatchSearch(params) {
   // ★ 統一走 resolveRexSeason（見其註解），與 loadResource 一致。
   let targetSeason = resolveRexSeason(season, seriesName, targetInfo.seasonNumber);
   // ★ 同 loadResource：episode 走 _toEpisodeNumber，NaN 會殺光結果。
-  const targetEpisode = _toEpisodeNumber(episode);
+  let targetEpisode = _toEpisodeNumber(episode);
+  // ★★ v125：TMDb「單季連續集數」→ 大陸「多季切分」的換算候選 ★★
+  //   詳見 loadResource 內同名區塊的註解（《咒術迴戰》E25 → 站方 S2E1）。
+  //   ★ 這裡只算「候選」；實際套用必須等站方結果回來、確認站方真的有
+  //     那一季之後（見下方 _stationSupportsArcRemap 守門員）。
+  targetInfo._arcRemap = null;
+  if (type === 'tv' && Number.isFinite(targetEpisode) && targetEpisode > 0) {
+    try {
+      const _arcs = await getTMDBArcBoundariesBlocking(targetInfo.baseName, type, targetSeason, 3000);
+      const _mapped = _mapAbsoluteEpToArcSeason(targetEpisode, _arcs, targetSeason);
+      if (_mapped) {
+        targetInfo._arcRemap = _mapped;
+        console.log(`🔀 TMDb 連續集數換算候選(batch): S${targetSeason}E${targetEpisode} → 站方 S${_mapped.season}E${_mapped.episode}（arc #${_mapped.arcIndex}）`);
+      }
+    } catch { targetInfo._arcRemap = null; }
+  }
   if (Number.isFinite(targetSeason) && targetSeason > 1) {
     targetInfo._expectedSequel = targetSeason;
   }
@@ -19520,11 +20338,30 @@ async function performBatchSearch(params) {
   if (!targetInfo._aliasSearchQuery && params?._aliasSearchQuery) {
     targetInfo._aliasSearchQuery = params._aliasSearchQuery;
   }
+  // ★★ v124：別名候選清單（0 筆時依序試其他站方片名）★★
+  if (!targetInfo._aliasCandidates && Array.isArray(params?._aliasCandidates)) {
+    targetInfo._aliasCandidates = [...params._aliasCandidates];
+  }
+  // ★★ v124：原始查詢詞（與別名並行搜尋取聯集）★★
+  if (!targetInfo._originalSearchQuery && params?._originalSearchQuery) {
+    targetInfo._originalSearchQuery = params._originalSearchQuery;
+  }
+  // ★★ v124：等價目標名（原始片名）★★
+  if (!targetInfo._altBaseNames && Array.isArray(params?._altBaseNames)) {
+    targetInfo._altBaseNames = [...params._altBaseNames];
+  }
   if (targetInfo._aliasSearchQuery) {
     const aliasQ = _stripTrailingVersionYear(String(targetInfo._aliasSearchQuery))
       .replace(/\s+$/, '')
       .trim();
     if (aliasQ) {
+      // ★★ v124：記下**原始查詢詞** ★★
+      //   別名與原詞是互補的：站方可能用繁體索引原詞、簡體索引別名。
+      //   實測「海賊王」→ 別名「航海王」站方沒有；原詞「海賊王」有 100 筆。
+      //   → 兩者都要搜（並行）→ 取聯集。
+      if (!targetInfo._originalSearchQuery) {
+        targetInfo._originalSearchQuery = String(targetInfo.searchQuery || '').trim();
+      }
       console.log(`🌐 [TMDB] 已採用對岸/別名 query: "${aliasQ}"（原本 "${targetInfo.searchQuery}"）`);
       targetInfo.searchQuery = aliasQ;
 // v2.9.6：別名被採用時必須同步改比對用的名稱，否則搜尋拿得到結果
@@ -20006,6 +20843,66 @@ async function performBatchSearch(params) {
         } catch { return null; }
       })
     );
+
+    // ★★ v124：原始查詢詞**並行**搜尋 ★★
+    //
+    // 為什麼要並行搜（而不是只靠 fallback 逐一試）：
+    //   實測（2026-11-28）：查「海賊王」(HK, One Piece)
+    //     → TMDB 的 CN 名 = 「航海王」→ 別名被採用 → 站方搜「航海王」
+    //     → 站方**沒有**這個片名（站方存的是「海賊王」100 筆）
+    //     → 別名查詢回 7 筆（樂高/特別篇）→ **非 0** → fallback 不觸發
+    //     → 原本能搜到的 100 筆被別名**取代**掉了 → 使用者只拿到 7 筆垃圾
+    //
+    // ★ 關鍵：別名與原始查詢詞是**互補**的，不是取代關係。
+    //   原始繁體詞 → 命中「海賊王」（站方用繁體索引該片）
+    //   別名簡體詞   → 命中「海王2：失落的王国」（站方用簡體索引該片）
+    //   → **兩者都要搜，取聯集** → 使用者永遠拿到最全的結果。
+    //
+    // 成本：每站多 1 次請求，且與主搜尋**並行**（不增加延遲）。
+    // ★ 只在「別名 ≠ 原始查詢詞」且「原始詞是繁體/中文」時才加搜，
+    //   避免對已經是簡體的查詢重複打同一個字串。
+    const _origSearchQuery = String(targetInfo._originalSearchQuery || '').trim();
+    if (!_macCacheHit && _origSearchQuery &&
+        _origSearchQuery !== String(targetInfo.searchQuery || '').trim()) {
+      try {
+        const _origSearches = await Promise.all(
+          resourceSites.map(async site => {
+            try {
+              const response = await fetchWithSmartRetry(
+                site.value,
+                { params: { ac: "detail", wd: _origSearchQuery } },
+                0,
+                site.title
+              );
+              if (!response?.list) return null;
+              return { site, list: response.list };
+            } catch { return null; }
+          })
+        );
+        const _added = _origSearches.filter(Boolean);
+        if (_added.length) {
+          console.log(`[TMDB-diag] 並行補搜原始查詢詞 "${_origSearchQuery}"（${_added.length} 站有回應）`);
+          // ★ 與主搜尋結果**合併**（同一站可能兩邊都有 → 以 list 長度為準取聯集）
+          for (const s of _added) {
+            const _exist = _macSearches.find(x => x && x.site === s.site);
+            if (_exist) {
+              const _seen = new Set(_exist.list.map(it => it?.vod_id ?? it?.vod_name));
+              for (const it of (s.list || [])) {
+                const _k = it?.vod_id ?? it?.vod_name;
+                if (_k == null || _seen.has(_k)) continue;
+                _seen.add(_k);
+                _exist.list.push(it);
+              }
+            } else {
+              _macSearches.push(s);
+            }
+          }
+          _pooledItems = _macSearches.flatMap(x => (Array.isArray(x?.list) ? x.list : []));
+        }
+      } catch (e) {
+        console.warn('[TMDB-diag] 原始查詢詞補搜失敗:', e?.message || e);
+      }
+    }
     // ★★ 跨站合併的候選池（填入上方宣告的 _pooledItems）★★
     //
     // marker（完結篇 / FINAL / 最終季）的季別靠「同年系列條目」推導，
@@ -20020,6 +20917,43 @@ async function performBatchSearch(params) {
     //
     // 這也是「跨站共識」能生效的前提：單站年份可能錯，多站才有真共識。
     _pooledItems = _macSearches.flatMap(x => (Array.isArray(x?.list) ? x.list : []));
+
+    // ★★ v125：套用「TMDb 連續集數 → 站方多季切分」的換算（**站方驗證過**才套）★★
+    //
+    // 場景（使用者回報 2026-11-28）：《咒術迴戰》
+    //   香港 TMDb：單一季、59 集連續編號（E1–E24 = S1、E25–E47 = S2、E48+ = S3）
+    //   大陸站方：三個獨立條目（咒术回战 24 集 / 第二季 23 集 / 第三季 12 集）
+    //   → 使用者點香港 TMDb 的「S1 第 25 集」→ Rex 收到 season=1, episode=25
+    //     → 站方 S1 只有 24 集 → **0 筆**（空白頁）
+    //   → 實際上 E25 是站方的「咒术回战第二季」第 1 集。
+    //
+    // ★ 為什麼在**搜到站方結果之後**才換算：
+    //   TMDb 的 arc 切法 ≠ 站方的切法。必須先看到站方真的有那一季，
+    //   才敢把「S1E25」導到「S2E1」。
+    //   反例（《名偵探柯南》）：TMDb 單季 1222 集切成 2 arc（E975 前有 4 年 gap），
+    //   但站方只有**一個**條目「名侦探柯南」1281 集連續編號 → 沒有 S2
+    //   → 不換算（否則會拿到《名侦探柯南：世纪末的魔术师》這部電影）。
+    //
+    // ★ 守門員 _stationSupportsArcRemap 要求站方條目同時滿足：
+    //   (1) 片名宣告自己是第 N 季 (2) 集數涵蓋目標集號 (3) 不是劇場版/特別篇
+    //   任一不滿足 → 不換算 → 維持原行為（0 筆仍是 0 筆，不會更差）。
+    if (type === 'tv' && targetInfo._arcRemap && !_macCacheHit) {
+      try {
+        const _allStationItems = _macSearches.flatMap(x => (Array.isArray(x?.list) ? x.list : []));
+        if (_stationSupportsArcRemap(_allStationItems, targetInfo._arcRemap, targetInfo.baseName)) {
+          const _from = `S${targetInfo.seasonNumber}E${targetEpisode}`;
+          targetInfo.seasonNumber = targetInfo._arcRemap.season;
+          targetInfo._expectedSequel = targetInfo._arcRemap.season;
+          targetEpisode = targetInfo._arcRemap.episode;
+          targetInfo._targetEpisode = targetEpisode;
+          console.log(`🔀 TMDb 連續集數換算: ${_from} → 站方 S${targetInfo.seasonNumber}E${targetEpisode}` +
+            `（站方確認有第${targetInfo.seasonNumber}季）`);
+        } else {
+          console.log(`🔀 TMDb 連續集數換算略過: 站方沒有獨立的第${targetInfo._arcRemap.season}季條目（維持原查詢）`);
+          targetInfo._arcRemap = null;
+        }
+      } catch { targetInfo._arcRemap = null; }
+    }
 
     // 預掃：把所有站的集名聯集起來，建立跨站一致的期結構
     //
@@ -20584,6 +21518,103 @@ async function performBatchSearch(params) {
         }
       } catch (e) {
         console.warn('[fallback] loose 重試失敗:', e?.message || e);
+      }
+    }
+
+    // ★★ v124：別名候選逐一試（多候選策略）★★
+    //
+    // 為什麼需要：TMDB 的「地區標題」是**官方譯名**，但**站方索引的片名**
+    // 不一定是官方譯名。實測（2026-11-28）：
+    //   查「水行俠」(HK, Aquaman 2018)
+    //     → TMDB 的 CN 名 = 「水行侠」（官方譯名）
+    //     → 但**站方索引的是「海王」**（大陸通用譯名）→ 站方沒有「水行侠」
+    //     → 只用第一名別名 → 0 筆 → 使用者看不到這部明明存在的片
+    //   → 保留多個候選 → 依序試 → 「海王」命中 ✅
+    //
+    // ★ 這正是跨區橋接的本質：**多猜幾個站方可能用的名字**，
+    //   而不是猜「最像」的那一個就定生死。
+    //   （官方譯名 ≠ 站方片名，是 MacCMS 站的普遍現象。）
+    //
+    // 安全閘：
+    // - 只在 0 筆時觸發（正常情況完全不增加請求數）；
+    // - 最多試 6 個候選（控制延遲；主候選在前、同名其他條目次之、原始查詢詞最後）；
+    // - 每個候選都走**同一套**比對與過濾流程，不會放行垃圾。
+    if (allResults.length === 0) {
+      const _cands = Array.isArray(targetInfo._aliasCandidates)
+        ? targetInfo._aliasCandidates.filter(Boolean)
+        : [];
+      const _used = String(targetInfo._aliasSearchQuery || '').trim();
+      const _tryCands = _cands.filter(c => c !== _used).slice(0, 6);
+      for (const _cand of _tryCands) {
+        try {
+          const _candQ = _stripTrailingVersionYear(String(_cand)).replace(/\s+$/, '').trim();
+          if (!_candQ) continue;
+          console.log(`🆘 [fallback] 0 筆，試另一個別名: "${_candQ}"`);
+          // ★★ v124：試這個別名時，它**本身就是**合法的目標名 ★★
+          //
+          // 場景：查「水行俠」(HK, Aquaman 2018)
+          //   → 主別名「水行侠」(TMDB 官方 CN 譯名) → 站方沒有 → 0 筆
+          //   → 試同名其他條目的別名「海王」(2018 版的大陸通用名)
+          //     → 站方有 9 筆 ✓
+          //   → 但比對時 target.baseName 仍是「水行侠」→ 「海王」比不過來
+          //     → 被 isSmartSeriesMatch 殺掉 → 仍 0 筆。
+          //
+          // ★ 解法：試某個別名時，把它**加進等價目標名**一起比對。
+          //   安全閘：
+          //   - 別名來自 TMDB 同一批搜尋結果（官方翻譯對照），
+          //     且經過「續集/衍生作」過濾 → 不會把另一部片放出來；
+          //   - 仍然走完整的 isSmartSeriesMatch（含 spin-off、
+          //     解說版、序號衝突、年份衝突等所有閘門）。
+          const _tgtForCand = {
+            ...targetInfo,
+            _altBaseNames: [
+              ...(Array.isArray(targetInfo._altBaseNames) ? targetInfo._altBaseNames : []),
+              _candQ,
+            ],
+          };
+          const _tasks = resourceSites.map(site => async () => {
+            try {
+              const resp = await fetchWithSmartRetry(
+                site.value,
+                { params: { ac: 'detail', wd: _candQ } },
+                0, site.title);
+              if (!resp?.list?.length) return [];
+              const eligible = [];
+              for (const it of resp.list) {
+                if (!it?.vod_name) continue;
+                if (/剧场版|劇場版|外传|外傳|总集篇|總集篇|番外|＊|∽/u.test(it.vod_name)) continue;
+                if (isNarrativeCut(it.vod_name, it.vod_remarks)) continue;
+                const ci = extractEnhancedInfo(it.vod_name, it);
+                const mr = isSmartSeriesMatch(_tgtForCand, ci, matchStrictness, { items: resp.list });
+                if (!mr.match) continue;
+                eligible.push({ item: it, matchResult: mr });
+              }
+              if (eligible.length === 0) return [];
+              const lim = CONFIG.MAC?.DETAIL_CONCURRENCY ?? 4;
+              const detailResults = await _adapterPool(
+                eligible.map(({ item: it, matchResult: mr }) => async () =>
+                  await extractPlayInfoForCache(it, site.title, type, mr, targetInfo)
+                ),
+                lim
+              );
+              const out = [];
+              for (const res of detailResults) { if (res) out.push(...res); }
+              return out;
+            } catch { return []; }
+          });
+          const rs = await Promise.allSettled(_tasks.map(t => t()));
+          const flat = rs.filter(r => r.status === 'fulfilled').flatMap(r => r.value || []);
+          if (flat.length > 0) {
+            const ded = new SmartSearchExecutor(new SiteManager(), targetInfo, type, matchStrictness).smartDeduplicate(flat);
+            if (ded.length > 0) {
+              console.log(`🆘 [fallback] 別名 "${_candQ}" 取得 ${ded.length} 筆`);
+              allResults = ded;
+              break;
+            }
+          }
+        } catch (e) {
+          console.warn('[fallback] 別名候選失敗:', e?.message || e);
+        }
       }
     }
 
